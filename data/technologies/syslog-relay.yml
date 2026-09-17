@@ -1,0 +1,2260 @@
+id: syslog-relay
+name: rsyslog/syslog-ng concentrators
+vendor: Multiple
+versions: >-
+  rsyslog 8.x (RHEL 8/9 default; counter names below verified against the
+  8-stable docs), syslog-ng OSE 3.3x/4.x and syslog-ng PE 7.x
+draft: true
+references:
+- https://docs.rsyslog.com/doc/configuration/modules/impstats.html
+- >-
+  https://github.com/rsyslog/rsyslog-doc/blob/master/source/configuration/modules/impstats.rst
+- https://docs.rsyslog.com/doc/configuration/rsyslog_statistic_counter.html
+- https://www.rsyslog.com/how-to-use-impstats/
+- https://docs.rsyslog.com/doc/configuration/modules/imuxsock.html
+- https://docs.rsyslog.com/doc/configuration/modules/imudp.html
+- https://docs.rsyslog.com/doc/configuration/modules/imtcp.html
+- >-
+  https://syslog-ng.github.io/admin-guide/150_Statistics_of_syslog-ng/000_Metrics_and_counters.html
+- >-
+  https://axoflow.com/docs/axosyslog-core/chapter-log-statistics/log-statistics-description/
+- https://manpages.ubuntu.com/manpages/bionic/man1/syslog-ng-ctl.1.html
+datasets:
+- id: rsyslog-impstats
+  name: rsyslog impstats counters
+  description: |
+    The legacy relay tier observing itself. rsyslog's impstats module registers counters on every internal object - each input module, each queue (the main queue, every ruleset queue, every action queue) and each action - and emits them on a fixed interval (module parameter interval, default 300 seconds) with the syslogtag rsyslogd-pstats at facility 5 / severity 6 by default.
+    This is the silent-feed-loss detector for the tier that sits in front of Cribl. A syslog concentrator that is shedding messages does not stop emitting - it keeps forwarding a reduced stream, and nothing downstream can tell a quiet source from a discarded one. The counters that make the difference visible are discarded.full and discarded.nf on the queue objects and ratelimit.discarded on imuxsock: every one of them represents messages that entered this host and never left it. discarded.nf is the worst of them because it is severity-selective - when a queue goes nearly full rsyslog discards the LOW severity messages first, so the feed stays alive, the high-severity alerts keep arriving, and the routine authentication and audit volume quietly disappears underneath a green dashboard.
+    During the ArcSight to Cribl cutover these counters are the upstream half of the count reconciliation doctrine - one hop earlier than the Cribl internal counters. Reconciling submitted here against inEvents on the low-side Cribl worker group, and low-side Cribl outEvents against high-side inEvents, is what turns "the feed looks fine" into an actual continuity claim across both the guard and the cutover.
+  event_categories:
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge Cribl worker group, on-prem enclave (low side)
+      notes: >
+        The concentrators are the collection tier: they sit in the enclave
+        with the devices they aggregate, upstream of Cribl, which is why the
+        low-side concentrators' own telemetry has to cross the Everfox HSG to
+        be reconciled against the high-side tier's.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >
+        allow-list on the logs-syslog_relay.impstats destination data stream
+        only; allowlisted key set with bounded string lengths - every value on
+        this route is a counter or a short object name, so the caps can be
+        tight
+      notes: |
+        The evidence that a shed did not happen must not itself be the thing that gets shed. Give this route its own guard destination and its own persistent queue rather than sharing one with the bulk vendor traffic these same concentrators relay.
+        Crossing transport is confirmed. TODAY the low-side Cribl ships through a Cribl Syslog Destination, using the __syslogout internal field whose value is a CEF-structured string; the high-side Cribl receives each message as _raw containing a JSON object string, runs a Parser function (Extract JSON) over _raw, adds Cribl fields and ships to Routes. That syslog/CEF leg is being retired. PLANNED and confirmed as the plan of record: low-side Cribl HTTP Destination -> guard -> high-side Cribl HTTP Source carrying NDJSON. "Its own guard destination" means a dedicated Syslog Destination today and a dedicated HTTP Destination after the cutover.
+    - hop: cribl
+      location: core worker group, Elastic side (high side)
+      notes: >
+        Merges the crossed relay telemetry with the Cribl tier's own internal
+        counters so a single reconciliation view can span relay -> low Cribl
+        -> guard -> high Cribl; the relay hostname and tier identity must be
+        stamped before the merge, not inferred after it.
+    - hop: elastic
+      data_stream: logs-syslog_relay.impstats
+    direct:
+    - hop: cribl
+      location: core Cribl worker group, Elastic enclave
+      notes: >
+        The concentrators are the collection tier: a high-side concentrator
+        sits in the Elastic enclave with the devices it aggregates, upstream
+        of Cribl, and forwards its own telemetry straight to the core Cribl
+        worker group with no guard crossing.
+    - hop: cribl
+      location: core worker group, Elastic side (high side)
+      notes: >
+        Merges the crossed relay telemetry with the Cribl tier's own internal
+        counters so a single reconciliation view can span relay -> low Cribl
+        -> guard -> high Cribl; the relay hostname and tier identity must be
+        stamped before the merge, not inferred after it.
+    - hop: elastic
+      data_stream: logs-syslog_relay.impstats
+  formats:
+  - format: syslog-kv
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom rsyslog impstats pipeline
+      notes: >
+        There is nothing to inherit. No Elastic integration and no Cribl pack
+        parses impstats output; the Elastic System integration handles the
+        messages a relay forwards, not the relay's own counters. The format is
+        a module parameter and the choice is consequential: the default
+        format="legacy" emits "<name>: counter=value ..." after the
+        rsyslogd-pstats tag and DOES NOT emit the origin at all, so two
+        objects with the same name under different origins are
+        indistinguishable, while format="json" emits a flat object such as {
+        "name": "main Q", "origin": "core.queue", "size": 0, "enqueued":
+        45839, "full": 0, "discarded.full": 0, "discarded.nf": 0, "maxqsize":
+        1836 }. Note also that format="json-elasticsearch" rewrites the dotted
+        keys with bangs (discarded.full becomes discarded!full) for pre-ES-2.0
+        compatibility, which is exactly wrong for a modern Elastic target and
+        must not be selected by reflex. The other decision to make before
+        parsing is resetCounters: off (the default) makes every counter
+        cumulative since startup, so a consumer must difference them and
+        handle the restart-to-zero discontinuity; on makes them per-interval
+        deltas, which is far easier to reconcile but loses the absolute total
+        if an interval is dropped in transit.
+    fields:
+    - vendor: timereported
+      type: timestamp
+      description: >-
+        syslog header timestamp of the impstats record, i.e. when the interval
+        sample was emitted
+      ecs: '@timestamp'
+      status: mapped
+      notes: >
+        the record has no separate window start/end, so the sample time is all
+        there is; a gap wider than the configured interval between consecutive
+        records is itself a restart or a stall signal
+    - vendor: hostname
+      type: string
+      description: hostname of the concentrator that emitted the counter record
+      ecs: host.name
+      status: mapped
+      notes: >
+        a genuine trap on this technology - this is the relay itself, not any
+        of the devices whose syslog it aggregates, and the same field name on
+        the traffic this host forwards means the opposite thing; keep the two
+        apart or relay health will be attributed to vendor appliances
+    - vendor: syslogtag
+      type: string
+      description: fixed tag rsyslogd-pstats identifying a statistics record
+      ecs: log.syslog.appname
+      status: partial
+      notes: >
+        the only discriminator separating stats records from the ordinary
+        relay traffic sharing the same transport; impstats records are emitted
+        into the regular syslog stream by default (log.syslog="on"), so they
+        are themselves counted by the counters they report unless routed to
+        their own ruleset
+    - vendor: pri
+      type: integer
+      description: syslog priority of the stats record, facility 5 / severity 6 by default
+      ecs: log.syslog.priority
+      status: mapped
+      notes: >
+        both halves are module parameters (facility, severity), and setting a
+        dedicated facility is the cheapest way to route stats records to their
+        own ruleset and destination instead of mixing them into the relayed
+        feed
+    - vendor: name
+      type: string
+      description: >-
+        identity of the object the counter block describes - e.g. imuxsock,
+        "main Q", a ruleset or action name, or an input listener spec such as
+        "*:514"
+      ecs: null
+      status: unmapped
+      custom: rsyslog.stats.name
+      notes: >
+        not unique on its own - the same name appears under different origins
+        - so every query and every reconciliation key must be the (origin,
+        name) pair; action names default to positional strings like "action
+        17" that renumber when the config is reordered, so name the actions
+        explicitly in rsyslog.conf before building anything on them
+    - vendor: origin
+      type: string
+      description: >-
+        subsystem that owns the counter block - core.queue, core.action,
+        imuxsock, imudp, imtcp, imptcp, imrelp, dynstats, resource-usage
+      ecs: null
+      status: unmapped
+      custom: rsyslog.stats.origin
+      notes: >
+        present ONLY in the json, cee and json-elasticsearch formats - the
+        default legacy format omits it entirely, which makes the counter block
+        unattributable and is the single strongest reason to set format="json"
+        on every concentrator. Kept custom rather than mapped to event.module,
+        which is reserved for the technology-level module name
+    - vendor: submitted
+      type: long
+      description: >-
+        messages submitted by an input module during the interval (imuxsock,
+        imudp, imtcp, imptcp, imrelp)
+      ecs: null
+      status: unmapped
+      custom: rsyslog.stats.submitted
+      notes: >
+        the ingress count for the whole tier and the upstream anchor of the
+        reconciliation chain - this number, summed per host and hour, is what
+        low-side Cribl inEvents must agree with before any claim about feed
+        continuity across the guard means anything
+    - vendor: processed
+      type: long
+      description: total messages processed by this action
+      ecs: null
+      status: unmapped
+      custom: rsyslog.stats.processed
+      notes: >
+        the egress counterpart to submitted, on the core.action objects; the
+        forwarding action pointed at Cribl is the one to watch, and submitted
+        minus processed on a single host is the local loss that never even
+        reaches the boundary
+    - vendor: failed
+      type: long
+      description: total messages that failed during processing by this action
+      ecs: null
+      status: unmapped
+      custom: rsyslog.stats.failed
+      notes: >
+        a failed message is not necessarily a lost one - it may be retried
+        after the action resumes - so this counter is only interpretable
+        alongside suspended and resumed on the same object
+    - vendor: suspended
+      type: long
+      description: number of times this action suspended itself (rsyslog 7.5.8 and later)
+      ecs: null
+      status: unmapped
+      custom: rsyslog.stats.suspended
+      notes: >
+        an action suspends when its destination is unreachable, so a rising
+        count on the forwarding action is the relay's view of Cribl or the
+        network being down - the same event the daemon reports in free text on
+        the operational dataset
+    - vendor: suspended.duration
+      type: long
+      description: total number of seconds this action was disabled
+      ecs: null
+      status: unmapped
+      custom: rsyslog.stats.suspended_duration
+      notes: >
+        kept custom rather than mapped to event.duration, which models the
+        duration of the event itself rather than an accumulated outage window;
+        converted to seconds it is the closest thing this technology has to a
+        per-destination availability figure
+    - vendor: resumed
+      type: long
+      description: number of times this action resumed itself (rsyslog 7.5.8 and later)
+      ecs: null
+      status: unmapped
+      custom: rsyslog.stats.resumed
+      notes: >
+        suspended without a matching resumed is an action that is still down
+        at sample time, which is the state worth alerting on rather than the
+        raw suspension count
+    - vendor: size
+      type: long
+      description: currently active messages held in this queue
+      ecs: null
+      status: unmapped
+      custom: rsyslog.stats.queue_size
+      notes: >
+        an instantaneous gauge, not a counter - it must be taken as a last
+        value over a window rather than summed, and it is meaningless without
+        the configured queue size to compare it against
+    - vendor: enqueued
+      type: long
+      description: total messages enqueued into this queue since startup
+      ecs: null
+      status: unmapped
+      custom: rsyslog.stats.enqueued
+      notes: >
+        cumulative unless resetCounters="on"; with the default off, a consumer
+        must difference consecutive samples and treat a decrease as a daemon
+        restart rather than as negative traffic
+    - vendor: full
+      type: long
+      description: >-
+        number of times the queue was actually full and could not accept
+        additional messages
+      ecs: null
+      status: unmapped
+      custom: rsyslog.stats.queue_full
+      notes: >
+        the backpressure event count; it rises before the discard counters do
+        when the queue is configured to block, and rises alongside them when
+        it is configured to discard
+    - vendor: discarded.full
+      type: long
+      description: messages discarded because the queue was full
+      ecs: null
+      status: unmapped
+      custom: rsyslog.stats.discarded_full
+      notes: >
+        messages that entered this host and will never leave it - the primary
+        silent-loss counter on the technology, and non-zero is always an
+        incident rather than a threshold to tune
+    - vendor: discarded.nf
+      type: long
+      description: >-
+        messages discarded because the queue was nearly full, discarding
+        lower-than-configured severity first
+      ecs: null
+      status: unmapped
+      custom: rsyslog.stats.discarded_nf
+      notes: >
+        the most dangerous counter here because the shed is severity-selective
+        - high-severity messages keep flowing while routine authentication and
+        audit volume disappears, so every liveness check still passes while
+        coverage is quietly gone
+    - vendor: maxqsize
+      type: long
+      description: high-water mark of active messages the queue has ever held
+      ecs: null
+      status: unmapped
+      custom: rsyslog.stats.max_queue_size
+      notes: >
+        two documented traps - the counter reference calls this maxsize in
+        prose while the emitted key is maxqsize, so a parser must match the
+        emitted name; and it is one of the counters that does not reset when
+        resetCounters="on", so it stays a since-boot high-water mark even on a
+        delta-configured relay
+    - vendor: ratelimit.discarded
+      type: long
+      description: messages discarded by the imuxsock rate limiter
+      ecs: null
+      status: unmapped
+      custom: rsyslog.stats.ratelimit_discarded
+      notes: >
+        the second silent-loss path, independent of the queues and triggered
+        per originating process; a zero here is weak evidence rather than
+        proof, since the counter has been reported as not surfacing correctly
+        on some rsyslog 8.x builds, so pair it with the imuxsock "begins to
+        drop messages" text on the operational dataset
+    - vendor: disallowed
+      type: long
+      description: imudp messages discarded because the sender was not in the allowed-sender list
+      ecs: null
+      status: unmapped
+      custom: rsyslog.stats.disallowed
+      notes: >
+        a security signal rather than a capacity one, but it is zero by
+        construction when no allowed senders are configured (the default) - so
+        a zero means "no policy" far more often than it means "no rejections",
+        and the two must not be conflated on a dashboard
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Shape this into ECS-style JSON on the edge worker group rather than
+          forwarding an envelope - there is no integration downstream waiting
+          to extract it, and the guard should see one stable counter schema
+          rather than rsyslog's legacy line grammar. The concrete work is to
+          key every record on the (origin, name) pair and reject any record
+          missing origin, which is the practical way to force the
+          format="json" configuration change onto the concentrators instead of
+          writing a parser that guesses; then normalize the dotted counter
+          keys to underscored custom-namespace names, difference the
+          cumulative counters against the previous interval per (host, origin,
+          name) so that what crosses is a delta rather than a since-boot
+          total, and emit an explicit zero for the discard counters so a
+          missing counter is never read as "no drops". Validate against a
+          Schema Library schema with a dead-letter route that alerts on its
+          own rate, run the guard destination on Persistent Queue backpressure
+          and never Block, and carry _raw permanently on this low-volume route
+          because it is the evidence trail for the cutover.
+        elastic: >
+          Own a custom logs-syslog_relay.impstats ingest pipeline with
+          explicit custom-namespace index-template mappings -
+          rsyslog.stats.submitted, .processed, .failed, .enqueued,
+          .queue_size, .max_queue_size, .discarded_full, .discarded_nf and
+          .ratelimit_discarded as long, rsyslog.stats.name and .origin as
+          keyword - because dynamic mapping will type the first counter it
+          sees and then reject the rest of the block. Build the reconciliation
+          consumer here rather than as a dashboard afterthought: sum submitted
+          per (host.name, hour) against the low-side Cribl inEvents for the
+          same window and alert on divergence, alert on any non-zero
+          discarded_full, discarded_nf or ratelimit_discarded, and alert
+          separately on max_queue_size approaching the configured queue size
+          since it leads the discard counters rather than following them.
+          Alert on absence too - a concentrator that stops emitting its
+          interval record is a dead collection tier, not a quiet one, and that
+          is the only signal that distinguishes it from a genuinely idle
+          estate.
+        relay: >
+          Full ECS-shaped NDJSON crosses (envelope mode B) - one flat JSON
+          object per counter block, UTF-8, LF-terminated, compression
+          disabled, nesting depth at most two with short ASCII keys. The
+          content-filter friction is unusually low here, which should be
+          preserved deliberately: every value is an integer or a short object
+          identifier, so allowlist the key set and reject unexpected keys
+          rather than letting a new rsyslog release leak untyped counters
+          across into a custom LUA filter that was never written for them. The
+          one value that is not bounded by construction is the object name,
+          which for input modules carries a listener bind spec and for actions
+          can carry an operator-chosen string, so cap it and strip control
+          characters low-side. The vendor feed is plain syslog rather than
+          CEF, so nothing CEF-shaped originates at the source - the crossing
+          envelope is a different matter, since the confirmed current
+          transport is a Cribl Syslog Destination on a CEF-structured
+          __syslogout value that the high side recovers from _raw with an
+          Extract JSON parser before Cribl fields and Routes. That leg is
+          being retired: the confirmed plan of record is a low-side Cribl HTTP
+          Destination to a high-side Cribl HTTP Source carrying exactly this
+          NDJSON, with AST/file drop kept only as a replay-capable fallback.
+          With no return channel, reconcile low-side against high-side counts
+          per (dataset, hour) and treat this feed as needing its own
+          independent proof of delivery, since it is the instrument the rest
+          of the estate's parity claims rest on.
+      direct:
+        parse_location: low
+        cribl: >
+          High-side concentrators inside the Elastic enclave shape this into
+          ECS-style JSON on the core worker group with no guard crossing -
+          there is no integration downstream waiting to extract it, so present
+          one stable counter schema rather than rsyslog's legacy line grammar.
+          Key every record on the (origin, name) pair and reject any record
+          missing origin, which is the practical way to force the
+          format="json" configuration change onto the concentrators instead of
+          writing a parser that guesses; then normalize the dotted counter
+          keys to underscored custom-namespace names, difference the
+          cumulative counters against the previous interval per (host, origin,
+          name) so a delta is stored rather than a since-boot total, and emit
+          an explicit zero for the discard counters so a missing counter is
+          never read as "no drops". Validate against a Schema Library schema
+          with a dead-letter route that alerts on its own rate, and stamp the
+          relay hostname and tier identity before merging with the Cribl
+          tier's own internal counters into one reconciliation view.
+        elastic: >
+          Own a custom logs-syslog_relay.impstats ingest pipeline with
+          explicit custom-namespace index-template mappings -
+          rsyslog.stats.submitted, .processed, .failed, .enqueued,
+          .queue_size, .max_queue_size, .discarded_full, .discarded_nf and
+          .ratelimit_discarded as long, rsyslog.stats.name and .origin as
+          keyword - because dynamic mapping will type the first counter it
+          sees and then reject the rest of the block. Build the reconciliation
+          consumer here rather than as a dashboard afterthought: sum submitted
+          per (host.name, hour) against the core Cribl inEvents for the same
+          window and alert on divergence, alert on any non-zero
+          discarded_full, discarded_nf or ratelimit_discarded, and alert
+          separately on max_queue_size approaching the configured queue size
+          since it leads the discard counters rather than following them.
+          Alert on absence too - a concentrator that stops emitting its
+          interval record is a dead collection tier, not a quiet one, and that
+          is the only signal that distinguishes it from a genuinely idle
+          estate.
+  - format: json
+    enable: >
+      Set the format module parameter on the impstats load line on every
+      concentrator: `module(load="impstats" interval="300" resetCounters="off"
+      severity="6" format="json")`. That emits one flat JSON object per
+      counter block after the rsyslogd-pstats tag, e.g. `{ "name": "main Q",
+      "origin": "core.queue", "size": 0, "enqueued": 45839, "full": 0,
+      "discarded.full": 0, "discarded.nf": 0, "maxqsize": 1836 }` - identical
+      counters to the legacy line but carrying the origin the legacy grammar
+      drops. `format="cee"` produces the same object behind a Lumberjack
+      `@cee:` cookie for parsers that key on it. Do NOT use
+      `format="json-elasticsearch"`: it rewrites the dotted keys with bangs
+      (`discarded.full` becomes `discarded!full`) for pre-ES-2.0
+      compatibility, which is wrong for a modern Elastic target. Route the
+      records to their own ruleset with a dedicated facility so the stats
+      object is not counted by the counters it reports.
+    references:
+    - https://docs.rsyslog.com/doc/configuration/modules/impstats.html
+    - https://docs.rsyslog.com/doc/reference/parameters/impstats-format.html
+    - https://docs.rsyslog.com/doc/configuration/rsyslog_statistic_counter.html
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        custom rsyslog impstats pipeline (Extract JSON variant, feeding
+        logs-syslog_relay.impstats)
+      notes: >
+        No Elastic integration or Cribl pack parses impstats output in any
+        format - the Elastic System integration handles what a relay forwards,
+        not the relay's own counters. The json form removes the legacy
+        line-grammar parse entirely: a single Extract JSON over the body
+        yields name, origin and the typed counters directly, and keying every
+        record on the (origin, name) pair and rejecting any record missing
+        origin is the practical way to force the format change onto the
+        concentrators rather than writing a parser that guesses subsystem from
+        name. resetCounters is still the consequential decision - off
+        (default) makes every counter cumulative since boot so a consumer must
+        difference consecutive samples and treat a decrease as a restart, on
+        makes them per-interval deltas (easier to reconcile, but maxqsize
+        stays a since-boot high-water mark regardless).
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Extract JSON low-side on the edge worker group, then do exactly the
+          shaping the legacy path has to synthesise: normalize the dotted
+          counter keys to underscored custom-namespace names, difference the
+          cumulative counters per (host, origin, name) so a delta crosses
+          rather than a since-boot total, and emit an explicit zero for the
+          discard counters so a missing counter is never read as "no drops".
+          The json form makes the reject-if-no-origin guard trivial to enforce
+          here. Cap the object name (it carries listener bind specs for inputs
+          and operator strings for actions) and strip control characters,
+          validate against a Schema Library schema with a self-rate-alerting
+          dead-letter route, run the guard destination on Persistent Queue and
+          never Block, and carry _raw permanently on this low-volume evidence
+          feed.
+        elastic: >
+          Own a custom logs-syslog_relay.impstats ingest pipeline with
+          explicit custom-namespace mappings - rsyslog.stats.submitted,
+          .processed, .failed, .enqueued, .queue_size, .max_queue_size,
+          .discarded_full, .discarded_nf and .ratelimit_discarded as long,
+          .name and .origin as keyword - because dynamic mapping types the
+          first counter it sees and rejects the rest of the block. Build the
+          reconciliation consumer here: sum submitted per (host.name, hour)
+          against low-side Cribl inEvents, alert on any non-zero
+          discarded_full/discarded_nf/ratelimit_discarded, alert on
+          max_queue_size approaching the configured queue size since it leads
+          the discard counters, and alert on absence of the interval record -
+          a concentrator that stops emitting is a dead collection tier, not a
+          quiet one.
+        relay: >
+          Full ECS-shaped NDJSON crosses (envelope mode B) - one flat object
+          per counter block, UTF-8, LF-terminated, compression disabled,
+          nesting depth at most two with short ASCII keys. Content-filter
+          friction is unusually low because every value is an integer or a
+          short object identifier, so allowlist the key set and reject
+          unexpected keys rather than letting a new rsyslog release leak
+          untyped counters into a LUA rule that was never written for them;
+          the object name is the one unbounded value, so cap it low-side. The
+          confirmed plan of record is a low-side Cribl HTTP Destination to a
+          high-side Cribl HTTP Source carrying exactly this NDJSON, with
+          AST/file drop kept only as a replay-capable fallback. With no return
+          channel, reconcile low-side against high-side counts per (dataset,
+          hour) - this feed is the instrument the rest of the estate's parity
+          claims rest on and must never be the thing that gets shed.
+      direct:
+        parse_location: low
+        cribl: >
+          High-side concentrators inside the Elastic enclave Extract JSON and
+          shape on the (origin, name) pair on the core worker group with no
+          guard crossing: parse there, difference the cumulative counters, and
+          stamp the relay hostname and tier identity before merging with the
+          Cribl tier's own internal counters into one reconciliation view.
+        elastic: >
+          Own a custom logs-syslog_relay.impstats ingest pipeline with the
+          same explicit custom-namespace mappings the counter block needs -
+          the stats counters as long and .name and .origin as keyword. The
+          reconciliation for a direct relay collapses to core Cribl inEvents
+          against submitted; alert on any non-zero discarded_full,
+          discarded_nf or ratelimit_discarded, alert on max_queue_size
+          approaching the configured queue size since it leads the discard
+          counters, and alert on absence of the interval record, since a
+          concentrator that stops emitting is a dead collection tier rather
+          than a quiet one.
+    fields:
+    - vendor: timereported
+      type: timestamp
+      description: >-
+        syslog header time of the impstats record, i.e. when the interval
+        sample was emitted
+      ecs: '@timestamp'
+      status: mapped
+      notes: >
+        the sample time is all there is - there is no separate window
+        start/end, so a gap wider than the configured interval between
+        consecutive records is itself a restart or a stall signal
+    - vendor: hostname
+      type: string
+      description: hostname of the concentrator that emitted the counter record
+      ecs: host.name
+      status: mapped
+      notes: >
+        the relay itself, never the devices whose syslog it aggregates; the
+        same field on the traffic this host forwards means the opposite thing,
+        so keep the two apart or relay health is attributed to vendor
+        appliances
+    - vendor: syslogtag
+      type: string
+      description: fixed tag rsyslogd-pstats identifying a statistics record even in json form
+      ecs: log.syslog.appname
+      status: partial
+      notes: >
+        the discriminator separating stats records from the ordinary relay
+        traffic on a shared transport; the json body follows the tag, so the
+        tag still routes the feed to its own ruleset and source
+    - vendor: pri
+      type: integer
+      description: syslog priority of the stats record, facility 5 / severity 6 by default
+      ecs: log.syslog.priority
+      status: mapped
+      notes: >
+        both halves are module parameters; a dedicated facility is the
+        cheapest way to route stats records to their own ruleset instead of
+        mixing them into the relayed feed
+    - vendor: origin
+      type: string
+      description: >-
+        subsystem owning the counter block - core.queue, core.action,
+        imuxsock, imudp, imtcp, imptcp, imrelp, dynstats, resource-usage
+      ecs: null
+      status: unmapped
+      custom: rsyslog.stats.origin
+      notes: >
+        emitted in json and cee but NOT in the default legacy format, which is
+        the entire reason to select format=json - without it the block is
+        unattributable and the same name under two subsystems collapses into
+        one series; kept custom rather than mapped to event.module, reserved
+        for the technology-level module name
+    - vendor: name
+      type: string
+      description: >-
+        identity of the object the counter block describes - imuxsock, "main
+        Q", a ruleset or action name, or a listener spec such as "*:514"
+      ecs: null
+      status: unmapped
+      custom: rsyslog.stats.name
+      notes: >
+        not unique on its own, so every reconciliation key is the (origin,
+        name) pair; action names default to positional strings like "action
+        17" that renumber when the config is reordered, so name the actions
+        explicitly in rsyslog.conf before building on them
+    - vendor: submitted
+      type: long
+      description: >-
+        messages submitted by an input module during the interval (imuxsock,
+        imudp, imtcp, imptcp, imrelp)
+      ecs: null
+      status: unmapped
+      custom: rsyslog.stats.submitted
+      notes: >
+        the ingress count for the tier and the upstream anchor of the
+        reconciliation chain - summed per host and hour it is what low-side
+        Cribl inEvents must agree with before any feed-continuity claim means
+        anything
+    - vendor: processed
+      type: long
+      description: total messages processed by this action (core.action objects)
+      ecs: null
+      status: unmapped
+      custom: rsyslog.stats.processed
+      notes: >
+        the egress counterpart to submitted; on the forwarding action pointed
+        at Cribl, submitted minus processed on one host is local loss that
+        never even reaches the boundary
+    - vendor: failed
+      type: long
+      description: total messages that failed during processing by this action
+      ecs: null
+      status: unmapped
+      custom: rsyslog.stats.failed
+      notes: >
+        a failed message is not necessarily lost - it may be retried after the
+        action resumes - so it is only interpretable alongside suspended and
+        resumed on the same object
+    - vendor: suspended
+      type: long
+      description: number of times this action suspended itself (rsyslog 7.5.8+)
+      ecs: null
+      status: unmapped
+      custom: rsyslog.stats.suspended
+      notes: >
+        an action suspends when its destination is unreachable, so a rising
+        count on the forwarding action is the relay's view of Cribl or the
+        network being down
+    - vendor: suspended.duration
+      type: long
+      description: total seconds this action was disabled
+      ecs: null
+      status: unmapped
+      custom: rsyslog.stats.suspended_duration
+      notes: >
+        kept custom rather than mapped to event.duration (which models the
+        event's own duration); in seconds it is the closest thing this
+        technology has to a per-destination availability figure
+    - vendor: resumed
+      type: long
+      description: number of times this action resumed itself (rsyslog 7.5.8+)
+      ecs: null
+      status: unmapped
+      custom: rsyslog.stats.resumed
+      notes: >
+        suspended without a matching resumed is an action still down at sample
+        time, which is the state to alert on rather than the raw suspension
+        count
+    - vendor: size
+      type: long
+      description: currently active messages held in this queue
+      ecs: null
+      status: unmapped
+      custom: rsyslog.stats.queue_size
+      notes: >
+        an instantaneous gauge, not a counter - take it as a last value over a
+        window rather than summing, and it is meaningless without the
+        configured queue size to compare against
+    - vendor: enqueued
+      type: long
+      description: total messages enqueued into this queue since startup
+      ecs: null
+      status: unmapped
+      custom: rsyslog.stats.enqueued
+      notes: >
+        cumulative unless resetCounters="on"; with the default off a consumer
+        must difference consecutive samples and treat a decrease as a daemon
+        restart
+    - vendor: full
+      type: long
+      description: number of times the queue was actually full and could not accept messages
+      ecs: null
+      status: unmapped
+      custom: rsyslog.stats.queue_full
+      notes: >
+        the backpressure event count; it rises before the discard counters
+        when the queue blocks and alongside them when it discards
+    - vendor: discarded.full
+      type: long
+      description: messages discarded because the queue was full
+      ecs: null
+      status: unmapped
+      custom: rsyslog.stats.discarded_full
+      notes: >
+        messages that entered this host and will never leave it - the primary
+        silent-loss counter, and non-zero is always an incident rather than a
+        threshold to tune
+    - vendor: discarded.nf
+      type: long
+      description: >-
+        messages discarded because the queue was nearly full, dropping
+        lower-severity messages first
+      ecs: null
+      status: unmapped
+      custom: rsyslog.stats.discarded_nf
+      notes: >
+        the most dangerous counter because the shed is severity-selective -
+        high-severity messages keep flowing while routine authentication and
+        audit volume disappears, so every liveness check still passes while
+        coverage is quietly gone
+    - vendor: maxqsize
+      type: long
+      description: high-water mark of active messages the queue has ever held
+      ecs: null
+      status: unmapped
+      custom: rsyslog.stats.max_queue_size
+      notes: >
+        the counter reference names it maxsize in prose while the emitted json
+        key is maxqsize, so a parser must match the emitted name; it does not
+        reset under resetCounters="on", staying a since-boot high-water mark
+    - vendor: ratelimit.discarded
+      type: long
+      description: messages discarded by the imuxsock rate limiter
+      ecs: null
+      status: unmapped
+      custom: rsyslog.stats.ratelimit_discarded
+      notes: >
+        the second silent-loss path, independent of the queues and triggered
+        per originating process; a zero is weak evidence, since it has been
+        reported as not surfacing on some 8.x builds, so pair it with the
+        imuxsock rate-limit text on the daemon dataset
+    - vendor: disallowed
+      type: long
+      description: imudp messages discarded because the sender was not in the allowed-sender list
+      ecs: null
+      status: unmapped
+      custom: rsyslog.stats.disallowed
+      notes: >
+        a security signal, but zero by construction when no allowed senders
+        are configured (the default), so a zero means "no policy" far more
+        often than "no rejections"
+- id: syslog-ng-stats
+  name: syslog-ng statistics counters
+  description: |
+    The syslog-ng half of the same tier, exposed two ways: on demand through syslog-ng-ctl stats (and the newer stats-exporter and syslog-ng-ctl query interfaces), and periodically as a "Log statistics;" message emitted to the internal() source on the stats(freq()) interval. The internal() path is what a SIEM actually ingests, because it arrives as an ordinary log message on the same transport as everything else the relay forwards.
+    The counter model is a long-format table rather than a record: each line is one counter for one object, semicolon-delimited as type;id;instance;state;counter;value - for example dst.tcp;d_network#0;10.50.0.111:514;a;dropped;5080. The consequence for parsing is that a single sample is many lines that must be pivoted by (type, id, instance) before any of it is interpretable, and the periodic internal() variant packs the same content as repeated key='value' pairs on one line, which naive key/value extraction collapses to a single surviving value.
+    Operationally this dataset answers the same question as the rsyslog one from the other daemon: dropped is the loss counter, queued is the backlog, and stamp - the UNIX time of the last message sent to a destination - is the cleanest liveness signal in either technology. A destination whose processed keeps climbing while stamp stops advancing is queueing; one where both stop is dead; and the state column going from a to o marks the moment a configured feed stopped arriving at all.
+  event_categories:
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge Cribl worker group, on-prem enclave (low side)
+      notes: >
+        Same collection-tier position as the rsyslog dataset above: the
+        low-side concentrators aggregate enclave devices upstream of Cribl and
+        their counters cross the Everfox HSG. Where a site runs both daemons -
+        which is the normal state of a tier assembled over a decade - both
+        feeds must cross or the reconciliation covers only part of the estate.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >
+        allow-list on the logs-syslog_relay.syslog_ng_stats destination data
+        stream only; allowlisted key set with tight length caps, since every
+        value is a counter, a driver name or a peer address
+      notes: >
+        the instance column carries peer addresses and is therefore the one
+        place on this route where enclave-internal addressing is disclosed
+        across the boundary; confirm with the guard owner that it may traverse
+        before assuming it can. Transport itself is no longer an open
+        question: current crossing is a Cribl Syslog Destination on the
+        __syslogout internal field carrying a CEF-structured string, with the
+        high side parsing _raw through Extract JSON before Cribl fields and
+        Routes, and that leg is being retired in favour of the confirmed plan
+        of record - a low-side Cribl HTTP Destination to a high-side Cribl
+        HTTP Source carrying NDJSON.
+    - hop: cribl
+      location: core worker group, Elastic side (high side)
+      notes: >
+        merges with the rsyslog counters into one relay-tier view; the daemon
+        identity must be stamped low-side so the two halves stay
+        distinguishable after the merge, because the counter names differ in
+        meaning between them
+    - hop: elastic
+      data_stream: logs-syslog_relay.syslog_ng_stats
+    direct:
+    - hop: cribl
+      location: core Cribl worker group, Elastic enclave
+      notes: >
+        Same collection-tier position as the rsyslog dataset above: a
+        high-side concentrator aggregates Elastic-enclave devices upstream of
+        Cribl and forwards its counters straight to the core Cribl worker
+        group with no guard crossing.
+    - hop: cribl
+      location: core worker group, Elastic side (high side)
+      notes: >
+        merges with the rsyslog counters into one relay-tier view; the daemon
+        identity must be stamped low-side so the two halves stay
+        distinguishable after the merge, because the counter names differ in
+        meaning between them
+    - hop: elastic
+      data_stream: logs-syslog_relay.syslog_ng_stats
+  formats:
+  - format: syslog-kv
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom syslog-ng statistics pipeline
+      notes: >
+        No Elastic integration or Cribl pack parses syslog-ng's own
+        statistics. Which collection path is used decides the whole shape of
+        the work and must be settled first: the internal() "Log statistics;"
+        message is free on the existing transport but arrives as repeated
+        key='value' pairs on one line carrying a nested object(id)=value
+        encoding inside each value, whereas syslog-ng-ctl stats (or the
+        stats-exporter, which exposes the same counters in Prometheus form on
+        newer builds) gives the clean semicolon- delimited table at the cost
+        of standing up a collector on each concentrator. The counter set is
+        also version-dependent - written is derived as processed minus queued
+        minus dropped and is not emitted at all on older OSE builds - so the
+        pipeline must compute it rather than expect it.
+    fields:
+    - vendor: ISODATE
+      type: timestamp
+      description: >-
+        syslog header timestamp of the periodic Log statistics message, from
+        the syslog-ng $ISODATE macro
+      ecs: '@timestamp'
+      status: mapped
+      notes: >
+        the sample time, not the time any counted message was handled; the
+        interval is the stats(freq()) setting and a gap wider than it is a
+        restart or a stall
+    - vendor: HOST
+      type: string
+      description: >-
+        hostname of the concentrator that emitted the statistics, from the
+        syslog-ng $HOST macro
+      ecs: host.name
+      status: mapped
+      notes: >
+        same trap as the rsyslog dataset - this is the relay, not the devices
+        it aggregates; on internal() messages syslog-ng fills it from the
+        local host rather than from any relayed message
+    - vendor: PROGRAM
+      type: string
+      description: program name on the internal() record, the constant syslog-ng
+      ecs: log.syslog.appname
+      status: mapped
+      notes: >
+        the discriminator that separates the daemon's own records from the
+        relayed traffic on a shared transport, and the practical way to route
+        this feed to its own Cribl source
+    - vendor: SourceName
+      type: string
+      description: >-
+        statistics object type - src.tcp, dst.tcp, dst.file, destination,
+        source, center, global, filter, parser
+      ecs: null
+      status: unmapped
+      custom: syslog_ng.stats.object_type
+      notes: >
+        the prefix decides which counters are meaningful on the line - queued,
+        dropped and stamp exist only on destinations, matched and not_matched
+        only on filters, discarded only on parsers - so a consumer that
+        averages a counter across object types is averaging different
+        quantities
+    - vendor: SourceID
+      type: string
+      description: >-
+        configuration-declared driver name plus an ordinal, e.g. s_network#0
+        or d_elastic#0
+      ecs: null
+      status: unmapped
+      custom: syslog_ng.stats.object_id
+      notes: >
+        the reconciliation join key, and it is not stable by construction -
+        the ordinal is positional within the driver, so reordering a source or
+        destination block silently renames the series; pin the driver names in
+        the config and treat an unrecognised id as a config-change signal
+    - vendor: SourceInstance
+      type: string
+      description: >-
+        instance discriminator for the object - typically a peer address and
+        port for network drivers, e.g. 10.50.0.111:514 or "tcp,127.0.0.5",
+        empty for static objects
+      ecs: null
+      status: partial
+      custom: syslog_ng.stats.instance
+      transform: >
+        split into source.address for src.* objects and destination.address
+        plus destination.port for dst.* objects rather than mapping the raw
+        value, because the same column means the peer we received from and the
+        peer we send to depending on the object type; on dynamic objects it is
+        also the main cardinality driver and is a candidate for dropping
+        low-side
+    - vendor: State
+      type: enum
+      description: >-
+        object state - a (active), d (dynamic, e.g. per-host or per-sender), o
+        (orphaned, previously active and no longer receiving)
+      ecs: null
+      status: unmapped
+      custom: syslog_ng.stats.state
+      notes: >
+        the o state is the highest-value value in this dataset - an orphaned
+        counter is a configured feed that has stopped arriving, which is
+        precisely the failure a volume-based check cannot see; the d state
+        marks the objects that should be dropped before the guard on
+        cardinality grounds
+    - vendor: Type
+      type: enum
+      description: >-
+        name of the counter carried on this line - processed, dropped, queued,
+        written, memory_usage, stamp, suppressed, discarded, matched,
+        not_matched, msg_size_max and others
+      ecs: null
+      status: unmapped
+      custom: syslog_ng.stats.counter
+      notes: >
+        the feed is long-format - one counter per line - so this column plus
+        the value column must be pivoted into typed fields before anything can
+        be queried; the internal() variant packs the same pairs onto one line
+        with repeated keys, which map-style key/value parsing silently
+        collapses
+    - vendor: Number
+      type: long
+      description: value of the counter named by the Type column
+      ecs: null
+      status: unmapped
+      custom: syslog_ng.stats.value
+      notes: >
+        holds message counts, byte totals, message sizes and epoch seconds
+        depending on Type, so it must never be mapped as a single numeric
+        field after the pivot - the stamp values in particular are epochs and
+        will wreck any aggregate they are summed into
+    - vendor: processed
+      type: long
+      description: messages that reached the destination driver (or were read by the source driver)
+      ecs: null
+      status: unmapped
+      custom: syslog_ng.stats.processed
+      notes: >
+        the egress anchor for reconciliation against low-side Cribl inEvents;
+        note it counts arrival at the driver, not successful delivery, so it
+        can climb while nothing actually leaves the host
+    - vendor: dropped
+      type: long
+      description: >-
+        messages the destination could not deliver, because the output buffer
+        was full or the driver rejected them
+      ecs: null
+      status: unmapped
+      custom: syslog_ng.stats.dropped
+      notes: >
+        the syslog-ng equivalent of rsyslog's discarded.full and the primary
+        silent-loss counter on this daemon; non-zero is an incident, and the
+        usual cause on a relay is log_fifo_size being smaller than the burst
+        the upstream devices produce
+    - vendor: queued
+      type: long
+      description: 'messages currently waiting in the destination driver''s output queue'
+      ecs: null
+      status: unmapped
+      custom: syslog_ng.stats.queued
+      notes: >
+        a gauge rather than a counter, and the one field on this dataset with
+        a known vendor defect - builds have been observed reporting near-2^64
+        values such as 18446744073709550428 where a small negative was
+        intended, so clamp and range-check before any threshold alert is
+        written on it
+    - vendor: written
+      type: long
+      description: messages successfully delivered, defined as processed minus queued minus dropped
+      ecs: null
+      status: unmapped
+      custom: syslog_ng.stats.written
+      notes: >
+        derived rather than independently measured, and not emitted at all on
+        older OSE builds - so compute it in the pipeline and do not treat
+        agreement between it and processed as corroboration, because it is
+        arithmetic on the same three numbers
+    - vendor: memory_usage
+      type: bytes
+      description: memory held by the messages sitting in the queues, in bytes
+      ecs: null
+      status: unmapped
+      custom: syslog_ng.stats.memory_usage
+      notes: >
+        the leading indicator before queued turns into dropped on a
+        memory-backed queue; on a disk-buffered destination it stays flat
+        while the backlog grows, so it is only interpretable once the queue
+        type per destination is known
+    - vendor: suppressed
+      type: long
+      description: messages collapsed by the suppress() feature
+      ecs: null
+      status: unmapped
+      custom: syslog_ng.stats.suppressed
+      notes: >
+        intended deduplication, but from a SOC's point of view these are
+        messages that existed and were never forwarded - a repeated
+        authentication failure is exactly the pattern suppress() removes, so
+        this counter belongs in the loss picture and not in a separate
+        efficiency metric
+    - vendor: discarded
+      type: long
+      description: messages a parser could not process
+      ecs: null
+      status: unmapped
+      custom: syslog_ng.stats.discarded
+      notes: >
+        parse failure at the relay, which usually means a device started
+        emitting a format the concentrator's parser was not built for - a
+        rising value is a coverage change on an upstream vendor, not a relay
+        capacity problem
+    - vendor: matched
+      type: long
+      description: messages accepted by a given filter
+      ecs: null
+      status: unmapped
+      custom: syslog_ng.stats.matched
+      notes: >
+        filters are where a relay tier assembled over years hides its
+        undocumented exclusions; the matched/not_matched pair is the only
+        place they are visible at all
+    - vendor: not_matched
+      type: long
+      description: messages filtered out by a given filter
+      ecs: null
+      status: unmapped
+      custom: syslog_ng.stats.not_matched
+      notes: >
+        a filtered-out message is neither processed nor dropped, so it is
+        invisible in every other counter - a climbing not_matched against a
+        flat matched is a feed that was silently excluded, and it is the
+        single most likely explanation for a source that reconciles to zero on
+        the Elastic side
+    - vendor: msg_size_max
+      type: long
+      description: size in bytes of the largest message handled
+      ecs: null
+      status: unmapped
+      custom: syslog_ng.stats.msg_size_max
+      notes: >
+        directly predicts guard content-filter length-cap violations and
+        syslog-ng's own log_msg_size() truncation; a value pinned exactly at
+        the configured maximum means messages are already being truncated at
+        the relay before anything downstream sees them
+    - vendor: stamp
+      type: timestamp
+      description: UNIX timestamp of the last message sent to the destination
+      ecs: event.end
+      status: partial
+      transform: >
+        epoch seconds, so it needs conversion to milliseconds or explicit date
+        parsing before it is a valid ECS date; mapped to event.end as the last
+        time activity was observed on the object, which is the closest GA
+        field to a per-destination liveness marker. It is the best silent-loss
+        detector in this file - a destination whose processed climbs while
+        stamp is frozen is queueing, and one where both are frozen is dead
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Pivot low-side: split the long-format table into one record per
+          (object_type, object_id, instance) with the counters as typed
+          fields, rather than shipping one thin event per counter line and
+          asking Elastic to reassemble a sample that may have lost lines at an
+          at-most-once boundary. Handle the two encodings explicitly - the
+          repeated key='value' pairs of the internal() variant must be parsed
+          as a list rather than a map or all but the last value is silently
+          lost, and the object(id)=value payload inside each one has to be
+          unwrapped - then compute written where the build does not emit it,
+          clamp the known unsigned-underflow values on queued (builds have
+          been observed reporting 18446744073709550428 for a small negative)
+          and dead-letter rather than forward anything that fails the range
+          check. Stamp the daemon identity and drop dynamic (state d)
+          per-sender objects low-side, since they are the cardinality driver
+          and the reconciliation runs on the static drivers.
+        elastic: >
+          Own a custom logs-syslog_relay.syslog_ng_stats ingest pipeline with
+          custom-namespace mappings for syslog_ng.stats.object_type,
+          .object_id, .instance and .state as keyword and .processed,
+          .dropped, .queued, .written, .memory_usage, .suppressed, .discarded,
+          .matched, .not_matched and .msg_size_max as long, and convert the
+          epoch-second stamp into a real date on ingest so it is never mapped
+          as a counter alongside the others. The alerts to build are liveness
+          rather than volume: a destination whose stamp stops advancing while
+          processed keeps rising, any non-zero dropped or discarded, a filter
+          whose not_matched climbs against a flat matched (a silently
+          filtered-out feed that neither dropped nor processed will reveal),
+          and any object transitioning from state a to state o, which is the
+          moment a configured source stopped arriving. Compare the
+          per-destination processed totals against low-side Cribl inEvents per
+          hour to close the same reconciliation loop the rsyslog dataset
+          opens.
+        relay: >
+          Pivoted, fully shaped NDJSON crosses (envelope mode B) - one flat
+          object per statistics object per sample, UTF-8, LF-terminated,
+          compression disabled, no nesting beyond the flat counter set - which
+          is a far friendlier payload for a hand-written custom filter than
+          the raw semicolon table would be. Two frictions are worth settling
+          with the guard owner before build: the instance column discloses
+          enclave peer addresses and ports, and the object_id carries
+          operator-chosen driver names that are unbounded free text, so cap
+          and allowlist both low-side. Volume is small once dynamic objects
+          are dropped, so carry _raw across permanently and reconcile counts
+          per (dataset, hour) - as with the rsyslog feed, the measurement must
+          never be the thing that gets shed to protect the measured. Transport
+          is confirmed: a Cribl Syslog Destination on a CEF-structured
+          __syslogout value today, with the high side parsing _raw through
+          Extract JSON before Cribl fields and Routes, retiring in favour of
+          the confirmed plan of record - a low-side Cribl HTTP Destination to
+          a high-side Cribl HTTP Source carrying this NDJSON. AST/file drop is
+          a replay-capable fallback only, not a co-equal candidate.
+      direct:
+        parse_location: low
+        cribl: >
+          High-side concentrators pivot on the core worker group with no guard
+          crossing: split the long-format table into one record per
+          (object_type, object_id, instance) with the counters as typed
+          fields, rather than shipping one thin event per counter line and
+          asking Elastic to reassemble a sample that may have lost lines at an
+          at-most-once boundary. Handle the two encodings explicitly - the
+          repeated key='value' pairs of the internal() variant must be parsed
+          as a list rather than a map or all but the last value is silently
+          lost, and the object(id)=value payload inside each one has to be
+          unwrapped - then compute written where the build does not emit it,
+          clamp the known unsigned-underflow values on queued (builds have
+          been observed reporting 18446744073709550428 for a small negative)
+          and dead-letter rather than forward anything that fails the range
+          check. Stamp the daemon identity and drop dynamic (state d)
+          per-sender objects, since they are the cardinality driver and the
+          reconciliation runs on the static drivers.
+        elastic: >
+          Own a custom logs-syslog_relay.syslog_ng_stats ingest pipeline with
+          custom-namespace mappings for syslog_ng.stats.object_type,
+          .object_id, .instance and .state as keyword and .processed,
+          .dropped, .queued, .written, .memory_usage, .suppressed, .discarded,
+          .matched, .not_matched and .msg_size_max as long, and convert the
+          epoch-second stamp into a real date on ingest so it is never mapped
+          as a counter alongside the others. The alerts to build are liveness
+          rather than volume: a destination whose stamp stops advancing while
+          processed keeps rising, any non-zero dropped or discarded, a filter
+          whose not_matched climbs against a flat matched (a silently
+          filtered-out feed that neither dropped nor processed will reveal),
+          and any object transitioning from state a to state o, which is the
+          moment a configured source stopped arriving. Compare the
+          per-destination processed totals against core Cribl inEvents per
+          hour to close the reconciliation loop.
+  - format: api-pull
+    enable: >
+      Run `syslog-ng-ctl stats` (or `syslog-ng-ctl stats --reset` for
+      per-interval deltas) against the local control socket - no config change
+      on the daemon, only a collector on each concentrator invoking it on a
+      fixed interval. Output is one counter per line, semicolon-delimited as
+      type;id;instance;state;counter;value, e.g.
+      `dst.tcp;d_network#0;10.50.0.111:514;a;dropped;5080` and
+      `src.tcp;s_network#0;tcp,127.0.0.5;a;processed;1`. Unlike the periodic
+      internal() message there is no syslog header and no packed key='value'
+      encoding - the collector stamps its own collection time and host.
+      `syslog-ng-ctl query` exposes the same counters by name-pattern for
+      targeted pulls on newer builds.
+    references:
+    - >-
+      https://syslog-ng.github.io/admin-guide/150_Statistics_of_syslog-ng/000_Metrics_and_counters.html
+    - https://manpages.ubuntu.com/manpages/bionic/man1/syslog-ng-ctl.1.html
+    - https://axoflow.com/docs/axosyslog-core/app-man-syslog-ng/syslog-ng-ctl.1/
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        custom syslog-ng statistics pipeline (semicolon-table variant, feeding
+        logs-syslog_relay.syslog_ng_stats)
+      notes: >
+        No integration or pack parses syslog-ng's own statistics in any form.
+        The control-socket table is the clean input the internal() path is
+        not: split each line on the semicolon into the six columns and pivot
+        by (type, id, instance) into one record per object with the counters
+        as typed fields, rather than shipping one thin event per line. The
+        counter set is version-dependent - written is derived as processed
+        minus queued minus dropped and is absent on older OSE builds, so
+        compute it - and the queued gauge has a known unsigned-underflow
+        defect (builds report 18446744073709550428 for a small negative), so
+        range-check and clamp before any threshold. The cost of this path over
+        the internal() feed is standing up the collector on each concentrator;
+        the gain is that no line is ever lost inside a packed one-line
+        encoding.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Pivot low-side: the semicolon table splits cleanly into one record
+          per (object_type, object_id, instance) with the counters as typed
+          fields. Compute written where the build omits it, clamp the queued
+          unsigned-underflow value, and dead-letter rather than forward
+          anything that fails the range check. Drop dynamic (state d)
+          per-sender objects low-side since they are the cardinality driver
+          and the reconciliation runs on the static drivers, stamp the daemon
+          identity, and convert the epoch-second stamp into a real date before
+          it crosses. The instance column carries enclave peer addresses and
+          the object_id carries operator-chosen driver names, so cap and
+          allowlist both.
+        elastic: >
+          Own a custom logs-syslog_relay.syslog_ng_stats ingest pipeline with
+          custom-namespace keyword mappings for .object_type, .object_id,
+          .instance and .state and long mappings for .processed, .dropped,
+          .queued, .written, .memory_usage, .suppressed, .discarded, .matched,
+          .not_matched and .msg_size_max, with stamp converted to a date on
+          ingest. Build liveness alerts rather than volume ones: a destination
+          whose stamp stops advancing while processed climbs, any non-zero
+          dropped or discarded, a filter whose not_matched climbs against a
+          flat matched, and any object transitioning from state a to state o.
+          Compare per-destination processed against low-side Cribl inEvents
+          per hour.
+        relay: >
+          Pivoted, fully shaped NDJSON crosses (envelope mode B) - one flat
+          object per statistics object per sample, UTF-8, LF-terminated,
+          compression disabled, no nesting beyond the flat counter set. The
+          pull happens low-side, so the collector and the shaping both sit
+          inside the enclave and only the clean NDJSON reaches the guard via
+          the confirmed low-side Cribl HTTP Destination to high-side Cribl
+          HTTP Source. Settle two frictions with the guard owner first: the
+          instance column discloses enclave peer addresses and ports, and
+          object_id carries unbounded operator-chosen driver names - cap and
+          allowlist both. Carry _raw across permanently and reconcile per
+          (dataset, hour); the measurement must never be the thing that gets
+          shed to protect the measured.
+      direct:
+        parse_location: low
+        cribl: >
+          High-side concentrators run a collector and pivot on the core worker
+          group with no guard crossing, then merge with the rsyslog counters
+          into one relay-tier view; the daemon identity must be stamped before
+          the merge because the counter names differ in meaning between the
+          two daemons.
+        elastic: >
+          Own a custom logs-syslog_relay.syslog_ng_stats pipeline with the
+          same custom-namespace keyword and long mappings the counter set
+          needs and stamp converted to a date on ingest; reconciliation
+          collapses to core Cribl inEvents against per-destination processed,
+          and build the liveness alerts here too - a destination whose stamp
+          stops advancing while processed climbs, any non-zero dropped or
+          discarded, and any object transitioning from state a to state o.
+    fields:
+    - vendor: SourceName
+      type: string
+      description: >-
+        statistics object type - src.tcp, dst.tcp, dst.file, destination,
+        source, center, global, filter, parser
+      ecs: null
+      status: unmapped
+      custom: syslog_ng.stats.object_type
+      notes: >
+        the prefix decides which counters are meaningful on the line - queued,
+        dropped and stamp exist only on destinations, matched and not_matched
+        only on filters, discarded only on parsers - so averaging a counter
+        across object types averages different quantities
+    - vendor: SourceID
+      type: string
+      description: >-
+        configuration-declared driver name plus an ordinal, e.g. s_network#0
+        or d_elastic#0
+      ecs: null
+      status: unmapped
+      custom: syslog_ng.stats.object_id
+      notes: >
+        the reconciliation join key, not stable by construction - the ordinal
+        is positional within the driver, so reordering a source or destination
+        block silently renames the series; pin the driver names and treat an
+        unrecognised id as a config-change signal
+    - vendor: SourceInstance
+      type: string
+      description: >-
+        instance discriminator - typically a peer address and port for network
+        drivers, e.g. 10.50.0.111:514 or "tcp,127.0.0.5", empty for static
+        objects
+      ecs: null
+      status: partial
+      custom: syslog_ng.stats.instance
+      transform: >
+        split into source.address for src.* objects and destination.address
+        plus destination.port for dst.* objects rather than mapping the raw
+        value, because the same column means the peer received from and the
+        peer sent to depending on object type; on dynamic objects it is the
+        main cardinality driver and a candidate for dropping low-side
+    - vendor: State
+      type: enum
+      description: >-
+        object state - a (active), d (dynamic, e.g. per-sender), o (orphaned,
+        previously active and no longer receiving)
+      ecs: null
+      status: unmapped
+      custom: syslog_ng.stats.state
+      notes: >
+        the o state is the highest-value signal here - an orphaned counter is
+        a configured feed that has stopped arriving, precisely the failure a
+        volume-based check cannot see; the d state marks the objects to drop
+        before the guard on cardinality grounds
+    - vendor: Type
+      type: enum
+      description: >-
+        name of the counter on this line - processed, dropped, queued,
+        written, memory_usage, stamp, suppressed, discarded, matched,
+        not_matched, msg_size_max and others
+      ecs: null
+      status: unmapped
+      custom: syslog_ng.stats.counter
+      notes: >
+        the feed is long-format, one counter per line, so this column plus the
+        value must be pivoted into typed fields before anything can be queried
+    - vendor: Number
+      type: long
+      description: value of the counter named by the Type column
+      ecs: null
+      status: unmapped
+      custom: syslog_ng.stats.value
+      notes: >
+        holds message counts, byte totals, message sizes and epoch seconds
+        depending on Type, so it must never be mapped as one numeric field
+        after the pivot - the stamp epochs in particular wreck any aggregate
+        they are summed into
+    - vendor: processed
+      type: long
+      description: messages that reached the destination driver (or were read by the source driver)
+      ecs: null
+      status: unmapped
+      custom: syslog_ng.stats.processed
+      notes: >
+        the egress anchor for reconciliation against low-side Cribl inEvents;
+        it counts arrival at the driver, not successful delivery, so it can
+        climb while nothing actually leaves the host
+    - vendor: dropped
+      type: long
+      description: >-
+        messages the destination could not deliver, because the output buffer
+        was full or the driver rejected them
+      ecs: null
+      status: unmapped
+      custom: syslog_ng.stats.dropped
+      notes: >
+        the syslog-ng equivalent of rsyslog's discarded.full and the primary
+        silent-loss counter on this daemon; the usual cause on a relay is
+        log_fifo_size smaller than the upstream burst
+    - vendor: queued
+      type: long
+      description: 'messages currently waiting in the destination driver''s output queue'
+      ecs: null
+      status: unmapped
+      custom: syslog_ng.stats.queued
+      notes: >
+        a gauge, and the one field with a known vendor defect - builds report
+        near-2^64 values such as 18446744073709550428 where a small negative
+        was intended, so clamp and range-check before any threshold
+    - vendor: written
+      type: long
+      description: messages successfully delivered, defined as processed minus queued minus dropped
+      ecs: null
+      status: unmapped
+      custom: syslog_ng.stats.written
+      notes: >
+        derived, not independently measured, and absent on older OSE builds -
+        compute it in the pipeline and do not treat its agreement with
+        processed as corroboration
+    - vendor: memory_usage
+      type: bytes
+      description: memory held by the messages sitting in the queues, in bytes
+      ecs: null
+      status: unmapped
+      custom: syslog_ng.stats.memory_usage
+      notes: >
+        the leading indicator before queued turns into dropped on a
+        memory-backed queue; on a disk-buffered destination it stays flat
+        while the backlog grows, so it is only interpretable once the queue
+        type is known
+    - vendor: dropped_stamp
+      type: timestamp
+      description: UNIX timestamp of the last message sent to the destination (the stamp counter)
+      ecs: event.end
+      status: partial
+      transform: >
+        epoch seconds, so convert to milliseconds or explicit date parsing
+        before it is a valid ECS date; mapped to event.end as the last time
+        activity was observed on the object - the best silent-loss detector in
+        this file, since a destination whose processed climbs while this is
+        frozen is queueing and one where both are frozen is dead
+    - vendor: not_matched
+      type: long
+      description: messages filtered out by a given filter
+      ecs: null
+      status: unmapped
+      custom: syslog_ng.stats.not_matched
+      notes: >
+        a filtered-out message is neither processed nor dropped, so it is
+        invisible in every other counter - a climbing not_matched against a
+        flat matched is a feed silently excluded, the single most likely
+        explanation for a source that reconciles to zero on the Elastic side
+  - format: prometheus
+    enable: >
+      Add a stats-exporter() source and scrape it: `source s_prometheus_stat {
+      stats-exporter( ip("0.0.0.0") port(8080) stat-type("stats")
+      scrape-freq-limit(1) stats-with-legacy(yes) stats-without-orphaned(yes)
+      ); };` then `curl -s http://localhost:8080/metrics/` (syslog-ng 4.1+ /
+      AxoSyslog; the 4.10+ options give parity with syslog-ng-ctl). The
+      counters arrive as Prometheus metric families with labels, e.g.
+      `syslogng_input_events_total{driver="journal",id="src#0"} 2036`,
+      `syslogng_internal_events_total{result="dropped"} 0` and
+      `syslogng_destination_processed{id="d_fromnet"} 877003`. `syslog-ng-ctl
+      stats --format=prometheus` emits the same exposition text on demand for
+      collectors that pull the socket rather than scrape HTTP.
+    references:
+    - >-
+      https://www.syslog-ng.com/community/b/blog/posts/the-syslog-ng-stats-exporter-now-has-all-functionality-of-syslog-ng-ctl
+    - >-
+      https://axoflow.com/docs/axosyslog-core/chapter-log-statistics/log-statistics-description/
+    - https://syslog-ng.github.io/admin-guide/150_Statistics_of_syslog-ng/README.html
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        custom syslog-ng Prometheus pipeline (exposition-format parser,
+        feeding logs-syslog_relay.syslog_ng_stats)
+      notes: >
+        The Prometheus form is a distinct field model: the object identity
+        that the semicolon table carries in the id and instance columns is
+        here split across metric-name suffix and labels (driver, id, result),
+        and the counter is the metric value. A collector parses the exposition
+        text into one record per (metric, label-set); the pipeline must map
+        the syslogng_* metric families back onto the same custom
+        syslog_ng.stats.* namespace the control-socket path uses so the two
+        collection methods land in one schema. The transport is a pull the
+        collector runs low-side, so as with the socket path the scrape happens
+        inside the enclave and only the shaped result crosses. Note the
+        direction: scraping a concentrator is a pull INTO the enclave, so a
+        cross-boundary scrape is not a candidate - the collector must sit
+        low-side and the result cross as NDJSON like every other dataset on
+        this technology.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Parse the exposition text low-side into one record per (metric,
+          label-set), normalize the syslogng_* metric names onto the
+          syslog_ng.stats.* namespace, and lift the driver/id/result labels
+          into object_id and a result discriminator so the Prometheus and
+          control-socket collection paths produce the identical shaped record.
+          Difference the _total counters per (host, id) if a delta is wanted,
+          drop the per-sender high-cardinality series, and cap the
+          operator-chosen id label before it crosses. Dead-letter any line
+          that fails the exposition-format parse rather than forwarding a
+          partial scrape.
+        elastic: >
+          Reuse the logs-syslog_relay.syslog_ng_stats pipeline and mappings -
+          the Prometheus path must land in the same custom namespace as the
+          socket path so a mixed estate (some concentrators scraped, some
+          pulled) is one queryable series. The same liveness alerts apply:
+          non-zero result="dropped" on syslogng_internal_events_total, a
+          destination processed that climbs while its activity stamp is
+          frozen, and absence of a scrape as a dead-tier signal.
+        relay: >
+          Shaped NDJSON crosses (envelope mode B), identical to the socket
+          path - the Prometheus exposition text is parsed and normalized
+          low-side and never crosses raw. The id label is operator-chosen free
+          text and the instance/peer detail rides in labels on network
+          drivers, so cap and allowlist the label set with the guard owner
+          before the crossing. Carry _raw across permanently and reconcile per
+          (dataset, hour).
+      direct:
+        parse_location: low
+        cribl: >
+          High-side concentrators are scraped on the core worker group and
+          normalized onto the shared syslog_ng.stats.* namespace without the
+          guard hop, merging with the rsyslog counters into one relay-tier
+          view.
+        elastic: >
+          Land in the shared logs-syslog_relay.syslog_ng_stats pipeline so a
+          mixed estate of scraped and pulled concentrators is one queryable
+          series; reconciliation collapses to core Cribl inEvents against
+          per-destination processed, and build the liveness alerts here too -
+          non-zero result="dropped" on syslogng_internal_events_total, a
+          destination processed that climbs while its activity stamp is
+          frozen, and absence of a scrape as a dead-tier signal.
+    fields:
+    - vendor: syslogng_input_events_total
+      type: long
+      description: >-
+        cumulative messages read by a source driver, labelled by driver and
+        id, e.g. syslogng_input_events_total{driver="journal",id="src#0"}
+      ecs: null
+      status: unmapped
+      custom: syslog_ng.stats.processed
+      notes: >
+        the Prometheus name for the source-side processed counter; the object
+        identity the semicolon table puts in id/instance columns is carried
+        here in the driver and id labels, which must be lifted out before the
+        metric is comparable to the socket path
+    - vendor: syslogng_output_events_total
+      type: long
+      description: cumulative messages delivered by a destination driver, labelled by id and result
+      ecs: null
+      status: unmapped
+      custom: syslog_ng.stats.written
+      notes: >
+        the destination-side delivery counter; the result label distinguishes
+        delivered from dropped events on newer builds, so it must be split on
+        result rather than summed
+    - vendor: syslogng_internal_events_total
+      type: long
+      description: >-
+        internal events by outcome, e.g.
+        syslogng_internal_events_total{result="dropped"}
+      ecs: null
+      status: unmapped
+      custom: syslog_ng.stats.dropped
+      notes: >
+        result="dropped" is the Prometheus form of the primary silent-loss
+        counter; a non-zero value is an incident exactly as dropped is on the
+        socket path, and the result label is the only thing separating it from
+        benign internal events
+    - vendor: syslogng_destination_processed
+      type: long
+      description: >-
+        messages processed toward a destination, labelled by id, e.g.
+        syslogng_destination_processed{id="d_fromnet"}
+      ecs: null
+      status: unmapped
+      custom: syslog_ng.stats.processed
+      notes: >
+        the egress anchor for reconciliation against low-side Cribl inEvents,
+        keyed on the id label rather than a SourceID column; counts arrival at
+        the driver, not successful delivery
+    - vendor: syslogng_socket_connections
+      type: long
+      description: active connections on a socket-based driver, labelled by id
+      ecs: null
+      status: unmapped
+      custom: syslog_ng.stats.connections
+      notes: >
+        a gauge with no counterpart column in the syslog-kv table - a
+        destination whose connection count falls to zero while processed is
+        still climbing is queueing against an unreachable peer, a liveness
+        signal the count-only feeds cannot give
+    - vendor: id
+      type: string
+      description: >-
+        Prometheus label carrying the configuration-declared driver name and
+        ordinal, e.g. id="d_fromnet"
+      ecs: null
+      status: unmapped
+      custom: syslog_ng.stats.object_id
+      notes: >
+        the same driver identity the semicolon table puts in the SourceID
+        column, here a metric label; operator-chosen free text, so cap and
+        allowlist it before the crossing and treat an unrecognised id as a
+        config-change signal
+    - vendor: driver
+      type: string
+      description: >-
+        Prometheus label naming the source/destination driver type, e.g.
+        driver="journal"
+      ecs: null
+      status: unmapped
+      custom: syslog_ng.stats.object_type
+      notes: >
+        the label equivalent of the SourceName object-type prefix; it decides
+        which metric families are meaningful for the object, the same way the
+        object type does on the socket path
+    - vendor: result
+      type: string
+      description: >-
+        Prometheus label on the events_total families distinguishing outcomes,
+        e.g. result="dropped"
+      ecs: null
+      status: unmapped
+      custom: syslog_ng.stats.result
+      notes: >
+        the outcome discriminator with no column equivalent on the socket
+        path, where dropped and processed are separate Type values rather than
+        one metric split by label; a consumer that ignores it double-counts
+- id: daemon-operational
+  name: Relay daemon operational messages
+  description: |
+    The concentrator daemons' own free-text operational log - the messages rsyslogd and syslog-ng write about themselves through rsyslog's internal messages mechanism and syslog-ng's internal() source. Startup and shutdown, configuration reload, action suspension and resumption, rate-limit engagement, broken destination connections, and queue-full drop warnings.
+    This dataset is the narrative counterpart to the two counter feeds. The counters say how many messages were lost; these messages say why, when, and to which destination - and several of them describe events that no counter reports at all. rsyslog's imuxsock "begins to drop messages from pid N due to rate-limiting" names the specific application whose logs are missing, which the ratelimit.discarded counter cannot. syslog-ng's "Destination queue full, dropping messages" names the driver and the configured fifo size. And the configuration-reload records are the change-control trail for the collection tier itself: a relay config edit can silently stop or re-filter a feed, and nothing else in the estate would record it - the data would simply look like a quiet source.
+    rsyslog messages carry RFC 5424 structured data of the form [origin software="rsyslogd" swVersion="8.2212.0" x-pid="2404" x-info="https://www.rsyslog.com"], and error messages carry a numeric error id in a trailing "try https://www.rsyslog.com/e/2007" hint, which is the closest thing this technology has to an event code.
+  event_categories:
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge Cribl worker group, on-prem enclave (low side)
+      notes: >
+        Same tier as the two counter datasets - these records are emitted by
+        the same daemons on the same hosts and normally share one Cribl syslog
+        source with them, split by tag or facility; the low-side
+        concentrators' records cross the Everfox HSG as shown.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >
+        allow-list on the logs-syslog_relay.daemon destination data stream
+        only; this is the only dataset on the technology carrying genuinely
+        unbounded free text, so the message body must be length-capped and
+        control-character-stripped before the guard destination
+      notes: >
+        change-control evidence for the collection tier, so it must cross even
+        when volume pressure argues otherwise - a config reload that is not
+        visible on the Elastic side is a feed that can be turned off
+        unaccountably. Same confirmed crossing as the two counter datasets: a
+        Cribl Syslog Destination on the __syslogout internal field carrying a
+        CEF-structured string today, with the high side parsing _raw through
+        Extract JSON before Cribl fields and Routes, retiring in favour of the
+        confirmed plan of record - a low-side Cribl HTTP Destination to a
+        high-side Cribl HTTP Source carrying NDJSON. The unbounded message
+        body on this dataset is the one most exposed to the syslog leg's
+        per-message size limit, which is a further reason to cap it low-side
+        rather than discover the truncation point after the fact
+    - hop: cribl
+      location: core worker group, Elastic side (high side)
+      notes: >
+        joins to the counter datasets on host and, for rsyslog, on the action
+        name - the suspension message and the suspended counter describe the
+        same event from two sides and should land in views that can be
+        correlated
+    - hop: elastic
+      data_stream: logs-syslog_relay.daemon
+    direct:
+    - hop: cribl
+      location: core Cribl worker group, Elastic enclave
+      notes: >
+        Same tier as the two counter datasets - these records are emitted by
+        the same daemons on the same hosts and normally share one Cribl syslog
+        source with them, split by tag or facility; a high-side concentrator
+        forwards them straight to the core Cribl worker group with no guard
+        crossing.
+    - hop: cribl
+      location: core worker group, Elastic side (high side)
+      notes: >
+        joins to the counter datasets on host and, for rsyslog, on the action
+        name - the suspension message and the suspended counter describe the
+        same event from two sides and should land in views that can be
+        correlated
+    - hop: elastic
+      data_stream: logs-syslog_relay.daemon
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom relay daemon operational pipeline
+      notes: >
+        No integration or pack covers these. The Elastic System integration's
+        syslog pipeline will strip the header and leave the body as message,
+        which loses everything that matters here, so the work is a bounded set
+        of message-form patterns rather than a general grammar: rsyslog's
+        start / "rsyslogd was HUPed" / "action '<name>' suspended|resumed
+        (module '<module>')" / imuxsock "begins to drop messages from pid
+        <pid> due to rate-limiting", and syslog-ng's "syslog-ng starting up;
+        version='...'" / "Configuration reload request received, reloading
+        configuration" / "Syslog connection broken; fd='...', server='...',
+        time_reopen='...'" / "Destination queue full, dropping messages;". Two
+        structural helps exist and should be used rather than regexed around:
+        rsyslog emits RFC 5424 structured data carrying the software name,
+        version and pid, and syslog-ng's own messages after the leading phrase
+        are key='value' pairs. Message wording is not a stable API across
+        releases, so the pattern set must be pinned to a lookup and
+        version-tested rather than left as inline substring matches.
+    fields:
+    - vendor: TIMESTAMP
+      type: timestamp
+      description: syslog header timestamp of the operational message
+      ecs: '@timestamp'
+      status: mapped
+      notes: >
+        legacy RFC 3164 relays emit this without a year or a timezone, so it
+        must be reconciled against the receiving Cribl worker's clock rather
+        than trusted - a concentrator whose clock has drifted will reorder the
+        very records used to explain a gap
+    - vendor: HOSTNAME
+      type: string
+      description: hostname of the concentrator that emitted the operational message
+      ecs: host.name
+      status: mapped
+      notes: same relay-versus-relayed-device distinction as the counter datasets
+    - vendor: APP-NAME
+      type: string
+      description: emitting daemon - rsyslogd or syslog-ng
+      ecs: log.syslog.appname
+      status: mapped
+      notes: >
+        also the branch discriminator for the whole pipeline, since the two
+        daemons share nothing in message form beyond the syslog envelope
+    - vendor: PRI
+      type: integer
+      description: syslog priority of the operational message
+      ecs: log.syslog.priority
+      status: mapped
+      notes: >
+        severity is the cheapest triage axis on this dataset - the messages
+        that matter (queue full, rate limiting, action suspended, connection
+        broken) are emitted at warning or error while the routine lifecycle
+        records are info
+    - vendor: syslogseverity-text
+      type: enum
+      description: textual severity of the record - emerg through debug
+      ecs: log.level
+      status: mapped
+      transform: >
+        copied to log.level verbatim; if a numeric threshold is wanted
+        alongside it, derive log.syslog.severity.code from the same PRI rather
+        than mapping the text a second time
+    - vendor: msg
+      type: string
+      description: free-text body of the operational message
+      ecs: message
+      status: mapped
+      transform: >
+        also the sole source of event.action and event.outcome on this
+        dataset, since there is no structured verb anywhere in the record; pin
+        the documented message forms to a lookup rather than substring
+        matching, and version-test it, because the wording is not a stable
+        interface across daemon releases
+    - vendor: software
+      type: string
+      description: >-
+        emitting software name from rsyslog's structured data, origin
+        software="rsyslogd"
+      ecs: service.type
+      status: partial
+      notes: >
+        constant per daemon, so it carries no per-record information, but it
+        is the reliable discriminator between the rsyslog and syslog-ng halves
+        of a mixed tier and should be set deliberately for syslog-ng records
+        too rather than left absent on half the feed
+    - vendor: swVersion
+      type: string
+      description: >-
+        daemon version, from rsyslog's structured data swVersion attribute or
+        syslog-ng's "starting up; version='...'" record
+      ecs: service.version
+      status: mapped
+      notes: >
+        the inventory of what is actually running on the legacy tier, which is
+        otherwise undocumented on a concentrator estate assembled over years;
+        counter availability is version-dependent on both daemons, so this
+        field decides which counters a given host can even be expected to emit
+    - vendor: x-pid
+      type: integer
+      description: 'process id of the daemon, from rsyslog''s structured data x-pid attribute'
+      ecs: process.pid
+      status: mapped
+      notes: >
+        a change in this value between records without an intervening start
+        message is an unlogged daemon restart, which is one of the few ways a
+        relay can lose in-memory queued messages without any counter recording
+        it
+    - vendor: error id (rsyslog.com/e/NNNN)
+      type: string
+      description: >-
+        numeric rsyslog error identifier carried in the trailing "try
+        https://www.rsyslog.com/e/2007" hint on error messages
+      ecs: error.code
+      status: partial
+      transform: >
+        extract the numeric id out of the URL and keep it as a short keyword;
+        it is the only stable, version-independent identifier on this dataset
+        and is the right key for a lookup table of causes, since the
+        surrounding prose changes between releases
+    - vendor: action
+      type: string
+      description: >-
+        name of the rsyslog action referenced by a suspension or resumption
+        message, e.g. "action 17" in "action 'action 17' suspended"
+      ecs: null
+      status: unmapped
+      custom: rsyslog.action.name
+      notes: >
+        the join key back to the impstats core.action counters, and the reason
+        to give actions explicit names in rsyslog.conf - the default
+        positional names renumber on a config edit, which breaks the
+        correlation exactly when a config change is what you are trying to
+        investigate
+    - vendor: module
+      type: string
+      description: >-
+        rsyslog output module owning the action, e.g. builtin:ompipe or
+        builtin:omfwd in "(module 'builtin:omfwd')"
+      ecs: null
+      status: unmapped
+      custom: rsyslog.action.module
+      notes: >
+        distinguishes a local write failure from a forwarding failure - an
+        omfwd suspension is the relay losing its path to Cribl, which is a
+        boundary incident, while an omfile suspension is usually a local disk
+        problem
+    - vendor: pid (rate-limited)
+      type: integer
+      description: >-
+        process id named in imuxsock's "begins to drop messages from pid <pid>
+        due to rate-limiting" warning
+      ecs: null
+      status: unmapped
+      custom: rsyslog.ratelimit.pid
+      notes: >
+        the most actionable value on the dataset and deliberately kept
+        separate from process.pid, which holds the daemon's own pid - this one
+        names the victim application whose messages were discarded, which the
+        ratelimit.discarded counter cannot tell you; resolve it to a program
+        name at the relay, because a pid is meaningless once the process has
+        exited
+    - vendor: server
+      type: string
+      description: >-
+        destination peer in syslog-ng's "Syslog connection broken;
+        server='AF_INET(10.1.1.1:514)'" record
+      ecs: destination.address
+      status: partial
+      transform: >
+        strip the AF_INET(...) wrapper and split the host and port into
+        destination.address and destination.port; an AF_UNIX form appears for
+        local destinations and must not be parsed as an address
+    - vendor: time_reopen
+      type: integer
+      description: seconds syslog-ng will wait before retrying a broken destination connection
+      ecs: null
+      status: unmapped
+      custom: syslog_ng.time_reopen
+      notes: >
+        bounds how long a destination stays down after a break, and therefore
+        how much of the queue can accumulate before dropping starts; a long
+        time_reopen with a small log_fifo_size is the standard recipe for
+        silent loss on a relay
+    - vendor: log_fifo_size
+      type: integer
+      description: >-
+        configured output queue depth reported alongside syslog-ng's
+        "Destination queue full, dropping messages;" warning
+      ecs: null
+      status: unmapped
+      custom: syslog_ng.log_fifo_size
+      notes: >
+        the configured ceiling the dropped counter on the stats dataset is
+        measured against; capturing it here is what makes a queued value
+        interpretable, since the counter feed reports the level but never the
+        limit
+    - vendor: persist_name
+      type: string
+      description: syslog-ng driver identifier reported on queue and connection records
+      ecs: null
+      status: unmapped
+      custom: syslog_ng.persist_name
+      notes: >
+        the join key from this dataset back to the object_id on the statistics
+        dataset, so a queue-full warning can be tied to the destination whose
+        counters recorded the loss
+    - vendor: event
+      type: enum
+      description: >-
+        normalized operational event derived from the message form - start,
+        hup/reload, action-suspended, action-resumed, ratelimit-drop,
+        connection-broken, queue-full-drop, shutdown
+      ecs: event.action
+      status: partial
+      transform: >
+        there is no verb field in either daemon's records, so this is derived
+        entirely from the message body through the pinned lookup; keep the raw
+        message alongside it and treat an unmatched form as a parse failure
+        worth surfacing rather than a record to discard, because a message
+        form nobody has seen before is usually a new failure mode rather than
+        noise
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Derive event.action from a pinned lookup of the documented message
+          forms rather than substring matching - "action 'x' suspended" and
+          "action 'x' resumed" differ by one word and mean opposite things,
+          and a match on "drop" will hit both the imuxsock rate-limit notice
+          and the syslog-ng queue-full notice, which need different handling.
+          Parse rsyslog's structured-data block for the software name, version
+          and daemon pid instead of regexing the message body, split
+          syslog-ng's key='value' tail into typed fields, extract the numeric
+          rsyslog error id out of the trailing rsyslog.com/e/NNNN hint into
+          error.code, and set event.outcome from the action verb so suspended,
+          resumed and reload-failure states are queryable without text search.
+          Cap and sanitize the message body before the guard destination -
+          this is the only unbounded free text on the technology - and stamp
+          the daemon identity and action name so these records join the
+          counter datasets.
+        elastic: >
+          Run a custom logs-syslog_relay.daemon ingest pipeline with
+          custom-namespace keyword mappings for rsyslog.action.name,
+          rsyslog.action.module and syslog_ng.persist_name and long mappings
+          for rsyslog.ratelimit.pid, syslog_ng.log_fifo_size and
+          syslog_ng.time_reopen, and normalize the daemon into service.type so
+          the rsyslog and syslog-ng halves of the tier can be filtered
+          together or apart. The detections to build are correlations rather
+          than patterns: join an action-suspended record against the impstats
+          suspended counter and the low-side Cribl inEvents for the same host
+          and alert when a suspension is followed by a step change in arrival
+          rate, alert on any configuration reload that is not inside a change
+          window - a relay reload can silently re-filter a feed and no other
+          log in the estate records it - and alert on the imuxsock rate-limit
+          notice by originating pid, since it names the specific application
+          whose logs are being discarded. Alert on absence of the periodic
+          startup/heartbeat pattern per host as well, for the same reason as
+          the counter datasets.
+        relay: >
+          Full ECS-shaped NDJSON crosses (envelope mode B) with the parsed
+          fields plus a capped message body, UTF-8, LF-terminated, compression
+          disabled, nesting depth at most two. This is the one dataset on the
+          technology that is genuinely hostile to a simple hand-written
+          content filter: the message body is unbounded operator- and
+          library-generated text that can carry file paths, configuration
+          fragments, peer addresses and non-ASCII characters, and error
+          messages from output modules can embed remote server responses
+          verbatim. Cap it to a flagged length and strip control characters
+          low-side rather than asking a custom LUA rule to cope, confirm with
+          the guard owner that destination hostnames and enclave peer
+          addresses in the connection-broken records may traverse, and keep
+          configuration content itself off the crossing - forward the fact
+          that a reload happened, never the config that was loaded. Volume is
+          low, so carry _raw across permanently and reconcile counts per
+          (dataset, hour); a single lost record here loses a whole boundary
+          configuration event. Transport is confirmed: a Cribl Syslog
+          Destination on a CEF-structured __syslogout value today, with the
+          high side parsing _raw through Extract JSON before Cribl fields and
+          Routes, retiring in favour of the confirmed plan of record - a
+          low-side Cribl HTTP Destination to a high-side Cribl HTTP Source
+          carrying this NDJSON. The cap on the message body should be set
+          against the syslog leg's per-message limit while that leg is live,
+          since silent truncation there would be indistinguishable from a
+          laconic daemon. AST/file drop is a replay-capable fallback only.
+      direct:
+        parse_location: low
+        cribl: >
+          Derive event.action from a pinned lookup of the documented message
+          forms rather than substring matching - "action 'x' suspended" and
+          "action 'x' resumed" differ by one word and mean opposite things,
+          and a match on "drop" will hit both the imuxsock rate-limit notice
+          and the syslog-ng queue-full notice, which need different handling.
+          Parse rsyslog's structured-data block for the software name, version
+          and daemon pid instead of regexing the message body, split
+          syslog-ng's key='value' tail into typed fields, extract the numeric
+          rsyslog error id out of the trailing rsyslog.com/e/NNNN hint into
+          error.code, and set event.outcome from the action verb so suspended,
+          resumed and reload-failure states are queryable without text search.
+          High-side concentrators do this on the core worker group with no
+          guard crossing; the message-body cap still applies for downstream
+          hygiene, and stamp the daemon identity and action name so these
+          records join the counter datasets.
+        elastic: >
+          Run a custom logs-syslog_relay.daemon ingest pipeline with
+          custom-namespace keyword mappings for rsyslog.action.name,
+          rsyslog.action.module and syslog_ng.persist_name and long mappings
+          for rsyslog.ratelimit.pid, syslog_ng.log_fifo_size and
+          syslog_ng.time_reopen, and normalize the daemon into service.type so
+          the rsyslog and syslog-ng halves of the tier can be filtered
+          together or apart. The detections to build are correlations rather
+          than patterns: join an action-suspended record against the impstats
+          suspended counter and the core Cribl inEvents for the same host and
+          alert when a suspension is followed by a step change in arrival
+          rate, alert on any configuration reload that is not inside a change
+          window - a relay reload can silently re-filter a feed and no other
+          log in the estate records it - and alert on the imuxsock rate-limit
+          notice by originating pid, since it names the specific application
+          whose logs are being discarded. Alert on absence of the periodic
+          startup/heartbeat pattern per host as well, for the same reason as
+          the counter datasets.
+  - format: json
+    enable: >
+      Bind a JSON template on the action that forwards the daemons' own
+      messages. rsyslog: enable internal messages as regular logs
+      (`global(processInternalMessages="on")`) and forward them with a
+      template such as `template(name="daemonJSON" type="list") {
+      property(name="timereported" dateFormat="rfc3339" format="jsonf"
+      outname="@timestamp") property(name="hostname" format="jsonf")
+      property(name="syslogfacility" format="jsonf")
+      property(name="syslogseverity" format="jsonf")
+      property(name="programname" format="jsonf")
+      property(name="structured-data" format="jsonf") property(name="msg"
+      format="jsonf") }`. The dateFormat="rfc3339" is the point: it emits a
+      full ISO 8601 timestamp with year and offset, removing the RFC 3164
+      guess, and the structured-data property carries rsyslog's origin block
+      (software="rsyslogd" swVersion="..." x-pid="...") as a typed key instead
+      of text embedded in msg. syslog-ng's internal() messages take the
+      equivalent format-json() / value-pairs destination template.
+    references:
+    - https://docs.rsyslog.com/doc/configuration/templates.html
+    - https://docs.rsyslog.com/doc/configuration/properties.html
+    - https://syslog-ng.github.io/admin-guide/150_Statistics_of_syslog-ng/README.html
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        custom relay daemon operational pipeline (JSON-envelope variant,
+        feeding logs-syslog_relay.daemon)
+      notes: >
+        No integration or pack covers these in any form. The json template
+        restructures only the envelope, so the work that remains is identical
+        to the syslog-raw feed: a bounded set of message-form patterns pinned
+        to a lookup (rsyslog's action-suspended/resumed and imuxsock
+        rate-limit forms, syslog-ng's reload/connection-broken/queue-full
+        forms) applied to the still-opaque msg. The gain is real but bounded -
+        the yearless timestamp and the regex-out-of-body extraction of
+        software, swVersion and x-pid both disappear because Extract JSON
+        yields them typed - while the message wording is not a stable API
+        across releases, so the pattern set must still be version-tested
+        rather than trusted.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Extract JSON low-side and take @timestamp straight from the rfc3339
+          property instead of reconciling a yearless RFC 3164 stamp against
+          the worker clock. Parse the structured-data key for software,
+          swVersion and x-pid rather than regexing the body, then still derive
+          event.action from the pinned lookup of the documented message forms
+          - "action 'x' suspended" and "action 'x' resumed" differ by one word
+          and mean opposite things, and a match on "drop" hits both the
+          imuxsock rate-limit notice and the syslog-ng queue-full notice.
+          Extract the numeric rsyslog error id from the trailing
+          rsyslog.com/e/NNNN hint into error.code. This is the one dataset
+          with genuinely unbounded free text, so cap and
+          control-character-strip the msg body before the guard.
+        elastic: >
+          Run a custom logs-syslog_relay.daemon ingest pipeline with
+          custom-namespace keyword mappings for rsyslog.action.name,
+          rsyslog.action.module and syslog_ng.persist_name and long mappings
+          for rsyslog.ratelimit.pid, syslog_ng.log_fifo_size and
+          syslog_ng.time_reopen, normalizing the daemon into service.type. On
+          the json path the date and structured-data processors become no-ops
+          - validate @timestamp, service.version and process.pid arrive
+          already populated and stop the pipeline from overwriting them. The
+          detections are correlations: join an action-suspended record against
+          the impstats suspended counter, alert on any configuration reload
+          outside a change window, and alert on the imuxsock rate-limit notice
+          by originating pid.
+        relay: >
+          Full ECS-shaped NDJSON crosses (envelope mode B) with the parsed
+          fields plus a capped msg body, UTF-8, LF-terminated, compression
+          disabled, nesting depth at most two. This is the dataset most
+          hostile to a simple content filter even in json form: the msg value
+          is unbounded operator- and library-generated text that can carry
+          file paths, config fragments, peer addresses and non-ASCII, and
+          output-module errors can embed remote server responses verbatim - so
+          cap it to a flagged length and strip control characters low-side
+          rather than asking a LUA rule to cope, and keep configuration
+          content itself off the crossing (forward that a reload happened,
+          never the config that loaded). Carry _raw across permanently and
+          reconcile per (dataset, hour) via the confirmed low-side to
+          high-side Cribl HTTP NDJSON path; a single lost record here loses a
+          whole boundary configuration event.
+      direct:
+        parse_location: hybrid
+        cribl: >
+          High-side concentrators Extract JSON, take @timestamp from the
+          rfc3339 property, parse the structured-data key for software,
+          swVersion and x-pid, and derive event.action from the pinned lookup
+          of the documented message forms on the core worker group with no
+          guard crossing; the msg cap still applies for downstream hygiene,
+          and the daemon identity and action name are stamped so these records
+          join the counter datasets on host and action name.
+        elastic: >
+          Run a custom logs-syslog_relay.daemon pipeline with the same
+          custom-namespace keyword and long mappings the fields need, and on
+          the json path validate that @timestamp, service.version and
+          process.pid arrive already populated rather than overwriting them.
+          Build the reload, suspension-correlation and rate-limit-by-pid
+          detections here too, and alert on absence of the periodic
+          startup/heartbeat pattern per host.
+    fields:
+    - vendor: timereported
+      type: timestamp
+      description: >-
+        operational message time as an rfc3339 property, carrying year and
+        timezone offset
+      ecs: '@timestamp'
+      status: mapped
+      transform: >
+        emitted by dateFormat="rfc3339", which removes the RFC 3164 yearless
+        guess the syslog-raw feed has to reconcile against the receiving
+        worker's clock
+    - vendor: hostname
+      type: string
+      description: hostname of the concentrator that emitted the operational message
+      ecs: host.name
+      status: mapped
+      notes: same relay-versus-relayed-device distinction as the counter datasets
+    - vendor: syslogfacility
+      type: integer
+      description: numeric syslog facility of the operational message
+      ecs: log.syslog.facility.code
+      status: mapped
+      notes: >
+        emitted as a decimal number by the jsonf template, removing the PRI/8
+        math the syslog-raw feed needs to recover facility
+    - vendor: syslogseverity
+      type: integer
+      description: numeric syslog severity of the operational message
+      ecs: log.syslog.severity.code
+      status: mapped
+      notes: >
+        the cheapest triage axis - the messages that matter (queue full, rate
+        limiting, action suspended, connection broken) are warning or error
+        while routine lifecycle records are info
+    - vendor: programname
+      type: string
+      description: emitting daemon - rsyslogd or syslog-ng
+      ecs: log.syslog.appname
+      status: mapped
+      notes: >
+        the branch discriminator for the whole pipeline, since the two daemons
+        share nothing in message form beyond the syslog envelope
+    - vendor: msg
+      type: string
+      description: >-
+        free-text body of the operational message, still one opaque field
+        inside the JSON envelope
+      ecs: message
+      status: mapped
+      transform: >
+        the sole source of event.action and event.outcome; the json template
+        types the envelope but leaves the body untouched, so pin the
+        documented message forms to a lookup rather than substring matching
+        and version-test it, exactly as the syslog-raw feed must
+    - vendor: software
+      type: string
+      description: >-
+        emitting software name from rsyslog's structured-data property, origin
+        software="rsyslogd"
+      ecs: service.type
+      status: partial
+      notes: >
+        constant per daemon so it carries no per-record information, but it is
+        the reliable discriminator between the rsyslog and syslog-ng halves of
+        a mixed tier and should be set deliberately for syslog-ng records too
+    - vendor: swVersion
+      type: string
+      description: >-
+        daemon version from rsyslog's structured-data swVersion attribute (or
+        syslog-ng's "starting up; version='...'" record)
+      ecs: service.version
+      status: mapped
+      notes: >
+        the inventory of what runs on the legacy tier, otherwise undocumented;
+        counter availability is version-dependent on both daemons, so this
+        field decides which counters a host can even be expected to emit
+    - vendor: x-pid
+      type: integer
+      description: 'daemon process id from rsyslog''s structured-data x-pid attribute'
+      ecs: process.pid
+      status: mapped
+      notes: >
+        a change in this value between records without an intervening start
+        message is an unlogged daemon restart, one of the few ways a relay can
+        lose in-memory queued messages without any counter recording it
+    - vendor: error id (rsyslog.com/e/NNNN)
+      type: string
+      description: >-
+        numeric rsyslog error identifier carried in the trailing "try
+        https://www.rsyslog.com/e/2007" hint on error messages
+      ecs: error.code
+      status: partial
+      transform: >
+        extract the numeric id from the URL and keep it as a short keyword; it
+        is the only stable, version-independent identifier on this dataset and
+        the right key for a lookup table of causes
+    - vendor: action
+      type: string
+      description: >-
+        name of the rsyslog action referenced by a suspension or resumption
+        message, e.g. "action 17"
+      ecs: null
+      status: unmapped
+      custom: rsyslog.action.name
+      notes: >
+        the join key back to the impstats core.action counters, and the reason
+        to give actions explicit names in rsyslog.conf - default positional
+        names renumber on a config edit, breaking the correlation exactly when
+        a config change is what you are investigating
+    - vendor: module
+      type: string
+      description: rsyslog output module owning the action, e.g. builtin:ompipe or builtin:omfwd
+      ecs: null
+      status: unmapped
+      custom: rsyslog.action.module
+      notes: >
+        distinguishes a local write failure from a forwarding failure - an
+        omfwd suspension is the relay losing its path to Cribl, a boundary
+        incident, while an omfile suspension is usually a local disk problem
+    - vendor: pid (rate-limited)
+      type: integer
+      description: >-
+        process id named in imuxsock's "begins to drop messages from pid <pid>
+        due to rate-limiting" warning
+      ecs: null
+      status: unmapped
+      custom: rsyslog.ratelimit.pid
+      notes: >
+        deliberately separate from process.pid (the daemon's own pid) - this
+        names the victim application whose messages were discarded, which the
+        ratelimit.discarded counter cannot; resolve it to a program name at
+        the relay before the process exits
+    - vendor: server
+      type: string
+      description: >-
+        destination peer in syslog-ng's "Syslog connection broken;
+        server='AF_INET(10.1.1.1:514)'" record
+      ecs: destination.address
+      status: partial
+      transform: >
+        strip the AF_INET(...) wrapper and split host and port into
+        destination.address and destination.port; an AF_UNIX form appears for
+        local destinations and must not be parsed as an address
+    - vendor: time_reopen
+      type: integer
+      description: seconds syslog-ng will wait before retrying a broken destination connection
+      ecs: null
+      status: unmapped
+      custom: syslog_ng.time_reopen
+      notes: >
+        bounds how long a destination stays down after a break, and therefore
+        how much queue accumulates before dropping starts; a long time_reopen
+        with a small log_fifo_size is the standard recipe for silent loss
+    - vendor: log_fifo_size
+      type: integer
+      description: >-
+        configured output queue depth reported alongside syslog-ng's
+        "Destination queue full, dropping messages;" warning
+      ecs: null
+      status: unmapped
+      custom: syslog_ng.log_fifo_size
+      notes: >
+        the configured ceiling the dropped counter is measured against;
+        capturing it here is what makes a queued value interpretable, since
+        the counter feed reports the level but never the limit
+    - vendor: persist_name
+      type: string
+      description: syslog-ng driver identifier reported on queue and connection records
+      ecs: null
+      status: unmapped
+      custom: syslog_ng.persist_name
+      notes: >
+        the join key from this dataset back to the object_id on the statistics
+        dataset, so a queue-full warning can be tied to the destination whose
+        counters recorded the loss
+    - vendor: event
+      type: enum
+      description: >-
+        normalized operational event derived from the message form - start,
+        hup/reload, action-suspended, action-resumed, ratelimit-drop,
+        connection-broken, queue-full-drop, shutdown
+      ecs: event.action
+      status: partial
+      transform: >
+        no verb field exists in either daemon's records, so this is derived
+        entirely from the msg body through the pinned lookup; keep the raw
+        message alongside it and treat an unmatched form as a parse failure
+        worth surfacing rather than a record to discard

@@ -1,0 +1,1045 @@
+id: f5-bigip-ltm
+name: F5 BIG-IP LTM
+vendor: F5
+versions: BIG-IP 15.1, 16.1, 17.1 (TMOS)
+draft: true
+references:
+- >-
+  https://techdocs.f5.com/en-us/bigip-15-0-0/external-monitoring-of-big-ip-systems-implementations/configuring-request-logging.html
+- >-
+  https://clouddocs.f5.com/products/extensions/f5-telemetry-streaming/latest/event-listener.html
+- >-
+  https://techdocs.f5.com/kb/en-us/products/big-ip_ltm/manuals/product/tmos-concepts-11-5-0/11.html
+- >-
+  https://techdocs.f5.com/kb/en-us/products/big-ip_ltm/releasenotes/related/log-messages.html
+- >-
+  https://techdocs.f5.com/en-us/bigip-15-0-0/big-ip-systems-user-account-administration/auditing-user-access.html
+- https://my.f5.com/manage/s/article/K16304
+- https://docs.elastic.co/integrations/f5_bigip
+datasets:
+- id: request-log
+  name: HSL request logging (virtual server traffic)
+  description: >
+    Per-transaction HTTP records emitted by a Request Logging profile attached
+    to a virtual server and shipped off-box through a high-speed logging (HSL)
+    publisher to a pool of remote syslog collectors. The template is
+    site-defined - the profile emits literally whatever string the operator
+    writes - but F5 publishes a canonical request/response template for
+    Telemetry Streaming, and the key names below are that template's.
+    Deployment should standardise every virtual server on one template; a
+    per-VIP template is the single biggest parsing risk on this technology.
+    APM access/session logging rides the same publisher but is a separately
+    licensed module and is out of scope for this map, as is ASM/WAF (its own
+    catalog entry, f5-bigip-asm).
+  event_categories:
+  - web
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        HSL publisher sends to a Cribl syslog source over TCP.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-f5_bigip.ltm_request
+      notes: >
+        custom data stream in the f5_bigip namespace; the stock integration's
+        single logs-f5_bigip.log stream does not accept syslog-delivered
+        records.
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        HSL publisher sends to a Cribl syslog source over TCP.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-f5_bigip.ltm_request
+      notes: >
+        custom data stream in the f5_bigip namespace; the stock integration's
+        single logs-f5_bigip.log stream does not accept syslog-delivered
+        records.
+  formats:
+  - format: syslog-kv
+    parsing:
+      mechanism: cribl-pipeline
+      notes: >
+        There is no usable Elastic integration for this feed. The f5_bigip
+        integration ships exactly one data stream and ingests only F5
+        Telemetry Streaming JSON pushed to an Elastic Agent HTTP endpoint or
+        staged through S3; its documentation states outright that parsing the
+        syslog events produced at the operating system level is not supported.
+        A Cribl pipeline therefore parses the quoted key=value template. There
+        is a community Cribl pack in the Dispensary covering F5 LTM/ASM syslog
+        and iRule output - evaluate it before writing the pipeline from
+        scratch, but do not assume it matches a locally customised template.
+        Name the extracted fields after the integration's f5_bigip.log.* keys
+        so that a later move to Telemetry Streaming is a re-route rather than
+        a re-map.
+    fields:
+    - vendor: event_source
+      type: string
+      description: literal marking which half of the Request Logging profile emitted the record
+      ecs: event.provider
+      status: partial
+      notes: >
+        F5's canonical template hard-codes request_logging on the request
+        template and response_logging on the response template; it identifies
+        the emitting subsystem rather than an action, and it is also the
+        natural switch for choosing which fields a record is expected to carry
+    - vendor: event_timestamp
+      type: timestamp
+      description: time the request was received, rendered by the $DATE_HTTP token
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        $DATE_HTTP emits an RFC 1123 HTTP date ("Tue, 5 Apr 2011 02:15:31
+        GMT") and needs parsing; templates built on $TIME_UNIX instead deliver
+        epoch seconds, so pin one form across every profile before writing the
+        parser
+    - vendor: hostname
+      type: string
+      description: configured host name of the BIG-IP unit or chassis ($BIGIP_HOSTNAME)
+      ecs: observer.hostname
+      status: mapped
+    - vendor: client_ip
+      type: ip
+      description: IP address of the client that opened the connection ($CLIENT_IP)
+      ecs: source.ip
+      status: mapped
+    - vendor: client_port
+      type: port
+      description: source port of the client connection ($CLIENT_PORT)
+      ecs: source.port
+      status: mapped
+    - vendor: virtual_ip
+      type: ip
+      description: IP address of the virtual server the client connected to ($VIRTUAL_IP)
+      ecs: destination.ip
+      status: mapped
+    - vendor: virtual_port
+      type: port
+      description: listening port of the virtual server ($VIRTUAL_PORT)
+      ecs: destination.port
+      status: mapped
+    - vendor: virtual_name
+      type: string
+      description: >-
+        full partition path of the virtual server that handled the request
+        ($VIRTUAL_NAME)
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.ltm.virtual_server
+      transform: >
+        values look like /Common/app.app/app_vs; split the leading path
+        elements into tenant and application the way Telemetry Streaming does,
+        so per-tenant and per-application dashboards work without a wildcard
+        query on the full path
+      notes: >
+        the virtual server is the service the client addressed, not an
+        observer or a rule; ECS has no field for a load-balancer listener
+        object
+    - vendor: virtual_pool_name
+      type: string
+      description: name of the pool containing the server that responded ($VIRTUAL_POOL_NAME)
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.ltm.pool.name
+    - vendor: server_ip
+      type: ip
+      description: IP address of the pool member the request was load balanced to ($SERVER_IP)
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.ltm.pool_member.ip
+      notes: >
+        the real ECS gap on this dataset. ECS models one destination per event
+        and destination.* already holds the virtual server the client
+        addressed; server.* is defined as the same endpoint as destination.*,
+        so putting the back-end pool member there would double-book the
+        destination role and silently corrupt any flow analytic. Kept custom
+        until the proxy/back-end hop has an ECS home.
+    - vendor: server_port
+      type: port
+      description: port of the pool member the request was load balanced to ($SERVER_PORT)
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.ltm.pool_member.port
+    - vendor: snat_ip
+      type: ip
+      description: BIG-IP self IP used as the source of the server-side connection ($SNAT_IP)
+      ecs: source.nat.ip
+      status: partial
+      notes: >
+        only a NAT address when SNAT is enabled on the virtual server; F5
+        documents that the token returns the client IP when SNAT is disabled,
+        so a pipeline that copies it unconditionally makes source.nat.ip equal
+        source.ip on every non-SNAT virtual server
+    - vendor: snat_port
+      type: port
+      description: BIG-IP port used on the server-side connection ($SNAT_PORT)
+      ecs: source.nat.port
+      status: partial
+      notes: >-
+        same SNAT-disabled fallback as snat_ip - leave unset rather than
+        mirroring client_port
+    - vendor: http_method
+      type: string
+      description: >-
+        HTTP method of the request - GET, PUT, HEAD, POST, DELETE, TRACE,
+        CONNECT ($HTTP_METHOD)
+      ecs: http.request.method
+      status: mapped
+    - vendor: http_uri
+      type: string
+      description: URI of the request as received ($HTTP_URI)
+      ecs: url.original
+      status: partial
+      notes: >
+        origin-form path and query only, with no scheme or authority; split
+        into url.path and url.query, and reconstruct url.full from the Host
+        header only if the local template carries one
+    - vendor: http_version
+      type: string
+      description: HTTP version designation of the request ($HTTP_VERSION)
+      ecs: http.version
+      status: partial
+      transform: >-
+        vendor emits the protocol token (HTTP/1.1); strip the HTTP/ prefix so
+        the value matches ECS's expected "1.1"
+    - vendor: http_statcode
+      type: integer
+      description: >-
+        numeric response status code, without the reason phrase
+        ($HTTP_STATCODE); response template only
+      ecs: http.response.status_code
+      status: mapped
+    - vendor: response_ms
+      type: integer
+      description: >-
+        elapsed milliseconds between receipt of the request and transmission
+        of the response ($RESPONSE_MSECS)
+      ecs: event.duration
+      status: partial
+      transform: >
+        ECS event.duration is nanoseconds - multiply by 1,000,000. Templates
+        that use $RESPONSE_USECS instead need a factor of 1,000, so the
+        pipeline must key the conversion off which token the profile actually
+        uses.
+    - vendor: response_size
+      type: bytes
+      description: size of the response in bytes ($RESPONSE_SIZE)
+      ecs: http.response.bytes
+      status: mapped
+    - vendor: user_agent
+      type: string
+      description: >-
+        value of the User-Agent request header, pulled in with the
+        ${User-agent} header token
+      ecs: user_agent.original
+      status: mapped
+      notes: >
+        not part of F5's canonical template - undelineated ${...} tokens
+        return the value of the named header, so this is present only where
+        the site template asks for it. Worth standardising on: it is the
+        cheapest useful field the base template omits.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Parse the quoted key=value template into ECS-shaped JSON in the core
+          worker group, keyed off event_source so the request and response
+          halves of the profile land in one document shape rather than two. Do
+          the conversions that are cheap here and awkward later: $DATE_HTTP to
+          a real timestamp, response_ms to nanosecond event.duration, the
+          HTTP/1.1 version prefix stripped, the virtual_name partition path
+          split into tenant and application, and a suppression rule that
+          leaves source.nat.* unset when SNAT is disabled instead of copying
+          the client address into it. Cap http_uri and the user-agent, and
+          reject records whose key set does not match the standard template to
+          a dead-letter route - that is the early-warning signal for a virtual
+          server running a non-standard profile.
+        elastic: >
+          Land pre-shaped documents in a custom logs-f5_bigip.ltm_request data
+          stream with an index template that maps the f5_bigip.ltm.* namespace
+          explicitly - virtual_server, pool.name, pool_member.ip and
+          pool_member.port as keyword/ip rather than letting dynamic mapping
+          guess. Keep high-side work to enrichment: derive event.outcome from
+          http.response.status_code (4xx/5xx to failure) since the template
+          carries no outcome column, and set observer.vendor/product/type on
+          ingest so BIG-IP records are separable from the other
+          network-security sources in the same tier.
+        relay: >
+          Low-side instances cross the guard carrying full ECS-shaped JSON,
+          not the raw template: parse-low gives the guard one stable schema
+          instead of a per-virtual-server text grammar it would have to
+          re-learn. The content-filter friction is entirely in the URI, the
+          user-agent and any header token the template pulls in - unbounded,
+          attacker-controlled, frequently percent- and unicode-encoded - so
+          normalise and length-cap those three before the guard destination
+          and hold the JSON to two levels of nesting with short ASCII keys.
+          This is the highest-volume and lowest-forensic-value dataset here,
+          so drop _raw on this route first, use Persistent Queue backpressure
+          rather than Block, and reconcile low- and high-side counts per hour
+          to catch silent at-most-once drops.
+      direct:
+        parse_location: low
+        cribl: >
+          Parse the quoted key=value template into ECS-shaped JSON in the core
+          worker group, keyed off event_source so the request and response
+          halves of the profile land in one document shape rather than two. Do
+          the conversions that are cheap here and awkward later: $DATE_HTTP to
+          a real timestamp, response_ms to nanosecond event.duration, the
+          HTTP/1.1 version prefix stripped, the virtual_name partition path
+          split into tenant and application, and a suppression rule that
+          leaves source.nat.* unset when SNAT is disabled instead of copying
+          the client address into it. Cap http_uri and the user-agent, and
+          reject records whose key set does not match the standard template to
+          a dead-letter route - that is the early-warning signal for a virtual
+          server running a non-standard profile.
+        elastic: >
+          Land pre-shaped documents in a custom logs-f5_bigip.ltm_request data
+          stream with an index template that maps the f5_bigip.ltm.* namespace
+          explicitly - virtual_server, pool.name, pool_member.ip and
+          pool_member.port as keyword/ip rather than letting dynamic mapping
+          guess. Keep high-side work to enrichment: derive event.outcome from
+          http.response.status_code (4xx/5xx to failure) since the template
+          carries no outcome column, and set observer.vendor/product/type on
+          ingest so BIG-IP records are separable from the other
+          network-security sources in the same tier.
+  - format: json
+    enable: >
+      Deploy the f5-telemetry-streaming RPM and POST a telemetry declaration
+      containing a Telemetry_Listener (the local Event Listener, default
+      TCP/UDP 6514). Build the HSL path to it: a pool of the TS listener
+      members, a Remote High-Speed Log destination (`telemetry_hsl`) pointing
+      at that pool with protocol tcp, a Formatted log destination
+      (`telemetry_formatted`) forwarding to it, and a log publisher
+      (`telemetry_publisher`). Create a Request Logging profile whose request-
+      and response-log templates emit quoted key=value pairs to that
+      publisher, using F5's canonical TS template - `create ltm profile
+      request-log telemetry_traffic_log_profile request-log-pool telemetry
+      request-log-protocol mds-tcp request-log-template
+      event_source="request_logging",hostname="$BIGIP_HOSTNAME",client_ip="$CLIENT_IP",server_ip="$SERVER_IP",http_method="$HTTP_METHOD",http_uri="$HTTP_URI",virtual_name="$VIRTUAL_NAME",event_timestamp="$DATE_HTTP"
+      request-logging enabled response-log-pool telemetry
+      response-log-protocol mds-tcp response-log-template
+      event_source="response_logging",...,http_statcode="$HTTP_STATCODE",http_status="$HTTP_STATUS",response_ms="$RESPONSE_MSECS"
+      response-logging enabled` - then attach it with `modify ltm virtual <vs>
+      profiles add { telemetry_traffic_log_profile { context all } }`. TS
+      classifies each record as telemetryEventCategory "LTM", normalises it to
+      JSON, and streams it to the declared consumer; no user-defined format
+      string is set beyond the template above, so the emitted keys are exactly
+      the template keys plus the TS envelope.
+    references:
+    - >-
+      https://clouddocs.f5.com/products/extensions/f5-telemetry-streaming/latest/event-listener.html
+    - >-
+      https://github.com/F5Networks/f5-telemetry-streaming/blob/master/docs/event-listener.rst
+    - >-
+      https://github.com/F5Networks/f5-telemetry-streaming/blob/master/examples/output/request_logs/ltm_request_log.json
+    - https://docs.elastic.co/integrations/f5_bigip
+    - >-
+      https://github.com/elastic/integrations/blob/main/packages/f5_bigip/_dev/build/docs/README.md
+    parsing:
+      mechanism: elastic-integration
+      artifact: >-
+        Elastic f5_bigip integration, data stream logs-f5_bigip.log (Agent
+        HTTP endpoint, Telemetry Streaming JSON)
+      notes: >
+        This is the only LTM form the stock f5_bigip package can read: its
+        single logs-f5_bigip.log stream accepts Telemetry Streaming JSON over
+        an Elastic Agent HTTP endpoint (or S3 polling) and cannot parse the
+        operating-system syslog the syslog-kv form produces. That one stream
+        flattens every TS category - LTM, AFM, ASM, APM, AVR - into a shared
+        index, so route on telemetryEventCategory "LTM" and land these in a
+        dedicated logs-f5_bigip.ltm_request stream rather than the shared one.
+        Because the TS keys ARE the template keys (event_source, client_ip,
+        http_uri, ...), a site already parsing the syslog-kv form in Cribl can
+        move to this JSON as a re-route plus a thin envelope-strip rather than
+        a re-map. Tolerate a missing key: server_ip is empty on the request
+        half and populated on the response half, and
+        http_statcode/http_status/response_ms appear only on response records.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          TS JSON is the LTM form that finally makes a thin-envelope hybrid
+          viable, because unlike the syslog-kv template it has a real
+          high-side parser waiting - so do only the cheap, guard-facing work
+          low-side and leave shaping to Elastic. Key off event_source so the
+          request_logging and response_logging halves land in one document
+          shape rather than two, drop the redundant TS envelope keys you do
+          not route on (tenant and application duplicate the leading path
+          elements of virtual_name), split virtual_name into
+          tenant/application only if you are NOT trusting the TS-injected
+          pair, and length-cap http_uri, which is the one unbounded,
+          attacker-controlled string on this template. Schema-validate to a
+          low-side dead-letter route and run the forwarding destination on
+          Persistent Queue backpressure, never Block.
+        elastic: >
+          Land in a dedicated logs-f5_bigip.ltm_request stream with the
+          f5_bigip.ltm.* namespace mapped explicitly as keyword/ip -
+          f5.ltm.virtual_server, f5.ltm.pool_member.ip - rather than letting
+          dynamic mapping guess, matching the custom fields the syslog-kv form
+          already lands so the two forms co-exist in one schema. Convert
+          response_ms to nanosecond event.duration and $DATE_HTTP to a real
+          @timestamp on ingest, derive event.outcome from
+          http.response.status_code (4xx/5xx to failure) since the template
+          carries no outcome column, and set observer.vendor/product/type so
+          BIG-IP records separate from the other network-security sources
+          sharing the tier.
+        relay: >
+          Full TS NDJSON - or ECS-shaped JSON - crosses cleanly here: it is
+          already one flat document per event with short ASCII keys, the
+          friendliest LTM content-filter surface and, unlike the raw syslog-kv
+          line, one with a high-side parser. Length-cap and
+          control-character-strip http_uri before the guard destination, hold
+          the JSON to the two nesting levels TS already emits, and because the
+          key set varies between the request and response halves let the
+          filter admit a superset rather than a fixed schema. This is the
+          highest-volume and lowest-forensic-value dataset on this technology,
+          so drop _raw on this route first, use Persistent Queue backpressure
+          rather than Block, and reconcile low- and high-side counts per hour
+          to catch silent at-most-once drops.
+      direct:
+        parse_location: high
+        cribl: >
+          For a high-side LTM instance with no guard, TS JSON needs no
+          low-side grammar at all: point the Telemetry_Consumer (or an Elastic
+          Agent HTTP endpoint) at the stack and interpose Cribl only for
+          routing and enrichment. Decide per appliance whether the TS JSON
+          form or the syslog-kv form is the authoritative request feed and
+          avoid landing the same transaction twice.
+        elastic: >
+          Run the stock f5_bigip integration or a custom ltm_request stream;
+          the TS JSON parses high-side natively, which is its whole advantage
+          over the syslog-kv template. Map the f5_bigip.ltm.* namespace
+          explicitly as keyword/ip - f5.ltm.virtual_server,
+          f5.ltm.pool_member.ip - and derive event.outcome from
+          http.response.status_code (4xx/5xx to failure) since the template
+          carries no outcome column, so a later consolidation of high- and
+          low-side instances lands one document shape.
+    fields:
+    - vendor: event_source
+      type: string
+      description: >-
+        literal marking which half of the Request Logging profile emitted the
+        record - request_logging or response_logging
+      ecs: event.provider
+      status: partial
+      notes: >
+        F5's canonical TS template hard-codes request_logging on the request
+        template and response_logging on the response template; it identifies
+        the emitting subsystem rather than an action, and is the natural
+        switch for which keys a record is expected to carry
+    - vendor: event_timestamp
+      type: timestamp
+      description: time the request was received, rendered by the $DATE_HTTP token
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        $DATE_HTTP emits an RFC 1123 HTTP date ("Tue, 5 Apr 2011 02:15:31
+        GMT") and needs parsing; the TS example carries a normalised
+        "2019-01-01:01:01.000Z" form, so pin one shape across every profile
+        before writing the parser. TS does not add a separate
+        f5telemetry_timestamp to the published LTM request example, so
+        @timestamp is derived from this key, not an ingest stamp
+    - vendor: hostname
+      type: string
+      description: configured host name of the BIG-IP unit ($BIGIP_HOSTNAME)
+      ecs: observer.hostname
+      status: mapped
+    - vendor: client_ip
+      type: ip
+      description: IP address of the client that opened the connection ($CLIENT_IP)
+      ecs: source.ip
+      status: mapped
+    - vendor: server_ip
+      type: ip
+      description: >-
+        IP address of the pool member the request was load balanced to
+        ($SERVER_IP); empty on the request half, populated on the response
+        half
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.ltm.pool_member.ip
+      notes: >
+        the same ECS gap as the syslog-kv form - ECS models one destination
+        per event and destination.* is reserved for the virtual server the
+        client addressed, while server.* is defined as the same endpoint as
+        destination.*, so putting the back-end pool member on server.ip would
+        double-book the destination role and corrupt flow analytics. Kept
+        custom until the back-end hop has an ECS home. Suppress the
+        empty-string value on request records rather than indexing a blank ip
+    - vendor: http_method
+      type: string
+      description: >-
+        HTTP method of the request - GET, PUT, HEAD, POST, DELETE, TRACE,
+        CONNECT ($HTTP_METHOD)
+      ecs: http.request.method
+      status: mapped
+    - vendor: http_uri
+      type: string
+      description: URI of the request as received ($HTTP_URI)
+      ecs: url.original
+      status: partial
+      notes: >
+        origin-form path and query only, with no scheme or authority; split
+        into url.path and url.query, and reconstruct url.full from the Host
+        header only if the local template adds one. The one unbounded,
+        attacker-controlled field on this template - length-cap it before the
+        guard destination
+    - vendor: virtual_name
+      type: string
+      description: >-
+        full partition path of the virtual server that handled the request
+        ($VIRTUAL_NAME), e.g. /Common/app.app/app_vs
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.ltm.virtual_server
+      notes: >
+        the virtual server is the service the client addressed, not an
+        observer or a rule, and ECS has no field for a load-balancer listener
+        object. TS parses this into the tenant and application envelope keys
+        automatically, so prefer those over re-splitting the path
+    - vendor: tenant
+      type: string
+      description: >-
+        partition/tenant namespace TS injects, taken from the leading element
+        of virtual_name, e.g. Common
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.ltm.tenant
+      notes: >
+        a TS-injected envelope field, not request-log content - it holds the
+        partition name and duplicates the first path element of virtual_name
+        on a classic (non-AS3) box, so treat it as routing metadata and use it
+        to key per-tenant dashboards without a wildcard query on the full path
+    - vendor: application
+      type: string
+      description: >-
+        AS3 application name TS injects, taken from the app.app element of
+        virtual_name, e.g. app.app
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.ltm.application
+      notes: >
+        a TS-injected envelope field, populated from the application folder of
+        the virtual server path; on a classic (non-AS3) box it mirrors the
+        app.app element and can be empty, so do not index a blank value
+    - vendor: telemetryEventCategory
+      type: string
+      description: 'TS classifier tagging the event''s source module, the literal "LTM" on this feed'
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.ltm.telemetry_event_category
+      notes: >
+        TS envelope metadata, not request-log content - it is the value the
+        consumer routes on to separate LTM from the AFM/ASM/APM/AVR events the
+        same logs-f5_bigip.log stream carries; keep it as the routing key
+        rather than mapping it to an ECS field
+    - vendor: http_statcode
+      type: integer
+      description: >-
+        numeric response status code, without the reason phrase
+        ($HTTP_STATCODE); response template only
+      ecs: http.response.status_code
+      status: mapped
+    - vendor: http_status
+      type: string
+      description: >-
+        full response status line including the reason phrase ($HTTP_STATUS),
+        e.g. "200 OK"; response template only
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.ltm.http_status
+      notes: >
+        ECS has no field for an HTTP reason phrase - http.response.status_code
+        already carries the numeric code from http_statcode, so keep the full
+        status line as a custom display value rather than re-deriving the code
+        from it
+    - vendor: response_ms
+      type: integer
+      description: >-
+        elapsed milliseconds between receipt of the request and transmission
+        of the response ($RESPONSE_MSECS); response template only
+      ecs: event.duration
+      status: partial
+      transform: >
+        ECS event.duration is nanoseconds - multiply by 1,000,000. Templates
+        that use $RESPONSE_USECS instead need a factor of 1,000, so key the
+        conversion off which token the profile actually uses
+- id: system
+  name: LTM system log
+  description: >
+    TMOS daemon messages written to /var/log/ltm and forwarded by the on-box
+    syslog-ng to remote syslog destinations - pool member and node monitor
+    status transitions, bigd health-check activity, tmm and mcpd events,
+    HA/failover state changes, and interface and link state. This is the
+    availability and device-health feed; it is a different path from the HSL
+    request logging above and does not pass through a Request Logging profile.
+  event_categories:
+  - network
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        On-box syslog-ng remote destination to a Cribl syslog source. Note
+        that BIG-IP can also emit these through a "formatted" ArcSight (CEF)
+        log destination - if the current ArcSight-era configuration does that,
+        retire the CEF destination in favour of plain syslog and parse in
+        Cribl.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-f5_bigip.ltm_system
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        On-box syslog-ng remote destination to a Cribl syslog source. Note
+        that BIG-IP can also emit these through a "formatted" ArcSight (CEF)
+        log destination - if the current ArcSight-era configuration does that,
+        retire the CEF destination in favour of plain syslog and parse in
+        Cribl.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-f5_bigip.ltm_system
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: cribl-pipeline
+      notes: >
+        The Elastic f5_bigip integration explicitly does not parse OS-level
+        syslog, so this feed has no integration path at all. Parse in Cribl,
+        keyed on the 8-digit hexadecimal message id rather than on the
+        human-readable text, which F5 changes between releases.
+    fields:
+    - vendor: message_id
+      type: string
+      description: >-
+        8-digit hexadecimal BIG-IP message identifier - product code, subset
+        and sequence - e.g. 01070638 for a pool member monitor status change
+      ecs: event.code
+      status: mapped
+      notes: >
+        stable across releases and the only reliable detection key on this
+        dataset; the descriptive text that follows it is not. 01070638 pool
+        member monitor status, 01070639 pool member session status, 01070640
+        node monitor status.
+    - vendor: level_number
+      type: integer
+      description: single-digit syslog severity following the message id, 0 (emerg) to 7 (debug)
+      ecs: log.syslog.severity.code
+      status: mapped
+    - vendor: level
+      type: enum
+      description: >-
+        syslog level keyword in the message header - emerg, alert, crit, err,
+        warning, notice, info, debug
+      ecs: log.level
+      status: mapped
+      notes: >
+        redundant with level_number in a well-formed message but the two
+        disagree on some daemons; prefer level_number for numeric comparisons
+        and keep this as the display value
+    - vendor: service
+      type: string
+      description: TMOS daemon that raised the message - mcpd, tmm, bigd, sod, syslog-ng, httpd
+      ecs: process.name
+      status: mapped
+      notes: >-
+        also worth copying to log.syslog.appname so syslog-shaped queries
+        resolve; the daemon name is the best proxy for subsystem on this feed
+    - vendor: pid
+      type: integer
+      description: process id of the emitting daemon, carried in brackets after the daemon name
+      ecs: process.pid
+      status: mapped
+    - vendor: hostname
+      type: string
+      description: BIG-IP host name from the syslog header
+      ecs: observer.hostname
+      status: mapped
+      notes: >
+        the load balancer is the observer, not the host under analysis - do
+        not also land this on host.name or every BIG-IP becomes an endpoint in
+        host-centric dashboards
+    - vendor: timestamp
+      type: timestamp
+      description: date and time from the syslog header
+      ecs: '@timestamp'
+      status: partial
+      notes: >
+        the legacy RFC 3164 header carries neither year nor timezone; set both
+        at the Cribl source, or switch the remote syslog destination to RFC
+        5424 where the platform version supports it
+    - vendor: message
+      type: string
+      description: one-line description of the event following the message id and severity digit
+      ecs: message
+      status: mapped
+    - vendor: pool_name
+      type: string
+      description: >-
+        full partition path of the pool referenced by a pool member status
+        message (e.g. /Common/q-qa-pool)
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.ltm.pool.name
+      notes: >-
+        present only in pool and node monitor messages - extract it per
+        message id, not with a global regex over the message text
+    - vendor: pool_member
+      type: string
+      description: >-
+        address and service port of the pool member whose monitor or session
+        status changed
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.ltm.pool_member.name
+      transform: >
+        split the address:port form into f5.ltm.pool_member.ip and
+        f5.ltm.pool_member.port as well, matching the request-logging
+        dataset's custom fields so the two feeds join on the back end
+      notes: >
+        IPv6 members are rendered with spaces around the port separator, so
+        the naive split on the last colon breaks on them
+    - vendor: monitor_status
+      type: enum
+      description: >-
+        new monitor or session status reported for the member or node - up,
+        down, forced disabled, checking, unchecked
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.ltm.monitor_status
+      notes: >
+        this is a state transition, not the result of an action, so
+        event.outcome is the wrong home and would make availability churn look
+        like failed operations to any outcome-based dashboard
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Build the pipeline as a message-id lookup, not a pile of regexes:
+          extract the syslog header, the hex message id and the severity digit
+          generically, then dispatch per-id extractors for the handful of ids
+          a SOC actually alerts on (01070638/01070639 pool member status,
+          01070640 node status, HA and link-state transitions). Set the year
+          and timezone at the Cribl source because the legacy syslog header
+          carries neither, and attach the device-to-site and device-to-owner
+          enrichment here where the inventory lookup already lives. Route
+          unrecognised message ids to a low-volume catch-all with message and
+          event.code populated rather than dropping them.
+        elastic: >
+          Land in logs-f5_bigip.ltm_system and keep an enrich/lookup index of
+          message id to a stable description and severity so detection content
+          can key on event.code without re-parsing text. Map f5.ltm.pool.name,
+          f5.ltm.pool_member.name and f5.ltm.monitor_status as keyword in the
+          index template - the pool-availability dashboards aggregate on all
+          three - and confirm the syslog severity digit lands in
+          log.syslog.severity.code as a number rather than a string so
+          threshold alerts work.
+        relay: >
+          These are small, bounded, high-value records, so low-side instances
+          cross the guard as full ECS JSON with _raw retained: the volume cost
+          is trivial and the message text is the forensic artefact.
+          Content-filter friction is low here - the only unbounded element is
+          the free-text description, which should be length-capped and
+          stripped of control characters before the guard destination. Use
+          Persistent Queue backpressure on the guard destination and reconcile
+          counts per hour; availability events are individually significant
+          and a silent drop is worse than a delay.
+      direct:
+        parse_location: low
+        cribl: >
+          Build the pipeline as a message-id lookup, not a pile of regexes:
+          extract the syslog header, the hex message id and the severity digit
+          generically, then dispatch per-id extractors for the handful of ids
+          a SOC actually alerts on (01070638/01070639 pool member status,
+          01070640 node status, HA and link-state transitions). Set the year
+          and timezone at the Cribl source because the legacy syslog header
+          carries neither, and attach the device-to-site and device-to-owner
+          enrichment here where the inventory lookup already lives. Route
+          unrecognised message ids to a low-volume catch-all with message and
+          event.code populated rather than dropping them.
+        elastic: >
+          Land in logs-f5_bigip.ltm_system and keep an enrich/lookup index of
+          message id to a stable description and severity so detection content
+          can key on event.code without re-parsing text. Map f5.ltm.pool.name,
+          f5.ltm.pool_member.name and f5.ltm.monitor_status as keyword in the
+          index template - the pool-availability dashboards aggregate on all
+          three - and confirm the syslog severity digit lands in
+          log.syslog.severity.code as a number rather than a string so
+          threshold alerts work.
+- id: audit
+  name: Configuration audit log
+  description: >
+    MCP audit records written to /var/log/audit for every configuration object
+    created, modified or deleted, plus optional tmsh command auditing and the
+    administrative authentication records mod_auth_pam writes through httpd.
+    Audit logging for configuration changes has been on by default since
+    BIG-IP 11.6.0. This is the administrative-accountability feed for the
+    device itself, covering CLI, Configuration Utility and iControl REST
+    changes alike.
+  event_categories:
+  - configuration
+  - iam
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        syslog-ng remote destination alongside the LTM system log. This is the
+        one BIG-IP feed whose payload can contain secrets, so the low-side
+        masking rules must be in place before it is turned up, not after.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-f5_bigip.audit
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        syslog-ng remote destination alongside the LTM system log. This is the
+        one BIG-IP feed whose payload can contain secrets, so the masking
+        rules must be in place before it is turned up, not after.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-f5_bigip.audit
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: cribl-pipeline
+      notes: >
+        No Elastic integration covers this feed - f5_bigip ingests only
+        Telemetry Streaming JSON. The record is a syslog line with a bracketed
+        message id followed by an AUDIT marker and a space-separated key=value
+        tail, so the pipeline needs a header parser plus a kv extractor scoped
+        to the text after "AUDIT -".
+    fields:
+    - vendor: message_id
+      type: string
+      description: >-
+        8-digit hexadecimal message identifier - 01420002 for mcpd
+        configuration/tmsh audit records, 01070417 for httpd administrative
+        authentication records
+      ecs: event.code
+      status: mapped
+    - vendor: user
+      type: string
+      description: >-
+        account name of the administrator that issued the configuration
+        command or authenticated
+      ecs: user.name
+      status: mapped
+    - vendor: pid
+      type: integer
+      description: process id of the client process that issued the configuration command
+      ecs: process.pid
+      status: mapped
+    - vendor: folder
+      type: string
+      description: administrative partition or folder the command applied to, e.g. /Common or /
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.audit.folder
+    - vendor: module
+      type: string
+      description: >-
+        configuration interface the command arrived through - "(tmos)#" and
+        "(tmos)" for CLI, plus Configuration Utility and iControl REST values
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.audit.module
+      notes: >
+        the only field that distinguishes CLI from GUI from API changes; ECS
+        has no field for the administrative channel a change was made over
+    - vendor: status
+      type: string
+      description: >
+        bracketed result of the command - "[Command OK]" on success, or a
+        nested error message id and text such as "[01020066:3: The requested
+        pool already exists]" on failure
+      ecs: event.outcome
+      status: partial
+      transform: >
+        "[Command OK]" becomes success and anything else becomes failure; keep
+        the bracketed error text in error.message and the nested error message
+        id alongside it rather than collapsing every failure to a bare
+        "failure"
+    - vendor: cmd_data
+      type: string
+      description: >-
+        the verbatim command that was audited, including the full object body
+        for create and modify operations
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.audit.cmd_data
+      transform: >
+        lift the leading verb (create, modify, delete, list, run) into
+        event.action before storing the remainder, so administrative activity
+        can be aggregated without matching on free text
+      notes: >
+        unbounded and the primary redaction target on this technology - user,
+        monitor, SNMP and iRule objects put passwords, community strings and
+        script bodies into this value in cleartext. process.command_line is
+        deliberately not used: this is an audited configuration transaction,
+        not a process execution.
+    - vendor: hostname
+      type: string
+      description: BIG-IP host name from the syslog header
+      ecs: observer.hostname
+      status: mapped
+    - vendor: service
+      type: string
+      description: >-
+        daemon that emitted the audit record - mcpd for configuration and tmsh
+        auditing, httpd for administrative authentication
+      ecs: process.name
+      status: mapped
+    - vendor: partition
+      type: string
+      description: >-
+        administrative partitions the authenticated administrator is scoped
+        to, e.g. "[All]" (httpd authentication records)
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.audit.partition
+    - vendor: level
+      type: string
+      description: >-
+        RBAC role held by the authenticated administrator - Administrator,
+        Manager, Operator, Guest, Resource Administrator
+      ecs: user.roles
+      status: partial
+      notes: >
+        ECS user.roles is an array; wrap the single vendor value rather than
+        storing a bare string, and do not confuse this "level" with the syslog
+        severity level of the same name on the LTM system dataset
+    - vendor: tty
+      type: string
+      description: shell or utility the administrator authenticated to, e.g. /usr/bin/tmsh
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.audit.tty
+    - vendor: host
+      type: string
+      description: >-
+        address of the client the administrative session originated from
+        (httpd authentication records)
+      ecs: source.ip
+      status: mapped
+    - vendor: attempts
+      type: integer
+      description: number of authentication attempts made in the session being reported
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.audit.attempts
+      notes: values above 1 are the cheapest brute-force signal on the management plane
+    - vendor: start
+      type: timestamp
+      description: >-
+        start time of the administrative session, quoted in local time (e.g.
+        "Mon Aug 08 16:43:41 2022")
+      ecs: event.start
+      status: partial
+      transform: >-
+        no timezone is carried in the value - apply the device timezone at
+        parse time rather than assuming UTC
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Redact before anything leaves the worker group: cmd_data carries the
+          verbatim tmsh command, which for user, monitor, SNMP and iRule
+          objects includes passwords, community strings and secret material in
+          cleartext. Mask those nodes, length-cap cmd_data, then lift the
+          leading verb (create, modify, delete, list, run) into event.action
+          and derive event.outcome from the bracketed status, keeping the
+          failure text in error.message instead of discarding it. Handle the
+          two record shapes separately - the mcpd 01420002 configuration
+          record and the httpd 01070417 administrative authentication record
+          share the AUDIT marker but not the key set.
+        elastic: >
+          Land in logs-f5_bigip.audit with keyword mappings for the f5.audit.*
+          namespace, and treat module as a first-class facet: it is what
+          separates a CLI change from a Configuration Utility change from an
+          iControl REST change, which is the question every
+          administrative-access review actually asks. Alert on the combination
+          of event.outcome failure and a non-empty error.message rather than
+          on cmd_data text, and exclude cmd_data from the default field set
+          given its size and its residual secret risk after masking.
+        relay: >
+          Only redacted, field-extracted JSON should cross - the boundary must
+          never see raw cmd_data, which is the least bounded and highest-risk
+          content on this technology. That argues for parse-low even though
+          the volume is small: a thin envelope would push unmasked
+          configuration text across the guard inside _raw. Drop _raw on this
+          route once the masking rules are proven, hold the JSON to two levels
+          of nesting with bounded string lengths so a custom NDJSON content
+          filter stays simple, and reconcile counts per hour - config changes
+          are low-volume and each one matters.
+      direct:
+        parse_location: low
+        cribl: >
+          Redact before anything leaves the worker group: cmd_data carries the
+          verbatim tmsh command, which for user, monitor, SNMP and iRule
+          objects includes passwords, community strings and secret material in
+          cleartext. Mask those nodes, length-cap cmd_data, then lift the
+          leading verb (create, modify, delete, list, run) into event.action
+          and derive event.outcome from the bracketed status, keeping the
+          failure text in error.message instead of discarding it. Handle the
+          two record shapes separately - the mcpd 01420002 configuration
+          record and the httpd 01070417 administrative authentication record
+          share the AUDIT marker but not the key set.
+        elastic: >
+          Land in logs-f5_bigip.audit with keyword mappings for the f5.audit.*
+          namespace, and treat module as a first-class facet: it is what
+          separates a CLI change from a Configuration Utility change from an
+          iControl REST change, which is the question every
+          administrative-access review actually asks. Alert on the combination
+          of event.outcome failure and a non-empty error.message rather than
+          on cmd_data text, and exclude cmd_data from the default field set
+          given its size and its residual secret risk after masking.

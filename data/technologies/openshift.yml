@@ -1,0 +1,2011 @@
+id: openshift
+name: Red Hat OpenShift / Kubernetes audit
+vendor: Red Hat
+versions: OpenShift Container Platform 4.14-4.18 (Kubernetes 1.27-1.31), audit.k8s.io/v1
+draft: true
+references:
+- https://kubernetes.io/docs/tasks/debug/debug-cluster/audit/
+- https://kubernetes.io/docs/reference/config-api/apiserver-audit.v1/
+- https://docs.okd.io/latest/security/audit-log-view.html
+- >-
+  https://developers.redhat.com/articles/2024/07/29/how-classify-red-hat-openshift-audit-logs
+- >-
+  https://github.com/openshift/cluster-logging-operator/blob/master/docs/reference/datamodels/viaq/v1.adoc
+- >-
+  https://github.com/openshift/cluster-logging-operator/blob/master/docs/features/logforwarding/filters/api-audit-filter.adoc
+- >-
+  https://github.com/elastic/integrations/blob/main/packages/kubernetes/data_stream/audit_logs/fields/fields.yml
+- https://www.elastic.co/docs/reference/integrations/kubernetes
+datasets:
+- id: kube-apiserver-audit
+  name: Kubernetes API server audit
+  description: >
+    audit.k8s.io/v1 Event records emitted by the kube-apiserver and the
+    openshift-apiserver for every API call that matches the cluster audit
+    policy - who called, what verb, which object, and the RBAC decision. One
+    JSON object per line (JSONlines). OpenShift's Cluster Logging Operator
+    (Vector collector, ClusterLogForwarder audit input) forwards the audit
+    record unmodified and wraps it in a small ViaQ envelope (log_type,
+    log_source, hostname, file, @timestamp), so both the raw audit keys and
+    the envelope keys arrive on the wire.
+  event_categories:
+  - iam
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge Cribl worker group, on-prem enclave
+      notes: >
+        receives NDJSON over HTTPS from the ClusterLogForwarder http output
+        (Vector).
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-kubernetes.audit_logs
+    direct:
+    - hop: cribl
+      location: edge Cribl worker group, on-prem enclave
+      notes: >
+        receives NDJSON over HTTPS from the ClusterLogForwarder http output
+        (Vector).
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-kubernetes.audit_logs
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: Kubernetes integration (audit_logs data stream)
+      notes: >
+        The Elastic Kubernetes integration's audit_logs pipeline expects the
+        raw audit Event nested under kubernetes.audit.*, because it normally
+        tails /var/log/kube-apiserver/audit.log with Elastic Agent. Arriving
+        through Cribl instead, the ViaQ envelope has to be unwrapped and the
+        event re-nested under kubernetes.audit before the stock pipeline
+        matches; the pipeline's GKE/AKS branches (protoPayload, resource.*,
+        aks_metadata) are inert for OpenShift.
+    fields:
+    - vendor: auditID
+      type: string
+      description: UUID that uniquely identifies an API request and correlates its stage records
+      ecs: event.id
+      status: mapped
+    - vendor: level
+      type: enum
+      description: audit level the event was recorded at (None, Metadata, Request, RequestResponse)
+      ecs: null
+      status: unmapped
+      custom: kubernetes.audit.level
+      notes: >
+        determines how much of the record exists - Metadata carries no bodies,
+        Request adds requestObject, RequestResponse adds responseObject; it is
+        the primary volume and content-risk knob
+    - vendor: stage
+      type: enum
+      description: >-
+        stage of the request lifecycle the record was written at
+        (RequestReceived, ResponseStarted, ResponseComplete, Panic)
+      ecs: null
+      status: unmapped
+      custom: kubernetes.audit.stage
+      notes: >
+        ResponseComplete is the canonical record; leaving RequestReceived
+        enabled doubles the event count and produces a partner record with no
+        responseStatus, so deduplicate on auditID + stage
+    - vendor: verb
+      type: string
+      description: >-
+        Kubernetes verb for the request (get, list, watch, create, update,
+        patch, delete, deletecollection)
+      ecs: event.action
+      status: mapped
+      transform: >
+        copied verbatim; for non-resource requests (/healthz, /metrics,
+        /version) the value is the lowercased HTTP method instead, so
+        event.action mixes two vocabularies unless non-resource URIs are
+        filtered out
+    - vendor: requestURI
+      type: string
+      description: request URI as sent by the client, including the query string
+      ecs: url.original
+      status: partial
+      notes: >
+        holds path and query together (e.g.
+        /api/v1/namespaces/x/pods?watch=true); needs splitting into url.path
+        and url.query before path-prefix queries and watch-request filtering
+        behave
+    - vendor: user.username
+      type: string
+      description: authenticated username of the requester
+      ecs: user.name
+      status: mapped
+      notes: >
+        service accounts appear as system:serviceaccount:<namespace>:<name>
+        and cluster components as system:node:<node> or
+        system:kube-controller-manager; split the composite form to attribute
+        activity to a namespace
+    - vendor: user.groups
+      type: string
+      description: >-
+        array of groups the authenticated user belongs to
+        (system:authenticated, system:masters, OIDC groups)
+      ecs: user.roles
+      status: partial
+      notes: >
+        Kubernetes groups are RBAC binding subjects, not named roles, so
+        user.roles is the closest ECS home rather than an exact one; the
+        Elastic integration keeps them under kubernetes.audit.user.groups
+        today. Membership in system:masters is the single highest-value
+        detection signal in this dataset.
+    - vendor: impersonatedUser.username
+      type: string
+      description: username the request was performed as, when the caller used impersonation
+      ecs: user.effective.name
+      status: mapped
+      notes: >
+        populated by "oc/kubectl --as"; the real caller stays in user.name, so
+        any privilege-escalation alerting must read both fields together
+    - vendor: sourceIPs
+      type: ip
+      description: array of source addresses the request arrived from
+      ecs: source.ip
+      status: mapped
+      transform: >
+        array-valued: the first element is the client and any later entries
+        are proxy hops recorded from X-Forwarded-For; take element zero for
+        source.ip (the integration also copies it to client.ip) and keep the
+        remainder rather than discarding the chain
+    - vendor: userAgent
+      type: string
+      description: user agent string of the calling client (kubectl, oc, controller, operator SDK)
+      ecs: user_agent.original
+      status: mapped
+    - vendor: objectRef.resource
+      type: string
+      description: resource type the request acted on (pods, secrets, clusterrolebindings, ...)
+      ecs: orchestrator.resource.type
+      status: mapped
+    - vendor: objectRef.namespace
+      type: string
+      description: namespace of the object the request acted on; empty for cluster-scoped resources
+      ecs: orchestrator.namespace
+      status: mapped
+    - vendor: objectRef.name
+      type: string
+      description: name of the object the request acted on
+      ecs: orchestrator.resource.name
+      status: mapped
+    - vendor: objectRef.subresource
+      type: string
+      description: subresource of the request, e.g. exec, attach, portforward, log, status
+      ecs: null
+      status: unmapped
+      custom: kubernetes.audit.object_ref.subresource
+      notes: >
+        no ECS equivalent, but pods/exec, pods/attach and pods/portforward are
+        the container-breakout verbs a SOC alerts on, so this field must
+        survive as its own queryable keyword rather than only inside
+        requestURI
+    - vendor: responseStatus.code
+      type: integer
+      description: HTTP status code returned to the caller (200, 201, 401, 403, 404, 409, 422)
+      ecs: http.response.status_code
+      status: mapped
+      notes: >
+        403 with no authorization annotation is the usual shape of an RBAC
+        denial on non-resource endpoints; this is the fallback source for
+        event.outcome when the annotation is absent. The sibling
+        responseStatus.reason (Forbidden, Unauthorized, NotFound,
+        AlreadyExists) is the natural event.reason and should be carried with
+        it.
+    - vendor: annotations."authorization.k8s.io/decision"
+      type: enum
+      description: RBAC authorizer verdict for the request (allow or forbid)
+      ecs: event.outcome
+      status: mapped
+      transform: >
+        allow becomes success and forbid becomes failure; the annotation is
+        absent on requests rejected before authorization (authentication
+        failures, malformed requests), where outcome must be derived from
+        responseStatus.code instead. The companion
+        annotations."authorization.k8s.io/reason" carries the RBAC attribution
+        string ("RBAC: allowed by ClusterRoleBinding ...") and should be kept
+        alongside as kubernetes.audit.annotations.authorization_reason - both
+        annotation keys contain dots and a slash and must be flattened before
+        indexing.
+    - vendor: requestReceivedTimestamp
+      type: timestamp
+      description: >-
+        RFC3339 time with microsecond precision at which the apiserver
+        received the request
+      ecs: '@timestamp'
+      status: mapped
+      transform: >
+        canonical event time; stageTimestamp (the time this stage record was
+        written) should be carried as event.end so request latency can be
+        derived, rather than being dropped or used as @timestamp
+    - vendor: requestObject
+      description: >-
+        full Kubernetes API object from the request body, present only at
+        Request or RequestResponse audit level
+      ecs: null
+      status: unmapped
+      custom: kubernetes.audit.request_object
+      notes: >
+        arbitrarily deep, arbitrarily large object (and for PATCH verbs a JSON
+        patch array rather than an object); it is where Secret data and
+        embedded credentials leak into the audit trail, so it needs an
+        explicit keep/redact/drop decision per resource rather than a default
+    - vendor: hostname
+      type: string
+      description: >-
+        control-plane node whose apiserver recorded the event (ViaQ envelope
+        field, equal to kubernetes.host)
+      ecs: host.name
+      status: mapped
+    - vendor: log_source
+      type: enum
+      description: >-
+        ViaQ envelope field naming which apiserver produced the record
+        (kubeAPI, openshiftAPI, oauthAPI, ovn, auditd)
+      ecs: null
+      status: unmapped
+      custom: openshift.log_source
+      notes: >
+        the only thing distinguishing kube-apiserver from openshift-apiserver
+        records once they are merged into one data stream; also the field the
+        OAuth and node-audit families are split off by
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Do the volume work at the source rather than in Cribl: the
+          ClusterLogForwarder kubeAPIAudit filter can omitStages
+          RequestReceived and cap high-churn read verbs at Metadata level,
+          which removes the duplicate stage records and the requestObject/
+          responseObject blobs before they ever reach a worker. In Cribl, keep
+          the route to envelope handling only - unwrap the ViaQ wrapper and
+          re-nest the audit Event under kubernetes.audit so the stock pipeline
+          matches, drop any RequestReceived record the cluster filter still
+          emits, and run the Elastic destination on Persistent Queue
+          backpressure.
+        elastic: >
+          Let the Kubernetes integration's audit_logs ingest pipeline parse,
+          then layer a logs-kubernetes.audit_logs@custom pipeline for the
+          three gaps this map records: split requestURI into url.path and
+          url.query (the stock pipeline maps neither), fall back to
+          responseStatus.code for event.outcome on the records that carry no
+          authorization annotation, and decompose
+          system:serviceaccount:<ns>:<name> usernames so service-account
+          activity can be aggregated by namespace. Add explicit keyword
+          mappings in the index template for kubernetes.audit.level, .stage,
+          .object_ref.subresource and .annotations.authorization_reason, and
+          keep requestObject out of the default field set given its size.
+        relay: >
+          On the low-side clusters nothing about the format needs to change -
+          the feed is already UTF-8 NDJSON, one event per line, no CEF
+          anywhere on this technology. The single content-filter problem is
+          requestObject/responseObject: unbounded nested Kubernetes objects
+          that can carry Secret and ConfigMap payloads and blow past any sane
+          depth or length rule, so cap the audit policy at Metadata level for
+          the crossing and hold the record to shallow nesting with bounded
+          string lengths. Treat the crossing as at-most-once and reconcile
+          low-side and high-side counts per (dataset, hour) rather than
+          expecting acknowledgements.
+      direct:
+        parse_location: high
+        cribl: >
+          Do the volume work at the source rather than in Cribl: the
+          ClusterLogForwarder kubeAPIAudit filter can omitStages
+          RequestReceived and cap high-churn read verbs at Metadata level,
+          which removes the duplicate stage records and the requestObject/
+          responseObject blobs before they ever reach a worker. In Cribl, keep
+          the route to envelope handling only - unwrap the ViaQ wrapper and
+          re-nest the audit Event under kubernetes.audit so the stock pipeline
+          matches, drop any RequestReceived record the cluster filter still
+          emits, and run the Elastic destination on Persistent Queue
+          backpressure.
+        elastic: >
+          Let the Kubernetes integration's audit_logs ingest pipeline parse,
+          then layer a logs-kubernetes.audit_logs@custom pipeline for the
+          three gaps this map records: split requestURI into url.path and
+          url.query (the stock pipeline maps neither), fall back to
+          responseStatus.code for event.outcome on the records that carry no
+          authorization annotation, and decompose
+          system:serviceaccount:<ns>:<name> usernames so service-account
+          activity can be aggregated by namespace. Add explicit keyword
+          mappings in the index template for kubernetes.audit.level, .stage,
+          .object_ref.subresource and .annotations.authorization_reason, and
+          keep requestObject out of the default field set given its size.
+  - format: syslog-raw
+    enable: >
+      Add a syslog output to the ClusterLogForwarder and reference it from the
+      pipeline that carries the audit input. Set type: syslog with syslog.rfc:
+      RFC5424 and syslog.url to a tls:// (or tcp://) receiver. For audit
+      records the operator calculates the header automatically: APP-NAME is
+      taken from .log_source (kubeAPI / openshiftAPI), PROCID from .auditID
+      when present, MSGID from .log_source, facility defaults to security (13)
+      and severity to informational (6). Leave syslog.payloadKey UNSET for
+      audit: the calculated default is .message, which audit records do not
+      have (their keys - auditID, verb, requestURI, user, objectRef,
+      responseStatus, annotations - sit at the record root), so an empty
+      payloadKey makes Vector serialise the whole record as the MSG. The
+      KubernetesMinimal enrichment applies only to container logs and has no
+      effect here. Transport is TCP/TLS or UDP; use tls:// so the boundary
+      sees a framed TLS stream rather than datagrams.
+    references:
+    - >-
+      https://github.com/openshift/cluster-logging-operator/blob/master/docs/features/logforwarding/outputs/syslog-forwarding.adoc
+    - >-
+      https://docs.redhat.com/en/documentation/red_hat_openshift_logging/6.4/html/configuring_logging/configuring-log-forwarding
+    - >-
+      https://github.com/openshift/cluster-logging-operator/blob/master/docs/reference/datamodels/viaq/v1.adoc
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        custom syslog-unframe pipeline feeding the Elastic Kubernetes
+        audit_logs data stream
+      notes: >
+        Two-stage parse: strip the RFC5424 frame (a Cribl syslog-aware source
+        or a KV/regex function that lifts PRI, VERSION, TIMESTAMP, HOSTNAME,
+        APP-NAME, PROCID, MSGID and the trailing MSG), then treat the MSG
+        exactly as the json feed's record - Extract JSON, re-nest the audit
+        Event under kubernetes.audit, and hand it to the stock Kubernetes
+        integration audit_logs pipeline. The header adds nothing the record
+        does not already carry (.log_source is in APP-NAME and in the
+        payload's log_source; .auditID is in PROCID and the payload's
+        auditID), so the header fields are best used only to validate the
+        un-frame, not as the authoritative values. UDP transport can fragment
+        a large audit line across datagrams and silently truncate the JSON, so
+        TCP/TLS is required if this format is adopted.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          This format only makes sense low-side as a fallback where the guard
+          owner will pass a classic syslog stream but not an HTTP body; it is
+          strictly worse than the plan-of-record NDSON-over-HTTP crossing
+          because it re-frames a record that then has to be un-framed on the
+          far side. If used, terminate the syslog stream on a Cribl Syslog
+          source at the core worker group, un-frame to recover the MSG, and
+          from there the route is identical to the json feed: unwrap the ViaQ
+          envelope, re-nest under kubernetes.audit, drop RequestReceived stage
+          duplicates, and run the Elastic destination on Persistent Queue. Do
+          the volume work at the source with the ClusterLogForwarder
+          kubeAPIAudit filter regardless of wire format.
+        elastic: >
+          Once un-framed the inner record is the same audit Event, so the same
+          logs-kubernetes.audit_logs@custom pipeline the json feed needs
+          applies unchanged - split requestURI into url.path/url.query, fall
+          back to responseStatus.code for event.outcome where the
+          authorization annotation is absent, decompose
+          system:serviceaccount:<ns>:<name> usernames. The only syslog-format
+          addition is optionally keeping the parsed log.syslog.* header fields
+          (facility.code 13, severity.code 6, appname, procid) as a provenance
+          breadcrumb; they are constants for this dataset and carry no
+          detection value, so index them only if a receipt trail for the
+          syslog hop is wanted.
+        relay: >
+          Re-framing as syslog does not help the crossing and adds a failure
+          mode: the audit JSON now lives inside a syslog MSG that a
+          line-oriented content filter will not introspect unless it un-frames
+          first, and the same unbounded requestObject/responseObject risk is
+          still inside that MSG. Cap the audit policy at Metadata level so no
+          request/response bodies enter the payload, hold the MSG to bounded
+          length and shallow nesting, and prefer the NDJSON-over-HTTP crossing
+          - keep this syslog path only for a guard that cannot pass an HTTP
+          body. At-most-once; reconcile per (dataset, hour).
+      direct:
+        parse_location: high
+        cribl: >
+          High side with no guard there is no reason to choose syslog over the
+          http output for this dataset - it costs an un-frame stage for
+          nothing. If a syslog receiver is already the house collection point,
+          terminate it on a Cribl Syslog source, un-frame, and pass the
+          recovered record to the same audit route the http feed uses; keep
+          the worker group a thin un-framer in front of the Elastic
+          destination.
+        elastic: >
+          Once un-framed the inner record is the same audit Event, so the
+          stock audit_logs pipeline plus the logs-kubernetes.audit_logs@custom
+          fixes apply on the un-framed record - split requestURI into
+          url.path/url.query, fall back to responseStatus.code for
+          event.outcome where the authorization annotation is absent,
+          decompose system:serviceaccount:<ns>:<name> usernames. The parsed
+          log.syslog.* header fields (facility.code 13, severity.code 6,
+          appname, procid) are constants for this dataset and carry no
+          detection value, so drop them rather than index them since nothing
+          downstream reads them.
+    fields:
+    - vendor: PRI
+      type: integer
+      description: >-
+        RFC5424 priority, computed facility*8 + severity; security/13 and
+        informational/6 give <110> for audit records
+      ecs: log.syslog.priority
+      status: mapped
+      notes: >-
+        constant for this dataset unless the record carries a .level the
+        output maps to a different severity; the facility.code and
+        severity.code below decompose it
+    - vendor: FACILITY
+      type: integer
+      description: syslog facility the output sets on audit records - security (13)
+      ecs: log.syslog.facility.code
+      status: mapped
+      transform: >-
+        the output emits the numeric code; carry the name (security) into
+        log.syslog.facility.name if a named value is wanted
+    - vendor: SEVERITY
+      type: integer
+      description: syslog severity the output sets on audit records - informational (6)
+      ecs: log.syslog.severity.code
+      status: mapped
+      transform: >-
+        constant 6 for audit; not derived from any per-event field, so it is a
+        provenance marker rather than a real event severity
+    - vendor: TIMESTAMP
+      type: timestamp
+      description: RFC5424 header timestamp the collector stamps on the frame
+      ecs: event.created
+      status: partial
+      notes: >-
+        this is the collection/framing time, not the API event time; keep
+        @timestamp from the payload's requestReceivedTimestamp and use the
+        header stamp only as event.created
+    - vendor: HOSTNAME
+      type: string
+      description: >-
+        syslog HOSTNAME field - the control-plane node whose apiserver
+        recorded the event (equal to the payload hostname)
+      ecs: host.name
+      status: mapped
+      notes: >-
+        duplicates the payload hostname/kubernetes.host; also available as
+        log.syslog.hostname if the raw header value is kept
+    - vendor: APP-NAME
+      type: string
+      description: RFC5424 APP-NAME, set from .log_source (kubeAPI, openshiftAPI)
+      ecs: log.syslog.appname
+      status: mapped
+      notes: >-
+        carries the same kubeAPI/openshiftAPI discriminator as the payload
+        log_source; promote it to openshift.log_source so kube-apiserver and
+        openshift-apiserver records stay separable after the merge
+    - vendor: PROCID
+      type: string
+      description: RFC5424 PROCID, set from .auditID when present
+      ecs: log.syslog.procid
+      status: mapped
+      notes: >-
+        equals the payload auditID (the event correlation id); it is the same
+        value that feeds event.id, carried in a header slot
+    - vendor: MSGID
+      type: string
+      description: RFC5424 MSGID, set from .log_source
+      ecs: log.syslog.msgid
+      status: mapped
+      notes: >-
+        a second copy of the log_source discriminator; redundant with APP-NAME
+        on this dataset
+    - vendor: MSG
+      type: string
+      description: >-
+        the audit Event serialised as JSON in the syslog message body - the
+        full json record, byte-for-byte
+      ecs: null
+      status: unmapped
+      custom: kubernetes.audit
+      notes: >
+        every json-format field (auditID, level, stage, verb, requestURI,
+        user.username, user.groups, objectRef.*, responseStatus.code, the
+        authorization.k8s.io annotations, requestReceivedTimestamp, hostname,
+        log_source) appears here unchanged; after the frame is stripped this
+        is parsed and re-nested exactly as the json feed's record, with
+        auditID -> event.id, verb -> event.action, requestURI -> url.original
+        and the rest per the json map. The full inventory is the json field
+        list.
+  - format: otlp
+    enable: >
+      Add an otlp output to the ClusterLogForwarder (type: otlp, otlp.url a
+      v1/logs endpoint on the OTel receiver, e.g.
+      http://collector:4318/v1/logs) and reference it from the pipeline
+      carrying the audit input. OTLP output is Technology Preview on logging
+      6.1-6.4 and is gated behind an annotation on the ClusterLogForwarder CR
+      - observability.openshift.io/tech-preview-otlp-output: "enabled" -
+      without which the operator rejects the otlp output type. The collector
+      then emits the OpenTelemetry data model instead of ViaQ: one
+      resourceLogs group per (node, log_source) with common identity as
+      resource attributes, and each audit Event as a logRecord whose body is
+      the untouched record and whose attributes are the promoted typed fields.
+      Compression gzip and serviceAccount-token or secret auth are configured
+      under otlp.tuning / otlp.authentication.
+    references:
+    - >-
+      https://github.com/openshift/cluster-logging-operator/blob/master/docs/features/logforwarding/outputs/otlp-forwarding.adoc
+    - >-
+      https://github.com/openshift/cluster-logging-operator/blob/master/hack/logsamples/otlp_audit_kube.json
+    - >-
+      https://docs.redhat.com/en/documentation/red_hat_openshift_logging/6.2/html/configuring_logging/opentelemetry-data-model
+    - https://github.com/rhobs/observability-data-model/blob/main/cluster-logging.md
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        custom OTLP-flatten pipeline feeding the Elastic Kubernetes audit_logs
+        data stream
+      notes: >
+        The elegant parse ignores the promoted attributes entirely: the
+        logRecord body.stringValue IS the raw audit.k8s.io Event, byte-for-
+        byte the same JSON the json feed carries, so drain the OTLP stream (a
+        Cribl OpenTelemetry source, or an OTel collector in front of Cribl),
+        pull body.stringValue, Extract JSON, re-nest under kubernetes.audit
+        and hand it to the stock audit_logs pipeline exactly as the json feed
+        does. The typed k8s.audit.event.* / k8s.user.* attributes and the
+        resource attributes are then redundant duplicates useful only for
+        routing (openshift.log.source) and for validating the body parse.
+        There is no stock Elastic integration that consumes OpenShift OTLP
+        audit into logs-kubernetes.audit_logs, so the flatten is hand-built;
+        alternatively Elastic's OTel-native ingest can take the OTLP directly,
+        but then the OTel attribute names have to be mapped to ECS rather than
+        reusing the ViaQ-shaped integration.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Adopt OTLP low-side only where OpenTelemetry is already the house
+          wire format on the enclave; otherwise it adds an OTel-to-ECS
+          translation on top of a record the json feed already delivers
+          ViaQ-shaped. If used, drain the OTLP receiver at the core worker
+          group, keep body.stringValue as _raw, and treat the route from there
+          as the json audit route - unwrap, re-nest under kubernetes.audit,
+          drop RequestReceived duplicates, Persistent Queue on the
+          destination. Do not try to reconcile the typed attributes against
+          the body; pick the body as authoritative and use the attributes only
+          for the openshift.log.source split.
+        elastic: >
+          Because the body is the same audit Event, the same
+          logs-kubernetes.audit_logs@custom pipeline the json feed uses
+          applies once the body is extracted - url.path/url.query split,
+          responseStatus.code outcome fallback, serviceaccount username
+          decomposition. If instead the OTel-native path is taken and the
+          typed attributes are indexed, map k8s.audit.event.request.verb ->
+          event.action, k8s.audit.event.response.code ->
+          http.response.status_code, k8s.user.username -> user.name and the
+          authorization.k8s.io/decision annotation attribute -> event.outcome,
+          and keep k8s.audit.event.level/.stage and the api_group/api_version
+          object-ref attributes as kubernetes.audit.* keywords.
+        relay: >
+          OTLP does not ease the crossing: the body carries the same unbounded
+          requestObject/responseObject risk as the json feed, now inside an
+          OTLP envelope a content filter must decode before it can inspect the
+          payload. Cap the audit policy at Metadata level so no bodies enter
+          the record, strip the resourceLogs/scopeLogs wrapping to the flat
+          record low-side so only the audit JSON crosses (matching the NDJSON
+          crossing shape), hold nesting shallow and string lengths bounded.
+          At-most-once; reconcile per (dataset, hour).
+      direct:
+        parse_location: high
+        cribl: >
+          High side with no guard, OTLP is worth choosing only if the SIEM
+          side is standardising on OpenTelemetry ingest; for a ViaQ/ECS
+          pipeline it is a lateral move that costs a flatten stage. If used,
+          drain the OTLP receiver, take body.stringValue as _raw, and pass to
+          the same audit route the http feed uses.
+        elastic: >
+          Because the body is the same audit Event, the same
+          logs-kubernetes.audit_logs@custom pipeline the json feed uses
+          applies once the body is extracted - url.path/url.query split,
+          responseStatus.code outcome fallback, serviceaccount username
+          decomposition. If instead the OTel-native path is taken and the
+          typed attributes are indexed, map k8s.audit.event.request.verb ->
+          event.action, k8s.audit.event.response.code ->
+          http.response.status_code, k8s.user.username -> user.name and the
+          authorization.k8s.io/decision annotation attribute -> event.outcome,
+          and keep k8s.audit.event.level/.stage and the api_group/api_version
+          object-ref attributes as kubernetes.audit.* keywords. Set this
+          dataset's ILM and keyword mappings (kubernetes.audit.level, .stage,
+          openshift.log_source) explicitly since the OTel path carries no
+          Elastic integration defaults.
+    fields:
+    - vendor: 'resource: openshift.cluster.uid'
+      type: string
+      description: resource attribute - unique id of the OpenShift cluster the record came from
+      ecs: orchestrator.cluster.id
+      status: mapped
+      notes: >-
+        the OTel-named twin of the legacy openshift.cluster_id resource
+        attribute, which is retained alongside it
+    - vendor: 'resource: openshift.log.source'
+      type: string
+      description: >-
+        resource attribute naming which apiserver produced the record
+        (kubeAPI, openshiftAPI, oauthAPI, ovn, auditd)
+      ecs: null
+      status: unmapped
+      custom: openshift.log_source
+      notes: >-
+        the primary routing key and the only thing separating kube-apiserver
+        from openshift-apiserver records once merged; the legacy log_source
+        resource attribute carries the same value
+    - vendor: 'resource: openshift.log.type'
+      type: string
+      description: resource attribute - top-level category, audit for this dataset
+      ecs: null
+      status: unmapped
+      custom: openshift.log_type
+      notes: legacy log_type resource attribute duplicates it
+    - vendor: 'resource: k8s.node.name'
+      type: string
+      description: resource attribute - control-plane node whose apiserver recorded the event
+      ecs: host.name
+      status: mapped
+      notes: OTel-named twin of the legacy kubernetes.host resource attribute
+    - vendor: 'resource: openshift.label.*'
+      type: string
+      description: >-
+        resource attributes carrying any ClusterLogForwarder-defined pipeline
+        labels (openshift.label.<key>)
+      ecs: null
+      status: unmapped
+      custom: openshift.label
+      notes: >-
+        operator-defined enrichment labels set on the forwarder pipeline;
+        keyword-map only the ones a given cluster actually sets
+    - vendor: timeUnixNano
+      type: timestamp
+      description: logRecord event time in epoch nanoseconds, from requestReceivedTimestamp
+      ecs: '@timestamp'
+      status: mapped
+      transform: >-
+        divide to milliseconds for the ECS date field; this is the
+        authoritative event time, not observedTimeUnixNano
+    - vendor: observedTimeUnixNano
+      type: timestamp
+      description: >-
+        logRecord observation time in epoch nanoseconds - when the collector
+        saw the record
+      ecs: event.created
+      status: partial
+      transform: >-
+        collector observe time, later than the event; keep as event.created so
+        collection latency is measurable, never as @timestamp
+    - vendor: body
+      type: string
+      description: >-
+        logRecord body.stringValue - the audit Event serialised as JSON,
+        byte-for-byte the json record
+      ecs: null
+      status: unmapped
+      custom: kubernetes.audit
+      notes: >
+        the full json inventory (auditID, level, stage, verb, requestURI,
+        user.username, user.groups, objectRef.*, responseStatus.code, the
+        authorization.k8s.io annotations, requestReceivedTimestamp) lives here
+        unchanged; extract and re-nest as the json feed does, auditID ->
+        event.id, verb -> event.action, and the rest per the json map. The
+        typed attributes below are convenience promotions of a subset of these
+        keys.
+    - vendor: 'attr: k8s.audit.event.level'
+      type: string
+      description: logRecord attribute - audit level (None, Metadata, Request, RequestResponse)
+      ecs: null
+      status: unmapped
+      custom: kubernetes.audit.level
+      notes: >-
+        same volume/content-risk knob as the json level field, promoted to a
+        typed OTel attribute
+    - vendor: 'attr: k8s.audit.event.stage'
+      type: string
+      description: >-
+        logRecord attribute - request lifecycle stage (RequestReceived,
+        ResponseStarted, ResponseComplete, Panic)
+      ecs: null
+      status: unmapped
+      custom: kubernetes.audit.stage
+      notes: >-
+        deduplicate on auditID + stage as on the json feed; ResponseStarted
+        and ResponseComplete both appear in the OTLP samples for one auditID
+    - vendor: 'attr: k8s.audit.event.request.uri'
+      type: string
+      description: logRecord attribute - request URI including query string, from requestURI
+      ecs: url.original
+      status: partial
+      notes: >-
+        holds path and query together; split into url.path and url.query
+        before path-prefix and watch-request filtering behave, exactly as on
+        the json feed
+    - vendor: 'attr: k8s.audit.event.request.verb'
+      type: string
+      description: logRecord attribute - Kubernetes verb, from verb
+      ecs: event.action
+      status: mapped
+      transform: >-
+        for non-resource endpoints this is the lowercased HTTP method, so
+        event.action mixes two vocabularies unless non-resource URIs are
+        filtered, as on the json feed
+    - vendor: 'attr: k8s.audit.event.response.code'
+      type: integer
+      description: >-
+        logRecord attribute - HTTP status returned to the caller, from
+        responseStatus.code
+      ecs: http.response.status_code
+      status: mapped
+      notes: >-
+        the fallback source for event.outcome when the authorization
+        annotation is absent
+    - vendor: 'attr: k8s.audit.event.user_agent'
+      type: string
+      description: logRecord attribute - user agent of the calling client, from userAgent
+      ecs: user_agent.original
+      status: mapped
+    - vendor: 'attr: k8s.user.username'
+      type: string
+      description: >-
+        logRecord attribute - authenticated username of the requester, from
+        user.username
+      ecs: user.name
+      status: mapped
+      notes: >-
+        service accounts appear as system:serviceaccount:<ns>:<name>; split
+        the composite to attribute activity to a namespace, as on the json
+        feed
+    - vendor: 'attr: k8s.user.groups'
+      type: string
+      description: >-
+        logRecord array attribute - groups the authenticated user belongs to,
+        from user.groups
+      ecs: user.roles
+      status: partial
+      notes: >-
+        Kubernetes groups are RBAC binding subjects rather than named roles;
+        user.roles is the closest ECS home. Membership in system:masters is
+        the highest-value detection signal, as on the json feed
+    - vendor: 'attr: k8s.audit.event.object_ref.resource'
+      type: string
+      description: logRecord attribute - resource type acted on, from objectRef.resource
+      ecs: orchestrator.resource.type
+      status: mapped
+    - vendor: 'attr: k8s.audit.event.object_ref.name'
+      type: string
+      description: >-
+        logRecord attribute - name of the object acted on, from objectRef.name
+        (empty string when absent)
+      ecs: orchestrator.resource.name
+      status: mapped
+    - vendor: 'attr: k8s.audit.event.object_ref.namespace'
+      type: string
+      description: >-
+        logRecord attribute - namespace of the object acted on, from
+        objectRef.namespace (empty for cluster-scoped resources)
+      ecs: orchestrator.namespace
+      status: mapped
+    - vendor: 'attr: k8s.audit.event.object_ref.api_group'
+      type: string
+      description: logRecord attribute - API group of the object acted on, from objectRef.apiGroup
+      ecs: null
+      status: unmapped
+      custom: kubernetes.audit.object_ref.api_group
+      notes: >-
+        the ViaQ feed does not surface apiGroup/apiVersion as first-class
+        fields; the OTLP reshape promotes them, so they are available here
+        without reaching into requestURI
+    - vendor: 'attr: k8s.audit.event.object_ref.api_version'
+      type: string
+      description: >-
+        logRecord attribute - API version of the object acted on, from
+        objectRef.apiVersion
+      ecs: null
+      status: unmapped
+      custom: kubernetes.audit.object_ref.api_version
+    - vendor: 'attr: k8s.audit.event.annotation.authorization.k8s.io/decision'
+      type: string
+      description: >-
+        logRecord attribute - RBAC authorizer verdict, from the
+        authorization.k8s.io/decision annotation (allow or forbid)
+      ecs: event.outcome
+      status: mapped
+      transform: >-
+        allow -> success, forbid -> failure; absent on requests rejected
+        before authorization, where outcome is derived from
+        k8s.audit.event.response.code instead
+    - vendor: 'attr: k8s.audit.event.annotation.authorization.k8s.io/reason'
+      type: string
+      description: >-
+        logRecord attribute - RBAC attribution string, from the
+        authorization.k8s.io/reason annotation
+      ecs: null
+      status: unmapped
+      custom: kubernetes.audit.annotations.authorization_reason
+      notes: >
+        the OTLP reshape flattens each annotation into its own attribute named
+        k8s.audit.event.annotation.<annotation-key>, so the dotted-and-
+        slashed annotation keys arrive pre-split rather than nested; keep the
+        RBAC reason alongside the decision for attribution
+- id: oauth-audit
+  name: OAuth server and OAuth API server audit
+  description: >
+    Login and token events from the OpenShift OAuth stack - the oauth-server
+    (/oauth/authorize, /login, /oauth/token) and the oauth-apiserver
+    (oauthaccesstokens, users, identities). Same audit.k8s.io/v1 Event schema
+    as the API server audit, but the interesting identity lives in
+    OpenShift-specific annotations rather than in user.username, which is
+    system:anonymous for an unauthenticated login attempt.
+  event_categories:
+  - authentication
+  - iam
+  route:
+    guarded:
+    - hop: cribl
+      location: edge Cribl worker group, on-prem enclave
+      notes: >
+        same ClusterLogForwarder audit input and http output as the API server
+        audit dataset, separated downstream by log_source.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-kubernetes.audit_logs
+    direct:
+    - hop: cribl
+      location: edge Cribl worker group, on-prem enclave
+      notes: >
+        same ClusterLogForwarder audit input and http output as the API server
+        audit dataset, separated downstream by log_source.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-kubernetes.audit_logs
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: Kubernetes integration (audit_logs data stream)
+      notes: >
+        The audit_logs pipeline parses these records because the schema is
+        identical, but it knows nothing about the authentication.openshift.io
+        annotations, so the username and the login decision stay unmapped
+        without a custom pipeline on top.
+    fields:
+    - vendor: auditID
+      type: string
+      description: UUID uniquely identifying the OAuth request
+      ecs: event.id
+      status: mapped
+    - vendor: annotations."authentication.openshift.io/username"
+      type: string
+      description: username presented to the OAuth server on a login attempt
+      ecs: user.name
+      status: mapped
+      notes: >
+        this, not user.username, is the account being authenticated - the
+        request is still anonymous at the point the record is written, so
+        failed-login alerting keyed on user.name must read the annotation
+    - vendor: annotations."authentication.openshift.io/decision"
+      type: enum
+      description: OAuth authentication verdict (allow, deny, error)
+      ecs: event.outcome
+      status: mapped
+      transform: >
+        allow becomes success and deny becomes failure; error is a third value
+        meaning the authentication attempt itself failed (identity provider
+        unreachable, malformed request) and should become unknown rather than
+        being folded into failure
+    - vendor: user.username
+      type: string
+      description: >-
+        authenticated identity of the caller, system:anonymous for
+        unauthenticated login requests
+      ecs: null
+      status: partial
+      custom: kubernetes.audit.user.username
+      notes: >
+        deliberately not mapped to user.name on this dataset - it is
+        system:anonymous for the login endpoints and would overwrite the real
+        account name taken from the authentication annotation; on
+        oauth-apiserver records it does hold a real identity
+    - vendor: verb
+      type: string
+      description: >-
+        verb of the OAuth request (create, get, delete for token objects; HTTP
+        method for the login endpoints)
+      ecs: event.action
+      status: mapped
+    - vendor: requestURI
+      type: string
+      description: >-
+        OAuth endpoint invoked, e.g. /oauth/authorize, /login, /oauth/token,
+        /oauth/accesstokens
+      ecs: url.original
+      status: partial
+      notes: >
+        carries the OAuth query string (client_id, response_type, state,
+        code); split into url.path and url.query and redact token-bearing
+        parameters before indexing
+    - vendor: sourceIPs
+      type: ip
+      description: >-
+        array of client addresses the login attempt came from; element zero is
+        the client, later entries are proxy hops
+      ecs: source.ip
+      status: mapped
+    - vendor: userAgent
+      type: string
+      description: user agent of the login client (browser, oc login, service)
+      ecs: user_agent.original
+      status: mapped
+    - vendor: responseStatus.code
+      type: integer
+      description: HTTP status returned by the OAuth endpoint (200, 302, 401, 403)
+      ecs: http.response.status_code
+      status: mapped
+    - vendor: objectRef.resource
+      type: string
+      description: >-
+        OAuth API resource acted on (oauthaccesstokens, oauthauthorizetokens,
+        oauthclients, users, identities)
+      ecs: orchestrator.resource.type
+      status: mapped
+      notes: populated on oauth-apiserver records; empty for the oauth-server login endpoints
+    - vendor: stage
+      type: enum
+      description: request lifecycle stage the record was written at
+      ecs: null
+      status: unmapped
+      custom: kubernetes.audit.stage
+      notes: same RequestReceived duplication as the API server audit dataset
+    - vendor: requestReceivedTimestamp
+      type: timestamp
+      description: RFC3339 time the OAuth request was received
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: hostname
+      type: string
+      description: control-plane node that served the OAuth request (ViaQ envelope field)
+      ecs: host.name
+      status: mapped
+    - vendor: log_source
+      type: enum
+      description: >-
+        ViaQ envelope field distinguishing oauth-server (login endpoints) from
+        oauthAPI (token objects)
+      ecs: null
+      status: unmapped
+      custom: openshift.log_source
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Split this family off the API-server route by log_source
+          (oauth-server vs oauthAPI) so it can carry its own retention and
+          alerting, and redact before anything is stored: the OAuth endpoints
+          put client_id, state, code and occasionally bearer tokens in
+          requestURI query strings, so mask the token-bearing query parameters
+          low-side. Otherwise keep the route to envelope unwrapping and
+          Persistent Queue backpressure - this is a low-volume, high-value
+          stream that should not be sampled.
+        elastic: >
+          Add a logs-kubernetes.audit_logs@custom pipeline that promotes
+          annotations."authentication.openshift.io/username" to user.name
+          whenever user.username is system:anonymous, and translates the
+          three-valued authentication decision properly: allow to success,
+          deny to failure, and error to unknown rather than silently to
+          failure, or brute-force dashboards will conflate bad passwords with
+          broken identity providers. Map the flattened annotation fields and
+          openshift.log_source as keyword in the index template so
+          failed-login-by-source-IP aggregations work.
+        relay: >
+          Only bounded scalar fields cross on this route - no request bodies
+          are recorded for the login endpoints - so the content filter has an
+          easy job here provided the query-string redaction happens before the
+          boundary, since a token that crosses cannot be recalled. NDJSON as
+          emitted, no CEF; at-most-once, so reconcile counts per (dataset,
+          hour), which matters more here than on bulk routes because each
+          login event is individually significant.
+      direct:
+        parse_location: high
+        cribl: >
+          Split this family off the API-server route by log_source
+          (oauth-server vs oauthAPI) so it can carry its own retention and
+          alerting, and redact before anything is stored: the OAuth endpoints
+          put client_id, state, code and occasionally bearer tokens in
+          requestURI query strings, so mask the token-bearing query parameters
+          at the source. Otherwise keep the route to envelope unwrapping and
+          Persistent Queue backpressure - this is a low-volume, high-value
+          stream that should not be sampled.
+        elastic: >
+          Add a logs-kubernetes.audit_logs@custom pipeline that promotes
+          annotations."authentication.openshift.io/username" to user.name
+          whenever user.username is system:anonymous, and translates the
+          three-valued authentication decision properly: allow to success,
+          deny to failure, and error to unknown rather than silently to
+          failure, or brute-force dashboards will conflate bad passwords with
+          broken identity providers. Map the flattened annotation fields and
+          openshift.log_source as keyword in the index template so
+          failed-login-by-source-IP aggregations work.
+  - format: syslog-raw
+    enable: >
+      The OAuth audit family rides the same audit input and the same
+      ClusterLogForwarder syslog output as the API-server audit; nothing about
+      the syslog framing is OAuth-specific. Set type: syslog, syslog.rfc:
+      RFC5424, syslog.url to a tls:// receiver, and leave syslog.payloadKey
+      unset so the whole record (which for the login endpoints carries no
+      .message either) serialises into the MSG. The calculated header takes
+      APP-NAME from .log_source (oauth-server for the login endpoints,
+      oauthAPI for the token objects), PROCID from .auditID, facility security
+      (13), severity informational (6). Because the OpenShift OAuth endpoints
+      put client_id, state, code and occasionally bearer tokens in the
+      requestURI query string, redact the token-bearing query parameters at
+      the source before the record is ever framed - a token that reaches the
+      wire cannot be recalled.
+    references:
+    - >-
+      https://github.com/openshift/cluster-logging-operator/blob/master/docs/features/logforwarding/outputs/syslog-forwarding.adoc
+    - >-
+      https://docs.redhat.com/en/documentation/red_hat_openshift_logging/6.4/html/configuring_logging/configuring-log-forwarding
+    - >-
+      https://developers.redhat.com/articles/2024/07/29/how-classify-red-hat-openshift-audit-logs
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        custom syslog-unframe pipeline feeding the Elastic Kubernetes
+        audit_logs data stream
+      notes: >
+        Same un-frame-then-treat-as-record flow as the API-server audit syslog
+        path: strip the RFC5424 frame, Extract JSON from the MSG, and hand to
+        the audit_logs pipeline - which parses the schema but knows nothing of
+        the authentication.openshift.io annotations, so the promoted OAuth
+        username and login decision still need a custom pipeline on top. The
+        syslog header adds only provenance here.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Keep this family split off the API-server route by log_source
+          (oauth-server vs oauthAPI) even on the syslog path so it carries its
+          own retention and alerting, and do the query-string token redaction
+          before the frame is built - once inside the MSG the token is opaque
+          to a syslog-line filter. Terminate the syslog stream on a Cribl
+          Syslog source at the core group, un-frame, and treat the record as
+          the json OAuth feed; this is a low-volume high-value stream, so no
+          sampling and Persistent Queue on the destination.
+        elastic: >
+          Once un-framed, the same logs-kubernetes.audit_logs@custom OAuth
+          extensions apply: promote
+          annotations."authentication.openshift.io/username" to user.name when
+          user.username is system:anonymous, and map the three-valued
+          authentication decision (allow -> success, deny -> failure, error ->
+          unknown) rather than folding error into failure. The syslog header
+          fields are constants and add nothing; drop them or keep only as a
+          hop receipt.
+        relay: >
+          Only bounded scalar fields cross for the login endpoints - no
+          request bodies are recorded - so the content filter's job is easy
+          provided the query-string redaction happened before the frame. The
+          syslog re-frame is otherwise a liability: the JSON is now inside a
+          MSG the filter must un-frame to inspect. Prefer the NDJSON-over-HTTP
+          crossing; at-most-once, reconcile per (dataset, hour), which matters
+          more here since each login event is individually significant.
+      direct:
+        parse_location: high
+        cribl: >
+          High side with no guard there is no reason to prefer syslog over the
+          http output for this low-volume stream; if a syslog collector is the
+          house endpoint, un-frame on a Cribl Syslog source and pass to the
+          OAuth route, still redacting the token-bearing query parameters.
+        elastic: >
+          Once un-framed, the same logs-kubernetes.audit_logs@custom OAuth
+          extensions apply: promote
+          annotations."authentication.openshift.io/username" to user.name when
+          user.username is system:anonymous, and map the three-valued
+          authentication decision (allow -> success, deny -> failure, error ->
+          unknown) rather than folding error into failure. Keyword-map
+          openshift.log_source and the flattened annotation fields so
+          failed-login-by-source-IP aggregations work; the syslog header
+          fields are constants and add nothing, so drop them.
+    fields:
+    - vendor: PRI
+      type: integer
+      description: >-
+        RFC5424 priority - security/13 + informational/6 give <110> for OAuth
+        audit records
+      ecs: log.syslog.priority
+      status: mapped
+      notes: >-
+        constant for this dataset; decomposed by the facility.code and
+        severity.code fields
+    - vendor: FACILITY
+      type: integer
+      description: syslog facility set on OAuth audit records - security (13)
+      ecs: log.syslog.facility.code
+      status: mapped
+      transform: numeric code emitted; carry the name into log.syslog.facility.name if wanted
+    - vendor: SEVERITY
+      type: integer
+      description: syslog severity set on OAuth audit records - informational (6)
+      ecs: log.syslog.severity.code
+      status: mapped
+      notes: >-
+        constant, not the login outcome; the real verdict is the
+        authentication.openshift.io/decision annotation in the payload
+    - vendor: HOSTNAME
+      type: string
+      description: syslog HOSTNAME - control-plane node that served the OAuth request
+      ecs: host.name
+      status: mapped
+    - vendor: APP-NAME
+      type: string
+      description: >-
+        RFC5424 APP-NAME, set from .log_source (oauth-server for login
+        endpoints, oauthAPI for token objects)
+      ecs: log.syslog.appname
+      status: mapped
+      notes: >-
+        the discriminator that separates the login endpoints from the
+        token-object API; promote to openshift.log_source
+    - vendor: PROCID
+      type: string
+      description: RFC5424 PROCID, set from .auditID
+      ecs: log.syslog.procid
+      status: mapped
+      notes: equals the payload auditID that feeds event.id
+    - vendor: MSGID
+      type: string
+      description: RFC5424 MSGID, set from .log_source
+      ecs: log.syslog.msgid
+      status: mapped
+    - vendor: MSG
+      type: string
+      description: >-
+        the OAuth audit Event serialised as JSON in the syslog message body -
+        the full json record
+      ecs: null
+      status: unmapped
+      custom: kubernetes.audit
+      notes: >
+        carries the full json OAuth inventory unchanged - auditID, the
+        authentication.openshift.io/username and /decision annotations,
+        user.username (system:anonymous on the login endpoints), verb,
+        requestURI (with the token-bearing query string), sourceIPs,
+        userAgent, responseStatus.code, objectRef.resource, log_source. After
+        the frame is stripped it is parsed and mapped exactly as the json
+        OAuth feed's record.
+  - format: otlp
+    enable: >
+      The OAuth audit family uses the same otlp output and the same
+      Technology-Preview annotation
+      (observability.openshift.io/tech-preview-otlp-output: "enabled") as the
+      API-server audit; reference the otlp output from the pipeline carrying
+      the audit input. The OpenTelemetry reshape is identical in shape - a
+      resourceLogs group keyed on openshift.log.source (oauth-server /
+      oauthAPI), each OAuth Event a logRecord whose body is the untouched
+      record and whose attributes are the promoted typed audit fields. Redact
+      the token-bearing requestURI query parameters at the source before OTLP
+      encoding, since the body carries requestURI verbatim.
+    references:
+    - >-
+      https://github.com/openshift/cluster-logging-operator/blob/master/docs/features/logforwarding/outputs/otlp-forwarding.adoc
+    - >-
+      https://github.com/openshift/cluster-logging-operator/blob/master/hack/logsamples/otlp_audit_kube.json
+    - >-
+      https://github.com/openshift/cluster-logging-operator/blob/master/hack/logsamples/otlp_audit_openshift.json
+    - >-
+      https://docs.redhat.com/en/documentation/red_hat_openshift_logging/6.2/html/configuring_logging/opentelemetry-data-model
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        custom OTLP-flatten pipeline feeding the Elastic Kubernetes audit_logs
+        data stream
+      notes: >
+        As with the API-server audit, the logRecord body.stringValue is the
+        untouched OAuth Event, so the flatten takes the body, Extract JSON,
+        and re-nests under kubernetes.audit for the audit_logs pipeline. The
+        OAuth-specific identity lives in the authentication.openshift.io
+        annotations, which the OTLP reshape flattens into logRecord attributes
+        named k8s.audit.event.annotation.<annotation-key> following the same
+        convention the authorization.k8s.io annotations use in the audit
+        samples; neither the stock pipeline nor those attributes give
+        user.name for an anonymous login without the custom promotion.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Adopt OTLP low-side only where OpenTelemetry is the house wire
+          format; keep the oauth-server/oauthAPI split by resource attribute
+          openshift.log.source, and redact the token-bearing query parameters
+          from body.requestURI before anything is stored. Take the body as
+          authoritative, keep it as _raw, and route as the json OAuth feed
+          with Persistent Queue on the destination.
+        elastic: >
+          Extract the body and apply the same OAuth custom pipeline as the
+          json feed - promote the authentication.openshift.io/username
+          annotation to user.name over a system:anonymous user.username, and
+          map allow/deny/error to success/failure/unknown. If the typed
+          attributes are indexed instead, k8s.user.username stays
+          system:anonymous for the login endpoints, so the annotation
+          attribute is still the real account and the promotion is mandatory.
+        relay: >
+          Bounded scalars only; the OTLP envelope is the only added cost, and
+          a content filter must decode it to reach the payload. Strip the
+          resourceLogs/scopeLogs wrapping to the flat record low-side so the
+          crossing shape matches the NDJSON feed, keep the query-string
+          redaction ahead of the boundary, validate against a schema with a
+          dead-letter route, and reconcile per (dataset, hour).
+      direct:
+        parse_location: high
+        cribl: >
+          High side with no guard, OTLP is a lateral move for this stream
+          unless the SIEM side is OTel-native; if used, drain the receiver,
+          take body.stringValue as _raw, and pass to the OAuth route with the
+          query-string redaction still applied.
+        elastic: >
+          Extract the body and apply the same OAuth custom pipeline as the
+          json feed - promote the authentication.openshift.io/username
+          annotation to user.name over a system:anonymous user.username, and
+          map allow/deny/error to success/failure/unknown. If the typed
+          attributes are indexed instead, k8s.user.username stays
+          system:anonymous for the login endpoints, so the annotation
+          attribute is still the real account and the promotion is mandatory.
+          Keyword-map openshift.log_source and the flattened annotation
+          attributes.
+    fields:
+    - vendor: 'resource: openshift.log.source'
+      type: string
+      description: >-
+        resource attribute distinguishing oauth-server (login endpoints) from
+        oauthAPI (token objects)
+      ecs: null
+      status: unmapped
+      custom: openshift.log_source
+      notes: >-
+        the split key for this family's own retention and alerting; legacy
+        log_source resource attribute carries the same value
+    - vendor: 'resource: openshift.log.type'
+      type: string
+      description: resource attribute - audit for this dataset
+      ecs: null
+      status: unmapped
+      custom: openshift.log_type
+    - vendor: 'resource: openshift.cluster.uid'
+      type: string
+      description: resource attribute - unique id of the OpenShift cluster
+      ecs: orchestrator.cluster.id
+      status: mapped
+    - vendor: 'resource: k8s.node.name'
+      type: string
+      description: resource attribute - control-plane node that served the OAuth request
+      ecs: host.name
+      status: mapped
+    - vendor: timeUnixNano
+      type: timestamp
+      description: logRecord event time in epoch nanoseconds, from requestReceivedTimestamp
+      ecs: '@timestamp'
+      status: mapped
+      transform: divide to milliseconds; the authoritative OAuth request time
+    - vendor: observedTimeUnixNano
+      type: timestamp
+      description: logRecord collector observation time in epoch nanoseconds
+      ecs: event.created
+      status: partial
+      transform: collection time, keep as event.created not @timestamp
+    - vendor: body
+      type: string
+      description: >-
+        logRecord body.stringValue - the OAuth audit Event serialised as JSON,
+        byte-for-byte the json record
+      ecs: null
+      status: unmapped
+      custom: kubernetes.audit
+      notes: >
+        carries the full json OAuth inventory - auditID, the
+        authentication.openshift.io/username and /decision annotations,
+        user.username (system:anonymous on login), verb, requestURI with the
+        token-bearing query string, sourceIPs, userAgent, responseStatus.code,
+        objectRef.resource; extract and map exactly as the json OAuth feed
+    - vendor: 'attr: k8s.user.username'
+      type: string
+      description: >-
+        logRecord attribute - authenticated identity, from user.username
+        (system:anonymous for the login endpoints)
+      ecs: null
+      status: partial
+      custom: kubernetes.audit.user.username
+      notes: >-
+        deliberately not user.name on the login endpoints - it is
+        system:anonymous and would overwrite the real account from the
+        authentication annotation; on oauth-apiserver records it holds a real
+        identity, as on the json feed
+    - vendor: 'attr: k8s.audit.event.annotation.authentication.openshift.io/username'
+      type: string
+      description: >-
+        logRecord attribute - username presented to the OAuth server, from the
+        authentication.openshift.io/username annotation
+      ecs: user.name
+      status: mapped
+      notes: >
+        the OTLP reshape flattens each annotation into a
+        k8s.audit.event.annotation.<annotation-key> attribute (the audit
+        samples show this for the authorization.k8s.io annotations); this is
+        the account being authenticated and, not user.username, is the value
+        failed-login alerting must key on
+    - vendor: 'attr: k8s.audit.event.annotation.authentication.openshift.io/decision'
+      type: string
+      description: >-
+        logRecord attribute - OAuth authentication verdict, from the
+        authentication.openshift.io/decision annotation (allow, deny, error)
+      ecs: event.outcome
+      status: mapped
+      transform: >-
+        allow -> success, deny -> failure, error -> unknown (identity provider
+        unreachable or malformed request) rather than folding error into
+        failure
+    - vendor: 'attr: k8s.audit.event.request.uri'
+      type: string
+      description: logRecord attribute - OAuth endpoint and query string, from requestURI
+      ecs: url.original
+      status: partial
+      notes: >-
+        carries the OAuth query string (client_id, response_type, state,
+        code); split into url.path/url.query and redact token-bearing
+        parameters before indexing
+    - vendor: 'attr: k8s.audit.event.request.verb'
+      type: string
+      description: >-
+        logRecord attribute - verb of the OAuth request, from verb
+        (create/get/delete for token objects, HTTP method for login endpoints)
+      ecs: event.action
+      status: mapped
+    - vendor: 'attr: k8s.audit.event.response.code'
+      type: integer
+      description: >-
+        logRecord attribute - HTTP status returned by the OAuth endpoint, from
+        responseStatus.code (200, 302, 401, 403)
+      ecs: http.response.status_code
+      status: mapped
+    - vendor: 'attr: k8s.audit.event.user_agent'
+      type: string
+      description: logRecord attribute - user agent of the login client, from userAgent
+      ecs: user_agent.original
+      status: mapped
+    - vendor: 'attr: k8s.audit.event.object_ref.resource'
+      type: string
+      description: >-
+        logRecord attribute - OAuth API resource acted on, from
+        objectRef.resource (oauthaccesstokens, users, identities); empty for
+        the login endpoints
+      ecs: orchestrator.resource.type
+      status: mapped
+    - vendor: 'attr: k8s.audit.event.level'
+      type: string
+      description: logRecord attribute - audit level the record was written at
+      ecs: null
+      status: unmapped
+      custom: kubernetes.audit.level
+    - vendor: 'attr: k8s.audit.event.stage'
+      type: string
+      description: logRecord attribute - request lifecycle stage
+      ecs: null
+      status: unmapped
+      custom: kubernetes.audit.stage
+      notes: same RequestReceived duplication as the API-server audit dataset
+- id: node-container-logs
+  name: Node and container runtime logs
+  description: >
+    thin starter - infrastructure-family logs collected by the same Vector
+    collector: journald records from CRI-O and kubelet on the nodes, and
+    container stdout/stderr from openshift*/kube*/default namespaces. Not
+    audit records; they carry the ViaQ envelope plus a kubernetes.* metadata
+    block and are ingested for container-lifecycle and node-health context
+    around the audit trail, not as a primary detection source.
+  event_categories:
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge Cribl worker group, on-prem enclave
+      notes: >
+        same ClusterLogForwarder http output as the audit datasets, selected
+        by the infrastructure input.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-kubernetes.container_logs
+    direct:
+    - hop: cribl
+      location: edge Cribl worker group, on-prem enclave
+      notes: >
+        same ClusterLogForwarder http output as the audit datasets, selected
+        by the infrastructure input.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-kubernetes.container_logs
+  formats:
+  - format: json
+    recommended: true
+    recommended_because: >-
+      the OTLP output of OpenShift logging is a Technology Preview feature;
+      the ViaQ JSON forwarder output is the supported path.
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom OpenShift ViaQ pipeline
+      notes: >
+        The Elastic Kubernetes integration's container_logs data stream is
+        built around Elastic Agent tailing the container log files with its
+        own add_kubernetes_metadata processor; arriving as ViaQ JSON from
+        Vector instead, none of that applies, so the field shaping is a
+        hand-built Cribl pipeline into the same data stream naming.
+    fields:
+    - vendor: message
+      type: string
+      description: original log entry text, UTF-8 encoded
+      ecs: message
+      status: mapped
+    - vendor: hostname
+      type: string
+      description: node the record originated on (equal to kubernetes.host)
+      ecs: host.name
+      status: mapped
+    - vendor: level
+      type: enum
+      description: >-
+        normalized severity of the record (emerg, alert, crit, err, warn,
+        notice, info, debug, trace, unknown)
+      ecs: log.level
+      status: mapped
+      transform: >
+        ViaQ maps each collector's native severity onto this fixed ten-value
+        list, including an explicit unknown bucket for values it cannot place
+    - vendor: log_type
+      type: enum
+      description: >-
+        source category of the record - application, infrastructure, or audit,
+        optionally dot-suffixed (infrastructure.container,
+        infrastructure.node)
+      ecs: null
+      status: unmapped
+      custom: openshift.log_type
+      notes: primary routing key for splitting the ClusterLogForwarder feed into data streams
+    - vendor: log_source
+      type: enum
+      description: subcategory within the log type - container or node for infrastructure logs
+      ecs: null
+      status: unmapped
+      custom: openshift.log_source
+    - vendor: kubernetes.namespace_name
+      type: string
+      description: namespace the emitting pod runs in
+      ecs: orchestrator.namespace
+      status: mapped
+    - vendor: kubernetes.pod_name
+      type: string
+      description: name of the pod that emitted the record
+      ecs: null
+      status: unmapped
+      custom: kubernetes.pod.name
+      notes: >
+        could be forced into orchestrator.resource.name, but that field models
+        the object an audit event acted upon; the Elastic Kubernetes
+        integration models pod identity under kubernetes.pod.name, so this
+        stays custom to keep both meanings distinct
+    - vendor: kubernetes.container_name
+      type: string
+      description: name of the container within the pod
+      ecs: container.name
+      status: mapped
+    - vendor: kubernetes.container_id
+      type: string
+      description: container runtime identifier of the emitting container
+      ecs: container.id
+      status: mapped
+      transform: >-
+        arrives with the runtime scheme prefix (cri-o://<id>); strip the
+        prefix so the value joins against runtime and orchestrator data
+    - vendor: kubernetes.container_image
+      type: string
+      description: image reference the container was started from
+      ecs: container.image.name
+      status: partial
+      transform: >-
+        single string holding repository plus tag or digest; split so
+        container.image.tag is populated separately
+    - vendor: kubernetes.pod_id
+      type: string
+      description: UID of the emitting pod
+      ecs: null
+      status: unmapped
+      custom: kubernetes.pod.id
+    - vendor: systemd.u.SYSLOG_IDENTIFIER
+      type: string
+      description: journald syslog identifier of the emitting node service (crio, kubelet, systemd)
+      ecs: process.name
+      status: partial
+      notes: >
+        present only on node-family (journald) records, absent on container
+        records; it is a service identifier rather than a process image name,
+        so process.name is an approximation
+    - vendor: openshift.cluster_id
+      type: string
+      description: unique identifier of the OpenShift cluster the record came from
+      ecs: orchestrator.cluster.id
+      status: mapped
+    - vendor: '@timestamp'
+      type: timestamp
+      description: UTC time the log payload was created, RFC3339
+      ecs: '@timestamp'
+      status: mapped
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Own the shaping here since no integration fits the ViaQ wire format:
+          strip the cri-o:// prefix off container_id, split container_image
+          into name and tag/digest, translate the ViaQ level vocabulary into
+          log.level, and rejoin multi-line stack traces before they are
+          forwarded as separate records. This is the right place to cut volume
+          too - allow-list the namespaces and systemd units worth keeping and
+          drop kubelet and CRI-O chatter at source - and to validate the
+          record shape with C.Schema(...).validate plus a dead-letter route,
+          with Persistent Queue backpressure on the destination.
+        elastic: >
+          There is no matching integration pipeline, so own a custom
+          logs-kubernetes.container_logs ingest pipeline and index template:
+          declare kubernetes.pod.name, kubernetes.pod.id,
+          kubernetes.namespace_labels and openshift.log_type/log_source as
+          keyword, keep the free-text message field as the only text-analysed
+          field, and set event.kind/event.dataset explicitly since nothing
+          upstream does. Treat this stream's coverage as deliberately thin -
+          it exists for context around the audit datasets, so resist growing
+          dynamic mappings off arbitrary container output.
+        relay: >
+          On the low-side clusters this route is the first candidate for
+          aggressive low-side reduction: highest volume and lowest forensic
+          value of the three datasets, and container stdout is exactly the
+          unbounded, arbitrary-encoding free text a content filter handles
+          worst. Cap message length, strip control and non-UTF-8 characters,
+          and drop _raw here before any other OpenShift dataset.
+      direct:
+        parse_location: low
+        cribl: >
+          Own the shaping here since no integration fits the ViaQ wire format:
+          strip the cri-o:// prefix off container_id, split container_image
+          into name and tag/digest, translate the ViaQ level vocabulary into
+          log.level, and rejoin multi-line stack traces before they are
+          forwarded as separate records. This is the right place to cut volume
+          too - allow-list the namespaces and systemd units worth keeping and
+          drop kubelet and CRI-O chatter at source - and to validate the
+          record shape with C.Schema(...).validate plus a dead-letter route,
+          with Persistent Queue backpressure on the destination.
+        elastic: >
+          There is no matching integration pipeline, so own a custom
+          logs-kubernetes.container_logs ingest pipeline and index template:
+          declare kubernetes.pod.name, kubernetes.pod.id,
+          kubernetes.namespace_labels and openshift.log_type/log_source as
+          keyword, keep the free-text message field as the only text-analysed
+          field, and set event.kind/event.dataset explicitly since nothing
+          upstream does. Treat this stream's coverage as deliberately thin -
+          it exists for context around the audit datasets, so resist growing
+          dynamic mappings off arbitrary container output.
+  - format: syslog-raw
+    enable: >
+      Reference a syslog output from the pipeline carrying the infrastructure
+      input. For container and node logs the calculated header differs from
+      the audit case: on RFC5424 the APP-NAME becomes namespace_pod_container
+      for container records and SYSLOG_IDENTIFIER for node/journald records,
+      PROCID becomes the pod_id (container) or _PID (journal), MSGID is
+      .log_source, facility defaults to user (1) for containers, and severity
+      is taken from the record .level. The MSG payload is the .message field.
+      Set syslog.enrichment: KubernetesMinimal to prefix namespace_name,
+      pod_name and container_name onto the message body (e.g.
+      namespace_name=x, container_name=y, pod_name=z, message=...); note this
+      makes the body an invalid JSON structure, so leave enrichment None if
+      the downstream parser needs clean JSON. Use RFC5424 over tls:// and
+      expect multi-line stack traces to arrive as separate frames unless
+      rejoined at the source.
+    references:
+    - >-
+      https://github.com/openshift/cluster-logging-operator/blob/master/docs/features/logforwarding/outputs/syslog-forwarding.adoc
+    - >-
+      https://docs.redhat.com/en/documentation/red_hat_openshift_logging/6.4/html/configuring_logging/configuring-log-forwarding
+    - >-
+      https://github.com/openshift/cluster-logging-operator/blob/master/docs/reference/datamodels/viaq/v1.adoc
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        custom OpenShift ViaQ syslog-unframe pipeline into
+        logs-kubernetes.container_logs
+      notes: >
+        No Elastic integration fits this wire shape - the container_logs data
+        stream expects Elastic Agent tailing files, and here the record is a
+        syslog-framed ViaQ line - so the shaping is a hand-built pipeline. The
+        APP-NAME (namespace_pod_container) has to be split back into
+        namespace/pod/container, or KubernetesMinimal must be enabled so those
+        values are in the body prefix; either way the syslog header carries
+        identity the ViaQ feed carries as first-class kubernetes.* fields, so
+        the un-frame is more lossy than for audit and the container metadata
+        (pod_id, container_id, container_image) present in the ViaQ record is
+        largely absent from a bare syslog frame.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Own the shaping at the source as for the json feed, but note the
+          syslog frame is a poorer carrier than the ViaQ JSON: only
+          namespace_pod_container and pod_id survive in the header, so the
+          container_id/container_image/pod label enrichment the json feed
+          carries is lost unless KubernetesMinimal plus a richer payloadKey is
+          used. This is still the right place to cut volume - allow-list the
+          namespaces and systemd units worth keeping and drop kubelet/CRI-O
+          chatter - and to rejoin multi-line stack traces before framing so
+          one exception is not scattered across syslog frames. Persistent
+          Queue on the destination; validate the un-frame with a dead-letter
+          route.
+        elastic: >
+          Own a custom logs-kubernetes.container_logs ingest pipeline and
+          index template: parse the syslog header, split
+          namespace_pod_container into orchestrator.namespace /
+          kubernetes.pod.name / container.name, map the .level-derived
+          severity to log.level, keep message as the only text-analysed field,
+          and set event.kind/event.dataset explicitly. Treat coverage as
+          deliberately thin - this exists for context around the audit
+          datasets - and resist growing dynamic mappings off arbitrary
+          container output.
+        relay: >
+          The first candidate for aggressive low-side reduction: highest
+          volume and lowest forensic value, and container stdout is exactly
+          the unbounded arbitrary-encoding free text a content filter handles
+          worst - now inside a syslog MSG. Cap message length, strip control
+          and non-UTF-8 characters, and drop the record before any other
+          OpenShift dataset. The syslog re-frame adds nothing here and, with
+          KubernetesMinimal, produces invalid JSON in the body, so prefer the
+          NDJSON crossing for this dataset outright.
+      direct:
+        parse_location: low
+        cribl: >
+          High side with no guard, syslog is strictly worse than the http feed
+          for container logs - it loses container metadata and can corrupt the
+          JSON body under KubernetesMinimal. If a syslog collector is
+          nonetheless the house endpoint, un-frame on a Cribl Syslog source,
+          reconstruct identity from the header, and apply the same namespace
+          allow-listing and multi-line rejoin the json feed uses.
+        elastic: >
+          Own a custom logs-kubernetes.container_logs ingest pipeline and
+          index template: parse the syslog header, split
+          namespace_pod_container into orchestrator.namespace /
+          kubernetes.pod.name / container.name, map the .level-derived
+          severity to log.level, keep message as the only text-analysed field,
+          and set event.kind/event.dataset explicitly. Treat coverage as
+          deliberately thin - this exists for context around the audit
+          datasets - and resist growing dynamic mappings off arbitrary
+          container output.
+    fields:
+    - vendor: PRI
+      type: integer
+      description: >-
+        RFC5424 priority, facility*8 + severity; facility user (1) for
+        containers, severity from the record .level
+      ecs: log.syslog.priority
+      status: mapped
+      notes: >-
+        unlike the audit datasets the severity here is real (derived from
+        .level), so the priority varies per record
+    - vendor: FACILITY
+      type: integer
+      description: syslog facility - user (1) for container records
+      ecs: log.syslog.facility.code
+      status: mapped
+    - vendor: SEVERITY
+      type: integer
+      description: syslog severity, mapped from the record .level (emerg..debug)
+      ecs: log.syslog.severity.code
+      status: partial
+      transform: >-
+        derived from the ViaQ .level ten-value vocabulary; also carry the
+        textual level into log.level, which is the field detections read
+    - vendor: HOSTNAME
+      type: string
+      description: syslog HOSTNAME - the node the record originated on
+      ecs: host.name
+      status: mapped
+    - vendor: APP-NAME
+      type: string
+      description: >-
+        RFC5424 APP-NAME - namespace_pod_container for container records,
+        SYSLOG_IDENTIFIER for node/journald records
+      ecs: log.syslog.appname
+      status: partial
+      notes: >
+        the container form packs namespace, pod and container into one
+        underscore-joined token that must be split back into
+        orchestrator.namespace / kubernetes.pod.name / container.name; the
+        node form is the systemd service identifier (crio, kubelet, systemd)
+    - vendor: PROCID
+      type: string
+      description: RFC5424 PROCID - pod_id for container records, _PID for journald records
+      ecs: log.syslog.procid
+      status: partial
+      notes: >-
+        the container form is the pod UID (maps to kubernetes.pod.id, not a
+        process id); the node form is a real PID mapping to process.pid
+    - vendor: MSGID
+      type: string
+      description: RFC5424 MSGID, set from .log_source (container or node)
+      ecs: log.syslog.msgid
+      status: mapped
+      notes: the infrastructure subcategory; promote to openshift.log_source
+    - vendor: MSG
+      type: string
+      description: >-
+        the .message field - the original container stdout/stderr line or
+        journald message text
+      ecs: message
+      status: mapped
+      notes: >
+        with syslog.enrichment KubernetesMinimal the body is prefixed with
+        namespace_name=, container_name=, pod_name= before the message, which
+        recovers the identity a bare frame loses but makes the body invalid
+        JSON; with enrichment None the body is the clean message but the
+        container metadata (container_id, container_image, pod labels) the
+        ViaQ feed carries is not present in the frame
+  - format: otlp
+    enable: >
+      Reference the otlp output (Technology Preview, annotation
+      observability.openshift.io/tech-preview-otlp-output: "enabled") from the
+      pipeline carrying the infrastructure input. The OpenTelemetry reshape
+      groups records into resourceLogs by (node, pod/container or systemd
+      unit): container identity becomes resource attributes k8s.pod.name,
+      k8s.pod.uid, k8s.container.name, k8s.namespace.name and per-label
+      k8s.pod.label.<key>; node/journald identity becomes
+      process.command_line, process.executable.path, process.pid and
+      service.name. Each log line is a logRecord with severityText from
+      .level, the raw line in body, and a small set of typed attributes
+      (log.iostream for containers; the journald systemd.t.* / systemd.u.*
+      transport fields for node records).
+    references:
+    - >-
+      https://github.com/openshift/cluster-logging-operator/blob/master/docs/features/logforwarding/outputs/otlp-forwarding.adoc
+    - >-
+      https://github.com/openshift/cluster-logging-operator/blob/master/hack/logsamples/otlp_container.json
+    - >-
+      https://github.com/openshift/cluster-logging-operator/blob/master/hack/logsamples/otlp_journal.json
+    - https://github.com/rhobs/observability-data-model/blob/main/cluster-logging.md
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom OTLP-flatten pipeline into logs-kubernetes.container_logs
+      notes: >
+        No stock integration consumes OpenShift OTLP infrastructure logs, so
+        flatten by hand: promote the resource attributes to the record, take
+        body.stringValue as message and severityText as log.level. The OTLP
+        model is actually a richer carrier than the syslog frame for this
+        dataset - it keeps k8s.pod.uid, k8s.container.name and the pod labels
+        as typed attributes rather than packing them into one APP-NAME token -
+        but it is still Technology Preview and carries no Elastic integration
+        defaults, so event.kind/event.dataset and every keyword mapping are
+        owned locally.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Adopt OTLP low-side only where OpenTelemetry is the house wire
+          format; it preserves container identity better than syslog but is
+          still the highest-volume lowest-value dataset, so the volume
+          controls come first - allow-list namespaces and systemd units on the
+          resource attributes (k8s.namespace.name, service.name) and drop
+          kubelet/CRI-O chatter before flattening. Rejoin multi-line records,
+          keep body.stringValue as message, and Persistent Queue the
+          destination with a dead-letter route for malformed OTLP.
+        elastic: >
+          Own a custom logs-kubernetes.container_logs pipeline: map
+          k8s.namespace.name -> orchestrator.namespace, k8s.container.name ->
+          container.name, severityText -> log.level, body -> message, and keep
+          k8s.pod.name/k8s.pod.uid and the k8s.pod.label.* set as
+          kubernetes.pod.* keywords. Keep the stream thin and resist dynamic
+          mappings off the arbitrary pod-label set.
+        relay: >
+          Same reduction priority as the syslog path: cap message length,
+          strip control and non-UTF-8 characters, and drop this dataset before
+          any other OpenShift feed. Strip the resourceLogs/scopeLogs wrapping
+          low-side so only the flat record crosses, and bound the pod-label
+          attribute set since k8s.pod.label.* is unbounded operator-defined
+          free text.
+      direct:
+        parse_location: low
+        cribl: >
+          High side with no guard, OTLP is a reasonable choice for this
+          dataset only if the SIEM side is OTel-native; otherwise the ViaQ
+          http feed already carries the same identity with an Elastic-shaped
+          field layout. If used, flatten the resource attributes, take body as
+          message, and apply the namespace allow-listing and multi-line
+          rejoin.
+        elastic: >
+          Own a custom logs-kubernetes.container_logs pipeline: map
+          k8s.namespace.name -> orchestrator.namespace, k8s.container.name ->
+          container.name, severityText -> log.level, body -> message, and keep
+          k8s.pod.name/k8s.pod.uid and the k8s.pod.label.* set as
+          kubernetes.pod.* keywords. Keep the stream thin and resist dynamic
+          mappings off the arbitrary pod-label set, and set
+          event.kind/event.dataset explicitly.
+    fields:
+    - vendor: 'resource: openshift.cluster.uid'
+      type: string
+      description: resource attribute - unique id of the OpenShift cluster
+      ecs: orchestrator.cluster.id
+      status: mapped
+    - vendor: 'resource: openshift.log.source'
+      type: string
+      description: resource attribute - container or node for infrastructure logs
+      ecs: null
+      status: unmapped
+      custom: openshift.log_source
+    - vendor: 'resource: openshift.log.type'
+      type: string
+      description: resource attribute - infrastructure for this dataset
+      ecs: null
+      status: unmapped
+      custom: openshift.log_type
+    - vendor: 'resource: k8s.node.name'
+      type: string
+      description: resource attribute - node the record originated on
+      ecs: host.name
+      status: mapped
+    - vendor: 'resource: k8s.namespace.name'
+      type: string
+      description: resource attribute - namespace the emitting pod runs in (container records)
+      ecs: orchestrator.namespace
+      status: mapped
+    - vendor: 'resource: k8s.container.name'
+      type: string
+      description: resource attribute - name of the container within the pod (container records)
+      ecs: container.name
+      status: mapped
+    - vendor: 'resource: k8s.pod.name'
+      type: string
+      description: resource attribute - name of the pod that emitted the record (container records)
+      ecs: null
+      status: unmapped
+      custom: kubernetes.pod.name
+      notes: >-
+        modelled under kubernetes.pod.name to match the Elastic Kubernetes
+        integration rather than orchestrator.resource.name, which models the
+        object an audit event acts on
+    - vendor: 'resource: k8s.pod.uid'
+      type: string
+      description: resource attribute - UID of the emitting pod (container records)
+      ecs: null
+      status: unmapped
+      custom: kubernetes.pod.id
+    - vendor: 'resource: k8s.pod.label.*'
+      type: string
+      description: >-
+        resource attributes carrying the emitting pod's labels
+        (k8s.pod.label.<key>, dots in the key replaced by underscores)
+      ecs: null
+      status: unmapped
+      custom: kubernetes.pod.labels
+      notes: >-
+        unbounded operator-defined set; keyword-map only the labels a given
+        workload actually sets and do not let dynamic mapping absorb the whole
+        namespace
+    - vendor: 'resource: process.command_line'
+      type: string
+      description: >-
+        resource attribute - full command line of the emitting node service
+        (journald records)
+      ecs: process.command_line
+      status: mapped
+    - vendor: 'resource: process.executable.path'
+      type: string
+      description: resource attribute - path of the emitting node service binary (journald records)
+      ecs: process.executable
+      status: mapped
+    - vendor: 'resource: process.executable.name'
+      type: string
+      description: >-
+        resource attribute - basename of the emitting node service binary
+        (journald records)
+      ecs: process.name
+      status: mapped
+    - vendor: 'resource: process.pid'
+      type: integer
+      description: resource attribute - PID of the emitting node service (journald records)
+      ecs: process.pid
+      status: mapped
+    - vendor: 'resource: service.name'
+      type: string
+      description: >-
+        resource attribute - the systemd unit / service that emitted the
+        record (journald records)
+      ecs: service.name
+      status: mapped
+    - vendor: timeUnixNano
+      type: timestamp
+      description: logRecord event time in epoch nanoseconds
+      ecs: '@timestamp'
+      status: mapped
+      transform: divide to milliseconds
+    - vendor: observedTimeUnixNano
+      type: timestamp
+      description: logRecord collector observation time in epoch nanoseconds
+      ecs: event.created
+      status: partial
+      transform: keep as event.created not @timestamp
+    - vendor: severityText
+      type: string
+      description: logRecord severityText - normalized level of the record (info, warn, err, ...)
+      ecs: log.level
+      status: mapped
+      notes: >-
+        the OTel-named twin of the ViaQ .level, also present as the record
+        attribute level
+    - vendor: body
+      type: string
+      description: >-
+        logRecord body.stringValue - the original container stdout/stderr line
+        or journald message text
+      ecs: message
+      status: mapped
+      notes: >-
+        plain text (not JSON) for infrastructure logs, unlike the audit
+        datasets where the body is a JSON record
+    - vendor: 'attr: log.iostream'
+      type: string
+      description: logRecord attribute - stdout or stderr for container records
+      ecs: null
+      status: unmapped
+      custom: kubernetes.log.iostream
+    - vendor: 'attr: systemd.u.syslog_identifier'
+      type: string
+      description: >-
+        logRecord attribute - journald syslog identifier of the emitting node
+        service (crio, kubelet, systemd)
+      ecs: process.name
+      status: partial
+      notes: >-
+        a service identifier rather than a process image name, so process.name
+        is an approximation; duplicates service.name for many units
+    - vendor: 'attr: systemd.t.*'
+      type: string
+      description: >-
+        logRecord attributes - journald trusted transport fields
+        (systemd.t.pid, systemd.t.systemd_unit, systemd.t.uid,
+        systemd.t.boot_id, systemd.t.machine_id, ...)
+      ecs: null
+      status: unmapped
+      custom: systemd.t
+      notes: >
+        the full journald trusted-field set carried on node records only;
+        systemd.t.pid and systemd.t.systemd_unit are the useful ones for
+        node-service attribution, the rest (cap_effective, selinux_context,
+        cgroup, invocation_id) are diagnostic and can be dropped low-side

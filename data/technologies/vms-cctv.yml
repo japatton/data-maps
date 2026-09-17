@@ -1,0 +1,983 @@
+id: vms-cctv
+name: Video Management System (Genetec/Milestone)
+vendor: Multiple
+versions: >-
+  Milestone XProtect Corporate/Expert 2022 R3 - 2025 R2 (class exemplar);
+  Genetec Security Center 5.11, 5.12, 5.13
+draft: true
+references:
+- >-
+  https://doc.milestonesys.com/2025r2/en-US/standard_features/sf_mc/sf_ui/mc_serverlogs.htm
+- >-
+  https://doc.milestonesys.com/2022r3/en-us/standard_features/sf_mc/sf_mcnodes/sf_8serverlogs/mc_serverlogs_explained.htm
+- >-
+  https://doc.milestonesys.com/2020R1/en-US/system/security/hardeningguide/hg_monitorlogsinthevmsfor.htm
+- >-
+  https://doc.milestonesys.com/2025r1/en-US/standard_features/sf_mc/sf_maintenance/mc_backuplogserverdatabase.htm
+- https://milestonepstools.com/commands/en-US/Get-VmsLog/
+- https://doc.developer.milestonesys.com/mipvmsapi/
+- >-
+  https://techdocs.genetec.com/r/en-US/Security-Center-User-Guide-5.12/Report-pane-columns-for-the-Activity-trails-task
+- >-
+  https://techdocs.genetec.com/r/en-US/Security-Center-Hardening-Guide-5.12/Logging-activity-trails-for-security-related-events-Basic
+- >-
+  https://techdocs.genetec.com/r/en-US/Security-Center-Administrator-Guide-5.12/Configuring-event-logging-for-video-sequences
+datasets:
+- id: operator-audit-events
+  name: Operator audit events (logon, camera view, export, PTZ)
+  description: |
+    Who watched what camera, when, and what they took away with them. This is the insider-threat feed of the physical estate: a video EXPORT is the single highest-value signal in this map, because export is the only VMS action that removes evidence-grade footage from the system and puts it on removable media or a share. Live/playback camera views, PTZ control, camera blocking and manual recording stops are the surrounding context that says whether an export was routine review or targeted collection. Paired with the pacs-badge access-events dataset, it completes the physical picture — a badge tap says a person entered a space, this feed says who was watching that space and who later pulled the recording.
+    Two vendors are used as class exemplars and BOTH sets of field names below are real documented column names, not one vendor's names imposed on the other. Milestone XProtect writes an Audit log through its Log Server (Management Client > Server Logs > Audit log) whose documented columns are Local time, Message text, Permission, Category, Source type, Source name, User and User location. Genetec Security Center writes an Activity trails report whose documented columns are Initiator, Initiator type, Activity name, Description, Impacted entity, Impacted entity type, Initiator machine, Initiator application, Event timestamp, and the provenance set Impacted entity version, Initiator version, Initiator application version and Original initiator. Genetec ALSO writes a separate, always-on Audit trails report covering configuration changes, whose columns are Entity, Entity type, Description, Initiator, Initiator type, Initiator machine, Initiator application, Initiator application version and Modification time — note it has no Activity name at all, so the modification type has to be parsed out of Description (grammar in parsing.notes below). The two shapes differ in one decisive way: Genetec carries a structured "Activity name" verb and a named "Impacted entity", while Milestone carries neither and buries the verb, the camera name and the export filename inside the free-text Message text. Whichever vendor is deployed, the other vendor's rows are the fields that will be absent.
+    Two documented coverage traps the CSOC must know before writing detections. First, Milestone's Audit log by default "notes only user logins" — the export/view/PTZ substance only appears once "Enable user access logging" is turned on in Tools > Options > Server Logs, and Milestone warns this increases system load. Second, the Milestone audit log explicitly does NOT record unsuccessful login attempts or user logoff, so failed-authentication and session-end detections cannot be built on this source and must come from Windows/AD. Genetec does not share that gap — its hardening guide names "User logon failed" and "User logged off" among the activities to enable.
+  event_categories:
+  - authentication
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge Cribl worker group, physical-security enclave
+      notes: >
+        Neither product ships a native CEF/LEEF syslog forwarder, so the
+        collection shape depends on version. On XProtect 2026 R1 and later the
+        API Gateway pushes OTLP directly into a Cribl OTLP source; below that
+        release, and on Genetec throughout, collection is a scheduled poll — a
+        Cribl REST/exec Collector driving the MIP SDK LogClient (or the
+        MilestonePSTools Get-VmsLog wrapper, LogType Audit) for Milestone, and
+        the Security Center SDK / Directory reporting surface for Genetec. The
+        poller runs in the physical-security enclave with the VMS head-end and
+        pushes across, since the guard carries no return channel.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-vms.operator_audit
+    direct:
+    - hop: cribl
+      location: edge Cribl worker group, physical-security enclave
+      notes: >
+        Neither product ships a native CEF/LEEF syslog forwarder, so the
+        collection shape depends on version. On XProtect 2026 R1 and later the
+        API Gateway pushes OTLP directly into a Cribl OTLP source; below that
+        release, and on Genetec throughout, collection is a scheduled poll — a
+        Cribl REST/exec Collector driving the MIP SDK LogClient (or the
+        MilestonePSTools Get-VmsLog wrapper, LogType Audit) for Milestone, and
+        the Security Center SDK / Directory reporting surface for Genetec. The
+        collector runs next to the VMS head-end and lands straight on the core
+        worker group with no guard hop.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-vms.operator_audit
+  formats:
+  - format: api-pull
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom VMS operator-audit pipeline
+      notes: |
+        Verified firm negatives, checked against the vendors' own index pages: no Genetec syslog plugin, no Splunk TA, no QRadar DSM, no Elastic package and no Sentinel connector exists for either product. The pipeline is hand-built and must be re-pointed per deployed vendor.
+        Collection has a version cliff on the Milestone side. XProtect 2026 R1 adds NATIVE OpenTelemetry log export through the API Gateway (OTLP on 4317 gRPC / 4318 HTTP, with VictoriaLogs on 9428 as the bundled backend), which is the preferred path from that release forward — a Cribl OTLP source replaces the polling collector entirely. Pre-2026 R1 the fallback is the scheduled MIP SDK LogClient poll (or the MilestonePSTools Get-VmsLog wrapper, LogType Audit). Treat the older "XProtect does not support syslog" statement as possibly stale: it comes from the 2020 hardening guide and predates the OTLP work.
+        Two parser specs the low-side pipeline has to implement. First, on the Genetec side the SDK column constants behind the UI labels (ActivityTrailsQuery / AuditTrailQuery) are the true field names and should be what the collector selects on, not the localized display strings used in the field list below. Second, Genetec's Audit trails report has no Activity name column, so the modification type must be parsed out of its free-text Description, which follows a documented grammar: "Entity created: <name>.", "The <Property> value changed from <Old> to <New>.", and the membership and access-rights sentence forms. That grammar is the config-change parser spec for this dataset.
+        An alternate collection path worth knowing: the Genetec Data Exporter plugin 1.0.0 exports Audit-trail events to PostgreSQL, which a Cribl database collector can read. It has no activity-trails view, so it covers the configuration half of this dataset only and cannot replace the SDK for the export/view/PTZ substance.
+    fields:
+    - vendor: Local time
+      type: timestamp
+      description: >-
+        time of the logged incident, documented as timestamped in the local
+        time of the system's server
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        Milestone documents this column as LOCAL server time, not UTC, so it
+        must be converted using the log server's configured timezone before
+        indexing; skipping the conversion silently shifts every video-export
+        event by the site's UTC offset and breaks correlation with the badge
+        feed
+    - vendor: Message text
+      type: string
+      description: description of the logged incident, rendered as a human-readable sentence
+      ecs: message
+      status: mapped
+      notes: >
+        on Milestone this is the ONLY carrier of the action verb, the camera
+        or output that was acted on, and the exported file name — there is no
+        structured action or entity column on the audit log at all, so
+        everything the CSOC wants to alert on has to be regexed out of this
+        string
+    - vendor: User
+      type: string
+      description: the user name of the remote user causing the logged incident
+      ecs: user.name
+      status: mapped
+    - vendor: User location
+      type: string
+      description: >-
+        the IP address or host name of the computer from which the remote user
+        caused the logged incident
+      ecs: source.ip
+      status: partial
+      transform: >
+        documented as "IP address OR host name" — a dual-typed column that
+        fails an ip-typed mapping outright when it holds a workstation name;
+        test and split low-side, routing the hostname case to source.address
+        instead of coercing it
+    - vendor: Permission
+      type: enum
+      description: whether the remote user action was allowed (granted) or not
+      ecs: event.outcome
+      status: partial
+      transform: >
+        granted becomes success and denied becomes failure, but the exact
+        rendered strings are not published and must be confirmed from a live
+        sample; note this is an AUTHORIZATION decision on a remote action, not
+        a logon result, so it must not be read as authentication outcome
+    - vendor: Category
+      type: string
+      description: category the logged incident belongs to
+      ecs: null
+      status: unmapped
+      custom: vms.log.category
+      notes: >-
+        no published enumeration of valid values exists for any XProtect log
+        type; the vocabulary has to be built by sampling a live system
+    - vendor: Source type
+      type: enum
+      description: >-
+        the type of equipment on which the logged incident occurred, for
+        example server or device
+      ecs: null
+      status: partial
+      custom: vms.log.source_type
+      notes: >
+        ECS observer.type is the obvious future home, but the value vocabulary
+        is undocumented and the ECS field expects a small fixed set, so it
+        stays custom until a real sample proves the values map
+    - vendor: Source name
+      type: string
+      description: >-
+        name of the equipment (server, service or device) on which the logged
+        incident occurred
+      ecs: observer.name
+      status: partial
+      notes: >
+        ambiguous by design — where the source is a recording server this is
+        genuinely the observer, but where it is a camera the same column names
+        the entity being acted upon; the observer/target split has to be
+        decided low-side from Source type or the export queries return the
+        camera as its own observer
+    - vendor: Activity name
+      type: string
+      description: >-
+        Genetec Security Center Activity trails column - the type of activity,
+        documented per activity rather than free text
+      ecs: event.action
+      status: mapped
+      transform: >
+        documented activity strings (the hardening guide names "User logged
+        on", "User logged off", "User logon failed", "Camera unblocked",
+        "Confidential video requested", "Recording stopped (manually)", "Video
+        file deleted (manually)", "Unit password exported", "Connected to
+        remote Security Desk") are lowercased and underscored into the same
+        verb vocabulary the Milestone Message text regex emits, so one
+        detection covers both vendors
+      notes: >
+        VALIDATE BEFORE FREEZING — the on-wire values are almost certainly the
+        SINGULAR forms (User logged on, User logon failed, Video exported, PTZ
+        activated) rather than the slash-paired wordings the documentation
+        prose uses, and the SDK's ActivityType enum
+        (ActivityType.UserLoggedOn) corroborates that. Confirm the exact
+        strings against a live Activity trails report before the normalization
+        table is frozen, because a near-miss here silently drops the export
+        detection
+    - vendor: Initiator
+      type: string
+      description: >-
+        Genetec Activity trails column - who or what performed the activity or
+        caused the activity event
+      ecs: user.name
+      status: partial
+      notes: >
+        the Genetec counterpart of Milestone's User, but it is NOT always a
+        person — a role entity can be the initiator, so Initiator type must be
+        checked before this lands in user.name or service activity is
+        attributed to a human
+    - vendor: Initiator type
+      type: string
+      description: Genetec Activity trails column - the type of entity that initiated the activity
+      ecs: null
+      status: unmapped
+      custom: vms.actor.type
+      notes: >-
+        distinguishes a user initiator from a role/service initiator; the
+        guard rail on the Initiator mapping above
+    - vendor: Impacted entity
+      type: string
+      description: Genetec Activity trails column - which entities were impacted by this activity
+      ecs: null
+      status: unmapped
+      custom: vms.entity.name
+      notes: >
+        the camera whose video was viewed or exported — the single most
+        important field on this dataset for insider-threat triage, and ECS has
+        no generic target-entity field to hold it (observer.name is already
+        taken by the recording server, and user.target.* models an account,
+        not a camera)
+    - vendor: Impacted entity type
+      type: string
+      description: Genetec Activity trails column - the type of entity impacted by this activity
+      ecs: null
+      status: unmapped
+      custom: vms.entity.type
+      notes: >-
+        separates a camera from a door, a cardholder or an archive so video
+        activity can be filtered out of the shared activity trail
+    - vendor: Initiator machine
+      type: string
+      description: Genetec Activity trails column - which computer the activity was performed on
+      ecs: source.address
+      status: mapped
+      notes: >
+        the operator workstation, kept on source.* alongside the resolved User
+        location IP so client and server identity stay separable; Milestone
+        has no equivalent column
+    - vendor: Initiator application
+      type: string
+      description: Genetec Activity trails column - the application used for this activity
+      ecs: null
+      status: unmapped
+      custom: vms.client.application
+      notes: >
+        which client made the request (Security Desk, Config Tool, web or
+        SDK); on Milestone the equivalent distinction between Smart Client,
+        Web Client, Management Client and a MIP SDK integration is only
+        inferable from Message text and Source type, which is a real coverage
+        gap for spotting SDK-driven bulk export
+    - vendor: Original initiator
+      type: string
+      description: >-
+        Genetec Activity trails column - who or what role performed the
+        activity on the Federation host
+      ecs: null
+      status: unmapped
+      custom: vms.actor.original_initiator
+      notes: >
+        on a federated estate the local Initiator is the federation role, not
+        the human — this column carries the real actor on the remote host, so
+        without it every activity from a federated site is attributed to a
+        service account and the insider-threat detections quietly stop working
+        across sites
+    - vendor: Modification time
+      type: timestamp
+      description: Genetec Audit trails column - when the configuration change was made
+      ecs: '@timestamp'
+      status: partial
+      notes: >
+        the always-on Audit trails report timestamps with this instead of
+        Event timestamp; the two reports have to be coalesced onto one
+        @timestamp low-side or configuration changes and operator actions
+        cannot be placed on a single timeline
+    - vendor: Description
+      type: string
+      description: >-
+        Genetec Activity trails column - description of the event, activity,
+        entity or incident (and, on the always-on Audit trails report, the
+        sole carrier of the modification type)
+      ecs: message
+      status: partial
+      notes: >
+        the Genetec counterpart of Milestone's Message text; only one of the
+        two is ever present, so the pipeline coalesces whichever arrived into
+        message rather than mapping both. On the Audit trails report this
+        column carries the whole change — "Entity created: <name>.", "The
+        <Property> value changed from <Old> to <New>.", plus the membership
+        and access-rights forms — so the documented grammar in parsing.notes
+        has to be applied here to recover event.action, the changed property
+        and its old and new values
+    - vendor: (placeholder) exported video file name
+      type: string
+      description: name or path of the media file written by a video export operation
+      ecs: file.name
+      status: partial
+      notes: >
+        PLACEHOLDER - neither vendor publishes a discrete column for this. On
+        Milestone it exists only inside Message text and must be regexed out;
+        on Genetec it is inside Description. It is nonetheless the field that
+        turns "someone exported video" into an actionable artifact, so it is
+        modelled now and flagged as extraction work
+    - vendor: (placeholder) exported footage interval
+      type: string
+      description: >-
+        the start and end of the recorded footage covered by an export, as
+        distinct from when the export ran
+      ecs: null
+      status: unmapped
+      custom: vms.export.footage_interval
+      notes: >
+        PLACEHOLDER - no published column. Once extracted it should be split
+        onto event.start and event.end so the interval is queryable; an export
+        whose footage window is wide or repeatedly walked backwards is the
+        collection signal, and it is invisible while this stays one string
+    - vendor: (placeholder) PTZ command or preset
+      type: string
+      description: the PTZ movement, preset recall or lock action an operator performed on a camera
+      ecs: null
+      status: unmapped
+      custom: vms.ptz.command
+      notes: >
+        PLACEHOLDER - no published column on either vendor. PTZ control is the
+        action that lets an operator point a camera away from an area before a
+        physical event, so it deserves its own field rather than living inside
+        message; capture the real grammar from a sample before this map leaves
+        draft
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Do the Message text dissection on the edge worker group, because on
+          the Milestone side it is the only place the action verb, the camera
+          names and the exported filename exist at all — regex them out into
+          event.action, vms.entity.name and vms.export.file_name next to the
+          VMS rather than shipping an unparsed sentence, and normalize
+          Genetec's Activity name strings into the same verb vocabulary so one
+          detection covers both vendors. Convert Local time out of the log
+          server's local timezone to UTC and split User location on its
+          documented IP-or- hostname ambiguity before anything downstream
+          trusts source.ip. Stand up the collection as an OTLP source pointed
+          at the XProtect 2026 R1 API Gateway where the site is on that
+          release, and keep the polling collector only as the pre-2026 R1 and
+          Genetec path; because that poll has no acknowledgement and the SDK's
+          read throughput degrades over long time spans, drive it with
+          adaptive short windows and a persisted watermark and de-duplicate on
+          the (Local time, User, Message text) triple across window overlaps.
+          Run the destination on Persistent Queue backpressure with
+          C.Schema(...).validate plus a dead-letter route ahead of it, and
+          select Genetec records on the SDK column constants rather than the
+          localized UI labels so a language pack cannot silently empty the
+          feed.
+        elastic: >
+          Own a custom logs-vms.operator_audit ingest pipeline — there is no
+          stock integration to override — and keep its work to what the low
+          side cannot finish: asserting event.action is populated whichever
+          vendor shape arrived, and deriving event.outcome so that Milestone's
+          Permission column (an authorization decision on a remote action) is
+          never confused with a logon result. Declare explicit
+          custom-namespace index-template mappings for vms.entity.name,
+          vms.entity.type, vms.log.category, vms.log.source_type,
+          vms.client.application and vms.export.file_name as keyword, since
+          the export-hunting queries all pivot on entity name plus filename.
+          Where the site is on XProtect 2026 R1, the OTLP feed arrives already
+          structured, so the pipeline's Milestone branch should degrade to
+          validation rather than re-running the Message text regex. Document
+          at the detection layer that on Milestone this feed answers neither
+          failed logon nor logoff, so those correlations must join to
+          Windows/AD rather than silently returning empty.
+        relay: >
+          Full ECS-shaped NDJSON crosses (envelope mode B) — one audit record
+          per line, UTF-8, LF-terminated, compression disabled, nesting depth
+          at most two — because the Message text extraction and the
+          camera-name enrichment have to happen next to the VMS and a thin
+          envelope would strand both. The content-filter friction to settle
+          with the guard owner is Message text and Description: unbounded
+          operator-facing free text carrying site-authored camera names,
+          export paths and frequently non-ASCII location strings, which should
+          be length-capped and allow-listed low-side rather than assuming the
+          custom NDJSON filter can inspect them. Nothing CEF-shaped crosses on
+          this route because the vendors emit no syslog to convert; treat the
+          crossing as at-most-once and reconcile low-side and high-side counts
+          per (dataset, hour), and carry _raw across the guard here — export
+          records are the forensic payload of this map and are the last place
+          to drop it.
+      direct:
+        parse_location: low
+        cribl: >
+          Do the Message text dissection on the edge worker group, because on
+          the Milestone side it is the only place the action verb, the camera
+          names and the exported filename exist at all — regex them out into
+          event.action, vms.entity.name and vms.export.file_name next to the
+          VMS rather than shipping an unparsed sentence, and normalize
+          Genetec's Activity name strings into the same verb vocabulary so one
+          detection covers both vendors. Convert Local time out of the log
+          server's local timezone to UTC and split User location on its
+          documented IP-or- hostname ambiguity before anything downstream
+          trusts source.ip. Stand up the collection as an OTLP source pointed
+          at the XProtect 2026 R1 API Gateway where the site is on that
+          release, and keep the polling collector only as the pre-2026 R1 and
+          Genetec path; because that poll has no acknowledgement and the SDK's
+          read throughput degrades over long time spans, drive it with
+          adaptive short windows and a persisted watermark and de-duplicate on
+          the (Local time, User, Message text) triple across window overlaps.
+          Run the destination on Persistent Queue backpressure with
+          C.Schema(...).validate plus a dead-letter route ahead of it, and
+          select Genetec records on the SDK column constants rather than the
+          localized UI labels so a language pack cannot silently empty the
+          feed.
+        elastic: >
+          Own a custom logs-vms.operator_audit ingest pipeline — there is no
+          stock integration to override — and keep its work to what the low
+          side cannot finish: asserting event.action is populated whichever
+          vendor shape arrived, and deriving event.outcome so that Milestone's
+          Permission column (an authorization decision on a remote action) is
+          never confused with a logon result. Declare explicit
+          custom-namespace index-template mappings for vms.entity.name,
+          vms.entity.type, vms.log.category, vms.log.source_type,
+          vms.client.application and vms.export.file_name as keyword, since
+          the export-hunting queries all pivot on entity name plus filename.
+          Where the site is on XProtect 2026 R1, the OTLP feed arrives already
+          structured, so the pipeline's Milestone branch should degrade to
+          validation rather than re-running the Message text regex. Document
+          at the detection layer that on Milestone this feed answers neither
+          failed logon nor logoff, so those correlations must join to
+          Windows/AD rather than silently returning empty.
+  - format: otlp
+    enable: >
+      On XProtect 2026 R1 the API Gateway ships an OpenTelemetry-based logging
+      system that supersedes the legacy Log Server for the audit log;
+      Milestone documents it in the "OpenTelemetry integration in XProtect for
+      audit logging" white paper. Point a receiver at the gateway's OTLP
+      endpoints - gRPC on 4317 and HTTP/protobuf on 4318 by OpenTelemetry
+      convention - or read the bundled VictoriaLogs backend on 9428
+      (/insert/opentelemetry/v1/logs). Enablement is a version upgrade rather
+      than a menu toggle: the audit log begins emitting OTLP once the site is
+      on 2026 R1, and Milestone runs a documented transition phase in which
+      components that have not yet been upgraded keep logging to the old Log
+      Server and an Open Collector service migrates historical logs. Because
+      this is a push transport it needs no return path into the VMS and can be
+      terminated by a low-side collector and forwarded one-way. The white
+      paper covers the AUDIT log specifically; do not assume the System and
+      Rule-triggered logs have moved to OTLP on the same release without
+      confirming against the deployed site.
+    references:
+    - >-
+      https://doc.milestonesys.com/sv-SE/bundle/White_paper_OpenTelemetry_audit_logs/resource/White_paper_OpenTelemetry_audit_logs.pdf
+    - >-
+      https://forum.milestonesys.com/t/audit-logging-on-xprotect-2026-r1-with-standalone-integration/14370
+    - https://opentelemetry.io/docs/specs/otel/logs/data-model/
+    - https://docs.victoriametrics.com/victorialogs/data-ingestion/opentelemetry/
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom VMS operator-audit pipeline (Cribl OTLP source)
+      notes: >
+        No stock parser exists for the XProtect OTLP audit stream - there is
+        no Elastic OTLP-logs integration, Splunk TA or QRadar DSM for it - so
+        the same hand-built operator-audit pipeline owns this transport, fed
+        by a Cribl OTLP source instead of the polling collector. The OTLP
+        LogRecord envelope (Timestamp, ObservedTimestamp, SeverityNumber,
+        SeverityText, Body, Resource, Attributes) parses deterministically
+        from the OpenTelemetry data model and is the transport-guaranteed,
+        sourced subset in the field table below. The XProtect-SPECIFIC content
+        - whether the User, camera name, action verb and export filename
+        arrive as structured OTLP Attributes or remain buried in the Body
+        string exactly as on the Log Server Message text column - is NOT
+        published in the white paper and must be captured from a live 2026 R1
+        audit sample before those attributes can be mapped. Until then the
+        pipeline's Milestone branch must keep the Body regex the api-pull
+        Message text needs rather than assuming structured attributes arrived.
+        During the transition phase both the OTLP feed and a residual
+        LogClient poll can carry the same event, so de-duplicate on
+        (Timestamp, User, Body) across the two paths.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Terminate the API Gateway OTLP export on a Cribl OTLP source (4317
+          gRPC / 4318 HTTP) on the edge worker group in the physical-security
+          enclave, or read the VictoriaLogs backend where the site runs it,
+          and do the audit-content dissection low-side next to the VMS. Map
+          the OTLP Timestamp straight to @timestamp - it is epoch-nanos UTC,
+          so this transport does NOT carry the Log Server's local-time trap
+          and needs no timezone conversion - and normalize SeverityNumber off
+          the OpenTelemetry 1-24 scale rather than indexing it raw. Until a
+          live 2026 R1 sample proves the User, camera name, action verb and
+          exported filename arrive as structured OTLP Attributes, keep the
+          same Body regex the Message text dissection runs and emit
+          event.action, vms.entity.name and vms.export.file_name from it so
+          one detection covers the OTLP and the api-pull shapes. Run the
+          destination on Persistent Queue backpressure with C.Schema(...).
+          validate and a dead-letter route, and during the transition phase
+          de-duplicate against any residual LogClient poll on the (Timestamp,
+          User, Body) triple so an event that crosses on both transports is
+          not double-counted.
+        elastic: >
+          Own the same custom logs-vms.operator_audit ingest pipeline the
+          api-pull path already needs - there is no stock integration to
+          override for the XProtect OTLP audit stream - and keep its work to
+          what the low side cannot finish: asserting event.action is populated
+          whichever transport arrived, and deriving event.outcome without
+          confusing a Permission/authorization decision with a logon result.
+          Where the low side proves the OTLP Attributes carry the structured
+          User/camera/action, the Milestone branch degrades to validation
+          rather than re-running the Body regex. Declare the same
+          custom-namespace index-template mappings (vms.entity.name,
+          vms.entity.type, vms.log.category, vms.client.application,
+          vms.export.file_name as keyword) so an OTLP 2026 R1 site and a
+          polled pre-2026 R1 site share one index shape, and map the OTLP
+          SeverityText onto the ECS level vocabulary rather than indexing the
+          raw label.
+        relay: >
+          Full ECS-shaped NDJSON crosses (envelope mode B) - one audit record
+          per line, UTF-8, LF-terminated, compression disabled, nesting depth
+          at most two - because the Body extraction and camera-name enrichment
+          have to happen next to the VMS and a thin envelope would strand
+          both. The content-filter friction to settle with the guard owner is
+          the OTLP Body: unbounded operator-facing free text carrying
+          site-authored camera names, export paths and frequently non-ASCII
+          location strings, which should be length-capped and allow-listed
+          low-side rather than assuming the custom NDJSON filter can inspect
+          it. Treat the crossing as at-most-once, reconcile low-side and
+          high-side counts per (dataset, hour), and carry _raw across the
+          guard - export records are the forensic payload of this map and are
+          the last place to drop it.
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side XProtect 2026 R1 with no guard, point the API
+          Gateway OTLP export straight at a Cribl OTLP source on the core
+          worker group and parse there; there is still no stock Elastic
+          OTLP-logs integration for the XProtect audit stream, so do not let
+          it land in a generic logs-otel.* stream divorced from the
+          api-pull-shaped records. Pick ONE authoritative audit transport per
+          site - do not run the OTLP feed and a LogClient poll against the
+          same server in parallel except briefly during the documented
+          transition, and if both run, de-duplicate on (Timestamp, User,
+          Body). Retain the full Body for forensics rather than capping it,
+          since there is no boundary to protect.
+        elastic: >
+          The custom logs-vms.operator_audit pipeline owns this feed; on the
+          direct path its work shrinks to the XProtect-specific attribute
+          extraction (once the live sample proves the schema), the
+          SeverityText-to-level normalization and the event.outcome
+          derivation. Declare the vms.entity.name, vms.entity.type,
+          vms.log.category, vms.client.application and vms.export.file_name
+          keyword mappings so an OTLP 2026 R1 site and a polled pre-2026 R1
+          site share one index shape, and document at the detection layer that
+          on Milestone this feed answers neither failed logon nor logoff, so
+          those correlations still join to Windows/AD.
+    fields:
+    - vendor: Timestamp (OTLP LogRecord)
+      type: timestamp
+      description: >-
+        OpenTelemetry LogRecord Timestamp - time the audit event occurred,
+        measured by the origin clock, as epoch nanoseconds in UTC.
+      ecs: '@timestamp'
+      status: mapped
+      notes: >
+        maps straight to @timestamp; because OTLP timestamps are UTC
+        epoch-nanos this transport does NOT carry the Log Server audit log's
+        documented local-time trap, so no timezone conversion is needed here
+    - vendor: ObservedTimestamp (OTLP LogRecord)
+      type: timestamp
+      description: >-
+        OpenTelemetry LogRecord ObservedTimestamp - time the event was
+        observed by the collection system.
+      ecs: event.created
+      status: mapped
+      notes: >-
+        the ingestion-observed time, kept distinct from the origin Timestamp
+        so collection lag is visible
+    - vendor: SeverityText (OTLP LogRecord)
+      type: string
+      description: OpenTelemetry LogRecord SeverityText - the source log level as a string.
+      ecs: log.level
+      status: partial
+      transform: >-
+        normalize the OpenTelemetry severity text onto the ECS level
+        vocabulary rather than indexing the raw label
+    - vendor: SeverityNumber (OTLP LogRecord)
+      type: integer
+      description: >-
+        OpenTelemetry LogRecord SeverityNumber - numerical severity normalized
+        to the OpenTelemetry 1-24 scale.
+      ecs: event.severity
+      status: partial
+      transform: >
+        the OpenTelemetry 1-24 severity range is not ECS's numeric long scale,
+        so it needs a lookup rather than a straight copy, and it reflects log
+        severity of the audit record, not an access or authorization outcome
+    - vendor: Body (OTLP LogRecord)
+      type: string
+      description: >-
+        OpenTelemetry LogRecord Body - the audit event content, carried as a
+        string or structured value.
+      ecs: message
+      status: mapped
+      notes: >
+        on the audit log this is the OTLP re-encoding of the human-readable
+        audit event; until a live 2026 R1 sample proves the User, camera name,
+        action verb and exported filename arrive as structured OTLP
+        Attributes, everything the CSOC alerts on still has to be regexed out
+        of Body exactly as on the Log Server Message text column
+    - vendor: Resource attributes (OTLP LogRecord)
+      type: string
+      description: >-
+        OpenTelemetry LogRecord Resource - describes the source of the log
+        (e.g. the service.name / component identity of the emitting VMS
+        server).
+      ecs: observer.name
+      status: partial
+      notes: >
+        the standard OTLP Resource carries the emitting component identity;
+        resolve it to the recording/log server so the observer/target split is
+        decided the same way it is on the api-pull Source name column
+    - vendor: Attributes (OTLP LogRecord)
+      type: string
+      description: >-
+        OpenTelemetry LogRecord Attributes - event-specific key/value pairs
+        describing the particular occurrence.
+      ecs: null
+      status: unmapped
+      custom: vms.otlp.attributes
+      notes: >
+        PLACEHOLDER-grade until a live 2026 R1 audit sample is captured - this
+        is where XProtect WOULD carry the structured User, camera name, action
+        verb and exported filename that the api-pull surfaces as discrete
+        columns, but the attribute-key inventory is not published in the white
+        paper, so it cannot be mapped to user.name / vms.entity.name /
+        event.action / vms.export.file_name until the real keys are read off
+        the wire
+  - format: jdbc-sql
+    enable: >
+      Install the GenetecTM Data Exporter plugin 1.0.0 in Security Center
+      (Plugins task) and configure a PostgreSQL target per the plugin guide's
+      PostgreSQL system requirements and database setup pages; the plugin then
+      exports Security Center data into named PostgreSQL views, among them a
+      "Detailed view of the system's audit events" (the audit-trail /
+      config-change events), plus access-control events and denied events,
+      alarm activities with acknowledge/investigation times, and entity views
+      for cardholders, users, cameras and devices. A Cribl database (JDBC)
+      collector in the physical-security enclave then reads the audit-events
+      view on a schedule. This path covers the always-on Audit trails
+      (configuration-change) subset ONLY - the plugin exposes no
+      activity-trails view, so the export/view/PTZ operator substance that is
+      the point of this dataset is absent and must still come from the SDK
+      api-pull. Run this alongside, not instead of, the ActivityTrailsQuery
+      collector.
+    references:
+    - >-
+      https://techdocs.genetec.com/r/en-US/GenetecTM-Data-Exporter-Plugin-Guide-1.0.0/How-the-Data-Exporter-plugin-works-with-Security-Center
+    - >-
+      https://techdocs.genetec.com/r/en-US/GenetecTM-Data-Exporter-Plugin-Guide-1.0.0/Supported-PostgreSQL-database-reports
+    - >-
+      https://techdocs.genetec.com/r/en-US/GenetecTM-Data-Exporter-Plugin-Guide-1.0.0/Setting-up-a-PostgreSQL-database
+    - >-
+      https://techdocs.genetec.com/r/en-US/Security-Center-Administrator-Guide-5.12/Report-pane-columns-for-the-Audit-trails-task
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom VMS operator-audit pipeline (Cribl database collector)
+      notes: >
+        A Cribl database collector reads the Data Exporter audit-events view;
+        because the SQL poll carries no acknowledgement, drive it with a
+        persisted watermark on the audit event's modification time and
+        adaptive windows, and de-duplicate across window overlaps. The view
+        carries the same audit-trail attributes the api-pull already documents
+        (Entity, Entity type, Description, Initiator, Initiator type,
+        Initiator machine, Initiator application, Initiator application
+        version, Modification time) - the plugin guide does NOT publish the
+        PostgreSQL column names, so the view schema must be read off the live
+        database and its config-change grammar in Description parsed with the
+        documented sentence forms ("Entity created: <name>.", "The <Property>
+        value changed from <Old> to <New>."). Field table is left empty
+        deliberately: the format is real and the underlying attribute
+        inventory is the audit-trail set the api-pull covers, but no
+        per-column PostgreSQL name is published to source.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Stand up a Cribl database collector against the Data Exporter
+          PostgreSQL audit-events view in the physical-security enclave with
+          the VMS, driven by a persisted watermark on the modification-time
+          column so the ack-less poll does not re-read or skip. Parse the
+          config-change type out of the Description sentence grammar low-side
+          exactly as the SDK path does, and coalesce the modification time
+          onto @timestamp so config changes and operator actions share one
+          timeline. This branch carries the CONFIGURATION half only, so run it
+          alongside the ActivityTrailsQuery SDK collector rather than treating
+          it as the whole feed, and key de-duplication across the two on
+          (modification time, Initiator, Description) so a change seen on both
+          paths lands once. Apply the same schema validation, dead-letter
+          route and Persistent Queue backpressure as the SDK branch.
+        elastic: >
+          Land this branch in the same custom logs-vms.operator_audit ingest
+          pipeline, and finish what the low side could not: recover
+          event.action, the changed property and its old/new values from the
+          parsed Description, and declare the vms.entity.name /
+          vms.entity.type keyword mappings the config-change records populate.
+          Document that this transport answers configuration changes only - so
+          export/view/PTZ detections must not be built against it or they
+          silently return empty - and keep the index shape identical to the
+          SDK branch so a Genetec site reading config changes from PostgreSQL
+          and operator substance from the SDK indexes into one stream.
+        relay: >
+          Cross full ECS-shaped NDJSON (envelope mode B), one config-change
+          record per line, with the identical outer envelope keys and bounded
+          key set the SDK api-pull branch crosses, so the guard's custom
+          content filter sees one shape for the whole technology. The
+          content-filter friction is the Description free text, which carries
+          site-authored entity names and property values - length-cap and
+          allow-list it low-side. With no return channel across the guard,
+          reconcile low-side and high-side counts per (dataset, hour) to
+          detect silent drops.
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side Genetec with no guard, point the Cribl database
+          collector straight at the Data Exporter PostgreSQL view on the core
+          worker group and parse the Description grammar there. Pick one
+          authoritative config-change transport per site - the PostgreSQL view
+          or the SDK AuditTrailsQuery, not both against the same window except
+          briefly during cutover - and remember this path still cannot supply
+          the activity-trails export/view/PTZ substance, which must come from
+          the SDK regardless.
+        elastic: >
+          Keep the custom logs-vms.operator_audit pipeline authoritative; on
+          the direct side its work is the Description-grammar extraction and
+          the modification-time-to-@timestamp coalescing. Retain the full
+          Description text for forensics rather than capping it, and declare
+          the vms.entity.name and vms.entity.type keyword mappings the
+          config-change records populate so the index shape does not fork by
+          transport.
+    fields_omitted: >
+      The Data Exporter plugin guide names the audit-events view but does not
+      publish its PostgreSQL column names, so the view schema has to be read
+      off the live database; the attributes it carries are the audit-trail set
+      the api-pull entry inventories (Entity, Entity type, Description,
+      Initiator and its machine/application details, Modification time).
+    fields: []
+- id: camera-system-health
+  name: Camera and recording health events
+  description: |
+    Thin starter - camera offline and communication failure, camera tampering, and recording/archiving failure, drawn from the Milestone System log and Rule-triggered log (collected by the same poll as the audit dataset, LogType System and Rules) and from the Security Center camera and Archiver health events. This is the "is the video evidence actually being recorded" dataset, and it is the necessary companion to the operator feed: a camera that has been offline for a week produces no view or export records at all, which looks identical to a camera nobody watched. It is also the tamper feed — a camera blinded or unplugged immediately before a badge-forced door is the correlation this dataset and pacs-badge exist to make possible.
+    Coverage here is deliberately shallower than the audit dataset and several fields are PLACEHOLDERS. The Milestone System and Rule-triggered log COLUMNS are firmly documented (System: Log level, Local time, Message text, Category, Source type, Source name, Event type; Rule-triggered adds Rule name and Service name), but the Event type VALUE vocabulary is not published anywhere — the only documented example is "Communication Error (Hardware)". Genetec's camera and Archiver health event names are enumerated in the Config Tool's own Options > Events list rather than in a published field reference. So the health conditions themselves are modelled as flagged placeholders and must be replaced from a live sample of each deployed product before this dataset leaves draft.
+  event_categories:
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge Cribl worker group, physical-security enclave
+      notes: >
+        Same scheduled collector as the operator-audit dataset — one poll of
+        the log server, split into two datasets by log type in the pipeline.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-vms.camera_health
+    direct:
+    - hop: cribl
+      location: edge Cribl worker group, physical-security enclave
+      notes: >
+        Same scheduled collector as the operator-audit dataset — one poll of
+        the log server, split into two datasets by log type in the pipeline.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-vms.camera_health
+  formats:
+  - format: api-pull
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom VMS health pipeline
+      notes: >
+        Shares the operator-audit collector and its watermark; the branch
+        differs in reading the System and Rules log types instead of Audit,
+        and in having no outcome column to lean on at all.
+    fields:
+    - vendor: Log level
+      type: enum
+      description: severity level the log server recorded the system incident at
+      ecs: log.level
+      status: partial
+      notes: >
+        present on the System log only, not on the Audit or Rule-triggered
+        logs; the value set is not published, so it needs a lookup onto ECS's
+        level vocabulary rather than being indexed raw
+    - vendor: Local time
+      type: timestamp
+      description: 'time of the logged incident, in the local time of the system''s server'
+      ecs: '@timestamp'
+      status: partial
+      transform: >-
+        same local-to-UTC conversion as the audit dataset; a camera-offline
+        event on the wrong offset will not window against the badge feed
+    - vendor: Message text
+      type: string
+      description: description of the logged incident
+      ecs: message
+      status: mapped
+      notes: >
+        Milestone's own documentation mis-describes this column on the System
+        log table as "the identification number for the logged incident" —
+        that is a copy/paste error, the Audit and Rule-triggered tables
+        correctly describe it as a description; do not model it as numeric
+    - vendor: Event type
+      type: string
+      description: the type of system event that occurred, e.g. "Communication Error (Hardware)"
+      ecs: event.action
+      status: partial
+      notes: >
+        the closest thing to a structured verb on this dataset, but no
+        enumeration of valid values is published — "Communication Error
+        (Hardware)" is the only documented example, so a per-deployment lookup
+        has to be built by sampling before this can drive detections
+    - vendor: Category
+      type: string
+      description: category the logged incident belongs to
+      ecs: null
+      status: unmapped
+      custom: vms.log.category
+    - vendor: Source type
+      type: enum
+      description: >-
+        the type of equipment on which the logged incident occurred, for
+        example server or device
+      ecs: null
+      status: partial
+      custom: vms.log.source_type
+      notes: >-
+        on this dataset it is what separates a recording-server failure from a
+        camera failure, so it drives the split more than it does on the audit
+        dataset
+    - vendor: Source name
+      type: string
+      description: name of the recording server, service or camera the incident occurred on
+      ecs: observer.name
+      status: partial
+      notes: >
+        must resolve to the same camera naming used for vms.entity.name on the
+        audit dataset, or a camera's tamper events and its export events
+        cannot be joined
+    - vendor: Rule name
+      type: string
+      description: name of the rule that was triggered, on the Rule-triggered log
+      ecs: rule.name
+      status: mapped
+      notes: >
+        present on the Rule-triggered log only; recording rules are what
+        actually start and stop archiving, so a rule that stopped firing is a
+        recording failure that no camera-status field reports
+    - vendor: Service name
+      type: string
+      description: name of the service that handled the rule-triggered incident
+      ecs: service.name
+      status: mapped
+      notes: present on the Rule-triggered log only
+    - vendor: (placeholder) camera state
+      type: enum
+      description: >-
+        the camera's connection/signal state at the time of the event -
+        online, offline, no signal
+      ecs: null
+      status: unmapped
+      custom: vms.camera.state
+      notes: >
+        PLACEHOLDER - neither vendor publishes a discrete state column on the
+        log record; Milestone surfaces it as an Event type value and Genetec
+        as a camera event name. Replace with the real token once samples are
+        captured from each deployed product
+    - vendor: (placeholder) tampering indicator
+      type: boolean
+      description: whether the event reports camera tampering (obstruction, defocus, reorientation)
+      ecs: null
+      status: unmapped
+      custom: vms.camera.tampering
+      notes: >
+        PLACEHOLDER - no published field name. This is the field the
+        physical-correlation detections key on, so it is modelled now and
+        parked visibly under vms.camera.* rather than left implicit in message
+    - vendor: (placeholder) recording failure reason
+      type: string
+      description: >-
+        why archiving or recording stopped - disk full, archiver disconnected,
+        storage write failure
+      ecs: error.message
+      status: partial
+      notes: >
+        PLACEHOLDER - carried inside Message text on Milestone and inside the
+        Genetec Archiver event description; extraction is unwritten. A
+        recording failure is the condition that makes every other dataset in
+        this map retrospectively worthless, so it is the first placeholder to
+        resolve
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Split this branch off the shared collector by log type on the edge
+          worker group and build the Event type to condition lookup here,
+          since the vocabulary is site-specific and unpublished and the table
+          will be maintained next to the VMS rather than in an ingest
+          pipeline. Emit on transition rather than on every poll so a
+          permanently dead camera does not generate a constant stream, and
+          keep a low-side per-camera last-seen state so a camera that simply
+          stops appearing still produces an offline event — an absent record
+          is the failure mode this dataset exists to catch and it is invisible
+          downstream. Apply the same UTC conversion of Local time and the same
+          schema validation, dead-letter route and Persistent Queue
+          backpressure as the audit branch.
+        elastic: >
+          Add a custom logs-vms.camera_health ingest pipeline that sets
+          event.outcome from the derived condition, because no vendor column
+          carries an outcome on this dataset and the configuration profile
+          requires one — without it every tamper and recording-failure event
+          lands unknown. Map log.level onto ECS's level vocabulary rather than
+          indexing the raw Milestone label, and declare custom-namespace
+          index-template mappings for vms.log.category and vms.log.source_type
+          as keyword, vms.camera.state as keyword and vms.camera.tampering as
+          boolean, so the tamper detection survives dynamic mapping. Build the
+          alerting off camera-offline duration and off tamper events windowed
+          against the pacs-badge door alarms, not off single raw records.
+        relay: >
+          Small, fully structured records with the same outer envelope keys
+          and bounded key set as the audit branch, so the guard's custom
+          NDJSON filter has one shape to inspect rather than two. This dataset
+          is the natural reconciliation heartbeat for the crossing — because
+          the guard gives no acknowledgement, emit a low-side per-(dataset,
+          hour) count alongside the health events and compare it against the
+          high-side count to detect silent drops on the operator-audit branch.
+          It is also where _raw is dropped first: these events are high-volume
+          and low forensic value next to an export record.
+      direct:
+        parse_location: low
+        cribl: >
+          Split this branch off the shared collector by log type on the edge
+          worker group and build the Event type to condition lookup here,
+          since the vocabulary is site-specific and unpublished and the table
+          will be maintained next to the VMS rather than in an ingest
+          pipeline. Emit on transition rather than on every poll so a
+          permanently dead camera does not generate a constant stream, and
+          keep a per-camera last-seen state so a camera that simply stops
+          appearing still produces an offline event — an absent record is the
+          failure mode this dataset exists to catch and it is invisible
+          downstream. Apply the same UTC conversion of Local time and the same
+          schema validation, dead-letter route and Persistent Queue
+          backpressure as the audit branch.
+        elastic: >
+          Add a custom logs-vms.camera_health ingest pipeline that sets
+          event.outcome from the derived condition, because no vendor column
+          carries an outcome on this dataset and the configuration profile
+          requires one — without it every tamper and recording-failure event
+          lands unknown. Map log.level onto ECS's level vocabulary rather than
+          indexing the raw Milestone label, and declare custom-namespace
+          index-template mappings for vms.log.category and vms.log.source_type
+          as keyword, vms.camera.state as keyword and vms.camera.tampering as
+          boolean, so the tamper detection survives dynamic mapping. Build the
+          alerting off camera-offline duration and off tamper events windowed
+          against the pacs-badge door alarms, not off single raw records.

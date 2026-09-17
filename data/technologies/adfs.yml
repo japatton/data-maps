@@ -1,0 +1,1302 @@
+id: adfs
+name: Active Directory Federation Services
+vendor: Microsoft
+versions: AD FS 2016 (Windows Server 2016), AD FS 2019, AD FS 2022
+draft: true
+references:
+- >-
+  https://learn.microsoft.com/en-us/windows-server/identity/ad-fs/technical-reference/auditing-enhancements-to-ad-fs-in-windows-server
+- >-
+  https://learn.microsoft.com/en-us/windows-server/identity/ad-fs/troubleshooting/ad-fs-tshoot-logging
+- >-
+  https://learn.microsoft.com/en-us/windows-server/identity/ad-fs/operations/configure-ad-fs-extranet-smart-lockout-protection
+- >-
+  https://learn.microsoft.com/en-us/troubleshoot/entra/entra-id/mfa/account-lockout-adfs-window-server
+- >-
+  https://techcommunity.microsoft.com/blog/coreinfrastructureandsecurityblog/tracking-the-source-of-adfs-account-lockouts/1399297
+- https://github.com/RandomRhythm/ADFS_Analysis
+- https://groups.google.com/g/wazuh/c/ufbnslD9y8g
+- >-
+  https://s4erka.wordpress.com/2018/11/02/ad-fs-2016-extranet-smart-lockout-eventids-1203-and-1210-clarification/
+- https://sanjars.com/adfs-3-0-security-audit-log-event-ids/
+- https://github.com/elastic/beats/issues/27288
+- https://www.elastic.co/docs/reference/integrations/windows
+- https://github.com/criblpacks/cribl-windows-events
+datasets:
+- id: security-audit
+  name: AD FS security audit - token issuance and credential validation
+  description: >
+    The AD FS 2016+ streamlined audit events written to the Windows Security
+    channel by the "AD FS Auditing" provider: 1200/1201 application token
+    success/failure, 1202/1203 fresh credential validation success/failure,
+    1204/1205 password change, 1206/1207 sign out, and 1210 extranet smart
+    lockout. This is the federation tier's own record of who authenticated and
+    which relying party a token was issued to - it is the SAML/OAuth-side view
+    that the `active-directory` map's Kerberos and NTLM datasets do not
+    contain, and 1203 with its IpAddress list is the primary extranet
+    password-spray signal in the estate. The events do not exist unless
+    auditing is turned on twice: the AD FS service account needs the "Generate
+    security audits" right and the "Application Generated" subcategory must be
+    enabled with auditpol, and Success/Failure audits must be ticked in the
+    Federation Service properties. Audit level Basic (the default) yields five
+    or fewer events per request; Verbose adds the legacy detail events covered
+    by the audit-detail dataset below.
+  event_categories:
+  - authentication
+  - iam
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Elastic Agent on each AD FS farm node reads the Security channel and
+        ships to Cribl. AD FS nodes are commonly placed in a DMZ or a separate
+        enclave from the Elastic stack precisely because they are
+        internet-facing through the Web Application Proxy.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-system.security
+    direct:
+    - hop: cribl
+      location: edge worker group
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-system.security
+  formats:
+  - format: windows-event
+    parsing:
+      mechanism: cribl-pack
+      artifact: Microsoft Windows Events pack (criblpacks/cribl-windows-events), extended
+      notes: >
+        There is no Elastic AD FS integration and no AD FS data stream; the
+        System integration will transport these events because they sit on the
+        Security channel, but it has no handling for the AD FS Auditing
+        provider, so nothing below the winlog envelope is parsed. The Cribl
+        Windows Events pack normalizes the envelope and can shape it to JSON,
+        but it is provider-agnostic and likewise does not touch the AD FS
+        payload - the explode step is a custom pipeline stage added to the
+        pack. Two structural problems drive that: (1) the EventData elements
+        are unnamed positional <Data> values rendered by the message template
+        "Activity ID: %1 XML: %2", so a winlog reader surfaces them as
+        param1/param2 rather than as named fields; (2) param2 is an entire
+        XML-escaped AuditBase document (AuditType, AuditResult, FailureType,
+        ErrorCode and nested Resource/AuthN/Protocol/Request audit components)
+        that must be unescaped and parsed before any field named below exists.
+        The field list below is the detection-relevant subset of that
+        document; ClaimsProvider, ProxyServer, MfaMethod, OAuthClientId,
+        OAuthGrant, DeviceAuth, TokenBindingProvidedId/ReferredId and
+        SsoBindingValidationLevel are also present and should be carried into
+        the adfs.audit.* namespace unmapped. Note also that AD FS reuses
+        Security-channel event ids owned by other publishers, so every rule
+        and pipeline condition must qualify on winlog.provider_name = "AD FS
+        Auditing" as well as the event id.
+    fields:
+    - vendor: EventID
+      type: integer
+      description: >-
+        numeric identifier of the AD FS audit event (1200, 1201, 1202, 1203,
+        1204, 1205, 1206, 1207, 1210)
+      ecs: event.code
+      status: mapped
+    - vendor: ProviderName
+      type: string
+      description: >-
+        publisher that wrote the Security-channel record, "AD FS Auditing" for
+        these events
+      ecs: event.provider
+      status: mapped
+      notes: >
+        load-bearing rather than cosmetic - AD FS reuses Security-channel
+        event ids owned by other publishers (1102 is the documented collision,
+        and 500/501/512 collide as well), so any detection that keys on event
+        id alone will misfire unless it also pins the provider
+    - vendor: Computer
+      type: string
+      description: hostname of the AD FS farm node that recorded the event
+      ecs: host.name
+      status: mapped
+    - vendor: XML
+      type: string
+      description: >-
+        the entire serialized AuditBase document, delivered XML-escaped inside
+        the second unnamed Data element
+      ecs: null
+      status: partial
+      custom: adfs.audit.audit_xml
+      transform: >
+        every field below this one is an element inside this blob and does not
+        exist as a field until it is unescaped and parsed; a reader that only
+        handles named EventData elements sees param1 (Activity ID) and param2
+        (this document) and nothing else
+    - vendor: AuditType
+      type: enum
+      description: >-
+        class of audited transaction - AppToken, FreshCredentials,
+        PasswordChange, SignOut
+      ecs: event.action
+      status: partial
+      transform: >-
+        needs a lookup to a stable action label; the same AuditType covers
+        both the success and failure event id of a pair, so it must be
+        combined with AuditResult rather than used alone
+    - vendor: AuditResult
+      type: enum
+      description: >-
+        outcome of the audited transaction as recorded in the payload -
+        Success or Failure
+      ecs: event.outcome
+      status: partial
+      notes: >
+        agrees with the Keywords audit-success/audit-failure bit but is the
+        value that survives once the payload is exploded and the winlog
+        envelope is dropped; reconcile the two during pipeline development
+        rather than mapping both to event.outcome in production
+    - vendor: FailureType
+      type: enum
+      description: category of failure on a failed transaction, "None" on success
+      ecs: event.reason
+      status: partial
+      transform: >-
+        enum label, not prose; the "None" value on successful events must be
+        dropped rather than written to event.reason
+    - vendor: ErrorCode
+      type: string
+      description: AD FS error identifier for the failure, frequently an MSIS code
+      ecs: error.code
+      status: partial
+      transform: >-
+        rendered as the literal string "N/A" when there is no error; that
+        sentinel has to become null or every success record pollutes
+        error.code aggregations
+    - vendor: RelyingParty
+      type: string
+      description: >-
+        identifier of the relying party trust the token was requested for,
+        e.g. urn:federation:MicrosoftOnline
+      ecs: service.target.name
+      status: partial
+      notes: >
+        the single most valuable field for federation detection - Golden SAML
+        and unexpected-application hunts key on it - but it is a URI or GUID
+        trust identifier, not a friendly application name, so it needs an
+        owner/application lookup to be usable by analysts
+    - vendor: UserId
+      type: string
+      description: identity the transaction was performed for, as carried in the request
+      ecs: user.name
+      status: partial
+      transform: >
+        rendered as DOMAIN\user, as a UPN, or as a claim URI depending on the
+        protocol and endpoint; the form must be normalized before it joins the
+        bare account names used by the active-directory map
+    - vendor: PrimaryAuth
+      type: string
+      description: >-
+        primary authentication method URI, e.g.
+        urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport
+      ecs: null
+      status: unmapped
+      custom: adfs.audit.primary_auth_method
+      notes: >-
+        ECS has no authentication-method field; a certificate/PKINIT class URI
+        here is the CAC/PIV signal and a password class on an account that
+        should be smartcard-only is directly alertable
+    - vendor: MfaPerformed
+      type: boolean
+      description: whether multi-factor authentication was performed for this request
+      ecs: null
+      status: unmapped
+      custom: adfs.audit.mfa_performed
+    - vendor: DeviceId
+      type: string
+      description: GUID of the registered (workplace-joined) device presenting a device certificate
+      ecs: device.id
+      status: mapped
+      notes: >-
+        empty on unregistered clients, which is the normal case for extranet
+        password authentication
+    - vendor: AuthProtocol
+      type: enum
+      description: federation protocol the request used - WSFederation, SAMLP, OAuth, WSTrust
+      ecs: null
+      status: unmapped
+      custom: adfs.audit.auth_protocol
+      notes: >
+        deliberately not mapped to network.protocol, which models the
+        application-layer wire protocol (https) rather than the federation
+        grammar carried over it; WSTrust volume here is the legacy-auth
+        indicator that password-spray campaigns exploit
+    - vendor: NetworkLocation
+      type: enum
+      description: whether AD FS classified the request as Intranet, Extranet or Unknown
+      ecs: null
+      status: unmapped
+      custom: adfs.audit.network_location
+      notes: >-
+        the field that makes extranet-only detections possible; Extranet Smart
+        Lockout only applies to requests arriving through the Web Application
+        Proxy, so an intranet-classified spray is invisible to lockout
+        counters
+    - vendor: IpAddress
+      type: string
+      description: the client addresses AD FS observed for the request
+      ecs: source.ip
+      status: partial
+      transform: >
+        not a single address - Microsoft documents this as the list of all
+        presented IPs in the order x-ms-forwarded-client-ip, x-forwarded-for,
+        x-ms-proxy-client-ip, so it must be split, every element written to
+        related.ip, and only the first (claimed originating) element promoted
+        to source.ip; for Exchange Online legacy-auth spraying the Microsoft
+        proxy address appears here alongside the real attacker address, and
+        taking the wrong element attributes the attack to Microsoft
+    - vendor: UserAgentString
+      type: string
+      description: User-Agent header supplied by the client
+      ecs: user_agent.original
+      status: mapped
+    - vendor: Endpoint
+      type: string
+      description: >-
+        AD FS endpoint path the request hit, e.g. /adfs/ls/ or
+        /adfs/services/trust/2005/usernamemixed
+      ecs: url.path
+      status: mapped
+      notes: >-
+        /adfs/services/trust/*/usernamemixed traffic is the legacy WS-Trust
+        endpoint most password-spray tooling targets
+    - vendor: Activity ID
+      type: string
+      description: >-
+        per-request correlation GUID, carried in the first unnamed Data
+        element and repeated on every event AD FS writes for that request
+      ecs: null
+      status: unmapped
+      custom: adfs.audit.activity_id
+      notes: >
+        the join key across the Security channel, the AD FS Admin channel and
+        the proxy nodes for one request. Kept custom rather than mapped to
+        trace.id, which models distributed-tracing context. A value of
+        all-zeros (00000000-0000-0000-0000-000000000000) is documented as the
+        legacy-authentication marker, not a missing value
+    - vendor: Keywords
+      type: string
+      description: HexInt64 keyword bitmask carrying the audit-success/audit-failure flag
+      ecs: event.outcome
+      status: mapped
+      transform: >-
+        audit-success/audit-failure keyword is translated to success/failure;
+        this is the envelope-level outcome and it is lost if the winlog
+        envelope is dropped after the payload explode
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Do the whole explode low-side: filter on provider "AD FS Auditing",
+          unescape param2 and run it through the XML function, then hoist the
+          AuditBase components into flat short-keyed fields, splitting the
+          multi-valued IpAddress list into an ordered array and promoting its
+          first element as the claimed client address. Drop the redundant
+          rendered Message once the payload is parsed - it repeats the XML and
+          roughly doubles event size - and keep _raw only until the explode is
+          proven against live 1200/1203/1210 samples. Add a lookup for
+          RelyingParty identifier to application owner near the source, and
+          validate the exploded object with C.Schema before the destination
+          with a dead-letter route for records whose XML fails to parse, so a
+          schema change in a future AD FS build shows up as dead-letter volume
+          rather than silently empty authentication fields.
+        elastic: >
+          There is no integration to inherit from, so build a dedicated
+          logs-system.security@custom (or a standalone
+          logs-adfs.security-audit) ingest pipeline that qualifies on
+          winlog.provider_name = "AD FS Auditing" before touching any event
+          code, since 1102, 500, 501 and 512 are reused by other
+          Security-channel publishers. Derive event.outcome from the
+          AuditResult element rather than the event id alone, convert
+          ErrorCode's "N/A" sentinel to null so error.code stays aggregatable,
+          map AuditType and FailureType through a lookup into event.action and
+          event.reason, and add explicitly typed index-template mappings for
+          the adfs.audit.* namespace - network_location, auth_protocol,
+          primary_auth_method and activity_id as keyword, mfa_performed as
+          boolean - so the extranet spray aggregations do not depend on
+          dynamic mapping.
+        relay: >
+          Low-side instances cross the guard: parse low and send the flat
+          ECS-shaped JSON, never the escaped AuditBase blob, because a
+          kilobyte XML document nested inside a JSON string value is exactly
+          what a custom NDJSON content filter cannot inspect cheaply. Cap
+          UserAgentString and RelyingParty lengths, normalize the UserId claim
+          to UTF-8, keep nesting at two levels, and treat the crossing as
+          at-most-once with per-(dataset, hour) count reconciliation - AD FS
+          is low-volume next to the Kerberos stream, so guard throughput
+          should not bind here.
+      direct:
+        parse_location: low
+        cribl: >
+          Do the whole explode low-side: filter on provider "AD FS Auditing",
+          unescape param2 and run it through the XML function, then hoist the
+          AuditBase components into flat short-keyed fields, splitting the
+          multi-valued IpAddress list into an ordered array and promoting its
+          first element as the claimed client address. Drop the redundant
+          rendered Message once the payload is parsed - it repeats the XML and
+          roughly doubles event size - and keep _raw only until the explode is
+          proven against live 1200/1203/1210 samples. Add a lookup for
+          RelyingParty identifier to application owner near the source, and
+          validate the exploded object with C.Schema before the destination
+          with a dead-letter route for records whose XML fails to parse, so a
+          schema change in a future AD FS build shows up as dead-letter volume
+          rather than silently empty authentication fields.
+        elastic: >
+          There is no integration to inherit from, so build a dedicated
+          logs-system.security@custom (or a standalone
+          logs-adfs.security-audit) ingest pipeline that qualifies on
+          winlog.provider_name = "AD FS Auditing" before touching any event
+          code, since 1102, 500, 501 and 512 are reused by other
+          Security-channel publishers. Derive event.outcome from the
+          AuditResult element rather than the event id alone, convert
+          ErrorCode's "N/A" sentinel to null so error.code stays aggregatable,
+          map AuditType and FailureType through a lookup into event.action and
+          event.reason, and add explicitly typed index-template mappings for
+          the adfs.audit.* namespace - network_location, auth_protocol,
+          primary_auth_method and activity_id as keyword, mfa_performed as
+          boolean - so the extranet spray aggregations do not depend on
+          dynamic mapping.
+  - format: api-pull
+    enable: >
+      Install the Microsoft Entra Connect Health for AD FS agent on every AD
+      FS farm node and every Web Application Proxy, and ensure AD FS security
+      auditing is already on (the same "Generate security audits" right plus
+      Success/Failure auditing in the Federation Service properties that the
+      windows-event feed depends on - Connect Health reads those events and
+      has nothing to upload without them). The agent uploads sign-in activity
+      to the Connect Health service; to get it as a queryable/pullable stream
+      rather than only the portal Risky IP report, open the AD FS service in
+      Microsoft Entra Connect Health, go to Diagnostic Settings, and stream
+      the ADFSSignInLogs category to a Log Analytics workspace and/or to an
+      Azure Event Hub. Records are then pulled with the Azure Monitor Logs API
+      (KQL over the ADFSSignInLogs table) or consumed off the Event Hub; the
+      Risky IP aggregate list is additionally exportable from the Connect
+      Health portal Download button.
+    references:
+    - >-
+      https://learn.microsoft.com/en-us/azure/azure-monitor/reference/tables/adfssigninlogs
+    - >-
+      https://learn.microsoft.com/en-us/azure/active-directory/hybrid/how-to-connect-health-adfs-risky-ip
+    - >-
+      https://learn.microsoft.com/en-us/azure/active-directory/hybrid/how-to-connect-health-adfs-risky-ip-workbook
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        custom AD FS sign-in (ADFSSignInLogs) pull pipeline via Azure Monitor
+        Logs / Event Hub source
+      notes: >
+        No stock Elastic integration parses ADFSSignInLogs - the Azure and
+        Entra ID integrations handle the Entra sign-in and activity-log
+        tables, not this AD FS table - so this is a hand-built pipeline that
+        consumes the Azure Monitor export (Event Hub source or scheduled Log
+        Analytics API pull) and reshapes the row into ECS. The heavy columns
+        AuthenticationDetails, AuthenticationProcessingDetails, DeviceDetail,
+        NetworkLocationDetails and ConditionalAccessPolicies arrive as
+        serialized JSON strings that must be re-parsed before any nested value
+        (the actual auth method, device id, or intranet/ extranet
+        classification) is reachable. This path is only realizable for AD FS
+        farms that can reach Azure: an air-gapped high-side farm has no
+        Connect Health uplink, so this alternate exists only for instances
+        with internet egress to the Microsoft cloud. Where it does exist it is
+        a materially different record shape from the raw audit event -
+        friendly ResourceDisplayName instead of the RP URI, MSIS error text
+        pre-rendered in ResultDescription, and the multi-IP forwarded chain
+        already collapsed to a single aggregated IPAddress - so it is not a
+        drop-in substitute for the windows-event fields.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Only low-side farms with Azure egress can produce this feed, so pull
+          ADFSSignInLogs on the low side (Event Hub source preferred over
+          polling the Logs API, to avoid the API's ingestion-latency window
+          and query cost) and shape it to ECS there. Re-parse the serialized
+          DeviceDetail, AuthenticationDetails and NetworkLocationDetails JSON
+          strings, promote the auth method and the intranet/extranet
+          classification into flat short-keyed fields, and convert the
+          ResultSignature error code's empty/"0" success sentinel to null so
+          error.code stays aggregatable, exactly as the windows-event pipeline
+          does with the "N/A" sentinel. Treat IPAddress as already-aggregated
+          (Connect Health collapses the Web Application Proxy forwarded chain
+          to one client address and drops Exchange/private IPs from the alert
+          view), so do not assume it carries the raw x-forwarded-for list the
+          audit events do - carry it to source.ip but annotate that the
+          per-hop chain is not recoverable from this feed. Validate against a
+          Schema Library schema with a dead-letter route before the guard
+          destination.
+        elastic: >
+          There is no integration to inherit, so build a dedicated
+          logs-adfs.signin (or logs-system.security@custom keyed off
+          observer.vendor) ingest pipeline that accepts the pre-shaped
+          records. Map ResultType to event.outcome and derive event.action
+          from OperationName, add explicitly typed keyword mappings for the
+          adfs.signin.* namespace (correlation_id, auth_requirement,
+          network_location, conditional_access_status, oauth_client_id) so the
+          extranet-spray and MFA-gap aggregations do not depend on dynamic
+          mapping, and set observer.product to "AD FS" with observer.vendor
+          "Microsoft" so this cloud-sourced feed reconciles against the on-box
+          windows-event stream for the same farm. Keep CorrelationId as
+          adfs.signin.correlation_id rather than trace.id - it is the same
+          Activity ID join key the windows-event datasets carry, and pinning
+          both feeds to it lets a single request be followed across the on-box
+          audit events and the cloud sign-in row.
+        relay: >
+          This feed can cross the guard only for low-side farms, and what
+          crosses is already flattened ECS JSON, never the raw Azure Monitor
+          envelope. The unbounded, content-inspection-relevant values are the
+          re-parsed nested blobs - DeviceDetail, the AuthenticationDetails
+          step array, ConditionalAccessPolicies and the free-text
+          ResultDescription - so strip or hard-cap those to declared lengths
+          low-side, hold nesting to two levels, and normalize
+          UserPrincipalName to UTF-8 before the crossing. Treat it as
+          at-most-once with per-(dataset, hour) count reconciliation; because
+          the Azure Monitor pull has its own ingestion latency, reconcile on
+          CreatedDateTime windows rather than on receive time, and expect this
+          feed to lag the on-box windows-event feed for the same events.
+      direct:
+        parse_location: low
+        cribl: >
+          For a low-side farm with Azure egress whose Elastic stack is on the
+          same side (no guard), pull ADFSSignInLogs from the Event Hub
+          (preferred over polling the Logs API, to avoid the API's
+          ingestion-latency window and query cost) and shape it to ECS.
+          Re-parse the serialized DeviceDetail, AuthenticationDetails and
+          NetworkLocationDetails JSON strings, promote the auth method and the
+          intranet/extranet classification into flat short-keyed fields, and
+          convert the ResultSignature error code's empty/"0" success sentinel
+          to null so error.code stays aggregatable. Treat IPAddress as
+          already-aggregated - Connect Health collapses the Web Application
+          Proxy forwarded chain to one client address and drops
+          Exchange/private IPs from the alert view - so carry it to source.ip
+          but annotate that the per-hop chain is not recoverable from this
+          feed. The one decision that matters here is deduplication against
+          the on-box windows-event feed - if both are collected for the same
+          farm, key on CorrelationId plus CreatedDateTime so the cloud sign-in
+          row and the 1200/1202/1203 audit events are recognized as the same
+          request rather than double-counted in authentication dashboards.
+        elastic: >
+          There is no integration to inherit, so build a dedicated
+          logs-adfs.signin (or logs-system.security@custom keyed off
+          observer.vendor) ingest pipeline that accepts the pre-shaped
+          records. Map ResultType to event.outcome and derive event.action
+          from OperationName, add explicitly typed keyword mappings for the
+          adfs.signin.* namespace (correlation_id, auth_requirement,
+          network_location, conditional_access_status, oauth_client_id) so the
+          extranet-spray and MFA-gap aggregations do not depend on dynamic
+          mapping, and set observer.product to "AD FS" with observer.vendor
+          "Microsoft" so this cloud-sourced feed reconciles against the on-box
+          windows-event stream for the same farm. Keep CorrelationId as
+          adfs.signin.correlation_id rather than trace.id - it is the same
+          Activity ID join key the windows-event datasets carry, so a single
+          request can be followed across the on-box audit events and the cloud
+          sign-in row. Because there is no boundary here, retain the re-parsed
+          AuthenticationDetails step array and ConditionalAccessPolicies for
+          hunting rather than stripping them, and treat this feed as
+          complementary to - not a replacement for - the on-box audit stream,
+          which still carries the verbose per-request detail (Instance Id
+          reassembly, WS-Trust endpoint path) that the cloud sign-in schema
+          does not expose.
+    fields:
+    - vendor: CreatedDateTime
+      type: timestamp
+      description: time the sign-in (token request) occurred, as recorded by AD FS
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        ISO-8601 UTC datetime; use this rather than TimeGenerated, which is
+        the Azure Monitor ingestion time and lags the actual sign-in by the
+        Connect Health upload and Log Analytics ingestion windows
+    - vendor: Id
+      type: string
+      description: unique identifier of the sign-in activity record
+      ecs: event.id
+      status: mapped
+    - vendor: IPAddress
+      type: ip
+      description: client IP address AD FS observed for the sign-in
+      ecs: source.ip
+      status: partial
+      notes: >
+        Connect Health aggregates the failed sign-in client IPs through the
+        Web Application Proxy servers and presents a single address, not the
+        ordered x-ms-forwarded-client-ip / x-forwarded-for chain the raw audit
+        events carry, so the per-hop forwarded list is not recoverable from
+        this feed; if the external load balancer does not preserve the client
+        IP this value is the balancer or proxy address
+    - vendor: UserPrincipalName
+      type: string
+      description: UPN of the user that initiated the sign-in
+      ecs: user.name
+      status: partial
+      transform: >-
+        UPN form (user@domain); normalize before it joins the bare account
+        names used by the active-directory map, as with the audit stream's
+        UserId
+    - vendor: UserId
+      type: string
+      description: directory identifier of the user that initiated the sign-in
+      ecs: user.id
+      status: partial
+      notes: >-
+        an object/GUID identity handle, not the sign-in name - do not treat it
+        as the account name, which is UserPrincipalName
+    - vendor: AlternateSignInName
+      type: string
+      description: on-premises UPN of the signing-in user
+      ecs: null
+      status: unmapped
+      custom: adfs.signin.alternate_signin_name
+      notes: >-
+        present for alternate-login-ID configurations where the sign-in name
+        differs from the primary UPN
+    - vendor: UserDisplayName
+      type: string
+      description: display name of the user that initiated the sign-in
+      ecs: user.full_name
+      status: mapped
+    - vendor: ResourceDisplayName
+      type: string
+      description: name of the relying party / application the user signed in to
+      ecs: service.target.name
+      status: partial
+      notes: >
+        the sign-in equivalent of the audit stream's RelyingParty, but a
+        friendly application name here rather than the RP URI/GUID trust
+        identifier - so it needs no owner lookup for analyst readability, but
+        it will not join directly against the RP identifier the windows-event
+        feed emits without a name-to-identifier map
+    - vendor: ResourceIdentity
+      type: string
+      description: unique identifier of the application the user signed in to
+      ecs: null
+      status: unmapped
+      custom: adfs.signin.resource_id
+      notes: >-
+        the stable identifier to join this row against the RelyingParty trust
+        identifier in the windows-event datasets
+    - vendor: AppDisplayName
+      type: string
+      description: display name of the OAuth client in the request
+      ecs: service.name
+      status: partial
+      notes: >-
+        the OAuth client application, distinct from ResourceDisplayName (the
+        relying party being accessed); empty for non-OAuth (WS-Fed/SAML) flows
+    - vendor: AppId
+      type: string
+      description: unique identifier of the OAuth client in the request
+      ecs: null
+      status: unmapped
+      custom: adfs.signin.oauth_client_id
+    - vendor: AuthenticationRequirement
+      type: enum
+      description: >-
+        whether the sign-in required MFA - multiFactorAuthentication or
+        singleFactorAuthentication
+      ecs: null
+      status: unmapped
+      custom: adfs.signin.auth_requirement
+      notes: >-
+        the cloud-feed analog of the audit stream's MfaPerformed boolean; a
+        singleFactorAuthentication result on a relying party that should
+        enforce MFA is directly alertable
+    - vendor: AuthenticationDetails
+      type: string
+      description: >-
+        record of each step of authentication performed in the sign-in,
+        including the method and whether it succeeded
+      ecs: null
+      status: unmapped
+      custom: adfs.signin.auth_details
+      notes: >
+        a serialized JSON array, not a scalar - it must be re-parsed before
+        the actual authentication method (password / certificate / Azure MFA)
+        is reachable; this is where the CAC/PIV-vs-password signal that
+        PrimaryAuth carries in the audit stream lives on this feed
+    - vendor: AuthenticationProcessingDetails
+      type: string
+      description: details associated with the authentication processor
+      ecs: null
+      status: unmapped
+      custom: adfs.signin.auth_processing_details
+      notes: serialized JSON key/value pairs; re-parse before use
+    - vendor: DeviceDetail
+      type: string
+      description: >-
+        details of the device used for the sign-in (device id, display name,
+        operating system, browser)
+      ecs: null
+      status: unmapped
+      custom: adfs.signin.device_detail
+      notes: >
+        a serialized composite record, not the bare GUID the audit stream's
+        DeviceId field carries; re-parse it and lift the nested device id to
+        device.id if device correlation is needed, but the blob as delivered
+        is a JSON string
+    - vendor: NetworkLocationDetails
+      type: string
+      description: network location classification associated with the authentication processor
+      ecs: null
+      status: unmapped
+      custom: adfs.signin.network_location
+      notes: >-
+        the cloud-feed analog of the audit stream's NetworkLocation
+        (Intranet/Extranet/Unknown) that makes extranet-only detections
+        possible; delivered as a serialized record that must be re-parsed
+    - vendor: ResultType
+      type: enum
+      description: result of the sign-in operation - Success or Failure
+      ecs: event.outcome
+      status: partial
+      transform: translate Success/Failure to the ECS success/failure vocabulary
+    - vendor: ResultSignature
+      type: string
+      description: error code for the sign-in operation, when one occurred
+      ecs: error.code
+      status: partial
+      transform: >-
+        an AD FS/MSIS error code on failures; the success sentinel (empty or
+        "0") must become null or every successful sign-in pollutes error.code
+        aggregations, as with the audit stream's "N/A" ErrorCode
+    - vendor: ResultDescription
+      type: string
+      description: human-readable description of the sign-in error
+      ecs: error.message
+      status: partial
+      notes: >-
+        free text; Microsoft's guidance that AD FS error wording does not
+        reliably separate a bad password from a locked-out account applies
+        here as on the audit-detail exception text, so it is analyst context,
+        not a field to branch a detection on
+    - vendor: CorrelationId
+      type: string
+      description: per-request correlation identifier providing the sign-in trail
+      ecs: null
+      status: unmapped
+      custom: adfs.signin.correlation_id
+      notes: >
+        the same Activity ID join key the windows-event datasets carry - kept
+        custom rather than mapped to trace.id (distributed-tracing context) so
+        the cloud sign-in row and the on-box audit events for one request can
+        be correlated across the two feeds
+    - vendor: OriginalRequestId
+      type: string
+      description: request id of the first request in the authentication sequence
+      ecs: null
+      status: unmapped
+      custom: adfs.signin.original_request_id
+    - vendor: UserAgent
+      type: string
+      description: User-Agent string supplied by the client
+      ecs: user_agent.original
+      status: mapped
+    - vendor: ConditionalAccessStatus
+      type: enum
+      description: aggregate status of the conditional access policies evaluated for the sign-in
+      ecs: null
+      status: unmapped
+      custom: adfs.signin.conditional_access_status
+    - vendor: ConditionalAccessPolicies
+      type: string
+      description: details of the conditional access policies applied to the sign-in
+      ecs: null
+      status: unmapped
+      custom: adfs.signin.conditional_access_policies
+      notes: >-
+        serialized JSON array of per-policy results; re-parse before use and
+        cap length before any guard crossing
+    - vendor: Requirement
+      type: enum
+      description: whether the authentication step was primary or secondary
+      ecs: null
+      status: unmapped
+      custom: adfs.signin.requirement
+    - vendor: TokenIssuerName
+      type: string
+      description: name of the identity provider that issued the token
+      ecs: null
+      status: unmapped
+      custom: adfs.signin.token_issuer
+    - vendor: TokenIssuerType
+      type: enum
+      description: type of identity provider - Azure AD or AD Federation Services
+      ecs: null
+      status: unmapped
+      custom: adfs.signin.token_issuer_type
+    - vendor: IsInteractive
+      type: boolean
+      description: whether the sign-in was interactive
+      ecs: null
+      status: unmapped
+      custom: adfs.signin.is_interactive
+      notes: >-
+        non-interactive sign-ins here are the legacy/automated-client
+        population that maps to the WS-Trust and Exchange autodiscover
+        legacy-auth pattern the audit datasets flag
+    - vendor: Level
+      type: enum
+      description: severity level of the sign-in event
+      ecs: event.severity
+      status: partial
+      transform: >-
+        needs conversion to the ECS numeric severity scale; like the Admin
+        channel's Level it reflects event severity rather than security
+        significance
+- id: audit-detail
+  name: AD FS verbose audit detail and caller identity
+  description: >
+    The older per-request detail events that AD FS still writes to the
+    Security channel at Verbose audit level: 299 token issued and 324 token
+    issuance authorization failure, 403/404 raw HTTP request and response, 410
+    request context headers, 411 token validation failed and 412 token
+    validation succeeded, 413 token request error diagnostics, and 500/501
+    "more information for the event entry with Instance <id>". This dataset
+    exists because the useful detail is deliberately spread across several
+    events tied together by an Instance Id: 411 gives the failed
+    authentication with the client address, and the matching 501 carries the
+    caller identity claim type and value that names the user. It is the
+    dataset SOC playbooks for AD FS account lockout and password spray
+    actually use, and it is also the reassembly problem in this map - a
+    partial group is worse than useless, because a 411 without its 501 is an
+    unattributed failure.
+  event_categories:
+  - authentication
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same Elastic Agent path as the security-audit dataset above; the
+        multi-event Instance Id groups here are the reason reassembly cannot
+        be deferred to the Elastic side.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-system.security
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Same Elastic Agent path as the security-audit dataset above; the
+        multi-event Instance Id groups here are the reason reassembly cannot
+        be deferred to the Elastic side.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-system.security
+  formats:
+  - format: windows-event
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom AD FS verbose-audit reassembly pipeline
+      notes: >
+        No integration or pack covers these. Like the 1200-series they use
+        unnamed positional Data elements, but unlike them the payload is
+        label-prefixed free text ("Instance Id:", "Activity ID:", "Token
+        type:", "Client IP:", "Additional Data") rather than XML, so
+        extraction is regex work over the rendered message. Enabling Verbose
+        auditing to get them multiplies event volume per request, which is the
+        trade to state explicitly at onboarding: Basic gives five or fewer
+        events per request and no 411/501 pair, Verbose gives attribution and
+        a large volume increase. Instance Id groups the 299/324/412 anchor
+        event with its 500/501 continuations; Activity ID groups everything
+        belonging to one request across nodes.
+    fields:
+    - vendor: EventID
+      type: integer
+      description: >-
+        numeric identifier of the verbose audit event (299, 324, 403, 404,
+        410, 411, 412, 413, 500, 501)
+      ecs: event.code
+      status: mapped
+    - vendor: ProviderName
+      type: string
+      description: publisher of the Security-channel record, "AD FS Auditing"
+      ecs: event.provider
+      status: mapped
+      notes: >-
+        mandatory qualifier here more than anywhere - 500 and 501 are also
+        emitted by unrelated Security-channel publishers, so an unqualified
+        rule on those ids matches the wrong events entirely
+    - vendor: Computer
+      type: string
+      description: hostname of the AD FS farm node that recorded the event
+      ecs: host.name
+      status: mapped
+    - vendor: Instance Id
+      type: string
+      description: GUID grouping one anchor event with its continuation events
+      ecs: null
+      status: partial
+      custom: adfs.audit.instance_id
+      notes: >
+        the reassembly key - 500 and 501 are literally titled "more
+        information for the event entry with Instance <id>" and correlate back
+        to 299, 324 and 412. Without it a 501 is an orphaned claim value; ECS
+        has no multi-record grouping field, so it stays custom
+    - vendor: Activity ID
+      type: string
+      description: >-
+        per-request correlation GUID shared across the Security channel, the
+        AD FS Admin channel and the proxy nodes
+      ecs: null
+      status: unmapped
+      custom: adfs.audit.activity_id
+      notes: >
+        documented as sometimes absent or all-zeros on 411 while 412 carries
+        both this and an Instance Id, so correlation logic must fall back to
+        Instance Id rather than assuming both keys are present
+    - vendor: Relying party
+      type: string
+      description: relying party trust identifier the token was requested for
+      ecs: service.target.name
+      status: partial
+      notes: >-
+        same trust-identifier form as the security-audit dataset; needs the
+        same application-owner lookup to be analyst-readable
+    - vendor: Token type
+      type: string
+      description: >-
+        type of security token being validated or issued, e.g.
+        urn:ietf:params:oauth:token-type:jwt or a SAML assertion type
+      ecs: null
+      status: unmapped
+      custom: adfs.audit.token_type
+    - vendor: Claim type
+      type: string
+      description: >-
+        URI of the claim AD FS used to identify the caller on a failed token
+        issuance, e.g. .../claims/upn or .../claims/windowsaccountname
+      ecs: null
+      status: unmapped
+      custom: adfs.audit.caller_claim_type
+      notes: >-
+        Microsoft documents eleven possible claim type URIs for the
+        caller-identity event, so the companion value below cannot be
+        interpreted without this field
+    - vendor: Claim value
+      type: string
+      description: >-
+        value of the caller-identity claim - the identity behind the failure,
+        carried on 501 rather than on 411
+      ecs: user.name
+      status: partial
+      transform: >
+        normalize according to Claim type before writing: a windowsaccountname
+        claim is DOMAIN\user, a upn claim is user@domain, an emailaddress
+        claim is a mailbox and a privatepersonalidentifier claim is an opaque
+        PPID that must not be written to user.name at all
+    - vendor: Client IP
+      type: ip
+      description: address AD FS observed the request arriving from
+      ecs: source.ip
+      status: partial
+      notes: >-
+        on extranet traffic this is the Web Application Proxy or load
+        balancer, not the real client; the forwarded headers below are what
+        actually identify the origin
+    - vendor: x-ms-forwarded-client-ip
+      type: string
+      description: request context header carrying the originating client address chain
+      ecs: network.forwarded_ip
+      status: partial
+      transform: >
+        a comma-separated chain, not a single address, and attacker-supplied
+        on the first hop - split it, write every element to related.ip, and
+        treat the value as an assertion rather than as ground truth for
+        geolocation or blocking
+    - vendor: x-ms-proxy-client-ip
+      type: string
+      description: address of the proxy that relayed the request, present on 410
+      ecs: null
+      status: unmapped
+      custom: adfs.audit.proxy_client_ip
+    - vendor: x-ms-client-application
+      type: string
+      description: >-
+        client application identifier from the request context headers, e.g.
+        Microsoft.Exchange.Autodiscover
+      ecs: null
+      status: unmapped
+      custom: adfs.audit.client_application
+      notes: >-
+        the cheapest legacy-authentication indicator in the map - Exchange
+        autodiscover and ActiveSync values here on failed validations are the
+        classic proxied spray pattern
+    - vendor: x-ms-client-user-agent
+      type: string
+      description: user agent supplied in the request context headers
+      ecs: user_agent.original
+      status: mapped
+    - vendor: Exception details
+      type: string
+      description: the .NET exception text explaining why token validation failed
+      ecs: error.message
+      status: partial
+      notes: >
+        multi-line free text of unbounded length, and Microsoft's own guidance
+        is that its wording does not reliably distinguish a bad password from
+        an account lockout - so it is context for an analyst, not a field a
+        detection should branch on
+    - vendor: Keywords
+      type: string
+      description: HexInt64 keyword bitmask carrying the audit-success/audit-failure flag
+      ecs: event.outcome
+      status: mapped
+      transform: audit-success/audit-failure keyword is translated to success/failure
+    - vendor: Message
+      type: string
+      description: >-
+        rendered human-readable event message text, the label-prefixed body
+        all of the above is extracted from
+      ecs: message
+      status: mapped
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Extract the labelled values with per-event-id regex and then do the
+          reassembly here, not downstream: use a stateful lookup keyed on
+          Instance Id to fold the 501 caller-identity claim value onto the
+          matching 411 and emit one attributed authentication-failure record,
+          with a bounded time window and an explicit "unattributed" marker
+          when the partner event never arrives. Suppress the 403/404 raw HTTP
+          bodies or reduce them to method, endpoint and status - they carry
+          SAML assertions and occasionally credentials in POST bodies and
+          should never be forwarded whole - and mask any password parameter
+          seen in a usernamemixed request before anything leaves the worker
+          group.
+        elastic: >
+          Ship the reassembled records into a dedicated ingest pipeline (there
+          is no integration to extend) that qualifies on provider "AD FS
+          Auditing", writes the caller-identity claim value into user.name
+          according to the claim type rather than assuming UPN form, splits
+          the comma-separated x-ms-forwarded-client-ip chain into
+          network.forwarded_ip plus related.ip, and keeps error.message
+          free-text but with an ignore_above high enough that .NET exception
+          chains are not clipped out of the index. Map adfs.audit.instance_id,
+          .activity_id, .token_type, .caller_claim_type and
+          .client_application as keyword so the lockout playbook's pivots
+          work, and set event.category to authentication rather than
+          inheriting a web category from the 403/404 members of the group.
+        relay: >
+          This is the dataset that decides the parse-location question for the
+          whole map: the guard is a protocol break with no return channel and
+          is at-most-once, so a group whose 411 crosses but whose 501 is
+          dropped can never be repaired high-side. Reassemble low and cross
+          one attributed record per authentication event, not the raw member
+          events. The content-filter friction is concentrated in the 403/404
+          HTTP payloads and the exception text - unbounded free text with
+          base64 SAML assertions and possible non-ASCII - so drop or truncate
+          those low-side rather than asking a custom NDJSON filter to reason
+          about them, and reconcile per-(dataset, hour) counts across both
+          sides.
+      direct:
+        parse_location: low
+        cribl: >
+          Extract the labelled values with per-event-id regex and then do the
+          reassembly here, not downstream: use a stateful lookup keyed on
+          Instance Id to fold the 501 caller-identity claim value onto the
+          matching 411 and emit one attributed authentication-failure record,
+          with a bounded time window and an explicit "unattributed" marker
+          when the partner event never arrives. Suppress the 403/404 raw HTTP
+          bodies or reduce them to method, endpoint and status - they carry
+          SAML assertions and occasionally credentials in POST bodies and
+          should never be forwarded whole - and mask any password parameter
+          seen in a usernamemixed request before anything leaves the worker
+          group.
+        elastic: >
+          Ship the reassembled records into a dedicated ingest pipeline (there
+          is no integration to extend) that qualifies on provider "AD FS
+          Auditing", writes the caller-identity claim value into user.name
+          according to the claim type rather than assuming UPN form, splits
+          the comma-separated x-ms-forwarded-client-ip chain into
+          network.forwarded_ip plus related.ip, and keeps error.message
+          free-text but with an ignore_above high enough that .NET exception
+          chains are not clipped out of the index. Map adfs.audit.instance_id,
+          .activity_id, .token_type, .caller_claim_type and
+          .client_application as keyword so the lockout playbook's pivots
+          work, and set event.category to authentication rather than
+          inheriting a web category from the 403/404 members of the group.
+- id: admin
+  name: AD FS Admin operational log
+  description: >
+    The AD FS/Admin channel under Applications and Services Logs, enabled by
+    default and independent of security auditing. It carries the extranet
+    lockout family whose fields Microsoft documents explicitly - 512 (a
+    sign-in was allowed for a locked-out account by configuration), 515 (a
+    locked-out account presented the CORRECT password, flagged by Microsoft as
+    a possible compromise) and 516 (account locked out) - alongside the
+    service-health and request-failure events 342 token validation failed, 364
+    error during federation passive request, and the AD FS 2019 smart lockout
+    node communication errors 557, 562 and 563. Its value is complementary
+    rather than duplicative: 515 has no equivalent anywhere in the security
+    audit stream, and 557/562/563 indicate that lockout counters are being
+    evaluated against stale local state, which silently degrades every
+    extranet detection built on the other two datasets.
+  event_categories:
+  - authentication
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Requires an explicit custom channel subscription for "AD FS/Admin" on
+        the Elastic Agent - it is not part of any default Windows or System
+        integration channel set, so it is the dataset most likely to be missed
+        at onboarding. It crosses the guard along with the Security-channel
+        datasets above.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-winlog.winlog
+    direct:
+    - hop: cribl
+      location: edge worker group
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-winlog.winlog
+  formats:
+  - format: windows-event
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom AD FS Admin channel pipeline
+      notes: >
+        Collected through the Custom Windows Event Logs integration (winlog
+        input on channel "AD FS/Admin"), which transports the channel but
+        applies no AD FS parsing. These are classic template events whose data
+        arrives as positional insertion strings - Microsoft documents 512 and
+        516 as "Activity ID: %1 User: %2 Client IP: %3 Bad Password Count: %4
+        Last Bad Password Attempt: %5" - so per-event-id extraction from the
+        rendered message is required, and the field positions differ between
+        event ids that otherwise look alike. Note this channel's provider is
+        "AD FS", distinct from the Security channel's "AD FS Auditing".
+    fields:
+    - vendor: EventID
+      type: integer
+      description: >-
+        numeric identifier of the AD FS Admin event (342, 364, 512, 515, 516,
+        557, 562, 563)
+      ecs: event.code
+      status: mapped
+    - vendor: ProviderName
+      type: string
+      description: publisher of the AD FS/Admin record, "AD FS"
+      ecs: event.provider
+      status: mapped
+      notes: >-
+        distinct from the Security channel's "AD FS Auditing" provider; both
+        must be carried so a single rule can tell which channel a record came
+        from
+    - vendor: Computer
+      type: string
+      description: hostname of the AD FS farm node that recorded the event
+      ecs: host.name
+      status: mapped
+    - vendor: Level
+      type: enum
+      description: >-
+        Windows severity level of the operational event - Critical, Error,
+        Warning, Information
+      ecs: event.severity
+      status: partial
+      notes: >-
+        needs a lookup to ECS's numeric scale, and severity here reflects
+        service health rather than security significance - 515 is logged at a
+        routine level despite being the most alertable event on the channel
+    - vendor: Activity ID
+      type: string
+      description: per-request correlation GUID, the first insertion string on the lockout events
+      ecs: null
+      status: unmapped
+      custom: adfs.admin.activity_id
+      notes: >-
+        the same GUID the Security-channel datasets carry, so it is the join
+        between an admin-side lockout record and the audit-side credential
+        validation failures that produced it
+    - vendor: User
+      type: string
+      description: account the lockout event applies to, as supplied in the sign-in request
+      ecs: user.name
+      status: partial
+      transform: >-
+        rendered in whatever form the client submitted (UPN, DOMAIN\user or
+        bare name), so it must be normalized before it joins the account names
+        in the active-directory map
+    - vendor: Client IP
+      type: ip
+      description: address the sign-in attempt for the locked-out account came from
+      ecs: source.ip
+      status: partial
+      notes: >-
+        extranet requests are relayed by the Web Application Proxy, so this
+        can be the proxy rather than the origin; the origin only appears in
+        the forwarded headers captured by the audit-detail dataset
+    - vendor: Bad Password Count
+      type: integer
+      description: >-
+        AD FS extranet lockout bad-password counter for the account at the
+        time of the event
+      ecs: null
+      status: partial
+      custom: adfs.lockout.bad_password_count
+      transform: >
+        arrives as an insertion string and must be cast to an integer to be
+        usable in a threshold rule. Semantics are narrower than the name
+        suggests - Microsoft documents that it only increments when password
+        validation actually reaches AD, so attempts rejected while the account
+        is already in a locked-out state do not advance it and the value
+        understates attack volume
+    - vendor: Last Bad Password Attempt
+      type: string
+      description: timestamp of the most recent failed password attempt counted against the account
+      ecs: null
+      status: partial
+      custom: adfs.lockout.last_bad_password_attempt
+      transform: >-
+        a locale-rendered date string in the insertion strings, not an ISO
+        timestamp; it must be parsed and timezone-resolved before it will
+        index as a date
+    - vendor: Relying Party
+      type: string
+      description: relying party trust involved in a failed request (342/364 additional data)
+      ecs: service.target.name
+      status: partial
+    - vendor: Protocol Name
+      type: string
+      description: federation protocol of the failed request (342/364 additional data)
+      ecs: null
+      status: unmapped
+      custom: adfs.admin.protocol_name
+    - vendor: Account store server name
+      type: string
+      description: >-
+        farm node hosting the user-activity primary role that could not be
+        reached (557/562/563)
+      ecs: null
+      status: unmapped
+      custom: adfs.admin.account_store_server
+      notes: >
+        present only on the AD FS 2019 smart lockout communication errors;
+        while these are firing the secondary nodes evaluate lockout against
+        local state only, so extranet lockout thresholds are effectively
+        per-node and spray detections built on counts are understated
+    - vendor: Exception Message
+      type: string
+      description: exception text explaining the failure on 342, 364 and 562
+      ecs: error.message
+      status: partial
+      notes: >-
+        multi-line .NET exception text; 342 and 364 are overwhelmingly
+        ordinary user credential errors, so they are volume rather than signal
+        unless rate-aggregated per account or per source
+    - vendor: Message
+      type: string
+      description: >-
+        rendered human-readable event message text carrying the positional
+        insertion strings
+      ecs: message
+      status: mapped
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Extract per event id from the rendered message with the
+          insertion-string positions pinned individually - 512/516 carry five
+          values and 515 only three, so one shared regex will mis-assign
+          fields - and convert Bad Password Count to an integer and Last Bad
+          Password Attempt to a real timestamp at the same time. Route 515 to
+          a priority destination independently of the rest of the channel,
+          since a correct password on a locked-out account is a compromise
+          indicator that should not wait behind bulk parsing, and tag
+          557/562/563 as a data-quality signal so a farm running on stale
+          lockout state is visible to the SOC rather than only to the AD FS
+          admins.
+        elastic: >
+          Build a small dedicated ingest pipeline for logs-winlog.winlog
+          filtered to provider "AD FS": derive event.action and event.outcome
+          from the event id lookup rather than from any field in the message,
+          convert the Windows Level enum into ECS's numeric event.severity,
+          and keep error.message as the exception text without attempting to
+          classify it. Map adfs.lockout.bad_password_count as long and
+          adfs.lockout.last_bad_password_attempt as date in the index template
+          - they arrive as strings and will otherwise be dynamically mapped as
+          keyword, which breaks threshold and rate detections - and map
+          adfs.admin.activity_id as keyword so it joins the Security-channel
+          datasets on the same request.
+        relay: >
+          This channel is small, entirely label-prefixed template text, and
+          has the highest evidentiary density per byte in the map, so it
+          should get priority in the guard throughput budget. The only real
+          filter friction is the exception text on 342/364/562, which is
+          multi-line and must be JSON-escaped so no embedded newline breaks
+          the LF-terminated one-object-per-line NDJSON framing, and
+          length-capped so the custom filter stays simple.
+      direct:
+        parse_location: low
+        cribl: >
+          Extract per event id from the rendered message with the
+          insertion-string positions pinned individually - 512/516 carry five
+          values and 515 only three, so one shared regex will mis-assign
+          fields - and convert Bad Password Count to an integer and Last Bad
+          Password Attempt to a real timestamp at the same time. Route 515 to
+          a priority destination independently of the rest of the channel,
+          since a correct password on a locked-out account is a compromise
+          indicator that should not wait behind bulk parsing, and tag
+          557/562/563 as a data-quality signal so a farm running on stale
+          lockout state is visible to the SOC rather than only to the AD FS
+          admins.
+        elastic: >
+          Build a small dedicated ingest pipeline for logs-winlog.winlog
+          filtered to provider "AD FS": derive event.action and event.outcome
+          from the event id lookup rather than from any field in the message,
+          convert the Windows Level enum into ECS's numeric event.severity,
+          and keep error.message as the exception text without attempting to
+          classify it. Map adfs.lockout.bad_password_count as long and
+          adfs.lockout.last_bad_password_attempt as date in the index template
+          - they arrive as strings and will otherwise be dynamically mapped as
+          keyword, which breaks threshold and rate detections - and map
+          adfs.admin.activity_id as keyword so it joins the Security-channel
+          datasets on the same request.

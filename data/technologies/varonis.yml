@@ -1,0 +1,331 @@
+id: varonis
+name: Varonis DatAdvantage / DatAlert
+vendor: Varonis
+versions: Varonis Data Security Platform 8.x, DatAdvantage with DatAlert
+draft: true
+references:
+- https://github.com/elastic/integrations/tree/main/packages/varonis
+- https://www.elastic.co/docs/reference/integrations/varonis
+datasets:
+- id: alert
+  name: DatAlert rule alert
+  description: |
+    Varonis watches who touches data - files, folders, mailboxes and Active Directory objects - and DatAlert fires when activity matches a rule. What arrives over syslog is the alert, not the underlying audit trail: Varonis records every file access, and exporting that stream is neither offered here nor wanted, so the rule is what decides which activity leaves the platform. That makes rule coverage, not collection, the limit on what this feed can ever detect.
+    It fills a capability the catalogue otherwise has no entry for. Guardium covers database access and the UAM feed covers user monitoring; nothing else says who read, moved or re-permissioned a file share, which is the question an insider-threat programme asks most often.
+  event_categories:
+  - file
+  - iam
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Receives CEF over syslog from the Varonis server. File paths and the
+        free-text msg field name real shares, folders and people, which makes
+        this one of the more sensitive feeds in the catalogue on content
+        grounds alone. The alternative is the Varonis REST API, which is a
+        different integration surface and a pull rather than a push.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes. Volume is alert-rate rather than activity-rate,
+        so this is a small feed by count and a difficult one by content.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-varonis.logs
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Receives CEF over syslog from the Varonis server.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-varonis.logs
+  formats:
+  - format: syslog-cef
+    parsing:
+      mechanism: elastic-integration
+      artifact: elastic/integrations varonis, data stream logs
+      notes: |
+        The integration parses CEF and then moves the whole extension set into varonis.logs.*, resolving the labelled custom slots by their emitted labels rather than by slot number - so cs2Label=RuleName becomes varonis.logs.rule_name. That is the right way round, and a hand-built pipeline should copy it: the slot numbers are not contractual and Varonis has moved them between releases.
+        Two CEF parsing traps show up in real records. Extension values are space-separated key=value pairs, and Varonis puts commas and backslashes inside values - a real duser reads "contosofoo.com\Bourne Jr., Jason", with a comma and a space in the middle of a name. A parser that splits on comma, or that treats the first space as a delimiter, corrupts the user on exactly the records that matter. And empty extensions are emitted rather than omitted (cs3=, cnt=, oldFilePermission=), so a field being present says nothing about it having a value.
+    fields:
+    - vendor: Device Product
+      type: string
+      description: CEF header product - DatAdvantage
+      ecs: observer.product
+      status: mapped
+    - vendor: Device Version
+      type: string
+      description: CEF header version of the Varonis server
+      ecs: observer.version
+      status: mapped
+    - vendor: SignatureID
+      type: integer
+      description: >-
+        CEF header signature id - the numeric alert type, e.g. 5015 for a
+        directory-services permission addition
+      ecs: event.code
+      status: partial
+      transform: cast to string
+      notes: >-
+        the stable identity of the alert type; the Name beside it is the
+        display wording and is the half that changes between releases
+    - vendor: Name
+      type: string
+      description: CEF header name - the alert type in words
+      ecs: event.action
+      status: partial
+      notes: >
+        duplicated by the act extension in every record observed, which is why
+        act below is not also mapped to event.action. If a record is ever
+        found where they differ, the header is the authority - act is a
+        convenience copy.
+    - vendor: Severity
+      type: integer
+      description: CEF header severity
+      ecs: event.severity
+      status: mapped
+      notes: >-
+        set from the DatAlert rule's configured severity, so it reflects a
+        local decision about the rule rather than anything measured about the
+        event
+    - vendor: rt
+      type: timestamp
+      description: receipt time - when Varonis recorded the alert
+      ecs: event.ingested
+      status: partial
+      transform: 'parse "MMM dd yyyy HH:mm:ss", assume the server''s timezone'
+      notes: >
+        no timezone and no year-first ordering, and the format is the same for
+        rt, start and end. The server's local time is what it means, so a
+        collector in a different zone silently shifts every timestamp -
+        confirm the Varonis server's timezone before trusting any of the
+        three.
+    - vendor: start
+      type: timestamp
+      description: when the activity that triggered the alert began
+      ecs: event.start
+      status: partial
+      transform: 'parse "MMM dd yyyy HH:mm:ss", assume the server''s timezone'
+    - vendor: end
+      type: timestamp
+      description: when the activity that triggered the alert ended
+      ecs: '@timestamp'
+      status: partial
+      transform: 'parse "MMM dd yyyy HH:mm:ss", assume the server''s timezone'
+      notes: >
+        the activity time, and the right choice for @timestamp over rt.
+        DatAlert rules can aggregate over a window before firing, so rt can
+        trail end by the length of that window and indexing on rt puts the
+        alert at the time Varonis decided rather than the time the user acted.
+    - vendor: cat
+      type: string
+      description: CEF category - Alert on every record from DatAlert
+      ecs: event.kind
+      status: partial
+      transform: map Alert to alert
+      notes: >-
+        the field that would distinguish an alert from a raw activity record
+        if Varonis exported the latter; it does not, so this is effectively
+        constant and is worth asserting rather than trusting
+    - vendor: cn1
+      type: integer
+      description: labelled RuleID - numeric id of the DatAlert rule
+      ecs: rule.id
+      status: partial
+      transform: cast to string
+    - vendor: cs2
+      type: string
+      description: labelled RuleName - name of the DatAlert rule
+      ecs: rule.name
+      status: mapped
+      notes: >-
+        the rule name is the only description of why this fired; there is no
+        rule description field, so a badly named rule is unexplainable
+        downstream
+    - vendor: act
+      type: string
+      description: the action taken, duplicating the CEF header Name
+      ecs: null
+      status: partial
+      custom: varonis.action
+      notes: >-
+        withheld from event.action, which the header Name holds; kept so a
+        divergence between the two is visible rather than silently resolved
+    - vendor: outcome
+      type: string
+      description: whether the activity succeeded
+      ecs: event.outcome
+      status: partial
+      transform: lowercase Success and Failure to success and failure
+      notes: >
+        a failed access attempt is often the more interesting record - it
+        means someone tried something they were not permitted to do - so this
+        is not a field to filter out in search of "real" events
+    - vendor: duser
+      type: string
+      description: the user the alert is attributed to
+      ecs: user.name
+      status: partial
+      transform: >-
+        split the leading domain on backslash into user.domain, keeping the
+        remainder whole
+      notes: |
+        the remainder is a display name, not an account name - a real value reads "Bourne Jr., Jason", with a comma, a space and a period in it. It will not join against sAMAccountName from Active Directory or against user.name from any Windows feed, and treating it as an account identifier is the mistake this field invites.
+        Which of duser and suser carries the acting user rather than the affected one is not settled here. In the records available, suser is empty and duser holds the actor, but CEF names duser the destination user, so confirm against a live alert of a type that has both before building a detection on either.
+    - vendor: suser
+      type: string
+      description: the source user, where the alert type distinguishes one
+      ecs: null
+      status: partial
+      custom: varonis.source_user
+      notes: >-
+        empty in every record observed; withheld from user.name until the
+        duser question above is settled, because populating both from an
+        unverified reading would produce a confidently wrong actor
+    - vendor: dpriv
+      type: string
+      description: the trustee a permission was granted to or removed from - a group or a user
+      ecs: user.target.group.name
+      status: partial
+      notes: >
+        on a permission-change alert this is the answer to "who can now read
+        it", which is the whole point of the alert. It carries a group in the
+        records observed but the field can hold a user, so a pipeline that
+        assumes group will mis-file individual grants - which are the rarer
+        and more suspicious case.
+    - vendor: dhost
+      type: string
+      description: host the affected object lives on
+      ecs: host.hostname
+      status: mapped
+    - vendor: dvchost
+      type: string
+      description: the Varonis server that produced the alert
+      ecs: observer.hostname
+      status: mapped
+      notes: >-
+        not host.hostname, which is the monitored host; confusing the two
+        makes every alert look like it happened on the Varonis server
+    - vendor: filePath
+      type: string
+      description: >-
+        full path of the affected object - a file share path, or an Active
+        Directory distinguished path
+      ecs: file.path
+      status: partial
+      notes: >
+        not always a filesystem path. On a directory-services alert it holds
+        an AD container path (contosofoo.com\Home Office Site\Computers\...),
+        and on a mail alert it describes a mailbox. file.path is still the
+        least wrong home, but a rule that assumes a UNC share or applies
+        path-splitting logic will produce nonsense on two of the three alert
+        families.
+    - vendor: fname
+      type: string
+      description: name of the affected object
+      ecs: file.name
+      status: partial
+      notes: same caveat as filePath - it is an object name, not always a file name
+    - vendor: fileType
+      type: string
+      description: the type of the affected object as Varonis classifies it
+      ecs: null
+      status: partial
+      custom: varonis.file.type
+      notes: >-
+        deliberately not ECS file.type, which is constrained to file,
+        directory and symlink; Varonis uses its own vocabulary and a value
+        outside the ECS set would fail the mapping
+    - vendor: filePermission
+      type: string
+      description: the permission after the change
+      ecs: null
+      status: partial
+      custom: varonis.permission.new
+      notes: >-
+        with the old value below, this is the before-and-after that makes a
+        permission alert actionable; ECS has no permission-change shape
+    - vendor: oldFilePermission
+      type: string
+      description: the permission before the change
+      ecs: null
+      status: partial
+      custom: varonis.permission.old
+      notes: >-
+        empty on an addition, which is how an addition is distinguished from a
+        modification without parsing the alert name
+    - vendor: cs6
+      type: string
+      description: labelled ChangedPermissions - the permissions that changed
+      ecs: null
+      status: unmapped
+      custom: varonis.permission.changed
+    - vendor: msg
+      type: string
+      description: human-readable description of what happened
+      ecs: message
+      status: mapped
+      notes: >-
+        names the object and the trustee in prose and is frequently the only
+        place the full detail appears; also the field most likely to trip a
+        content filter, since it quotes real share and account names
+    - vendor: cnt
+      type: integer
+      description: base event count - how many underlying events the alert aggregates
+      ecs: null
+      status: partial
+      custom: varonis.base_event_count
+      notes: >
+        one alert can stand for thousands of file accesses. Ignoring this
+        turns a mass-exfiltration alert into a single event in every count and
+        every dashboard, which is the specific way this feed misleads.
+    - vendor: cs1
+      type: string
+      description: labelled MailRecipient - recipient on a mail-related alert
+      ecs: email.to.address
+      status: partial
+      notes: populated only on the mail alert family; empty and present on every other record
+    - vendor: cs3
+      type: string
+      description: labelled AttachmentName - attachment on a mail-related alert
+      ecs: email.attachments.file.name
+      status: partial
+      notes: >-
+        deliberately not file.name, which fname holds; an attachment and the
+        affected object are different things and a mail alert can carry both
+    - vendor: cs4
+      type: string
+      description: labelled ClientAccessType - how the client reached the mailbox
+      ecs: null
+      status: unmapped
+      custom: varonis.mail.client_access_type
+    - vendor: cs5
+      type: string
+      description: labelled MailboxAccessType - the kind of mailbox access
+      ecs: null
+      status: unmapped
+      custom: varonis.mail.mailbox_access_type
+    - vendor: deviceCustomDate1
+      type: timestamp
+      description: a custom date whose meaning depends on the alert type
+      ecs: null
+      status: unmapped
+      custom: varonis.custom_date
+      notes: >-
+        emitted without a label in the records observed, so nothing on the
+        wire says what it means; carried rather than dropped, and not mapped
+        to any ECS date because guessing which one would be worse than leaving
+        it

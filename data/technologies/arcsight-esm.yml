@@ -1,0 +1,1589 @@
+id: arcsight-esm
+name: ArcSight ESM (transitional)
+vendor: OpenText
+versions: ESM 7.5, 7.6, 7.7, 7.8 (OpenText/Micro Focus); Forwarding Connector 7.5-7.8
+draft: true
+references:
+- >-
+  https://www.microfocus.com/documentation/arcsight/arcsight-esm-7.8/ESM_ArcSightConsole_UserGuide/Content/ESM_UserGuide/Audit_Events.htm
+- >-
+  https://www.microfocus.com/documentation/arcsight/arcsight-esm-7.7/ESM_ArcSightConsole_UserGuide_24.1/Content/ESM_UserGuide/Audit_Events.htm
+- >-
+  https://community.opentext.com/cfs-file/__key/telligent-evolution-components-attachments/00-224-00-00-00-17-64-26/ArcSight_5F00_Audit_5F00_Event_5F00_IDs.pdf
+- >-
+  https://community.opentext.com/cfs-file/__key/communityserver-discussions-components-files/224/ArcSight-Specific-Device-Event-Class-IDs.pdf
+- >-
+  https://www.microfocus.com/documentation/arcsight/arcsight-esm-7.8/pdfdoc/fwdconn_configguide/fwdconn_configguide.pdf
+- https://www.elastic.co/docs/reference/integrations/cef
+- https://github.com/criblpacks/cribl-common-event-format
+- https://portal.microfocus.com/s/article/KM000031403
+datasets:
+- id: audit-events
+  name: ESM audit events
+  description: |
+    ESM's own internal audit events - the events the Manager generates about itself rather than about a monitored device. These are what keeps the legacy SIEM accountable while it is being stood down: console/connector authentication (authentication:100 client authenticated, :101 login failed, :102 logout, :104 excessive failed logins, :200/:201 connector login success/failure), resource configuration changes (resource:100 deleted, :101 updated, :102 added, :103 locked, :104 unlocked), user and actor administration (user:100/:101/:102, actor:100/:102/:110), active-list mutation (activelist:101-:105) and analyst workflow (case, report, archive, channel).
+    TRANSITIONAL ROW - READ FIRST. ArcSight ESM is the SIEM being decommissioned, not a strategic log source. The point of ingesting this feed into Elastic is to keep an independent, outside-the-tool record of who was still administering ESM, what content they changed and when the last analyst logged out, so that the decommission has an audit trail that does not live inside the system being switched off. Everything mapped here should be retired with the platform, not grown.
+    The events reach a syslog listener the same way any other ESM event does - through an ArcSight Forwarding Connector with a CEF Syslog destination, filtered to ArcSight-generated events. The vendor documents the resulting record shape directly, e.g. "CEF:0|ArcSight|Logger|3.5.0.13412.0|logger:500|Filter added|2| cat=/Logger/Resource/Filter/Configuration/Add msg=Filter [...] has been added", with per-event additional fields carried in fname, duser, duid, dvc/dvchost and the csN/cnN custom slots named by their paired Label keys.
+  event_categories:
+  - authentication
+  - iam
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Receives CEF over TCP syslog from an ArcSight Forwarding Connector
+        whose destination filter selects ArcSight-generated audit events
+        (deviceVendor = ArcSight).
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-arcsight_esm.audit
+      notes: >
+        The stock CEF integration lands events in logs-cef.log; a reroute
+        processor should move ArcSight-sourced records into a dedicated
+        logs-arcsight_esm.audit stream so the transitional feed can be
+        retention-scoped and deleted as a unit at decommission, instead of
+        being mixed into the shared CEF dataset.
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Receives CEF over TCP syslog from an ArcSight Forwarding Connector
+        whose destination filter selects ArcSight-generated audit events
+        (deviceVendor = ArcSight).
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-arcsight_esm.audit
+      notes: >
+        The stock CEF integration lands events in logs-cef.log; a reroute
+        processor should move ArcSight-sourced records into a dedicated
+        logs-arcsight_esm.audit stream so the transitional feed can be
+        retention-scoped and deleted as a unit at decommission, instead of
+        being mixed into the shared CEF dataset.
+  formats:
+  - format: syslog-cef
+    parsing:
+      mechanism: elastic-integration
+      artifact: Common Event Format (CEF) integration
+      notes: >
+        There is no ArcSight-ESM-specific Elastic integration and no vendor
+        Cribl pack for ESM's own audit stream. The generic Elastic CEF
+        integration parses the header and extensions into cef.* plus ECS,
+        which is the cheapest realistic option for a feed with a known end
+        date. The Cribl Pack for Common Event Format and Log Event Extended
+        Format is the low-side alternative used where the guard forces CEF
+        conversion before the boundary.
+    fields:
+    - vendor: deviceEventClassId
+      type: string
+      description: >-
+        CEF signature-ID header carrying the ESM Device Event Class (DEC) ID
+        of the audit event
+      ecs: event.code
+      status: mapped
+      notes: >
+        the vendor-documented identifier for the audit event, e.g.
+        authentication:101 (failed client login), resource:102 (resource
+        added), user:100 (user account deleted), activelist:105 (active list
+        entry evicted); this is the field ESM's own rules and filters key on,
+        so it is the stable join between legacy ESM content and any
+        replacement Elastic detection
+    - vendor: name
+      type: string
+      description: >-
+        CEF Name header - the human-readable audit event name, e.g. "Filter
+        added" or "Failed client login"
+      ecs: event.action
+      status: partial
+      notes: >
+        a fixed ESM vocabulary of "<resource type> added/updated/deleted/
+        locked/unlocked" and authentication phrases, not ECS action verbs; it
+        needs normalizing before it can drive cross-source admin-activity
+        dashboards
+    - vendor: severity
+      type: integer
+      description: CEF severity header - ArcSight agent severity on the 0-10 scale
+      ecs: event.severity
+      status: partial
+      transform: >
+        the 0-10 ArcSight scale is not the ECS numeric convention used
+        elsewhere in this map set; needs the same normalization applied to
+        other CEF sources. Audit events are also largely fixed-severity (the
+        vendor sample shows every Logger application audit event at severity
+        2), so severity carries almost no triage signal here
+    - vendor: cat
+      type: string
+      description: >-
+        deviceEventCategory - the ESM audit event category path, e.g.
+        /Logger/Resource/Filter/Configuration/Add
+      ecs: null
+      status: unmapped
+      custom: arcsight.esm.event_category
+      notes: >
+        ECS event.category is a closed vocabulary and this is a vendor
+        resource-taxonomy path, so it stays custom; it is the most useful
+        field for grouping audit events by subsystem
+    - vendor: msg
+      type: string
+      description: rendered audit message text, e.g. Filter [Unified Query Test] has been added
+      ecs: message
+      status: mapped
+    - vendor: duser
+      type: string
+      description: destinationUserName - the ESM account the audit event concerns
+      ecs: user.name
+      status: partial
+      notes: >
+        ESM does not consistently separate the administrator performing the
+        action from the account being acted upon: for user:100/:101/ :102 the
+        affected account and the acting admin can both surface here, so
+        user.target.name is left unpopulated and iam alerting cannot reliably
+        answer "who changed whose account" from this feed alone
+    - vendor: duid
+      type: string
+      description: destinationUserId - the ESM internal user id of the account in duser
+      ecs: user.id
+      status: mapped
+    - vendor: src
+      type: ip
+      description: >-
+        sourceAddress - client address the Console, connector or web session
+        authenticated from
+      ecs: source.ip
+      status: mapped
+      notes: >-
+        populated for authentication and session audit events; absent on
+        scheduler-driven or internally generated audit events
+    - vendor: dvc
+      type: ip
+      description: deviceAddress - address of the ESM Manager that generated the audit event
+      ecs: observer.ip
+      status: mapped
+    - vendor: dvchost
+      type: string
+      description: deviceHostName - hostname of the ESM Manager that generated the audit event
+      ecs: observer.hostname
+      status: mapped
+    - vendor: deviceVendor
+      type: string
+      description: CEF Device Vendor header, ArcSight for every internally generated event
+      ecs: observer.vendor
+      status: mapped
+    - vendor: deviceProduct
+      type: string
+      description: >-
+        CEF Device Product header naming the emitting ArcSight component
+        (Manager, Logger, Connector)
+      ecs: observer.product
+      status: mapped
+      notes: >-
+        the value is the discriminator for filtering ESM Manager audit events
+        away from Logger and connector audit events on a shared syslog
+        listener
+    - vendor: rt
+      type: timestamp
+      description: >-
+        deviceReceiptTime - when the Manager recorded the audit event, epoch
+        milliseconds
+      ecs: '@timestamp'
+      status: mapped
+      transform: >-
+        epoch milliseconds; must be parsed with an explicit timezone
+        assumption because ESM emits it as a bare millisecond value
+    - vendor: art
+      type: timestamp
+      description: agentReceiptTime - when the Forwarding Connector received the event
+      ecs: event.created
+      status: partial
+      notes: >-
+        useful as a forwarding-delay drift check against rt during cutover,
+        not as the event time
+    - vendor: fname
+      type: string
+      description: >-
+        fileName - ESM overloads this to carry the RESOURCE NAME the audit
+        event is about (for example "John's Filter")
+      ecs: null
+      status: unmapped
+      custom: arcsight.esm.resource.name
+      notes: >
+        not a filesystem object; the stock CEF integration will map fname to
+        file.name, which silently injects ESM resource names into file-based
+        detections and dashboards, so the custom pipeline must move it here
+        and clear file.name
+    - vendor: filePath
+      type: string
+      description: >-
+        filePath - ESM overloads this to carry the RESOURCE URI (for example
+        /All Filters/admin's Filter/John's Filter)
+      ecs: null
+      status: unmapped
+      custom: arcsight.esm.resource.uri
+      notes: >
+        same overload as fname; the URI is the only field that identifies
+        WHICH resource changed, so it is the highest-value field in this
+        dataset for the decommission record and must not be dropped as a
+        file.path lookalike
+    - vendor: fileType
+      type: string
+      description: >-
+        fileType - ESM overloads this to carry the RESOURCE TYPE (Filter,
+        Report, Case, Rule, Active List)
+      ecs: null
+      status: unmapped
+      custom: arcsight.esm.resource.type
+      notes: same overload; keep out of file.type
+    - vendor: cs1..cs6 (with paired cs1Label..cs6Label)
+      type: string
+      description: >-
+        generic ArcSight custom string slots, named at runtime by their paired
+        Label key (documented examples include cs4Label=Session ID,
+        cs1Label=Filter, cs2Label=Email Destination(s))
+      ecs: null
+      status: unmapped
+      custom: arcsight.esm.custom_string
+      notes: >
+        slot assignment is per audit event type and per ArcSight component, so
+        any parser must key off the Label value and never off the slot number;
+        the session id that ties a sequence of audit events to one console
+        login arrives here rather than in a named field
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Keep the core worker group a pass-through and deliberately do NOT
+          build an ArcSight CEF parser here: this feed has a decommission
+          date, so low-side parsing work is investment in a system being
+          switched off. Confine low-side work to routing - split the ArcSight
+          signature-ID prefixes (authentication:, resource:, user:, actor:,
+          activelist:) onto the audit stream and away from the correlation
+          stream so the two feeds can be retired independently - plus
+          Persistent Queue backpressure on the Elastic destination and a
+          volume guard on activelist:101/:103, which fire per active-list
+          entry and can dwarf every other audit event on the route.
+        elastic: >
+          Parse with the stock CEF integration and add a
+          logs-arcsight_esm.audit@custom pipeline that fixes the three things
+          the raw feed cannot express: derive event.outcome from the
+          signature-ID suffix through an explicit lookup (authentication:100
+          and :200 are success, :101/:104/:201 and authorization:100 are
+          failure) because ESM audit events carry no outcome column; resolve
+          the csN/cnN slots by their paired Label value rather than slot
+          number; and move fname/filePath/fileType out of file.* into
+          arcsight.esm.resource.* so ESM resource names stop polluting
+          file-based detections. Copy observer.hostname into host.name so the
+          authentication, iam and configuration alerting profiles resolve at
+          all, and map the arcsight.esm.* custom namespace as keyword in the
+          index template.
+        relay: >
+          Low-side instances cross the guard and the CEF must not cross: parse
+          it to NDJSON on the low side and send the thin envelope (_dataId,
+          @timestamp, host, _raw) with _dataId set to the
+          logs-arcsight_esm.audit route key, since a good Elastic-side parser
+          already exists and teaching the low side ESM's full audit grammar is
+          throwaway work. The content-filter friction is resource identity,
+          not volume - resource URIs and msg values embed analyst-chosen free
+          text in square brackets and can carry non-ASCII characters - so cap
+          their length and strip control characters before the guard
+          destination. Crossing is at-most-once with no return channel:
+          reconcile low-side and high-side counts per (dataset, hour), which
+          matters here because a missing configuration-change audit event is
+          exactly the gap the decommission record is meant to close.
+      direct:
+        parse_location: high
+        cribl: >
+          Keep the core worker group a pass-through and deliberately do NOT
+          build an ArcSight CEF parser here: this feed has a decommission
+          date, so low-side parsing work is investment in a system being
+          switched off. Confine low-side work to routing - split the ArcSight
+          signature-ID prefixes (authentication:, resource:, user:, actor:,
+          activelist:) onto the audit stream and away from the correlation
+          stream so the two feeds can be retired independently - plus
+          Persistent Queue backpressure on the Elastic destination and a
+          volume guard on activelist:101/:103, which fire per active-list
+          entry and can dwarf every other audit event on the route.
+        elastic: >
+          Parse with the stock CEF integration and add a
+          logs-arcsight_esm.audit@custom pipeline that fixes the three things
+          the raw feed cannot express: derive event.outcome from the
+          signature-ID suffix through an explicit lookup (authentication:100
+          and :200 are success, :101/:104/:201 and authorization:100 are
+          failure) because ESM audit events carry no outcome column; resolve
+          the csN/cnN slots by their paired Label value rather than slot
+          number; and move fname/filePath/fileType out of file.* into
+          arcsight.esm.resource.* so ESM resource names stop polluting
+          file-based detections. Copy observer.hostname into host.name so the
+          authentication, iam and configuration alerting profiles resolve at
+          all, and map the arcsight.esm.* custom namespace as keyword in the
+          index template.
+  - format: csv-file
+    enable: >
+      Two vendor-native paths emit the same ESM audit events as CSV rather
+      than CEF. Automated: on the ArcSight Forwarding Connector, add a CSV
+      File destination (SmartConnector destination type "CSV File") in
+      addition to or instead of the CEF Syslog destination, keeping the same
+      destination filter that selects ArcSight-generated audit events
+      (deviceVendor = ArcSight, signature-ID prefixes authentication:,
+      resource:, user:, actor:, activelist:); the connector then writes one
+      row per event to a rolling CSV file whose columns are ArcSight
+      event-schema field names, and the column set is chosen at destination
+      configuration time from a field list rather than being fixed like the
+      CEF header/extension layout. On-demand: from the ArcSight Console, open
+      an active channel or query viewer over the audit events, right-click and
+      choose Export > Events in Channel, set Destination = Local CSV File and
+      Columns to the "Export" field set (or a custom saved field set built by
+      right-clicking the column headers and choosing Field Sets > Save As),
+      which is the path that lets an operator include the categorization
+      columns the automated CEF feed cannot carry. Either way the
+      differentiator is field selection: the ArcSight event schema exposes the
+      normalized Category Outcome / Category Behavior / Category Object /
+      Category Significance taxonomy and every deviceCustomString slot as an
+      independently named column.
+    references:
+    - >-
+      https://www.microfocus.com/documentation/arcsight/arcsight-esm-7.8/pdfdoc/fwdconn_configguide/fwdconn_configguide.pdf
+    - >-
+      https://www.microfocus.com/documentation/arcsight/arcsight-smartconnectors/pdfdoc/SmartConnInstallandUserGuide/SmartConnInstallandUserGuide.pdf
+    - >-
+      https://www.microfocus.com/documentation/arcsight/arcsight-esm-7.6/ESM_ArcSightConsole_UserGuide/Content/ESM_UserGuide/Exporting_Data_Fields_to.htm
+    - >-
+      https://www.microfocus.com/documentation/arcsight/arcsight-esm-7.5/ESM_Console_HTML5/Content/ESM_UserGuide/Export_Events_to_File.htm
+    - >-
+      https://www.microfocus.com/documentation/arcsight/arcsight-smartconnectors-8.4/pdfdoc/cef-implementation-standard/cef-implementation-standard.pdf
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom ArcSight event-schema CSV pipeline
+      notes: >
+        There is no Elastic integration and no vendor Cribl pack for the
+        ArcSight event-schema CSV, so this is a header-driven CSV parse (Cribl
+        Parser in CSV mode keyed on the emitted header row, or an Elastic CSV
+        ingest processor) that then renames the ArcSight schema columns into
+        ECS. It is not a reuse of the CEF integration: the column names are
+        the schema names (deviceEventClassId, categoryOutcome,
+        deviceCustomString1) not the CEF short keys, and the categorization
+        columns have no CEF equivalent to inherit a mapping from. The one real
+        fragility is that the column set is chosen at export time, so the
+        parser must bind to the header row rather than to fixed ordinal
+        positions, and a re-exported feed with a different field set will
+        silently shift columns if it does not.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          CSV does not cross the guard cleanly as CSV - a row truncated
+          mid-field is unrecoverable and the header travels separately from
+          the data - so if this format is ever adopted on a low-side instance
+          the parse-to-NDJSON has to happen low-side regardless of the
+          transitional "don't invest low-side" stance the CEF feed takes. Bind
+          the CSV Parser to the emitted header row, emit ECS-shaped NDJSON,
+          and take the one genuine win of this format on the low side: read
+          Category Outcome straight into event.outcome instead of carrying the
+          signature-ID lookup the CEF route needs. Cap the free-text Message
+          and the resource-URI columns (filePath) and strip control characters
+          before the guard destination, split the same signature-ID prefixes
+          onto the audit stream, and use Persistent Queue backpressure with a
+          volume guard on activelist:101/:103 rows exactly as on the CEF
+          route.
+        elastic: >
+          Stand up a logs-arcsight_esm.audit ingest pipeline that consumes the
+          pre-shaped NDJSON (or parses the CSV directly with a CSV processor
+          bound to the header) rather than the CEF integration. The payoff
+          over CEF is that event.outcome comes from Category Outcome
+          (/Success, /Failure, /Attempt normalized to success/failure/unknown)
+          with no per-signature lookup table, and the ArcSight categorization
+          path lands in a typed arcsight.esm.category_* namespace for
+          grouping. Everything the CEF @custom pipeline already fixes still
+          applies: move fileName / filePath / fileType into
+          arcsight.esm.resource.* so ESM resource names never reach file.*,
+          resolve the deviceCustomString slots by their paired label column,
+          and copy observer.hostname into host.name so the authentication, iam
+          and configuration profiles resolve.
+        relay: >
+          ECS-shaped NDJSON crosses, never CSV: the connector keeps writing
+          CSV low-side and the row is reshaped before the boundary, so the
+          header/column-shift hazard is contained on the low side and only
+          flat records with short ASCII keys reach the guard. The
+          content-filter friction is the same resource-identity problem as the
+          CEF feed - Message and filePath embed analyst-chosen free text in
+          square brackets and can carry non-ASCII characters - so cap their
+          length and strip control characters low-side. At-most-once with no
+          return channel: reconcile low-side and high-side counts per
+          (dataset, hour), which matters most for the configuration-change
+          rows that are the point of the decommission audit trail.
+      direct:
+        parse_location: high
+        cribl: >
+          For a high-side instance with no guard, keep the low/core worker
+          groups a pass-through and do not build an ArcSight CSV parser here -
+          the same transitional logic as the CEF route, since this feed has a
+          decommission date. Confine any low-side work to routing the ArcSight
+          signature-ID prefixes onto the audit stream and Persistent Queue
+          backpressure on the Elastic destination; if CSV is delivered as a
+          file rather than over syslog, a Cribl file/S3 collector picks it up
+          unparsed and hands the raw rows to Elastic.
+        elastic: >
+          Parse on the Elastic side with a CSV ingest processor bound to the
+          header row feeding the logs-arcsight_esm.audit@custom pipeline. The
+          payoff over CEF is that event.outcome comes from Category Outcome
+          (/Success, /Failure, /Attempt normalized to success/failure/unknown)
+          with no per-signature lookup table, and the ArcSight categorization
+          path lands in a typed arcsight.esm.category_* namespace for
+          grouping. Because the CSV can carry a much wider field set than CEF,
+          pin the accepted columns in the pipeline and drop unmapped schema
+          columns explicitly rather than letting a re-export with a larger
+          field set balloon the mapping.
+    fields:
+    - vendor: deviceEventClassId
+      type: string
+      description: >-
+        ArcSight event-schema Device Event Class ID column - the audit event
+        signature ID, e.g. authentication:101, resource:102, activelist:105
+      ecs: event.code
+      status: mapped
+      notes: >-
+        same identifier the CEF header carries, but as a named schema column
+        rather than the CEF signature-ID slot; the stable join between legacy
+        ESM content and replacement Elastic detections
+    - vendor: name
+      type: string
+      description: >-
+        Name column - the human-readable audit event name, e.g. "Filter
+        added", "Failed client login"
+      ecs: event.action
+      status: partial
+      notes: >-
+        a fixed ESM vocabulary of "<resource type>
+        added/updated/deleted/locked/unlocked" and authentication phrases, not
+        ECS action verbs; normalize before it drives cross-source
+        admin-activity dashboards
+    - vendor: categoryOutcome
+      type: string
+      description: >-
+        Category Outcome column - the ESM-normalized outcome taxonomy value,
+        /Success, /Failure or /Attempt
+      ecs: event.outcome
+      status: partial
+      transform: >
+        the field the CEF audit feed does NOT have and has to reconstruct from
+        the signature-ID suffix; here it is emitted directly, so map
+        /Success->success, /Failure->failure and /Attempt->unknown (never
+        force /Attempt to failure). This is the single reason the CSV export
+        is worth considering for the audit feed over CEF
+    - vendor: categoryBehavior
+      type: string
+      description: >-
+        Category Behavior column - the ESM normalized action taxonomy, e.g.
+        /Modify/Configuration, /Authentication/Verify, /Create, /Delete
+      ecs: null
+      status: unmapped
+      custom: arcsight.esm.category_behavior
+      notes: >-
+        a vendor taxonomy path, not an ECS action verb, so it stays custom;
+        more consistent across audit event types than the free-text Name and
+        useful for grouping admin activity by what was done
+    - vendor: categoryObject
+      type: string
+      description: >-
+        Category Object column - the ESM taxonomy for what the audit event
+        acted on, e.g. /Actor/User, /Host/Resource
+      ecs: null
+      status: unmapped
+      custom: arcsight.esm.category_object
+      notes: >-
+        complements categoryBehavior; together they classify "what was done to
+        what" without parsing the free-text Name
+    - vendor: categorySignificance
+      type: string
+      description: >-
+        Category Significance column - ESM significance taxonomy, e.g.
+        /Informational, /Normal/Configuration
+      ecs: null
+      status: unmapped
+      custom: arcsight.esm.category_significance
+      notes: >-
+        kept custom rather than forced into event.type, whose vocabulary it
+        does not match
+    - vendor: deviceEventCategory
+      type: string
+      description: >-
+        Device Event Category column - the ESM audit event category path, e.g.
+        /Logger/Resource/Filter/Configuration/Add
+      ecs: null
+      status: unmapped
+      custom: arcsight.esm.event_category
+      notes: >-
+        same vendor resource-taxonomy path the CEF cat extension carries; ECS
+        event.category is a closed vocabulary so it stays custom
+    - vendor: agentSeverity
+      type: string
+      description: >-
+        Agent Severity column - ArcSight normalized severity as text (Unknown,
+        Low, Medium, High, Very-High)
+      ecs: event.severity
+      status: partial
+      transform: >
+        the CSV export carries the normalized text severity rather than the
+        CEF 0-10 numeric; map the five-value text scale onto the platform
+        numeric convention. Audit events are largely fixed-severity so this
+        carries almost no triage signal here regardless
+    - vendor: message
+      type: string
+      description: >-
+        Message column - rendered audit message text, e.g. "Filter [Unified
+        Query Test] has been added"
+      ecs: message
+      status: mapped
+    - vendor: destinationUserName
+      type: string
+      description: Destination User Name column - the ESM account the audit event concerns
+      ecs: user.name
+      status: partial
+      notes: >-
+        as on the CEF feed, ESM does not consistently separate the acting
+        admin from the account acted upon, so user.target.name is left
+        unpopulated and iam alerting cannot reliably answer "who changed whose
+        account" from this feed alone
+    - vendor: destinationUserId
+      type: string
+      description: >-
+        Destination User ID column - the ESM internal user id of the account
+        in destinationUserName
+      ecs: user.id
+      status: mapped
+    - vendor: sourceAddress
+      type: ip
+      description: >-
+        Source Address column - client address the Console, connector or web
+        session authenticated from
+      ecs: source.ip
+      status: mapped
+      notes: >-
+        populated for authentication and session audit events; absent on
+        scheduler-driven or internally generated audit events
+    - vendor: deviceAddress
+      type: ip
+      description: >-
+        Device Address column - address of the ESM Manager that generated the
+        audit event
+      ecs: observer.ip
+      status: mapped
+    - vendor: deviceHostName
+      type: string
+      description: >-
+        Device Host Name column - hostname of the ESM Manager that generated
+        the audit event
+      ecs: observer.hostname
+      status: mapped
+    - vendor: deviceVendor
+      type: string
+      description: Device Vendor column - ArcSight for every internally generated event
+      ecs: observer.vendor
+      status: mapped
+    - vendor: deviceProduct
+      type: string
+      description: >-
+        Device Product column - the emitting ArcSight component (Manager,
+        Logger, Connector)
+      ecs: observer.product
+      status: mapped
+      notes: >-
+        the discriminator for filtering ESM Manager audit events away from
+        Logger and connector audit events when a shared CSV field set carries
+        all of them
+    - vendor: deviceReceiptTime
+      type: timestamp
+      description: Device Receipt Time column - when the Manager recorded the audit event
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        unlike the CEF rt extension (bare epoch milliseconds), the CSV export
+        renders this as a formatted date-time string in the exporting
+        Console's or connector's locale/timezone, so it must be parsed with an
+        explicit timezone assumption and the format pinned to the export
+        locale
+    - vendor: agentReceiptTime
+      type: timestamp
+      description: Agent Receipt Time column - when the Forwarding Connector received the event
+      ecs: event.created
+      status: partial
+      notes: >-
+        useful as a forwarding-delay drift check against deviceReceiptTime
+        during cutover, not as the event time
+    - vendor: fileName
+      type: string
+      description: >-
+        File Name column - ESM overloads this to carry the RESOURCE NAME the
+        audit event is about (for example "John's Filter")
+      ecs: null
+      status: unmapped
+      custom: arcsight.esm.resource.name
+      notes: >-
+        not a filesystem object; keep it out of file.name, which a naive
+        schema-to-ECS rename would populate and thereby inject ESM resource
+        names into file-based detections
+    - vendor: filePath
+      type: string
+      description: >-
+        File Path column - ESM overloads this to carry the RESOURCE URI (for
+        example /All Filters/admin's Filter/John's Filter)
+      ecs: null
+      status: unmapped
+      custom: arcsight.esm.resource.uri
+      notes: >-
+        the only field identifying WHICH resource changed, so the
+        highest-value column in this dataset for the decommission record; must
+        not be dropped as a file.path lookalike and must be length-capped
+        before any guard crossing
+    - vendor: fileType
+      type: string
+      description: >-
+        File Type column - ESM overloads this to carry the RESOURCE TYPE
+        (Filter, Report, Case, Rule, Active List)
+      ecs: null
+      status: unmapped
+      custom: arcsight.esm.resource.type
+      notes: same overload; keep out of file.type
+    - vendor: deviceCustomString1..6 (with paired deviceCustomString1Label..6Label)
+      type: string
+      description: >-
+        generic ArcSight custom string columns, named at runtime by their
+        paired Label column (documented examples include Session ID, Filter,
+        Email Destination(s))
+      ecs: null
+      status: unmapped
+      custom: arcsight.esm.custom_string
+      notes: >-
+        slot assignment is per audit event type and per ArcSight component, so
+        any parser must key off the paired Label column and never the slot
+        number; the session id tying a sequence of audit events to one console
+        login arrives here
+- id: correlation-events
+  name: Correlation and notification events (forwarded)
+  description: |
+    ESM correlation events - the alerts the legacy SIEM's rules produce - forwarded onward by an ArcSight Forwarding Connector with a CEF Syslog destination, together with the notification events (notification:100-:112, :300/:301) that record how those alerts were escalated and acknowledged. The vendor is explicit that when all rule conditions and thresholds are met ESM generates a correlation event representing the contributing events, and that the Forwarding Connector sends both the correlation event and the base events that triggered it, the latter flagged with the "correlated" annotation.
+    THIS IS THE TRANSITIONAL ALERT-PARITY FEED AND NOTHING MORE. Its only job is to let the CSOC prove, for the duration of the cutover, that every alert ESM would have raised is also raised by an Elastic detection rule - and then to be switched off. It is deliberately not a strategic detection source: correlation events are second-order records whose fidelity depends entirely on ESM content that is itself being retired, and dual-alerting on both feeds without a reconciliation plan produces duplicate cases rather than better coverage.
+    Note the double-counting hazard: because the connector forwards the correlated base events alongside the correlation event, and those same base events usually also reach Elastic directly from the original device, a naive ingest counts the same activity two or three times.
+  event_categories:
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Receives CEF over TCP syslog from the Forwarding Connector's CEF
+        Syslog destination. Where the connector chain sets CEF Forwarder mode
+        true, the originating connector's identity is preserved in the agent
+        fields and must be kept.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-arcsight_esm.correlation
+      notes: >
+        Reroute out of the shared logs-cef.log stream so the alert-parity feed
+        carries its own retention and can be deleted at decommission without
+        touching other CEF sources.
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Receives CEF over TCP syslog from the Forwarding Connector's CEF
+        Syslog destination. Where the connector chain sets CEF Forwarder mode
+        true, the originating connector's identity is preserved in the agent
+        fields and must be kept.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-arcsight_esm.correlation
+      notes: >
+        Reroute out of the shared logs-cef.log stream so the alert-parity feed
+        carries its own retention and can be deleted at decommission without
+        touching other CEF sources.
+  formats:
+  - format: syslog-cef
+    parsing:
+      mechanism: elastic-integration
+      artifact: Common Event Format (CEF) integration
+      notes: >
+        The generic Elastic CEF integration parses the header and extensions;
+        no ArcSight-specific integration or Cribl pack covers ESM correlation
+        output. The awkward part is not the CEF grammar but the csN/cnN label
+        indirection ESM uses to carry rule identity and correlation metadata,
+        which the stock integration surfaces as unnamed slots.
+    fields:
+    - vendor: deviceEventClassId
+      type: string
+      description: >-
+        CEF signature-ID header identifying the ESM rule-fire class that
+        produced the correlation event
+      ecs: event.code
+      status: mapped
+      notes: >
+        the vendor documents rule:101 (fired OnEveryEvent) through rule:106
+        (fired OnSubsequentThresholds) for rule firing, and rule:300-:316 for
+        rule actions such as Send to Notifier (rule:303) and Add to Active
+        List (rule:310); whether a given deployment's correlation events carry
+        the rule-fire class or a rule-specific class depends on rule
+        configuration and must be confirmed against the live feed before
+        alerts key on it
+    - vendor: name
+      type: string
+      description: CEF Name header - for a correlation event, the name of the ESM rule that fired
+      ecs: rule.name
+      status: mapped
+      notes: >
+        rule.* is the correct home here because rule.name and rule.id would
+        describe the same object (the ESM correlation rule), unlike maps where
+        rule.name is already occupied by a policy rule; this is the field the
+        alert-parity comparison joins on
+    - vendor: cs1..cs6 (with paired cs1Label..cs6Label)
+      type: string
+      description: >-
+        generic ArcSight custom string slots, named at runtime by their paired
+        Label key; ESM uses them for rule and correlation metadata
+      ecs: null
+      status: unmapped
+      custom: arcsight.esm.custom_string
+      notes: >
+        key off the Label value, never the slot number - assignment varies by
+        rule and by connector version. Where a Label identifies the firing
+        rule's resource URI, promote that slot to rule.id so it pairs with
+        rule.name from the CEF Name header
+    - vendor: severity
+      type: integer
+      description: >-
+        CEF severity header - ArcSight agent severity derived from the ESM
+        event priority, 0-10
+      ecs: event.severity
+      status: partial
+      transform: >
+        the 0-10 ArcSight priority scale needs the same lookup to the platform
+        numeric convention used for other CEF sources; do not compare it
+        directly with an Elastic detection rule's risk score during parity
+        work
+    - vendor: cnt
+      type: integer
+      description: Base Event Count - number of base events the correlation event aggregates
+      ecs: null
+      status: unmapped
+      custom: arcsight.esm.base_event_count
+      notes: >
+        ECS 9.4 has no event-count field, so this stays custom; it is
+        load-bearing for parity work because one correlation event does not
+        equal one base event, and comparing raw document counts between ESM
+        and Elastic without it is meaningless
+    - vendor: src
+      type: ip
+      description: sourceAddress - attacker/source address carried up from the base events
+      ecs: source.ip
+      status: mapped
+    - vendor: dst
+      type: ip
+      description: destinationAddress - target address carried up from the base events
+      ecs: destination.ip
+      status: mapped
+    - vendor: spt
+      type: port
+      description: sourcePort of the correlated activity
+      ecs: source.port
+      status: mapped
+    - vendor: dpt
+      type: port
+      description: destinationPort of the correlated activity
+      ecs: destination.port
+      status: mapped
+    - vendor: proto
+      type: string
+      description: transportProtocol of the correlated activity (tcp, udp, icmp)
+      ecs: network.transport
+      status: mapped
+    - vendor: suser
+      type: string
+      description: sourceUserName - the attacker-side user carried up from the base events
+      ecs: source.user.name
+      status: mapped
+    - vendor: duser
+      type: string
+      description: destinationUserName - the target-side user carried up from the base events
+      ecs: destination.user.name
+      status: mapped
+    - vendor: act
+      type: string
+      description: deviceAction - action recorded for the correlated activity
+      ecs: event.action
+      status: partial
+      notes: >
+        inherited from whichever base event ESM promoted, so the vocabulary is
+        the union of every device feeding ESM rather than a single vendor's;
+        do not build detections on its literal values
+    - vendor: outcome
+      type: string
+      description: Device Outcome - ESM category outcome for the correlated activity
+      ecs: event.outcome
+      status: partial
+      transform: >
+        ESM emits the /Success, /Failure and /Attempt vocabulary rather than
+        ECS values; /Attempt has no ECS equivalent and must become unknown
+        rather than being forced to failure
+    - vendor: rt
+      type: timestamp
+      description: deviceReceiptTime - when ESM generated the correlation event, epoch milliseconds
+      ecs: '@timestamp'
+      status: mapped
+      transform: >
+        epoch milliseconds; note this is the correlation time, not the time of
+        the underlying activity, so parity comparisons against Elastic
+        detections must allow for ESM rule lag
+    - vendor: externalId
+      type: string
+      description: >-
+        the originating ESM event id, used to trace a forwarded alert back
+        into the Console
+      ecs: event.id
+      status: mapped
+    - vendor: ahost
+      type: string
+      description: agentHostName - hostname of the Forwarding Connector that relayed the event
+      ecs: null
+      status: unmapped
+      custom: arcsight.esm.connector.host
+      notes: >
+        not observer.hostname - the observer is the ESM Manager, this is the
+        relay. Where the connector chain runs with CEF Forwarder mode true the
+        ORIGINAL connector's identity is preserved in the agent fields and
+        must be retained, otherwise the chain of custody for a forwarded alert
+        is lost
+    - vendor: msg
+      type: string
+      description: >-
+        rendered correlation message text, including fragments carried up from
+        the contributing base events
+      ecs: message
+      status: mapped
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Pass through and instrument rather than parse: the value of this
+          route is the reconciliation counters, so emit a per-(rule name,
+          hour) count on the low side and hold it alongside the equivalent
+          Elastic detection-rule count, because that comparison - not the
+          event content - is what proves alert parity before ESM is switched
+          off. Suppress the correlated base events the Forwarding Connector
+          sends alongside each correlation event when the same base events
+          already reach Elastic directly from the originating device, or every
+          correlated session is counted two or three times. Use Persistent
+          Queue backpressure on the Elastic destination, and give this route
+          an explicit shutdown filter so the feed can be turned off in one
+          place at decommission.
+        elastic: >
+          Parse with the CEF integration into logs-arcsight_esm.correlation
+          and add a @custom pipeline that resolves the csN/cnN slots by their
+          paired Label value, promoting the firing rule's resource URI to
+          rule.id alongside rule.name from the CEF Name header - rule.name and
+          rule.id describe the same object here (the ESM rule), unlike vendor
+          maps where rule.name holds a policy rule. Normalize the ESM
+          /Success, /Failure, /Attempt outcome vocabulary to ECS
+          success/failure/unknown and the 0-10 agent severity onto the
+          platform numeric convention, and set event.kind to alert so these
+          records never mix with raw device telemetry in the same dashboards.
+          Build the parity view as a saved comparison of ESM correlation
+          counts against Elastic detection-rule counts per rule per hour, and
+          treat a rule with no Elastic counterpart as a migration backlog
+          item; at decommission, delete the data stream and the pipeline
+          together rather than leaving an orphaned parser behind.
+        relay: >
+          Low-side instances cross the guard: ECS-shaped NDJSON crosses, not
+          CEF - the Forwarding Connector keeps emitting CEF and that does not
+          change, but the conversion happens low-side so no CEF reaches the
+          boundary. The content-filter friction here is that a correlation
+          event embeds fragments of its base events, so free-text carried
+          forward from the original device (URLs, command lines, filenames)
+          arrives inside msg and the csN slots with no length discipline of
+          its own; cap those values low-side and hold the JSON to two levels
+          of nesting with short ASCII keys so a custom NDJSON filter stays
+          simple. At-most-once crossing with no acknowledgement: reconcile
+          low-side and high-side counts per (dataset, hour) - and note this is
+          the same counter the parity comparison needs, so build it once.
+      direct:
+        parse_location: high
+        cribl: >
+          Pass through and instrument rather than parse: the value of this
+          route is the reconciliation counters, so emit a per-(rule name,
+          hour) count on the low side and hold it alongside the equivalent
+          Elastic detection-rule count, because that comparison - not the
+          event content - is what proves alert parity before ESM is switched
+          off. Suppress the correlated base events the Forwarding Connector
+          sends alongside each correlation event when the same base events
+          already reach Elastic directly from the originating device, or every
+          correlated session is counted two or three times. Use Persistent
+          Queue backpressure on the Elastic destination, and give this route
+          an explicit shutdown filter so the feed can be turned off in one
+          place at decommission.
+        elastic: >
+          Parse with the CEF integration into logs-arcsight_esm.correlation
+          and add a @custom pipeline that resolves the csN/cnN slots by their
+          paired Label value, promoting the firing rule's resource URI to
+          rule.id alongside rule.name from the CEF Name header - rule.name and
+          rule.id describe the same object here (the ESM rule), unlike vendor
+          maps where rule.name holds a policy rule. Normalize the ESM
+          /Success, /Failure, /Attempt outcome vocabulary to ECS
+          success/failure/unknown and the 0-10 agent severity onto the
+          platform numeric convention, and set event.kind to alert so these
+          records never mix with raw device telemetry in the same dashboards.
+          Build the parity view as a saved comparison of ESM correlation
+          counts against Elastic detection-rule counts per rule per hour, and
+          treat a rule with no Elastic counterpart as a migration backlog
+          item; at decommission, delete the data stream and the pipeline
+          together rather than leaving an orphaned parser behind.
+  - format: csv-file
+    enable: >
+      The same ArcSight Forwarding Connector CSV File destination and ESM
+      Console Export > Events in Channel path emit correlation and
+      notification events as CSV rather than CEF, selected by the same
+      destination filter (rule-fire and notification signature IDs). The
+      field-set choice is where CSV differs from the CEF: the ArcSight event
+      schema exposes Base Event Count and the Category Outcome / Category
+      Behavior taxonomy as named columns, and the rule-identity and
+      correlation metadata that CEF buries in numbered csN/cnN slots can be
+      exported through named custom-field columns with their Label columns
+      alongside. For an on-demand pull an analyst builds a query viewer over
+      the correlation events and exports the "Export" field set (or a custom
+      saved field set) to a Local CSV File; for a continuous feed the CSV File
+      destination writes one row per correlation event with the same
+      double-counting hazard as CEF, since the connector still forwards the
+      correlated base events alongside each correlation event.
+    references:
+    - >-
+      https://www.microfocus.com/documentation/arcsight/arcsight-esm-7.8/pdfdoc/fwdconn_configguide/fwdconn_configguide.pdf
+    - >-
+      https://www.microfocus.com/documentation/arcsight/arcsight-smartconnectors/pdfdoc/SmartConnInstallandUserGuide/SmartConnInstallandUserGuide.pdf
+    - >-
+      https://www.microfocus.com/documentation/arcsight/arcsight-esm-7.6/ESM_ArcSightConsole_UserGuide/Content/ESM_UserGuide/Exporting_Data_Fields_to.htm
+    - >-
+      https://www.microfocus.com/documentation/arcsight/arcsight-esm-7.5/ESM_Console_HTML5/Content/ESM_UserGuide/Export_Events_to_File.htm
+    - >-
+      https://www.microfocus.com/documentation/arcsight/arcsight-smartconnectors-8.4/pdfdoc/cef-implementation-standard/cef-implementation-standard.pdf
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom ArcSight event-schema CSV pipeline
+      notes: >
+        Header-driven CSV parse then rename of ArcSight schema columns into
+        ECS; no Elastic integration or Cribl pack covers it. The awkward part
+        that CEF makes worse - the csN/cnN label indirection carrying rule
+        identity - is partly relieved here because the export can name those
+        columns directly, but only if the exported field set includes the
+        custom-field Label columns, so the pipeline must still resolve custom
+        slots by their paired Label column rather than by position.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Parse-to-NDJSON low-side is mandatory for a CSV crossing (a cut row
+          is unrecoverable), so bind the CSV Parser to the header and emit
+          ECS-shaped JSON. Keep the value of this route on the counters: emit
+          a per-(rule name, hour) count low-side to hold against the Elastic
+          detection-rule count, since that comparison is what proves alert
+          parity before ESM is switched off, and suppress the correlated base
+          events the connector forwards alongside each correlation event when
+          those base events already reach Elastic directly, or every
+          correlated session is counted two or three times. Cap the free-text
+          Message and any csN columns that carry base-event fragments before
+          the guard destination and use Persistent Queue backpressure with an
+          explicit shutdown filter.
+        elastic: >
+          Consume the pre-shaped NDJSON into logs-arcsight_esm.correlation.
+          The CSV advantage over CEF is that event.outcome comes from Category
+          Outcome directly and Base Event Count is a typed column rather than
+          the cnt extension, so parity math (one correlation event is not one
+          base event) does not depend on decoding a numbered slot. Promote the
+          firing rule's resource URI to rule.id alongside rule.name from the
+          Name column - they describe the same ESM rule - set event.kind to
+          alert so these records never mix with raw device telemetry, and
+          build the parity view as a saved comparison of ESM correlation
+          counts against Elastic detection-rule counts per rule per hour. At
+          decommission, delete the data stream and pipeline together.
+        relay: >
+          ECS-shaped NDJSON crosses, never CSV. The content-filter friction is
+          the same as the CEF feed: a correlation event embeds fragments of
+          its base events, so free text carried forward from the original
+          device (URLs, command lines, filenames) arrives inside Message and
+          the custom-string columns with no length discipline of its own - cap
+          those low-side and hold the JSON to two levels of nesting with short
+          ASCII keys. At-most-once with no acknowledgement: reconcile low-side
+          and high-side counts per (dataset, hour), which is the same counter
+          the parity comparison needs, so build it once.
+      direct:
+        parse_location: high
+        cribl: >
+          High-side instance, no guard: pass through and instrument rather
+          than parse, the same stance as the CEF route. Emit the per-(rule
+          name, hour) reconciliation counter low-side, suppress the forwarded
+          correlated base events that already reach Elastic directly, and
+          leave the CSV parse to the Elastic side.
+        elastic: >
+          Parse with a CSV ingest processor bound to the header feeding
+          logs-arcsight_esm.correlation@custom, resolving named or numbered
+          custom-field columns by their Label column, mapping Category Outcome
+          to event.outcome and normalizing Agent Severity onto the platform
+          numeric convention. Pin the accepted column set so a re-export with
+          a wider field set does not silently expand the mapping, and treat a
+          rule with no Elastic counterpart as a migration-backlog item.
+    fields:
+    - vendor: deviceEventClassId
+      type: string
+      description: >-
+        Device Event Class ID column - the ESM rule-fire class that produced
+        the correlation event, e.g. rule:101 (OnEveryEvent) through rule:106,
+        or a rule-action class rule:300-:316
+      ecs: event.code
+      status: mapped
+      notes: >-
+        whether a deployment's correlation events carry the rule-fire class or
+        a rule-specific class depends on rule configuration and must be
+        confirmed against the live feed before alerts key on it
+    - vendor: name
+      type: string
+      description: Name column - for a correlation event, the name of the ESM rule that fired
+      ecs: rule.name
+      status: mapped
+      notes: >-
+        rule.* is the correct home here because rule.name and rule.id describe
+        the same object (the ESM correlation rule); the field the alert-parity
+        comparison joins on
+    - vendor: baseEventCount
+      type: integer
+      description: Base Event Count column - number of base events the correlation event aggregates
+      ecs: null
+      status: unmapped
+      custom: arcsight.esm.base_event_count
+      notes: >-
+        a typed named column here rather than the CEF cnt extension; ECS has
+        no event-count field, but it is load-bearing for parity work because
+        comparing raw document counts between ESM and Elastic without it is
+        meaningless
+    - vendor: categoryOutcome
+      type: string
+      description: >-
+        Category Outcome column - the ESM normalized outcome for the
+        correlated activity, /Success, /Failure or /Attempt
+      ecs: event.outcome
+      status: partial
+      transform: >-
+        map /Success->success, /Failure->failure, /Attempt->unknown; /Attempt
+        has no ECS equivalent and must not be forced to failure. Carried as a
+        named column here rather than the CEF Device Outcome extension
+    - vendor: agentSeverity
+      type: string
+      description: >-
+        Agent Severity column - ArcSight normalized severity as text (derived
+        from the ESM event priority)
+      ecs: event.severity
+      status: partial
+      transform: >-
+        the CSV export carries the normalized text severity rather than the
+        CEF 0-10; map the text scale onto the platform numeric convention and
+        do not compare it directly with an Elastic detection rule's risk score
+        during parity work
+    - vendor: deviceCustomString1..6 (with paired deviceCustomString1Label..6Label)
+      type: string
+      description: >-
+        generic ArcSight custom string columns named by their paired Label
+        column; ESM uses them for rule and correlation metadata
+      ecs: null
+      status: unmapped
+      custom: arcsight.esm.custom_string
+      notes: >-
+        key off the Label column, never the slot number; where a Label
+        identifies the firing rule's resource URI, promote that column to
+        rule.id so it pairs with rule.name from the Name column
+    - vendor: sourceAddress
+      type: ip
+      description: Source Address column - attacker/source address carried up from the base events
+      ecs: source.ip
+      status: mapped
+    - vendor: destinationAddress
+      type: ip
+      description: Destination Address column - target address carried up from the base events
+      ecs: destination.ip
+      status: mapped
+    - vendor: sourcePort
+      type: port
+      description: Source Port column of the correlated activity
+      ecs: source.port
+      status: mapped
+    - vendor: destinationPort
+      type: port
+      description: Destination Port column of the correlated activity
+      ecs: destination.port
+      status: mapped
+    - vendor: transportProtocol
+      type: string
+      description: Transport Protocol column of the correlated activity (tcp, udp, icmp)
+      ecs: network.transport
+      status: mapped
+    - vendor: sourceUserName
+      type: string
+      description: Source User Name column - the attacker-side user carried up from the base events
+      ecs: source.user.name
+      status: mapped
+    - vendor: destinationUserName
+      type: string
+      description: >-
+        Destination User Name column - the target-side user carried up from
+        the base events
+      ecs: destination.user.name
+      status: mapped
+    - vendor: deviceAction
+      type: string
+      description: Device Action column - action recorded for the correlated activity
+      ecs: event.action
+      status: partial
+      notes: >-
+        inherited from whichever base event ESM promoted, so the vocabulary is
+        the union of every device feeding ESM rather than a single vendor's;
+        do not build detections on its literal values
+    - vendor: externalId
+      type: string
+      description: >-
+        External ID column - the originating ESM event id, used to trace a
+        forwarded alert back into the Console
+      ecs: event.id
+      status: mapped
+    - vendor: deviceReceiptTime
+      type: timestamp
+      description: Device Receipt Time column - when ESM generated the correlation event
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        rendered as a formatted date-time string in the exporter's timezone
+        (not the CEF epoch milliseconds); parse with an explicit timezone, and
+        note this is the correlation time not the underlying activity time, so
+        parity comparisons must allow for ESM rule lag
+    - vendor: agentHostName
+      type: string
+      description: >-
+        Agent Host Name column - hostname of the Forwarding Connector that
+        relayed the event
+      ecs: null
+      status: unmapped
+      custom: arcsight.esm.connector.host
+      notes: >-
+        not observer.hostname (the observer is the ESM Manager, this is the
+        relay); where the connector chain runs with CEF Forwarder mode true
+        the original connector identity is preserved and must be retained or
+        chain of custody is lost
+    - vendor: message
+      type: string
+      description: >-
+        Message column - rendered correlation message text, including
+        fragments carried up from the contributing base events
+      ecs: message
+      status: mapped
+- id: manager-health
+  name: Manager, connector and status-monitor health events
+  description: |
+    ESM's own operational health as events on the same CEF feed: Manager lifecycle (manager:100 Manager has started, manager:101 a clean shutdown has been requested), event-flow interruption (manager:200 Manager has stopped the event flow, manager:201 event flow resumed), SmartConnector connection state (agent:030 connector started, agent:031 shutting down, agent:041 event flow started/stopped/paused, agent:043 device status monitoring report, agent:101 connector connected, agent:102 sending events but no heartbeats, agent:103 sending neither events nor heartbeats, agent:104/:105 unknown connector or bad shared secret), and the status-monitor counters (monitor:123 total events aggregated, monitor:124 total EPS, monitor:125/:126 output and input EPS, monitor:127 filtered EPS).
+    This is the dataset that answers "is the thing we are migrating away from still actually collecting?" during cutover. manager:200 and the agent:102/:103 heartbeat-loss events are the ones that matter: a silent ESM is indistinguishable from a quiet network, and during a migration an unnoticed ESM outage will be misread as successful cutover.
+    DELIBERATELY THIN, AND DELIBERATELY EVENT-BASED. The Manager's filesystem log, server.std.log under ARCSIGHT_HOME/logs/default, carries the JVM detail (heap, full-GC frequency and duration, persistence times, thread dumps) that a deep performance investigation needs, but ArcSight publishes no format specification for it, it needs a separate file collector on the Manager host, and multi-line thread dumps need reassembly. For a platform with a decommission date that collector is not worth building: this map covers the event-based health signal that arrives on a feed the org already has, and leaves server.std.log to ad-hoc troubleshooting on the host.
+  event_categories:
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same Forwarding Connector CEF syslog listener as the audit and
+        correlation datasets, selected by signature-ID prefix rather than by a
+        separate source.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-arcsight_esm.health
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Same Forwarding Connector CEF syslog listener as the audit and
+        correlation datasets, selected by signature-ID prefix rather than by a
+        separate source.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-arcsight_esm.health
+  formats:
+  - format: syslog-cef
+    parsing:
+      mechanism: elastic-integration
+      artifact: Common Event Format (CEF) integration
+      notes: >
+        Parsed by the same generic CEF integration as the other two datasets;
+        the only dataset-specific work is pulling the numeric counter out of
+        the label-named cnN slot on the monitor:12x events.
+    fields:
+    - vendor: deviceEventClassId
+      type: string
+      description: CEF signature-ID header carrying the manager, connector or status-monitor DEC ID
+      ecs: event.code
+      status: mapped
+      notes: >-
+        the single most important field in this dataset - the entire health
+        signal is the signature ID vocabulary, not the message text
+    - vendor: name
+      type: string
+      description: CEF Name header - the health event name, e.g. "Manager has started"
+      ecs: event.action
+      status: partial
+      notes: >-
+        fixed vendor phrases rather than ECS action verbs; keep the raw value
+        and normalize in the pipeline
+    - vendor: cat
+      type: string
+      description: deviceEventCategory path for the health event
+      ecs: null
+      status: unmapped
+      custom: arcsight.esm.event_category
+      notes: >-
+        same vendor taxonomy path as the audit dataset; ECS event.category is
+        a closed vocabulary so it stays custom
+    - vendor: msg
+      type: string
+      description: rendered health message text
+      ecs: message
+      status: mapped
+    - vendor: severity
+      type: integer
+      description: CEF severity header - ArcSight agent severity, 0-10
+      ecs: event.severity
+      status: partial
+      transform: >-
+        needs the same 0-10 to platform-numeric lookup as the other datasets;
+        health events cluster at low severities regardless of operational
+        impact, so do not alert on it
+    - vendor: cn1..cn3 (with paired cn1Label..cn3Label)
+      type: integer
+      description: >-
+        generic ArcSight custom number slots named at runtime by their paired
+        Label key; the monitor:12x status events carry the actual EPS and
+        aggregation counters here
+      ecs: null
+      status: unmapped
+      custom: arcsight.esm.custom_number
+      notes: >
+        these are metrics wearing a log schema - monitor:124 total EPS,
+        monitor:125/:126 output and input EPS, monitor:127 filtered EPS - and
+        there is no ECS home for a vendor-defined throughput counter; extract
+        by Label value and map as a numeric type or they will be dynamically
+        mapped as strings and unchartable
+    - vendor: dvchost
+      type: string
+      description: deviceHostName - hostname of the ESM Manager reporting its own health
+      ecs: observer.hostname
+      status: mapped
+    - vendor: dvc
+      type: ip
+      description: deviceAddress - address of the ESM Manager reporting its own health
+      ecs: observer.ip
+      status: mapped
+    - vendor: deviceProduct
+      type: string
+      description: >-
+        CEF Device Product header naming the reporting ArcSight component
+        (Manager, Connector)
+      ecs: observer.product
+      status: mapped
+    - vendor: ahost
+      type: string
+      description: agentHostName - the SmartConnector the agent:0xx / agent:1xx event is about
+      ecs: null
+      status: unmapped
+      custom: arcsight.esm.connector.host
+      notes: >
+        identifies which connector went silent on agent:102 / agent:103;
+        without it the heartbeat-loss events are unactionable. Kept custom
+        rather than mapped to observer.* or host.*, which belong to the
+        Manager on this dataset
+    - vendor: rt
+      type: timestamp
+      description: >-
+        deviceReceiptTime - when the Manager recorded the health event, epoch
+        milliseconds
+      ecs: '@timestamp'
+      status: mapped
+      transform: >-
+        epoch milliseconds; on heartbeat-loss events this is the detection
+        time, not the time the connector actually stopped
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Pass through with Persistent Queue backpressure and split by
+          signature-ID prefix (manager:, agent:, monitor:) onto this stream so
+          health telemetry is never mixed into the alert-parity feed.
+          Rate-limit the monitor:12x counters low-side - they are periodic
+          status samples, not events, and at their native interval they will
+          out-volume every real audit event on the route.
+        elastic: >
+          Add a logs-arcsight_esm.health@custom pipeline that lifts the
+          numeric counter out of its label-named cnN slot into a typed field
+          so EPS and aggregation counts can be charted rather than searched as
+          strings, and that derives event.outcome from the signature ID
+          (agent:102, agent:103, agent:104, agent:105 and manager:200 are
+          failures; manager:100, manager:201 and agent:030/:101 are successes)
+          since no outcome column exists. Copy observer.hostname into
+          host.name so the configuration profile resolves, and drive the two
+          cutover alerts off this stream: manager:200 without a matching
+          manager:201 inside the expected window, and any connector whose
+          agent:043 status report stops arriving - both are conditions where
+          ESM has gone quiet and the migration dashboard would otherwise show
+          a clean, empty legacy SIEM.
+      direct:
+        parse_location: high
+        cribl: >
+          Pass through with Persistent Queue backpressure and split by
+          signature-ID prefix (manager:, agent:, monitor:) onto this stream so
+          health telemetry is never mixed into the alert-parity feed.
+          Rate-limit the monitor:12x counters low-side - they are periodic
+          status samples, not events, and at their native interval they will
+          out-volume every real audit event on the route.
+        elastic: >
+          Add a logs-arcsight_esm.health@custom pipeline that lifts the
+          numeric counter out of its label-named cnN slot into a typed field
+          so EPS and aggregation counts can be charted rather than searched as
+          strings, and that derives event.outcome from the signature ID
+          (agent:102, agent:103, agent:104, agent:105 and manager:200 are
+          failures; manager:100, manager:201 and agent:030/:101 are successes)
+          since no outcome column exists. Copy observer.hostname into
+          host.name so the configuration profile resolves, and drive the two
+          cutover alerts off this stream: manager:200 without a matching
+          manager:201 inside the expected window, and any connector whose
+          agent:043 status report stops arriving - both are conditions where
+          ESM has gone quiet and the migration dashboard would otherwise show
+          a clean, empty legacy SIEM.
+  - format: csv-file
+    enable: >
+      The same ArcSight Forwarding Connector CSV File destination and ESM
+      Console Export > Events in Channel path emit the Manager, connector and
+      status-monitor health events as CSV, selected by the manager:, agent:
+      and monitor: signature-ID prefixes. The field-set choice matters most
+      here for the status-monitor counters: the monitor:12x events carry their
+      EPS and aggregation numbers in ArcSight custom number fields, and
+      exporting the paired Device Custom Number Label columns names each
+      counter directly instead of leaving it in a numbered cnN slot. As with
+      the other two feeds, a continuous feed uses the CSV File destination and
+      an on-demand pull uses a query viewer exported to a Local CSV File with
+      the "Export" or a custom saved field set. This CSV path still does not
+      replace the Manager's server.std.log JVM detail, which has no published
+      format specification and needs a separate on-host file collector not
+      worth building for a platform with a decommission date.
+    references:
+    - >-
+      https://www.microfocus.com/documentation/arcsight/arcsight-esm-7.8/pdfdoc/fwdconn_configguide/fwdconn_configguide.pdf
+    - >-
+      https://www.microfocus.com/documentation/arcsight/arcsight-smartconnectors/pdfdoc/SmartConnInstallandUserGuide/SmartConnInstallandUserGuide.pdf
+    - >-
+      https://www.microfocus.com/documentation/arcsight/arcsight-esm-7.6/ESM_ArcSightConsole_UserGuide/Content/ESM_UserGuide/Exporting_Data_Fields_to.htm
+    - >-
+      https://www.microfocus.com/documentation/arcsight/arcsight-smartconnectors-8.4/pdfdoc/cef-implementation-standard/cef-implementation-standard.pdf
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom ArcSight event-schema CSV pipeline
+      notes: >
+        Header-driven CSV parse then rename into ECS; the only
+        dataset-specific work is lifting the numeric counter out of the
+        label-named Device Custom Number column on the monitor:12x events and
+        typing it, exactly the same problem as on the CEF feed but with a
+        named column instead of a cnN slot when the Label columns are included
+        in the export.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Parse-to-NDJSON low-side (a cut CSV row is unrecoverable), split by
+          signature-ID prefix (manager:, agent:, monitor:) onto this stream,
+          and rate-limit the monitor:12x counter rows low-side - they are
+          periodic status samples, not events, and at their native interval
+          they out-volume every real health event. Read Category Outcome into
+          event.outcome so the heartbeat-loss and event-flow-stopped
+          conditions are queryable without a signature-ID lookup, and use
+          Persistent Queue backpressure.
+        elastic: >
+          Consume into logs-arcsight_esm.health, lifting the numeric counter
+          out of its label-named Device Custom Number column into a typed
+          field so EPS and aggregation counts chart rather than being searched
+          as strings. Derive event.outcome from Category Outcome directly (the
+          CSV advantage over CEF, which has to look up the signature ID), copy
+          observer.hostname into host.name so the configuration profile
+          resolves, and drive the two cutover alerts off this stream:
+          manager:200 without a matching manager:201 inside the expected
+          window, and any connector whose agent:043 status report stops
+          arriving - both being conditions where a silent ESM would otherwise
+          read as a clean cutover.
+        relay: >
+          ECS-shaped NDJSON crosses, never CSV. This feed's free-text surface
+          is small (health message text), so the crossing discipline is mostly
+          about volume: rate-limit the monitor:12x counter rows before the
+          boundary so status samples do not consume the transfer budget.
+          At-most-once with no acknowledgement: reconcile per (dataset, hour),
+          and treat a gap in the health feed itself as a cutover signal rather
+          than noise.
+      direct:
+        parse_location: high
+        cribl: >
+          High-side instance, no guard: pass through with Persistent Queue
+          backpressure, split by signature-ID prefix onto the health stream,
+          and rate-limit the monitor:12x counters; leave the CSV parse to the
+          Elastic side.
+        elastic: >
+          Parse with a CSV ingest processor bound to the header feeding
+          logs-arcsight_esm.health@custom, typing the label-named Device
+          Custom Number counters and deriving event.outcome from Category
+          Outcome. Drive the two cutover alerts off this stream: manager:200
+          without a matching manager:201 inside the expected window, and any
+          connector whose agent:043 status report stops arriving, both being
+          conditions where a silent ESM would otherwise read as a clean
+          cutover. Health events cluster at low severities regardless of
+          operational impact, so alert on the signature-ID conditions, not on
+          Agent Severity.
+    fields:
+    - vendor: deviceEventClassId
+      type: string
+      description: >-
+        Device Event Class ID column - the manager, connector or
+        status-monitor signature ID (manager:100, agent:102, monitor:124)
+      ecs: event.code
+      status: mapped
+      notes: >-
+        the single most important column in this dataset - the entire health
+        signal is the signature-ID vocabulary, not the message text
+    - vendor: name
+      type: string
+      description: Name column - the health event name, e.g. "Manager has started"
+      ecs: event.action
+      status: partial
+      notes: >-
+        fixed vendor phrases rather than ECS action verbs; keep the raw value
+        and normalize in the pipeline
+    - vendor: categoryOutcome
+      type: string
+      description: >-
+        Category Outcome column - ESM normalized outcome for the health event,
+        /Success or /Failure
+      ecs: event.outcome
+      status: partial
+      transform: >
+        the CSV advantage over CEF for this feed - agent:102, agent:103,
+        agent:104, agent:105 and manager:200 surface as /Failure and
+        manager:100/:201 and agent:030/:101 as /Success, so event.outcome
+        comes from this column directly instead of the signature-ID lookup the
+        CEF health pipeline needs; map /Failure->failure, /Success->success
+    - vendor: deviceEventCategory
+      type: string
+      description: Device Event Category column - the ESM category path for the health event
+      ecs: null
+      status: unmapped
+      custom: arcsight.esm.event_category
+      notes: >-
+        same vendor taxonomy path as the audit dataset; ECS event.category is
+        a closed vocabulary so it stays custom
+    - vendor: message
+      type: string
+      description: Message column - rendered health message text
+      ecs: message
+      status: mapped
+    - vendor: agentSeverity
+      type: string
+      description: Agent Severity column - ArcSight normalized severity as text
+      ecs: event.severity
+      status: partial
+      transform: >-
+        map the text scale onto the platform numeric convention; health events
+        cluster at low severities regardless of operational impact, so do not
+        alert on it
+    - vendor: deviceCustomNumber1..3 (with paired deviceCustomNumber1Label..3Label)
+      type: integer
+      description: >-
+        generic ArcSight custom number columns named by their paired Label
+        column; the monitor:12x status events carry the EPS and aggregation
+        counters here
+      ecs: null
+      status: unmapped
+      custom: arcsight.esm.custom_number
+      notes: >
+        these are metrics wearing a log schema - monitor:124 total EPS,
+        monitor:125/:126 output and input EPS, monitor:127 filtered EPS - with
+        no ECS home for a vendor-defined throughput counter; extract by Label
+        column and type as numeric or they are dynamically mapped as strings
+        and unchartable
+    - vendor: deviceHostName
+      type: string
+      description: Device Host Name column - hostname of the ESM Manager reporting its own health
+      ecs: observer.hostname
+      status: mapped
+    - vendor: deviceAddress
+      type: ip
+      description: Device Address column - address of the ESM Manager reporting its own health
+      ecs: observer.ip
+      status: mapped
+    - vendor: deviceProduct
+      type: string
+      description: Device Product column - the reporting ArcSight component (Manager, Connector)
+      ecs: observer.product
+      status: mapped
+    - vendor: agentHostName
+      type: string
+      description: >-
+        Agent Host Name column - the SmartConnector the agent:0xx / agent:1xx
+        event is about
+      ecs: null
+      status: unmapped
+      custom: arcsight.esm.connector.host
+      notes: >-
+        identifies which connector went silent on agent:102 / agent:103;
+        without it the heartbeat-loss events are unactionable, and it is kept
+        custom rather than mapped to observer.* or host.*, which belong to the
+        Manager on this dataset
+    - vendor: deviceReceiptTime
+      type: timestamp
+      description: Device Receipt Time column - when the Manager recorded the health event
+      ecs: '@timestamp'
+      status: partial
+      transform: >-
+        rendered as a formatted date-time string in the exporter's timezone
+        (not CEF epoch milliseconds); on heartbeat-loss events this is the
+        detection time, not the time the connector actually stopped

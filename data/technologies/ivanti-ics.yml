@@ -1,0 +1,1598 @@
+id: ivanti-ics
+name: Ivanti Connect Secure
+vendor: Ivanti
+versions: 9.1Rx (Pulse Connect Secure), 22.x (Ivanti Connect Secure)
+draft: true
+references:
+- https://help.ivanti.com/ps/help/en_US/ICS/22.x/ag/logging_n_monitoring.htm
+- https://help.ivanti.com/ps/help/en_US/IPS/22.x/ag/log_filtering.htm
+- https://www.elastic.co/docs/reference/integrations/pulse_connect_secure
+- https://github.com/elastic/integrations/tree/main/packages/pulse_connect_secure
+- https://docs.sekoia.com/integration/categories/network/pulse/
+- https://github.com/u-siem/usiem-pulsesecure
+- https://forums.ivanti.com/s/article/KB44755
+- >-
+  https://www.splunk.com/en_us/blog/security/monitoring-pulse-connect-secure-with-splunk-cisa-emergency-directive-21-03.html
+datasets:
+- id: user-access
+  name: User access log
+  description: >
+    End-user session lifecycle on the SSL VPN concentrator: primary and
+    secondary authentication, login/logout, realm evaluation and role
+    assignment, session timeout, VPN (Network Connect) tunnel establishment
+    with the assigned inner address, and web/file resource access. Exported
+    over syslog with the WELF filter selected, which wraps every forwarded
+    message in a stable key=value envelope
+    (id/time/pri/fw/vpn/ivs/user/realm/roles/proto/src/dst/dstname/type/
+    op/arg/result/sent/rcvd/agent/duration/msg). The catch this map exists to
+    record: the envelope is stable but mostly EMPTY. Of roughly 3,150
+    documented message ids only ~990 have a documented WELF field rendering,
+    and the NWC (VPN tunneling) class has none at all, so on the highest-value
+    records the structured keys arrive blank and the entire payload - assigned
+    tunnel IP, session id, failure reason, auth server name - lives in the
+    free-text msg value behind its five-digit message id (AUT####
+    authentication, NWC#### network connect, USR#### user account change).
+  event_categories:
+  - authentication
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Receives WELF-formatted syslog directly from the ICS syslog forwarding
+        configuration. ICS is an internet-facing ingress, so most of the
+        estate sits in the lower enclave and takes the guarded path shown
+        here.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-ivanti_ics.user_access
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Receives WELF-formatted syslog directly from the ICS syslog forwarding
+        configuration and forwards it to Elastic without a guard crossing.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-ivanti_ics.user_access
+  formats:
+  - format: syslog-kv
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Ivanti ICS WELF pipeline
+      notes: >
+        No Cribl pack and no usable Elastic integration exists for this feed.
+        The stock Elastic pulse_connect_secure integration was evaluated and
+        rejected: its envelope grok matches the STANDARD format only
+        ("PulseSecure: - - - ... [client]user(realm)[roles]") and will not
+        match WELF at all; even on Standard input it never extracts the
+        message id, carries only four message-body grok patterns (agent login,
+        VPN tunneling session, session user-agent, login reason), hard-codes
+        event.category to [network] for every record including admin config
+        changes, and exposes just four vendor fields (pulse_secure.realm,
+        .role, .session.id, .session.id_short). A hand-built pipeline keyed on
+        the message id is required either way.
+    fields:
+    - vendor: time
+      type: timestamp
+      description: appliance-local event time, quoted as "YYYY-MM-DD HH:MM:SS"
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        the WELF value carries no timezone; the offset must be taken from the
+        syslog header timestamp (or the appliance timezone setting) before
+        this parses as @timestamp
+    - vendor: pri
+      type: integer
+      description: syslog severity code for the record (0-7)
+      ecs: log.syslog.severity.code
+      status: mapped
+    - vendor: fw
+      type: ip
+      description: IP address of the ICS appliance that emitted the record
+      ecs: observer.ip
+      status: mapped
+    - vendor: vpn
+      type: string
+      description: configured name of the ICS appliance or cluster node (e.g. ive)
+      ecs: observer.name
+      status: mapped
+    - vendor: ivs
+      type: string
+      description: virtual system (IVS) the session belongs to, e.g. Default Network or Root
+      ecs: null
+      status: unmapped
+      custom: ivanti.ics.virtual_system
+      transform: >
+        emitted UNQUOTED and routinely contains spaces ("ivs=Default
+        Network"); a whitespace-delimited kv parser will mis-split this value
+        and consume the following user= key, so the field needs an explicit
+        anchored extraction
+    - vendor: user
+      type: string
+      description: username the session authenticated as, or System for appliance-generated records
+      ecs: user.name
+      status: mapped
+    - vendor: realm
+      type: string
+      description: authentication realm the user signed in to, quoted and often empty
+      ecs: null
+      status: unmapped
+      custom: ivanti.ics.realm
+      notes: >
+        ICS realm is a sign-in policy container, not a directory domain -
+        mapping it to user.domain would collide with the AD domain that
+        appears in the Standard-format user string, so it is kept custom
+    - vendor: roles
+      type: string
+      description: quoted, comma-separated list of roles the realm mapping assigned to the session
+      ecs: user.roles
+      status: mapped
+      transform: >
+        split the quoted value on comma into an array; the value is empty on
+        pre-authorization records (role assignment happens after primary auth
+        succeeds) so absence is not an error
+    - vendor: proto
+      type: enum
+      description: >-
+        ICS access method for the record (auth, web, fbr for Windows file
+        share, meeting, ...)
+      ecs: null
+      status: unmapped
+      custom: ivanti.ics.access_method
+      notes: >
+        despite the key name this is not a network protocol and must not be
+        written to network.protocol; it is the ICS access-method taxonomy, and
+        CISA ED 21-03 monitoring guidance keys on proto=fbr and proto=meeting
+        specifically
+    - vendor: src
+      type: ip
+      description: public IP address the client connected from
+      ecs: source.ip
+      status: mapped
+    - vendor: dst
+      type: ip
+      description: IP address of the internal resource the session reached
+      ecs: destination.ip
+      status: partial
+      notes: >-
+        populated only for resource-access records (proto=web/fbr/meeting);
+        emitted empty on every authentication record
+    - vendor: arg
+      type: string
+      description: quoted resource path or URI the operation acted on
+      ecs: url.path
+      status: partial
+      notes: >
+        the ED 21-03 webshell indicators are CGI paths in this field
+        (/dana/fb/smb/wfb.cgi, /dana-na/.../meetingrun.cgi); empty on
+        authentication records, and for proto=fbr it holds an SMB path rather
+        than a URL path
+    - vendor: result
+      type: string
+      description: operation result string
+      ecs: event.outcome
+      status: partial
+      transform: >
+        emitted empty on virtually every authentication record, so
+        event.outcome cannot be derived from it - the real outcome has to come
+        from a message-id lookup (AUT24326/AUT31504 success, AUT24327/AUT23457
+        failure) with this field used only as confirmation where it is present
+    - vendor: sent
+      type: bytes
+      description: bytes sent by the client during the session or operation
+      ecs: source.bytes
+      status: partial
+      notes: >-
+        populated on session-teardown and resource-access records only; empty
+        on authentication records
+    - vendor: rcvd
+      type: bytes
+      description: bytes received by the client during the session or operation
+      ecs: destination.bytes
+      status: partial
+      notes: same population caveat as sent
+    - vendor: agent
+      type: string
+      description: quoted browser or Ivanti Secure Access client user-agent string
+      ecs: user_agent.original
+      status: mapped
+    - vendor: msg
+      type: string
+      description: quoted free-text event message, prefixed by its five-digit message id
+      ecs: message
+      status: mapped
+    - vendor: msgid
+      type: string
+      description: >-
+        three-letter class plus five-digit event code prefixing every msg
+        value (AUT24326, NWC23464, USR22898)
+      ecs: event.code
+      status: partial
+      transform: >
+        not a separate WELF key - split it off the front of msg on the first
+        colon. This is the only stable join key for the dataset and the class
+        prefix (AUT authentication, NWC network connect, USR user change) is
+        what drives event.category/type/outcome assignment, so the lookup
+        table it feeds is the parser
+    - vendor: session id (msg substring)
+      type: string
+      description: eight-character session identifier rendered inside msg as "(session:xxxxxxxx)"
+      ecs: null
+      status: unmapped
+      custom: ivanti.ics.session.id
+      notes: >
+        the only field that ties an authentication record to its tunnel and
+        logout records; never exposed as a WELF key, so it must be regexed out
+        of msg on every class that renders it
+    - vendor: tunnel address (NWC23464/NWC23465 msg)
+      type: ip
+      description: >-
+        inner IP address assigned to the VPN tunnel, rendered inside the NWC
+        session-start/session-end message text
+      ecs: client.nat.ip
+      status: partial
+      notes: >
+        the NWC class has NO documented WELF field rendering, so the assigned
+        address and the accompanying client hostname exist only as free text.
+        ECS has no vpn.* namespace for a concentrator-assigned inner address;
+        client.nat.ip is the closest GA field and is what Elastic's own
+        pulse_connect_secure pipeline uses, but it is a tunnel assignment
+        rather than a NAT translation - revisit if ECS grows a VPN namespace
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Split the WELF envelope from the msg payload low-side and drive
+          everything else off a message-id lookup table, because the envelope
+          keys arrive empty on most records - build the kv parser to tolerate
+          ivs= being unquoted with embedded spaces ("ivs=Default Network"),
+          which breaks naive whitespace-delimited kv splitting and silently
+          swallows the following user= key. Extract the five-digit id into
+          event.code, then run a per-id template regex to recover what the
+          envelope does not carry: the tunnel-assigned inner IP and hostname
+          from NWC23464/NWC23465, the session id from the trailing
+          "(session:xxxxxxxx)", the auth server name and failure reason from
+          AUT23457, and the true success/failure outcome (result= is blank on
+          virtually every authentication record). Split roles= on comma into
+          an array, mask the credential and token values that appear in
+          AUT/USR message text, and gate the Elastic destination with
+          C.Schema(...).validate plus a dead-letter route whose own rate is
+          alerted on, since a hand-built per-id table will silently fall
+          behind new firmware message ids.
+        elastic: >
+          Own a custom logs-ivanti_ics.user_access ingest pipeline that
+          finishes only what the low side cannot, and do not layer the stock
+          pulse_connect_secure integration underneath it - its unconditional
+          event.category=[network] would mislabel every authentication record
+          on this dataset. Derive event.outcome and event.type from the
+          event.code lookup rather than from result=, and add explicit
+          custom-namespace index-template mappings for ivanti.ics.realm,
+          .access_method, .virtual_system and .session.id as keyword so realm
+          and session pivots work without dynamic mapping. Assert that
+          user.roles lands as an array and that event.duration is nanoseconds,
+          not the raw seconds the vendor emits.
+        relay: >
+          Low-side instances cross the guard as full ECS-shaped NDJSON
+          (envelope mode B) - UTF-8, LF-terminated, compression disabled,
+          nesting depth two - because the guard needs field-aware records to
+          make decisions about VPN identity data, and a thin envelope would
+          push the whole msg blob across unparsed. The content-filter friction
+          to settle with the guard owner is the free-text msg value: unbounded
+          length, and genuinely non-ASCII in practice (auth-server reason
+          strings are emitted in the appliance locale, so accented UTF-8
+          reaches the boundary), so cap and normalize it low-side rather than
+          assuming the filter tolerates it. Nothing CEF-shaped crosses - the
+          vendor feed is WELF key=value and is converted low-side. Crossing is
+          at-most-once with no return channel, so detect silent drops by
+          reconciling low-side and high-side counts per (dataset, hour); carry
+          _raw here until the per-message-id table is proven, since this is
+          the forensically load-bearing dataset on a repeatedly-exploited
+          ingress.
+      direct:
+        parse_location: low
+        cribl: >
+          Split the WELF envelope from the msg payload at the edge and drive
+          everything else off a message-id lookup table, because the envelope
+          keys arrive empty on most records - build the kv parser to tolerate
+          ivs= being unquoted with embedded spaces ("ivs=Default Network"),
+          which breaks naive whitespace-delimited kv splitting and silently
+          swallows the following user= key. Extract the five-digit id into
+          event.code, then run a per-id template regex to recover what the
+          envelope does not carry: the tunnel-assigned inner IP and hostname
+          from NWC23464/NWC23465, the session id from the trailing
+          "(session:xxxxxxxx)", the auth server name and failure reason from
+          AUT23457, and the true success/failure outcome (result= is blank on
+          virtually every authentication record). Split roles= on comma into
+          an array, mask the credential and token values that appear in
+          AUT/USR message text, and gate the Elastic destination with
+          C.Schema(...).validate plus a dead-letter route whose own rate is
+          alerted on, since a hand-built per-id table will silently fall
+          behind new firmware message ids.
+        elastic: >
+          Own a custom logs-ivanti_ics.user_access ingest pipeline that
+          carries the record the rest of the way to ECS, and do not layer the
+          stock pulse_connect_secure integration underneath it - its
+          unconditional event.category=[network] would mislabel every
+          authentication record on this dataset. Derive event.outcome and
+          event.type from the event.code lookup rather than from result=, and
+          add explicit custom-namespace index-template mappings for
+          ivanti.ics.realm, .access_method, .virtual_system and .session.id as
+          keyword so realm and session pivots work without dynamic mapping.
+          Assert that user.roles lands as an array and that event.duration is
+          nanoseconds, not the raw seconds the vendor emits.
+  - format: syslog-raw
+    enable: >
+      On the ICS admin UI go to System > Log/Monitoring > User Access >
+      Settings, add or edit the external syslog server for that tab, and set
+      its Filter dropdown to Standard (the non-editable predefined filter)
+      instead of WELF. The format is chosen per log type on this tab, so the
+      User Access log can be flipped to Standard while Admin Access and Events
+      keep their own filters; point it at a dedicated collector if the WELF
+      feed is being retained in parallel. Standard emits the positional line
+      "<date time> - <node> - [<source ip>] <ivs>::<user>(<realm>)[<roles>] -
+      <message>" with the five-digit id (AUT/NWC/USR) prefixing the message.
+    references:
+    - >-
+      https://help.ivanti.com/ps/help/en_US/IPS/22.x/ag/configuring_an_external_syslog_server.htm
+    - https://help.ivanti.com/ps/help/en_US/ICS/22.x/ag/logging_n_monitoring.htm
+    - https://www.elastic.co/docs/reference/integrations/pulse_connect_secure
+    - >-
+      https://www.splunk.com/en_us/blog/security/monitoring-pulse-connect-secure-with-splunk-cisa-emergency-directive-21-03.html
+    parsing:
+      mechanism: elastic-integration
+      artifact: Elastic pulse_connect_secure integration + logs-pulse_connect_secure.log@custom
+      notes: >
+        The stock pulse_connect_secure integration's envelope grok matches
+        THIS format (it will not match WELF), so on Standard input it does
+        extract the positional node/source-ip/user/realm/roles fields for free
+        - the one reason to prefer Standard here. It still contributes nothing
+        to the hard problem: it never extracts the five-digit message id,
+        ships only four body grok patterns (agent login, VPN tunneling
+        session, session user-agent, login reason), and hard-codes
+        event.category to [network] on every record including account changes.
+        So the same message-id lookup table the WELF form needs still has to
+        run in a @custom pipeline (or a Cribl pipeline) on top of the
+        integration. Note Standard carries NO
+        proto/op/arg/dst/sent/rcvd/agent/duration slots, so the
+        resource-access and byte-count detail the WELF envelope reserves keys
+        for is simply absent on this form - it is identity-and-message only.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Anchor a positional regex on the "<date time> - <node> - [<src>]
+          <ivs>::<user>(<realm>)[<roles>] - <msg>" layout LOW-SIDE and split
+          the five-digit id off the front of the message before the crossing,
+          since the id is the only stable join key and the appliance-side
+          lookup table is what recovers the NWC tunnel IP, the
+          (session:xxxxxxxx) id and the true AUT outcome that the positional
+          slots do not carry. Standard sidesteps the WELF ivs= unquoted-spaces
+          splitting hazard because ivs is positionally bounded by the "::"
+          separator, so the parser is simpler here than on WELF - but a mixed
+          collector can still see WELF and Standard on one stream when other
+          tabs differ, so sniff the shape and dead-letter unrecognized lines
+          ahead of the parser. Split roles on comma into an array and mask
+          credential/token substrings in AUT/USR message text before the
+          guard.
+        elastic: >
+          Run the pulse_connect_secure integration to get the envelope grok,
+          then override it in a logs-pulse_connect_secure.log@custom pipeline:
+          derive event.category/type/outcome from the message-id class rather
+          than from the integration's hard-coded [network], set event.code
+          from the id, and add keyword mappings for ivanti.ics.realm,
+          .virtual_system and .session.id so realm and session pivots resolve
+          without dynamic mapping. Assert user.roles is an array and normalize
+          the tz-less timestamp using the syslog header offset before it lands
+          as @timestamp.
+        relay: >
+          Low-side instances cross the guard as full ECS-shaped NDJSON
+          (envelope mode B), converted from the positional line low-side - the
+          guard needs field-aware records to reason about VPN identity, and a
+          thin envelope would push the whole message blob across unparsed. The
+          free-text message value is the content-filter friction here as on
+          the WELF form: unbounded and genuinely non-ASCII (auth-server reason
+          strings in the appliance locale), so cap and normalize it low-side.
+          Nothing Standard-text crosses; it is converted low-side.
+          At-most-once crossing with no return channel - reconcile low-side
+          and high-side counts per (dataset, hour), and carry _raw until the
+          per-id table is proven on this forensically load-bearing ingress.
+      direct:
+        parse_location: hybrid
+        cribl: >
+          High-side instances skip the guard: terminate the Standard syslog at
+          the core group, do the positional split and id extraction there, and
+          run Persistent Queue backpressure. Decide per appliance whether the
+          Standard or WELF feed is authoritative for user access so a login is
+          not counted on both.
+        elastic: >
+          Run the pulse_connect_secure integration to get the envelope grok,
+          then override it in a logs-pulse_connect_secure.log@custom pipeline:
+          derive event.category/type/outcome from the message-id class rather
+          than from the integration's hard-coded [network], set event.code
+          from the id, and add keyword mappings for ivanti.ics.realm,
+          .virtual_system and .session.id so realm and session pivots resolve
+          without dynamic mapping. Assert user.roles is an array and normalize
+          the tz-less timestamp using the syslog header offset before it lands
+          as @timestamp. The envelope grok is the only thing Standard gives
+          for free, so the id-driven category/outcome overrides carry the
+          rest.
+    fields:
+    - vendor: date time (positional)
+      type: timestamp
+      description: appliance-local event date and time opening the Standard record
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        carries no timezone; take the offset from the syslog header timestamp
+        or the appliance timezone setting before this parses as @timestamp
+    - vendor: node (positional)
+      type: string
+      description: appliance or cluster node name, the second dash-delimited component
+      ecs: observer.name
+      status: mapped
+    - vendor: source ip (positional)
+      type: ip
+      description: client public IP address in square brackets that opened the session
+      ecs: source.ip
+      status: mapped
+      notes: >
+        populated with the connecting client address on user-access records,
+        unlike the events log where this positional slot is usually the
+        loopback for appliance-internal events
+    - vendor: ivs (positional)
+      type: string
+      description: >-
+        virtual system (IVS) name preceding the "::" separator, e.g. Default
+        Network or Root
+      ecs: null
+      status: unmapped
+      custom: ivanti.ics.virtual_system
+      notes: >
+        positionally bounded by "::" here, so it does NOT carry the WELF
+        form's unquoted-embedded-spaces splitting hazard - the one parsing win
+        Standard has over WELF on this dataset
+    - vendor: user (positional)
+      type: string
+      description: username the session authenticated as, or System for appliance-generated records
+      ecs: user.name
+      status: mapped
+    - vendor: realm (positional)
+      type: string
+      description: authentication realm in parentheses following the username
+      ecs: null
+      status: unmapped
+      custom: ivanti.ics.realm
+      notes: >
+        ICS realm is a sign-in policy container, not a directory domain, so it
+        is kept custom rather than mapped to user.domain, as on the WELF form
+    - vendor: roles (positional)
+      type: string
+      description: comma-separated role list in square brackets following the realm
+      ecs: user.roles
+      status: mapped
+      transform: >
+        split on comma into an array; empty on pre-authorization records since
+        role assignment happens after primary auth succeeds, so absence is not
+        an error
+    - vendor: message (positional)
+      type: string
+      description: >-
+        free-text event message following the final dash separator, prefixed
+        by its five-digit message id
+      ecs: message
+      status: mapped
+    - vendor: msgid
+      type: string
+      description: >-
+        three-letter class plus five-digit event code prefixing the message
+        (AUT24326, NWC23464, USR22898)
+      ecs: event.code
+      status: partial
+      transform: >
+        split off the front of the message on the first colon; the stock
+        integration does NOT extract this, yet the class prefix (AUT
+        authentication, NWC network connect, USR user change) is what drives
+        event.category/type/outcome, so the id lookup table is still the
+        parser
+    - vendor: syslog severity (header)
+      type: integer
+      description: syslog severity code from the transport header, 0-7
+      ecs: log.syslog.severity.code
+      status: mapped
+      notes: >
+        the Standard body carries no pri= key of its own (unlike WELF), so
+        severity comes from the syslog header; numeric ECS event.severity is
+        derived from it by lookup
+    - vendor: session id (msg substring)
+      type: string
+      description: >-
+        eight-character session identifier rendered inside the message as
+        "(session:xxxxxxxx)"
+      ecs: null
+      status: unmapped
+      custom: ivanti.ics.session.id
+      notes: >
+        never a structured slot in Standard any more than in WELF - it must be
+        regexed out of the message text; it is the only field tying an
+        authentication record to its tunnel and logout records
+    - vendor: tunnel address (NWC23464/NWC23465 msg)
+      type: ip
+      description: >-
+        inner IP address assigned to the VPN tunnel, rendered inside the NWC
+        session-start/session-end message text
+      ecs: client.nat.ip
+      status: partial
+      notes: >
+        the NWC class has no structured field rendering in either format, so
+        the assigned address and client hostname exist only as free text;
+        client.nat.ip is the closest GA field and the one Elastic's own
+        pipeline uses, though it is a tunnel assignment rather than a NAT
+        translation
+  - format: json
+    enable: >
+      On ICS 22.x go to System > Log/Monitoring > User Access > Settings, add
+      or edit the external syslog server, and set its Filter dropdown to
+      "JSON: JSON" (the fixed predefined JSON filter). This forwards all User
+      Access records to the collector as native JSON rather than the WELF text
+      line; the filter is per log type, so Admin Access and Events can stay on
+      their own filters. Transport is syslog over UDP/TCP/TLS in RFC5424
+      framing, or a Cribl/HTTP collector can receive the JSON directly.
+    references:
+    - https://help.ivanti.com/ps/help/en_US/IPS/22.x/ag/log_filtering.htm
+    - https://help.ivanti.com/ps/help/en_US/ICS/22.x/ag/logging_n_monitoring.htm
+    - https://docs.datadoghq.com/integrations/ivanti-connect-secure/
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Ivanti ICS JSON reparse pipeline
+      notes: >
+        No stock Elastic integration parses the ICS JSON form (pulse_connect_
+        secure is written against the Standard syslog line), so the reparse is
+        custom: Extract JSON, then map the keys to ECS and the ivanti.ics.*
+        customs. Because the JSON key names are not published (Datadog
+        confirms the format and that it covers web-request, authentication,
+        connection, VPN-tunneling, statistics and administrator-activity
+        classes, but lists no field names), the pipeline must be built against
+        a captured sample from the target firmware and the id-driven
+        category/outcome logic from the WELF form still applies. Whether the
+        JSON payload promotes the NWC-class tunnel IP and the session id into
+        structured keys (rather than leaving them in a message string as
+        WELF/Standard do) is the specific thing to verify on-device, since
+        that is what would make JSON strictly richer than the WELF.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          This is the alternate that crosses cleanest: build full ECS-shaped
+          JSON LOW-SIDE from the already-structured document, since a content
+          filter can inspect NDJSON directly. Map keys to ECS at the source,
+          split the five-digit id into event.code and drive category/outcome
+          off it, cap the free-text message value, and mask credential/token
+          substrings before the destination. Point the JSON filter at a
+          low-side Cribl HTTP/syslog source, schema-validate with
+          C.Schema(...) into a dead-letter route, and run Persistent Queue
+          backpressure - the same guard discipline as the other forms, just
+          without the text-line parse.
+        elastic: >
+          With records arriving pre-structured, keep high-side work to a
+          custom pipeline that finishes what the low side cannot: run
+          category/outcome off the message-id class rather than any network
+          default, add keyword mappings for
+          ivanti.ics.realm/.virtual_system/.session.id, and assert user.roles
+          is an array and event.duration nanoseconds. Do not layer the
+          Standard-oriented stock integration underneath - it cannot read this
+          form.
+        relay: >
+          Redacted ECS-shaped NDJSON crosses; JSON is the friendliest content-
+          filter surface on this technology because it is one document per
+          record with short keys rather than an unbounded WELF/Standard line.
+          Hold it to shallow nesting, cap the message and any auth-server
+          reason string (still locale-encoded UTF-8 in practice), and drop
+          credential-bearing substrings low-side. At-most-once crossing;
+          reconcile low-side and high-side counts per (dataset, hour) and
+          carry _raw until the id table is proven, exactly as on the WELF
+          feed.
+      direct:
+        parse_location: low
+        cribl: >
+          High-side instances point the JSON filter straight at a low-friction
+          Cribl HTTP source (or the Elastic stack) and map to ECS at the
+          source; no text-line parse and no flow collector is needed, making
+          JSON the lowest-overhead form high-side. Pick JSON or the WELF feed
+          as the single authoritative user-access source per appliance to
+          avoid double-counting.
+        elastic: >
+          With records arriving pre-structured, keep the Elastic work to a
+          custom JSON reparse pipeline: run category/outcome off the
+          message-id class rather than any network default, add keyword
+          mappings for ivanti.ics.realm/.virtual_system/.session.id, and
+          assert user.roles is an array and event.duration nanoseconds. Do not
+          layer the Standard-oriented stock integration underneath - it cannot
+          read this form. Retain the full message and reason strings, and
+          treat JSON as the structured replacement for the WELF envelope if
+          on-device inspection confirms it carries the tunnel IP and session
+          id as keys.
+    fields_omitted: >
+      Ivanti publishes no key names for the predefined JSON filter -
+      third-party coverage confirms only that the User Access JSON stream
+      spans the web-request, authentication, connection, VPN-tunneling,
+      statistics and administrator-activity classes - so a key inventory can
+      only come from a capture off the target firmware, including whether it
+      promotes the NWC-class tunnel IP and session id that the syslog-kv
+      (WELF) entry leaves inside the message string.
+    fields: []
+- id: admin-access
+  name: Admin access log
+  description: >
+    Administrative activity on the appliance: administrator logins and
+    logouts, configuration changes, user and auth-server account management,
+    license changes, and administrative-recovery token creation. Emitted as
+    WELF records carrying type=mgmt and keyed by ADM#### message ids (with
+    some AUT#### records for the admin realm's own authentication). This is
+    the smallest dataset by volume and the largest by consequence on a
+    repeatedly-exploited federal ingress - and the one where the WELF envelope
+    is thinnest: mgmt records omit src, proto, op, arg, result, sent, rcvd,
+    agent and duration altogether, so the administrator's source IP address
+    exists nowhere except inside the free-text message.
+  event_categories:
+  - configuration
+  - iam
+  - authentication
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same syslog forwarding configuration as the user access log.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-ivanti_ics.admin_access
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Same syslog forwarding configuration as the user access log.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-ivanti_ics.admin_access
+  formats:
+  - format: syslog-kv
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Ivanti ICS WELF pipeline
+      notes: >
+        Shares the user-access pipeline's envelope parser but needs its own
+        message-id table: the ADM class is the largest in the catalog (~1,265
+        of ~3,150 documented ids) and only about a tenth of those have a
+        documented WELF field rendering, so nearly all admin semantics are
+        free text. The Elastic pulse_connect_secure integration is actively
+        wrong for this dataset - it stamps event.category=[network] on every
+        record it parses, which would file administrator configuration changes
+        as network events.
+    fields:
+    - vendor: time
+      type: timestamp
+      description: appliance-local event time, quoted as "YYYY-MM-DD HH:MM:SS"
+      ecs: '@timestamp'
+      status: partial
+      transform: no timezone in the value; take the offset from the syslog header before parsing
+    - vendor: pri
+      type: integer
+      description: syslog severity code for the record (0-7)
+      ecs: log.syslog.severity.code
+      status: mapped
+    - vendor: fw
+      type: ip
+      description: IP address of the ICS appliance that emitted the record
+      ecs: observer.ip
+      status: mapped
+    - vendor: vpn
+      type: string
+      description: configured name of the ICS appliance or cluster node
+      ecs: observer.name
+      status: mapped
+    - vendor: ivs
+      type: string
+      description: virtual system (IVS) context of the administrative action
+      ecs: null
+      status: unmapped
+      custom: ivanti.ics.virtual_system
+      notes: unquoted and space-bearing, same kv-splitting hazard as on the user access log
+    - vendor: user
+      type: string
+      description: >-
+        administrator account performing the action, or System for
+        appliance-generated records
+      ecs: user.name
+      status: mapped
+    - vendor: realm
+      type: string
+      description: administrative realm, typically "Admin Users"
+      ecs: null
+      status: unmapped
+      custom: ivanti.ics.realm
+    - vendor: roles
+      type: string
+      description: administrative roles held by the account, e.g. ".Administrators"
+      ecs: user.roles
+      status: mapped
+      transform: split the quoted value on comma into an array
+    - vendor: type
+      type: enum
+      description: WELF record class - mgmt for administrative records, vpn for end-user records
+      ecs: null
+      status: unmapped
+      custom: ivanti.ics.log_type
+      notes: >
+        the cheapest reliable discriminator for routing a mixed syslog stream
+        into the admin-access versus user-access datasets, and the signal that
+        the short envelope (no src/proto/op/arg/result) is in effect
+    - vendor: msg
+      type: string
+      description: quoted free-text administrative event message, prefixed by its message id
+      ecs: message
+      status: mapped
+    - vendor: msgid
+      type: string
+      description: three-letter class plus five-digit event code (ADM22668, ADM20716, ADM24511)
+      ecs: event.code
+      status: partial
+      transform: >
+        split off the front of msg on the first colon; the ADM class carries
+        ~1,265 documented ids, so the id-to-action lookup table is the parser
+        for this dataset
+    - vendor: admin source IP (msg substring)
+      type: ip
+      description: >-
+        IP address the administrator connected from, rendered only inside the
+        message text
+      ecs: source.ip
+      status: partial
+      notes: >
+        type=mgmt records emit no src= key whatsoever, so this must be regexed
+        per message template (ADM22668 "... from %1 via %4 port", ADM22671
+        "Logout from %1", ADM23452 "... from %1"); templates that do not
+        render it leave the administrative action with no source address at
+        all
+    - vendor: changed account (msg substring)
+      type: string
+      description: >-
+        account the administrative action created or modified, rendered inside
+        account-management message text
+      ecs: user.target.name
+      status: partial
+      notes: >
+        recovered from templates such as ADM20716 "User Accounts modified.
+        Added %1 with username %2 to authentication server %3"; only the
+        account-management ids render it, so coverage is partial by
+        construction
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Treat this as a message-id extraction problem, not a kv problem:
+          parse the short mgmt envelope, then recover the administrator's
+          source IP from the message text (ADM22668 "Login succeeded for %2/%3
+          from %1 via %4 port", ADM22671 "Logout from %1") because no src= key
+          is emitted on type=mgmt records at all, and an admin-access dataset
+          without source.ip cannot answer the question the CSOC will actually
+          ask. Extract the changed object and target account from the
+          account-management and configuration templates into explicit fields
+          rather than leaving them in prose, and flag the administrative
+          recovery path (ADM24511 token creation, ADM23452 Super Admin session
+          created using token) as its own event type low-side - it is the
+          highest-signal record on the appliance. Validate against a Schema
+          Library schema with a dead-letter route before the destination and
+          run Persistent Queue backpressure, never Block; because these
+          records are individually significant, alert on the dead-letter rate
+          directly.
+        elastic: >
+          Own a custom logs-ivanti_ics.admin_access ingest pipeline and set
+          event.category from the message-id class rather than inheriting
+          anything from the network-oriented stock integration - ADM records
+          are configuration and iam, not network. Drive event.outcome off the
+          id lookup (ADM22668 success versus the failed-login ids) since no
+          result= key is emitted, and map ivanti.ics.realm, .virtual_system,
+          .change.target and .change.object as keyword in the custom-namespace
+          index template so administrator-activity dashboards can aggregate
+          without dynamic mapping. Add an enrich or lookup step that resolves
+          the ADM id to a stable human-readable action name, so detections do
+          not have to pattern-match localized message prose.
+        relay: >
+          Low-side instances cross the guard as full ECS-shaped NDJSON, with
+          the source IP already promoted out of the message text - a thin
+          envelope would defeat the point, since the guard would then be
+          inspecting free-text admin prose it cannot reason about.
+          Content-filter friction here is configuration values echoed into the
+          message (server names, account names, license strings, recovery
+          token fragments): allow-list the extracted fields and cap the
+          residual message length rather than letting arbitrary configuration
+          text reach the boundary. Volume is low and each record is
+          individually significant, so the at-most-once crossing matters more
+          here than anywhere else on this technology - reconcile low-side and
+          high-side counts per (dataset, hour) and treat any gap as an
+          incident rather than as noise.
+      direct:
+        parse_location: low
+        cribl: >
+          Treat this as a message-id extraction problem, not a kv problem:
+          parse the short mgmt envelope, then recover the administrator's
+          source IP from the message text (ADM22668 "Login succeeded for %2/%3
+          from %1 via %4 port", ADM22671 "Logout from %1") because no src= key
+          is emitted on type=mgmt records at all, and an admin-access dataset
+          without source.ip cannot answer the question the CSOC will actually
+          ask. Extract the changed object and target account from the
+          account-management and configuration templates into explicit fields
+          rather than leaving them in prose, and flag the administrative
+          recovery path (ADM24511 token creation, ADM23452 Super Admin session
+          created using token) as its own event type at the edge - it is the
+          highest-signal record on the appliance. Validate against a Schema
+          Library schema with a dead-letter route before the destination and
+          run Persistent Queue backpressure, never Block; because these
+          records are individually significant, alert on the dead-letter rate
+          directly.
+        elastic: >
+          Own a custom logs-ivanti_ics.admin_access ingest pipeline and set
+          event.category from the message-id class rather than inheriting
+          anything from the network-oriented stock integration - ADM records
+          are configuration and iam, not network. Drive event.outcome off the
+          id lookup (ADM22668 success versus the failed-login ids) since no
+          result= key is emitted, and map ivanti.ics.realm, .virtual_system,
+          .change.target and .change.object as keyword in the custom-namespace
+          index template so administrator-activity dashboards can aggregate
+          without dynamic mapping. Add an enrich or lookup step that resolves
+          the ADM id to a stable human-readable action name, so detections do
+          not have to pattern-match localized message prose.
+  - format: syslog-raw
+    enable: >
+      On the ICS admin UI go to System > Log/Monitoring > Admin Access >
+      Settings, add or edit the external syslog server for that tab, and set
+      its Filter dropdown to Standard instead of WELF. The Admin Access tab's
+      format is independent of the other two tabs, so it can be flipped to
+      Standard alone. Standard emits the positional line "<date time> - <node>
+      - [<source ip>] <ivs>::<user>(<realm>)[<roles>] - <message>" with the
+      ADM id (and some AUT ids for the admin realm's own auth) prefixing the
+      message.
+    references:
+    - >-
+      https://help.ivanti.com/ps/help/en_US/IPS/22.x/ag/configuring_an_external_syslog_server.htm
+    - https://help.ivanti.com/ps/help/en_US/ICS/22.x/ag/logging_n_monitoring.htm
+    - https://www.elastic.co/docs/reference/integrations/pulse_connect_secure
+    parsing:
+      mechanism: elastic-integration
+      artifact: Elastic pulse_connect_secure integration + logs-pulse_connect_secure.log@custom
+      notes: >
+        The stock integration's envelope grok matches the Standard line, so it
+        extracts the positional node/source-ip/user/realm/roles for free - but
+        it hard-codes event.category to [network], which is actively wrong for
+        configuration and iam records, and it never extracts the message id.
+        The ADM-class message-id table (the largest class in the catalog,
+        ~1,265 ids, only ~a tenth WELF-rendered) still has to run in a @custom
+        pipeline. The single reason to prefer Standard here is the positional
+        [source ip] slot: it is the structured home the WELF type=mgmt
+        envelope lacks, so an administrator source IP can be parsed
+        positionally rather than regexed out of ADM22668 message prose -
+        subject to on-device confirmation that mgmt records populate the slot
+        rather than leaving the appliance address.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Parse the positional line LOW-SIDE and lift the bracketed [source
+          ip] into source.ip directly - the win over WELF mgmt, where no src=
+          is emitted and the admin IP lives only in ADM22668/ADM23452 text.
+          Still treat this as a message-id extraction problem: split the
+          ADM/AUT id off the message front, recover the changed object and
+          target account from the account-management templates into explicit
+          fields, and flag the administrative-recovery ids (ADM24511 token
+          creation, ADM23452 Super Admin session via token) as their own event
+          type before the crossing. Validate against a Schema Library schema
+          with a dead-letter route and run Persistent Queue backpressure,
+          never Block; alert on the dead-letter rate since each admin record
+          is individually significant.
+        elastic: >
+          Run pulse_connect_secure for the envelope grok, then override
+          event.category to configuration/iam off the ADM id class in a
+          @custom pipeline rather than inheriting the stock [network]. Drive
+          event.outcome from the id lookup (ADM22668 success vs the
+          failed-login ids) since no result= is emitted, map
+          ivanti.ics.realm/.virtual_system/.change.target/ .change.object as
+          keyword, and add an enrich step resolving the ADM id to a stable
+          action name so detections do not pattern-match localized prose.
+        relay: >
+          Low-side instances cross as full ECS-shaped NDJSON with the source
+          IP already promoted out of the positional slot - a thin envelope
+          would defeat the point since the guard would inspect free-text admin
+          prose it cannot reason about. Content-filter friction is
+          configuration values echoed into the message (server/account names,
+          license strings, recovery token fragments): allow-list the extracted
+          fields and cap the residual message rather than letting arbitrary
+          config text reach the boundary. Volume is low and each record
+          individually significant, so the at-most-once crossing matters most
+          here - reconcile per (dataset, hour) and treat any gap as an
+          incident.
+      direct:
+        parse_location: hybrid
+        cribl: >
+          High-side instances terminate the Standard syslog at the core group,
+          do the positional split and ADM-id extraction there, and run
+          Persistent Queue backpressure. Decide per appliance whether Standard
+          or WELF is the authoritative admin feed to avoid double-counting an
+          administrator login.
+        elastic: >
+          Run pulse_connect_secure for the envelope grok, then override
+          event.category to configuration/iam off the ADM id class in a
+          @custom pipeline rather than inheriting the stock [network]. Drive
+          event.outcome from the id lookup (ADM22668 success vs the
+          failed-login ids) since no result= is emitted, map
+          ivanti.ics.realm/.virtual_system/.change.target/ .change.object as
+          keyword, and add an enrich step resolving the ADM id to a stable
+          action name so detections do not pattern-match localized prose. The
+          one Standard win to exploit here is the positional [source ip] slot,
+          which lands the administrator source IP without an ADM22668 message
+          regex.
+    fields:
+    - vendor: date time (positional)
+      type: timestamp
+      description: appliance-local event date and time opening the Standard record
+      ecs: '@timestamp'
+      status: partial
+      transform: no timezone in the value; take the offset from the syslog header before parsing
+    - vendor: node (positional)
+      type: string
+      description: appliance or cluster node name, the second dash-delimited component
+      ecs: observer.name
+      status: mapped
+    - vendor: source ip (positional)
+      type: ip
+      description: address in square brackets associated with the administrative action
+      ecs: source.ip
+      status: partial
+      notes: >
+        the structural advantage over WELF mgmt, which emits no src= key at
+        all; confirm on-device whether a given ADM id renders the
+        administrator's client IP here or the appliance loopback, since some
+        appliance-internal mgmt records carry 127.0.0.1 rather than an actor
+        address
+    - vendor: ivs (positional)
+      type: string
+      description: >-
+        virtual system (IVS) context of the administrative action, before the
+        "::" separator
+      ecs: null
+      status: unmapped
+      custom: ivanti.ics.virtual_system
+    - vendor: user (positional)
+      type: string
+      description: >-
+        administrator account performing the action, or System for
+        appliance-generated records
+      ecs: user.name
+      status: mapped
+    - vendor: realm (positional)
+      type: string
+      description: administrative realm in parentheses, typically "Admin Users"
+      ecs: null
+      status: unmapped
+      custom: ivanti.ics.realm
+    - vendor: roles (positional)
+      type: string
+      description: administrative roles in square brackets, e.g. ".Administrators"
+      ecs: user.roles
+      status: mapped
+      transform: split on comma into an array
+    - vendor: message (positional)
+      type: string
+      description: >-
+        free-text administrative event message following the final dash
+        separator, prefixed by its message id
+      ecs: message
+      status: mapped
+    - vendor: msgid
+      type: string
+      description: three-letter class plus five-digit event code (ADM22668, ADM20716, ADM24511)
+      ecs: event.code
+      status: partial
+      transform: >
+        split off the front of the message on the first colon; the ADM class
+        carries ~1,265 documented ids, so the id-to-action lookup is the
+        parser for this dataset and the stock integration does not extract it
+    - vendor: syslog severity (header)
+      type: integer
+      description: syslog severity code from the transport header, 0-7
+      ecs: log.syslog.severity.code
+      status: mapped
+    - vendor: changed account (msg substring)
+      type: string
+      description: >-
+        account the administrative action created or modified, rendered inside
+        account-management message text
+      ecs: user.target.name
+      status: partial
+      notes: >
+        recovered from templates such as ADM20716 "User Accounts modified.
+        Added %1 with username %2 to authentication server %3"; only
+        account-management ids render it, so coverage is partial by
+        construction, exactly as on the WELF form
+  - format: json
+    enable: >
+      On ICS 22.x go to System > Log/Monitoring > Admin Access > Settings, add
+      or edit the external syslog server, and set its Filter dropdown to
+      "JSON: JSON". This forwards all Admin Access records as native JSON to
+      the collector; the filter is per log type. Transport is syslog over
+      UDP/TCP/TLS (RFC5424) or a Cribl/HTTP collector directly.
+    references:
+    - https://help.ivanti.com/ps/help/en_US/IPS/22.x/ag/log_filtering.htm
+    - https://help.ivanti.com/ps/help/en_US/ICS/22.x/ag/logging_n_monitoring.htm
+    - https://docs.datadoghq.com/integrations/ivanti-connect-secure/
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Ivanti ICS JSON reparse pipeline
+      notes: >
+        No stock Elastic integration reads the ICS JSON form, so the reparse
+        is custom: Extract JSON, map keys to ECS/customs, and run the ADM
+        message-id category/outcome logic. Key names are not published, so
+        build against a captured sample. The specific thing to verify is
+        whether the JSON payload promotes the administrator source IP into a
+        structured key - if it does, JSON removes the WELF-mgmt "no src="
+        problem without needing the Standard positional slot at all, which
+        would make it the preferred admin form.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Build full ECS-shaped JSON LOW-SIDE from the structured document:
+          map keys to ECS, split the ADM id into event.code, promote any
+          structured admin source IP into source.ip, and extract the changed
+          object/target account into explicit fields before the crossing.
+          Schema-validate into a dead-letter route and alert on its rate; each
+          admin record is individually significant, so run Persistent Queue
+          backpressure, never Block.
+        elastic: >
+          Keep high-side work to a custom pipeline that sets event.category to
+          configuration/iam off the ADM id class, drives event.outcome off the
+          id lookup, and maps ivanti.ics.realm/.virtual_system/.change.* as
+          keyword. Do not layer the Standard-oriented stock integration
+          underneath - it cannot read this form.
+        relay: >
+          Redacted ECS-shaped NDJSON crosses; JSON is the friendliest surface
+          here because the admin record becomes one short-keyed document
+          rather than an unbounded mgmt line. Allow-list the extracted fields,
+          cap the residual message, and drop recovery-token/credential
+          fragments low-side. Low volume, individually significant records:
+          reconcile per (dataset, hour) and treat any gap as an incident.
+      direct:
+        parse_location: low
+        cribl: >
+          High-side instances point the JSON filter at a low-friction Cribl
+          HTTP source or the Elastic stack and map to ECS at the source; pick
+          JSON or the WELF feed as the single authoritative admin source per
+          appliance.
+        elastic: >
+          Keep the Elastic work to a custom JSON reparse pipeline that sets
+          event.category to configuration/iam off the ADM id class, drives
+          event.outcome off the id lookup, and maps
+          ivanti.ics.realm/.virtual_system/.change.* as keyword. Do not layer
+          the Standard-oriented stock integration underneath - it cannot read
+          this form. Retain the full message and treat JSON as the structured
+          replacement for the WELF mgmt envelope if on-device inspection
+          confirms it carries the admin source IP as a key.
+    fields_omitted: >
+      The JSON filter's key names are undocumented by Ivanti, so an Admin
+      Access inventory would have to be derived from a captured sample of the
+      target firmware rather than from a vendor reference - starting with
+      whether the payload carries the administrator source IP as its own key,
+      which the syslog-kv (WELF) mgmt line omits entirely.
+    fields: []
+- id: events
+  name: Events log
+  description: >
+    Appliance health and integrity: system status, cluster and interface
+    state, certificate and licensing events, daemon errors, log-capacity
+    warnings and - the reason a federal SOC ingests this log at all - the
+    built-in Integrity Checker Tool results, which since PCS 9.1R12 report new
+    or mismatched files on the appliance as SYS32039 and SYS32040. Mapped here
+    against the STANDARD (msgid-keyed) format rather than WELF, because the
+    classes that dominate this log have almost no WELF field rendering (SYS
+    ~12%, ERR ~2% of ids) and ICS lets the export format be selected per log
+    type; choosing WELF here would buy an empty envelope at the cost of
+    positional parseability. Standard records are positional - "<date time> -
+    <node> - [<source ip>] <ivs>::<user>(<realm>)[<roles>] - <message>" - so
+    the vendor entries below are documented positional components, not named
+    keys.
+  event_categories:
+  - configuration
+  - file
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Standard-format syslog from the same appliance; note that ICS can emit
+        Standard and WELF records onto one syslog stream when formats differ
+        per log type, so the receiver must discriminate rather than assume.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-ivanti_ics.events
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Standard-format syslog from the same appliance; note that ICS can emit
+        Standard and WELF records onto one syslog stream when formats differ
+        per log type, so the receiver must discriminate rather than assume.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-ivanti_ics.events
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Ivanti ICS Standard-format pipeline
+      notes: >
+        Positional regex over the Standard format plus a message-id lookup.
+        The Elastic pulse_connect_secure integration's envelope grok does
+        match this format, but it contributes almost nothing here: it never
+        extracts the message id, its four body patterns are all login/session
+        oriented, and it would tag system and integrity events as
+        event.category=[network].
+    fields:
+    - vendor: date time (positional)
+      type: timestamp
+      description: appliance-local event date and time opening the Standard record
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        carries no timezone; take the offset from the syslog header timestamp
+        or the appliance timezone setting
+    - vendor: node (positional)
+      type: string
+      description: appliance or cluster node name, the second dash-delimited component
+      ecs: observer.name
+      status: mapped
+    - vendor: source ip (positional)
+      type: ip
+      description: >-
+        address in square brackets that raised the event; 127.0.0.1 for
+        appliance-internal events
+      ecs: source.ip
+      status: partial
+      notes: >
+        on system and integrity records this is usually the loopback address
+        rather than a meaningful actor, so alerting must not treat it as an
+        external source without checking the message class
+    - vendor: ivs (positional)
+      type: string
+      description: virtual system name preceding the "::" separator
+      ecs: null
+      status: unmapped
+      custom: ivanti.ics.virtual_system
+    - vendor: user (positional)
+      type: string
+      description: >-
+        account associated with the event, typically System for
+        appliance-generated records
+      ecs: user.name
+      status: mapped
+    - vendor: realm (positional)
+      type: string
+      description: realm name in parentheses following the username
+      ecs: null
+      status: unmapped
+      custom: ivanti.ics.realm
+    - vendor: roles (positional)
+      type: string
+      description: comma-separated role list in square brackets following the realm
+      ecs: user.roles
+      status: mapped
+      transform: split on comma into an array; usually empty on system-generated events
+    - vendor: message (positional)
+      type: string
+      description: free-text event message following the final dash separator
+      ecs: message
+      status: mapped
+    - vendor: msgid
+      type: string
+      description: three-letter class plus five-digit event code (SYS, ERR, LIC, NET, ARC, ...)
+      ecs: event.code
+      status: partial
+      transform: >
+        split off the front of the message text on the first colon; the class
+        prefix is what separates integrity and system-status records from
+        licensing and archival noise
+    - vendor: syslog severity (header)
+      type: integer
+      description: syslog severity code from the transport header, 0-7
+      ecs: log.syslog.severity.code
+      status: mapped
+      notes: >
+        the Standard format carries no severity of its own, unlike WELF's pri=
+        key; the numeric ECS event.severity has to be derived from this by
+        lookup
+    - vendor: integrity check result (SYS32039/SYS32040)
+      type: enum
+      description: >-
+        built-in Integrity Checker Tool outcome - new or mismatched appliance
+        files detected versus check completed clean
+      ecs: null
+      status: unmapped
+      custom: ivanti.ics.integrity.result
+      notes: >
+        available from PCS 9.1R12 onward when the in-build ICT is scheduled;
+        these two ids are the highest-value records this technology emits
+        given the repeated CISA emergency directives against this appliance,
+        and they are absent from older firmware and from the published
+        pre-9.1R12 message catalog, so their presence should itself be
+        monitored
+    - vendor: integrity file path (SYS32039 message text)
+      type: string
+      description: path of a new or modified appliance file reported by the Integrity Checker
+      ecs: file.path
+      status: partial
+      notes: >
+        rendered inside the message text rather than as a structured field,
+        and a single finding can list many paths - extract to an array and cap
+        the count so one large finding does not produce an unbounded value
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Anchor a positional regex on the Standard layout and pull the
+          message id out first, then discriminate the stream by shape before
+          parsing - the same syslog receiver can see Standard and WELF records
+          when the export format differs per log type, so a format sniff plus
+          a dead-letter route for unrecognized shapes belongs ahead of the
+          parser. Give the Integrity Checker ids their own handling rather
+          than letting them fall through as generic system messages: promote
+          SYS32039/SYS32040 to an explicit integrity-result field, extract the
+          reported file paths and counts, and route them to a dedicated
+          low-latency path so an integrity finding is not queued behind
+          log-capacity chatter. Because SYS/ERR templates are the least
+          WELF-covered classes in the catalog, expect the id table to lag
+          firmware upgrades - alert on the dead-letter rate and keep
+          Persistent Queue backpressure on the destination.
+        elastic: >
+          Own a custom logs-ivanti_ics.events ingest pipeline and set
+          event.category from the id class rather than accepting the stock
+          integration's blanket network categorization. Convert the syslog
+          severity code to ECS's numeric event.severity through an explicit
+          lookup instead of leaving the raw 0-7 value, and map
+          ivanti.ics.integrity.result and .virtual_system as keyword plus the
+          extracted integrity file paths into file.path so an appliance tamper
+          finding is queryable alongside every other file-integrity source.
+          Add a detection-facing alias or enrich step that marks the
+          SYS32039/SYS32040 ids as security-relevant, so the CSOC does not
+          have to know an Ivanti-specific code to find them.
+        relay: >
+          Low-side instances cross the guard as full ECS-shaped NDJSON, with
+          the integrity results already promoted to fields - an appliance
+          reporting that its own binaries were modified is exactly the record
+          that must not be delayed behind, or silently dropped by, a content
+          filter inspecting free text. Constrain the JSON low-side to shallow
+          nesting and bounded strings, and cap the file-path list that
+          SYS32039/SYS32040 can carry so a large integrity finding cannot
+          produce a kilobyte-scale value the filter rejects wholesale. Nothing
+          CEF-shaped crosses. Reconcile low-side and high-side counts per
+          (dataset, hour), and treat a missing integrity-class record as an
+          incident rather than as expected at-most-once loss.
+      direct:
+        parse_location: low
+        cribl: >
+          Anchor a positional regex on the Standard layout and pull the
+          message id out first, then discriminate the stream by shape before
+          parsing - the same syslog receiver can see Standard and WELF records
+          when the export format differs per log type, so a format sniff plus
+          a dead-letter route for unrecognized shapes belongs ahead of the
+          parser. Give the Integrity Checker ids their own handling rather
+          than letting them fall through as generic system messages: promote
+          SYS32039/SYS32040 to an explicit integrity-result field, extract the
+          reported file paths and counts, and route them to a dedicated
+          low-latency path so an integrity finding is not queued behind
+          log-capacity chatter. Because SYS/ERR templates are the least
+          WELF-covered classes in the catalog, expect the id table to lag
+          firmware upgrades - alert on the dead-letter rate and keep
+          Persistent Queue backpressure on the destination.
+        elastic: >
+          Own a custom logs-ivanti_ics.events ingest pipeline and set
+          event.category from the id class rather than accepting the stock
+          integration's blanket network categorization. Convert the syslog
+          severity code to ECS's numeric event.severity through an explicit
+          lookup instead of leaving the raw 0-7 value, and map
+          ivanti.ics.integrity.result and .virtual_system as keyword plus the
+          extracted integrity file paths into file.path so an appliance tamper
+          finding is queryable alongside every other file-integrity source.
+          Add a detection-facing alias or enrich step that marks the
+          SYS32039/SYS32040 ids as security-relevant, so the CSOC does not
+          have to know an Ivanti-specific code to find them.
+  - format: syslog-kv
+    enable: >
+      On the ICS admin UI go to System > Log/Monitoring > Events > Settings,
+      add or edit the external syslog server for that tab, and set its Filter
+      dropdown to WELF (or WELF-SRC-2.0-Access for the access-query superset)
+      instead of Standard. The Events tab format is independent of User Access
+      and Admin Access. WELF wraps each record in a key=value envelope; the
+      five-digit id still prefixes the msg= value, and the syslog severity is
+      carried as pri=.
+    references:
+    - >-
+      https://help.ivanti.com/ps/help/en_US/IPS/22.x/ag/configuring_an_external_syslog_server.htm
+    - https://help.ivanti.com/ps/help/en_US/ICS/22.x/ag/logging_n_monitoring.htm
+    - >-
+      https://www.juniper.net/documentation/us/en/software/jsa7.5.0/jsa-dsm/topics/task/jsa-configuring-dsm-configuring-a-pulse-secure-pulse.html
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Ivanti ICS WELF pipeline (events)
+      notes: >
+        Selecting WELF for the events log gives the envelope keys but not the
+        data: SYS and ERR are the least WELF-covered classes in the catalog,
+        so most of pri/fw/vpn/user aside, the envelope arrives blank and the
+        Integrity Checker results (SYS32039/SYS32040) still live in the msg
+        free text exactly as they do in Standard. WELF adds one thing Standard
+        lacks - a pri= severity key inside the body rather than only in the
+        syslog header - but costs the Standard form's clean positional [source
+        ip] slot. The stock pulse_connect_secure integration will NOT parse
+        WELF at all (its grok is Standard-only), so this form is
+        Cribl/hand-parsed end to end. Net: an empty-envelope trade that is
+        rarely worth taking for this log, recorded here because it is a
+        genuine per-log-type option.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Split the WELF envelope from the msg payload LOW-SIDE and drive
+          everything off the five-digit id in msg, because the envelope keys
+          arrive empty on the SYS/ERR classes that dominate this log. Build
+          the kv parser to tolerate ivs= being unquoted with embedded spaces
+          ("ivs=Default Network"), which breaks naive whitespace-delimited kv
+          splitting - the hazard Standard's positional layout avoids. Give
+          SYS32039/SYS32040 their own handling: promote the integrity result
+          to an explicit field, extract the reported file paths from msg into
+          a capped array, and route them to a dedicated low-latency path so a
+          tamper finding is not queued behind log-capacity chatter. Sniff
+          shape and dead-letter unrecognized lines, since a mixed collector
+          can carry Standard and WELF when tabs differ.
+        elastic: >
+          Own a custom logs-ivanti_ics.events pipeline: set event.category
+          from the id class rather than any network default, take numeric
+          event.severity from the WELF pri= key by lookup (the one field WELF
+          carries that Standard leaves to the header), map
+          ivanti.ics.integrity.result and .virtual_system as keyword, and land
+          the extracted integrity paths in file.path. Add an alias/enrich
+          marking SYS32039/SYS32040 as security-relevant so the CSOC does not
+          need an Ivanti-specific code.
+        relay: >
+          Low-side instances cross as full ECS-shaped NDJSON with the
+          integrity results already promoted to fields - an appliance
+          reporting its own binaries were modified is exactly the record that
+          must not be delayed or dropped by a filter inspecting free text.
+          Constrain the JSON to shallow nesting and bounded strings, and cap
+          the SYS32039/SYS32040 file-path list so a large finding cannot
+          produce a kilobyte-scale value the filter rejects. Nothing WELF-text
+          crosses; it is converted low-side. Reconcile per (dataset, hour) and
+          treat a missing integrity-class record as an incident, not expected
+          at-most-once loss.
+      direct:
+        parse_location: low
+        cribl: >
+          High-side instances parse the WELF envelope at the core group with
+          Persistent Queue backpressure; the empty-envelope reality means the
+          id-driven msg parse is doing the work regardless, so the near-source
+          vs core-group choice is about placement, not capability.
+        elastic: >
+          Own a custom logs-ivanti_ics.events pipeline: set event.category
+          from the id class rather than any network default, take numeric
+          event.severity from the WELF pri= key by lookup (the one field WELF
+          carries that Standard leaves to the header), map
+          ivanti.ics.integrity.result and .virtual_system as keyword, and land
+          the extracted integrity paths in file.path. Add an alias/enrich
+          marking SYS32039/SYS32040 as security-relevant so the CSOC does not
+          need an Ivanti-specific code.
+    fields:
+    - vendor: time
+      type: timestamp
+      description: appliance-local event time, quoted as "YYYY-MM-DD HH:MM:SS"
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        the WELF value carries no timezone; take the offset from the syslog
+        header timestamp or the appliance timezone setting before it parses
+    - vendor: pri
+      type: integer
+      description: syslog severity code for the record (0-7), carried as a body key in WELF
+      ecs: log.syslog.severity.code
+      status: mapped
+      notes: >
+        the one field WELF adds over the Standard form for this log, where
+        severity is otherwise only in the syslog header; numeric ECS
+        event.severity is still derived from it by lookup
+    - vendor: fw
+      type: ip
+      description: IP address of the ICS appliance that emitted the record
+      ecs: observer.ip
+      status: mapped
+    - vendor: vpn
+      type: string
+      description: configured name of the ICS appliance or cluster node
+      ecs: observer.name
+      status: mapped
+    - vendor: ivs
+      type: string
+      description: virtual system (IVS) context of the event
+      ecs: null
+      status: unmapped
+      custom: ivanti.ics.virtual_system
+      notes: >-
+        emitted unquoted and space-bearing, the kv-splitting hazard the
+        Standard positional form avoids
+    - vendor: user
+      type: string
+      description: >-
+        account associated with the event, typically System for
+        appliance-generated records
+      ecs: user.name
+      status: mapped
+    - vendor: realm
+      type: string
+      description: realm associated with the event, usually empty on system-generated records
+      ecs: null
+      status: unmapped
+      custom: ivanti.ics.realm
+    - vendor: type
+      type: enum
+      description: >-
+        WELF record class - vpn for end-user records, mgmt for administrative;
+        system events carry the class for the events log
+      ecs: null
+      status: unmapped
+      custom: ivanti.ics.log_type
+    - vendor: msg
+      type: string
+      description: quoted free-text event message, prefixed by its five-digit message id
+      ecs: message
+      status: mapped
+    - vendor: msgid
+      type: string
+      description: >-
+        three-letter class plus five-digit event code prefixing the msg value
+        (SYS, ERR, LIC, NET, ARC, ...)
+      ecs: event.code
+      status: partial
+      transform: >
+        not a separate WELF key - split it off the front of msg on the first
+        colon; the class prefix separates integrity and system-status records
+        from licensing and archival noise, and the SYS/ERR classes render
+        almost nothing else into the envelope
+    - vendor: integrity check result (SYS32039/SYS32040)
+      type: enum
+      description: >-
+        built-in Integrity Checker Tool outcome - new or mismatched appliance
+        files detected versus check completed clean
+      ecs: null
+      status: unmapped
+      custom: ivanti.ics.integrity.result
+      notes: >
+        available from PCS 9.1R12 onward; the SYS class has no WELF field
+        rendering for it, so it lives in the msg free text under WELF exactly
+        as under Standard - selecting WELF buys no structure here
+    - vendor: integrity file path (SYS32039 message text)
+      type: string
+      description: >-
+        path of a new or modified appliance file reported by the Integrity
+        Checker, inside the msg text
+      ecs: file.path
+      status: partial
+      notes: >
+        rendered inside the message rather than as a structured key; a single
+        finding can list many paths, so extract to an array and cap the count
+  - format: json
+    enable: >
+      On ICS 22.x go to System > Log/Monitoring > Events > Settings, add or
+      edit the external syslog server, and set its Filter dropdown to "JSON:
+      JSON". This forwards all Events records as native JSON to the collector;
+      the filter is per log type. Transport is syslog over UDP/TCP/TLS
+      (RFC5424) or a Cribl/HTTP collector directly.
+    references:
+    - https://help.ivanti.com/ps/help/en_US/IPS/22.x/ag/log_filtering.htm
+    - https://help.ivanti.com/ps/help/en_US/ICS/22.x/ag/logging_n_monitoring.htm
+    - https://docs.datadoghq.com/integrations/ivanti-connect-secure/
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Ivanti ICS JSON reparse pipeline (events)
+      notes: >
+        No stock Elastic integration reads the ICS JSON form, so the reparse
+        is custom: Extract JSON, map keys to ECS/customs, run the SYS/ERR
+        id-class categorization. Key names are unpublished - build against a
+        captured sample. The thing to verify is whether the JSON payload
+        promotes the Integrity Checker result and file paths
+        (SYS32039/SYS32040) into structured keys; if it does, JSON is the one
+        form that makes the highest-value records on this log queryable
+        without a per-id msg regex.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Build full ECS-shaped JSON LOW-SIDE from the structured document:
+          map keys to ECS, split the SYS/ERR id into event.code, and give the
+          Integrity Checker ids their own low-latency path with the file paths
+          promoted to a capped array. Schema-validate into a dead-letter route
+          and keep Persistent Queue backpressure.
+        elastic: >
+          Keep high-side work to a custom pipeline that sets event.category
+          from the id class, maps ivanti.ics.integrity.result and
+          .virtual_system as keyword and the integrity paths into file.path,
+          and marks SYS32039/SYS32040 as security-relevant. Do not layer the
+          Standard-only stock integration underneath.
+        relay: >
+          Redacted ECS-shaped NDJSON crosses; JSON is the friendliest surface
+          for this log because the integrity result becomes a structured field
+          a filter can pass on its own merits rather than free text. Shallow
+          nesting, bounded strings, cap the file-path list. Reconcile per
+          (dataset, hour) and treat a missing integrity-class record as an
+          incident.
+      direct:
+        parse_location: low
+        cribl: >
+          High-side instances point the JSON filter at a low-friction Cribl
+          HTTP source or the Elastic stack and map to ECS at the source; pick
+          JSON or the Standard feed as the single authoritative events source
+          per appliance.
+        elastic: >
+          Keep the Elastic work to a custom JSON reparse pipeline that sets
+          event.category from the id class, maps ivanti.ics.integrity.result
+          and .virtual_system as keyword and the integrity paths into
+          file.path, and marks SYS32039/SYS32040 as security-relevant. Do not
+          layer the Standard-only stock integration underneath. Treat JSON as
+          the structured replacement for the Standard positional form if
+          on-device inspection confirms it carries the integrity result and
+          file paths as keys.
+    fields_omitted: >
+      No vendor reference lists the key names the JSON filter emits for the
+      Events log, so the inventory has to be captured off the target firmware
+      - in particular whether the Integrity Checker result and the
+      SYS32039/SYS32040 file paths appear as structured keys rather than
+      inside the free-text msg string the syslog-raw (Standard) entry
+      inventories.
+    fields: []

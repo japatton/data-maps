@@ -1,0 +1,2194 @@
+id: zeek
+name: Zeek / Corelight
+vendor: Zeek Project / Corelight
+versions: Zeek 6.0 LTS, Zeek 7.0 LTS; Corelight Sensor v27+ (same log schemas)
+draft: true
+references:
+- https://docs.zeek.org/en/master/logs/index.html
+- https://docs.zeek.org/en/master/reference/logs/conn.html
+- https://docs.zeek.org/en/master/reference/logs/dns.html
+- https://docs.zeek.org/en/master/reference/logs/http.html
+- https://docs.zeek.org/en/master/reference/logs/weird-and-notice.html
+- https://docs.zeek.org/en/master/scripts/base/protocols/http/main.zeek.html
+- https://docs.zeek.org/en/master/scripts/base/frameworks/notice/main.zeek.html
+- https://www.elastic.co/docs/reference/integrations/zeek
+datasets:
+- id: conn
+  name: Connection log (conn.log)
+  description: >
+    One record per TCP, UDP, or ICMP flow observed by the sensor, written at
+    flow teardown or inactivity timeout. This is the backbone dataset: the
+    `uid` on every record is the join key that every other Zeek log (dns,
+    http, ssl, files, notice) carries, so conn.log has to be ingested even
+    where a protocol log is dropped for volume.
+  event_categories:
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Sensors write newline-delimited JSON (the json-streaming-logs policy
+        on open-source Zeek; the default export format on Corelight) and ship
+        it to Cribl over TCP/TLS as a single mixed stream. Every record
+        carries a `_path` field naming its source log (conn, dns, http,
+        notice, ...) and that is what Cribl routes on to fan the stream out to
+        the per-log data streams; map it to event.dataset with a "zeek."
+        prefix, remembering that conn.log lands in zeek.connection rather than
+        zeek.conn. The crossing is under an allow-list on the logs-zeek.*
+        destination data streams, and the variable-length string fields
+        (history, service) need length-capping before the boundary.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-zeek.connection
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Sensors write newline-delimited JSON (the json-streaming-logs policy
+        on open-source Zeek; the default export format on Corelight) and ship
+        it to Cribl over TCP/TLS as a single mixed stream. Every record
+        carries a `_path` field naming its source log (conn, dns, http,
+        notice, ...) and that is what Cribl routes on to fan the stream out to
+        the per-log data streams; map it to event.dataset with a "zeek."
+        prefix, remembering that conn.log lands in zeek.connection rather than
+        zeek.conn.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-zeek.connection
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: Zeek integration
+      notes: >
+        The Elastic Zeek integration ships a per-log data stream and expects
+        JSON input, so no field extraction is needed in Cribl — Cribl's job on
+        this source is routing, sampling, and the guard allow-list, not
+        parsing. Corelight appliances emit the same field names, so the same
+        pipeline serves both. The integration also ships ssl, files, x509,
+        smtp, ssh, and weird data streams that are not mapped in this file
+        yet; ssl.log is the highest-value follow-on, since it carries SNI,
+        JA3, and certificate issuer.
+    fields:
+    - vendor: ts
+      type: timestamp
+      description: time the flow was first seen by the sensor
+      ecs: '@timestamp'
+      status: mapped
+      transform: >
+        Zeek writes a double epoch-seconds value with microsecond precision
+        (e.g. 1751385600.123456); parse as epoch_second, not as a string date,
+        or the sub-second component is silently lost
+    - vendor: uid
+      type: string
+      description: >-
+        sensor-unique flow identifier (e.g. CHhAvVGS1DHFjwGM9) that every
+        other Zeek log references
+      ecs: event.id
+      status: mapped
+      notes: >
+        the analyst pivot for this whole technology — keep it as a keyword and
+        never let a downstream transform lowercase it, the base62 alphabet is
+        case-significant
+    - vendor: id.orig_h
+      type: ip
+      description: IP address of the connection originator
+      ecs: source.ip
+      status: mapped
+    - vendor: id.orig_p
+      type: port
+      description: transport port of the connection originator
+      ecs: source.port
+      status: mapped
+    - vendor: id.resp_h
+      type: ip
+      description: IP address of the connection responder
+      ecs: destination.ip
+      status: mapped
+    - vendor: id.resp_p
+      type: port
+      description: transport port of the connection responder
+      ecs: destination.port
+      status: mapped
+    - vendor: proto
+      type: enum
+      description: transport protocol of the flow — tcp, udp, or icmp
+      ecs: network.transport
+      status: mapped
+    - vendor: service
+      type: string
+      description: >-
+        a comma-separated list of confirmed protocol(s) the analyzer
+        identified on the flow (dns, http, ssl, ssh, ...)
+      ecs: network.protocol
+      status: partial
+      transform: >
+        Zeek joins the confirmed protocols into one lowercased comma-separated
+        string before logging (c$conn$service =
+        to_lower(join_string_set(c$service, ","))), so a layered flow arrives
+        as a single JSON string like "ssl,http" while ECS network.protocol is
+        a single keyword; split the value on the comma and either take the
+        first element or write the array before it reaches network.protocol —
+        written through verbatim, a filter for network.protocol: http matches
+        nothing on those flows
+      notes: >
+        empty whenever dynamic protocol detection did not positively identify
+        the flow, which is a large share of records on an encrypted segment;
+        an alert that filters on network.protocol will silently miss those
+        flows
+    - vendor: duration
+      type: float
+      description: elapsed time between the first and last packet of the flow, in seconds
+      ecs: event.duration
+      status: partial
+      transform: >
+        Zeek emits fractional seconds (interval); ECS event.duration is
+        nanoseconds, so multiply by 1e9 and round to an integer — copying the
+        raw value through produces durations off by nine orders of magnitude
+    - vendor: orig_bytes
+      type: long
+      description: application-layer payload bytes sent by the originator
+      ecs: source.bytes
+      status: partial
+      notes: >
+        payload only — it excludes IP/TCP headers, so it does not agree with
+        the byte counts a firewall reports for the same session; orig_ip_bytes
+        is the comparable figure
+    - vendor: resp_bytes
+      type: long
+      description: application-layer payload bytes sent by the responder
+      ecs: destination.bytes
+      status: partial
+      notes: same payload-only caveat as orig_bytes
+    - vendor: orig_pkts
+      type: long
+      description: number of IP packets sent by the originator
+      ecs: source.packets
+      status: mapped
+    - vendor: resp_pkts
+      type: long
+      description: number of IP packets sent by the responder
+      ecs: destination.packets
+      status: mapped
+    - vendor: orig_ip_bytes
+      type: long
+      description: total IP-layer bytes sent by the originator, headers included
+      ecs: null
+      status: unmapped
+      custom: zeek.connection.orig_ip_bytes
+      notes: >-
+        no ECS field distinguishes wire bytes from payload bytes; kept so
+        volume reconciliation against firewall logs is possible
+    - vendor: conn_state
+      type: enum
+      description: >-
+        how the flow started and ended — SF, S0, REJ, RSTO, RSTR, OTH, SH,
+        SHR, S1, S2, S3, RSTOS0, RSTRH
+      ecs: event.outcome
+      status: partial
+      transform: >
+        needs a 13-value lookup: SF/S1/S2/S3 to success, S0/REJ/RSTO/
+        RSTR/RSTOS0/RSTRH to failure, and OTH/SH/SHR left unset because they
+        mean the sensor missed the handshake rather than that the connection
+        failed. Note that event.action has no vendor equivalent at all on this
+        dataset — the ingest pipeline sets it as a constant — so the network
+        alerting profile is only partially satisfiable from conn.log alone.
+    - vendor: history
+      type: string
+      description: >-
+        ordered letter string recording the connection state machine (S, h, A,
+        D, a, d, F, f, R, r; uppercase = originator, lowercase = responder)
+      ecs: null
+      status: unmapped
+      custom: zeek.connection.history
+      notes: >
+        the single most useful triage field in conn.log (scan detection,
+        one-sided flows, data-exfil shape) and it has no ECS home; index it as
+        a keyword so wildcard/prefix queries work
+    - vendor: missed_bytes
+      type: long
+      description: bytes the sensor knows it did not capture on this flow
+      ecs: null
+      status: unmapped
+      custom: zeek.connection.missed_bytes
+      notes: >-
+        non-zero means packet loss on the tap — treat any analytic over the
+        byte counts of such a flow as unreliable
+    - vendor: local_orig
+      type: boolean
+      description: whether the originator address falls inside the configured local networks
+      ecs: network.direction
+      status: partial
+      transform: >
+        network.direction has to be derived from the local_orig/ local_resp
+        pair (true/false to outbound, false/true to inbound, true/true to
+        internal, false/false to external); neither vendor field alone carries
+        it, and both are absent unless Site::local_nets is configured on the
+        sensor
+    - vendor: community_id
+      type: string
+      description: >-
+        Community ID v1 flow hash, for correlating this flow with the same
+        flow seen by Suricata or another sensor
+      ecs: network.community_id
+      status: mapped
+      notes: >-
+        present by default on Corelight and on Zeek 6+ with the community-id
+        policy script loaded; confirm it is enabled before building
+        cross-sensor correlation rules on it
+    - vendor: _system_name
+      type: string
+      description: >-
+        hostname of the sensor that wrote the record, added by the JSON
+        streaming-log writer
+      ecs: observer.name
+      status: mapped
+      notes: >
+        this is the sensor, not an endpoint — the network profile's host.name
+        requirement has no source in Zeek data, since Zeek observes traffic
+        rather than running on the hosts involved
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          No field extraction low-side — the sensor stream is already JSON, so
+          Cribl's work here is routing on `_path` into the per-log data
+          streams (mapping conn to zeek.connection, not zeek.conn), Persistent
+          Queue backpressure on the Elastic destination, and sensor-context
+          enrichment (sensor→site/segment) that is cheaper near the source.
+          This is the volume driver of the technology, so it is the first Zeek
+          dataset where dropping _raw is acceptable once the integration
+          parser is proven, and the right place to shape volume by sampling
+          rather than trimming fields.
+        elastic: >
+          The stock Zeek integration ingest pipeline is the parser; layer a
+          logs-zeek.connection@custom pipeline that resolves conn_state
+          through a 13-value lookup into event.outcome (SF/S1/S2/S3 success,
+          S0/REJ/RSTO/ RSTR/RSTOS0/RSTRH failure, OTH/SH/SHR deliberately
+          unset), multiplies duration by 1e9 into nanosecond event.duration,
+          derives network.direction from the local_orig/local_resp pair rather
+          than either column alone, and splits the comma-joined service string
+          so network.protocol holds a single protocol keyword (or an explicit
+          array) rather than the literal "ssl,http". Add custom-namespace
+          index-template mappings for zeek.connection.history (keyword, so
+          prefix/wildcard triage queries work), orig_ip_bytes, and
+          missed_bytes, and record that the network profile's host.name is
+          permanently unsatisfiable on sensor data — observer.name from
+          _system_name is the only host identity available.
+        relay: >
+          Low-side instances cross the guard: that path is hybrid on a thin
+          {_dataId, @timestamp, host, _raw} envelope with the integration
+          still extracting high-side; cap the variable-length history and
+          service strings low-side — service is a comma-joined list, so cap it
+          on an element boundary rather than mid-token — and validate the
+          envelope with C.Schema(...) into a dead-letter route before the
+          guard destination. Because `uid` is the join key every other Zeek
+          log carries, conn must cross whenever any protocol log crosses or
+          the joins silently break — reconcile low-side and high-side counts
+          per (dataset, hour) to detect drops, since the crossing is
+          at-most-once with no acknowledgement.
+      direct:
+        parse_location: high
+        cribl: >
+          No field extraction needed in Cribl — the sensor stream is already
+          JSON, so Cribl's work here is routing on `_path` into the per-log
+          data streams (mapping conn to zeek.connection, not zeek.conn),
+          Persistent Queue backpressure on the Elastic destination, and
+          sensor-context enrichment (sensor→site/segment) that is cheaper near
+          the source. This is the volume driver of the technology, so it is
+          the first Zeek dataset where dropping _raw is acceptable once the
+          integration parser is proven, and the right place to shape volume by
+          sampling rather than trimming fields.
+        elastic: >
+          The stock Zeek integration ingest pipeline is the parser; layer a
+          logs-zeek.connection@custom pipeline that resolves conn_state
+          through a 13-value lookup into event.outcome (SF/S1/S2/S3 success,
+          S0/REJ/RSTO/ RSTR/RSTOS0/RSTRH failure, OTH/SH/SHR deliberately
+          unset), multiplies duration by 1e9 into nanosecond event.duration,
+          derives network.direction from the local_orig/local_resp pair rather
+          than either column alone, and splits the comma-joined service string
+          so network.protocol holds a single protocol keyword (or an explicit
+          array) rather than the literal "ssl,http". Add custom-namespace
+          index-template mappings for zeek.connection.history (keyword, so
+          prefix/wildcard triage queries work), orig_ip_bytes, and
+          missed_bytes, and record that the network profile's host.name is
+          permanently unsatisfiable on sensor data — observer.name from
+          _system_name is the only host identity available.
+  - format: csv-file
+    enable: >
+      Open-source Zeek: leave (or restore) the LogAscii writer default -
+      `redef LogAscii::use_json = F;` - and do NOT load the
+      json-streaming-logs package; Zeek then writes tab-separated conn.log
+      with the #separator/
+      #set_separator/#empty_field/#unset_field/#path/#open/#fields/#types/#close
+      header block, unset_field "-", empty_field "(empty)", set_separator ",".
+      On Corelight, select the TSV (Zeek ASCII) export profile on the sensor's
+      export configuration instead of the default JSON. The log identity is
+      the #path header value ("conn"), one file per log type, so a collector
+      tails conn.log directly rather than demultiplexing a mixed _path stream.
+    references:
+    - https://docs.zeek.org/en/master/frameworks/logging.html
+    - >-
+      https://docs.zeek.org/en/master/scripts/base/frameworks/logging/writers/ascii.zeek.html
+    - https://docs.zeek.org/en/master/logs/conn.html
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        Cribl Zeek-TSV parser pipeline (reads #fields/#types header, splits on
+        tab), then logs-zeek.connection@custom
+      notes: >
+        The stock Elastic Zeek integration ingests JSON only, so it cannot
+        parse TSV - a custom parser is mandatory. The robust shape is a Cribl
+        pipeline that reads the #fields and #types header lines to name and
+        type the tab-split columns (never hard-code column order - it varies
+        with the sensor's loaded scripts), maps unset_field "-" to null and
+        empty_field "(empty)" to "", and splits the set_separator "," column
+        tunnel_parents into an array. service needs the same comma split for a
+        different reason: Zeek joins that one into a plain string in script,
+        so its commas are part of the value rather than set_separator markup.
+        Once the record is structured NDJSON it can feed the same
+        logs-zeek.connection@custom enrichment the JSON path uses (conn_state
+        lookup, duration nanoseconds, network.direction from the
+        local_orig/local_resp pair). observer.name has no in-record source in
+        TSV conn.log - derive it from the file source's sensor identity.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Split the TSV to structured fields at the low-side edge worker - the
+          guard should carry compact NDJSON, not the multi-line #-header TSV
+          block, and the header-driven split (with "-"->null, tunnel_parents
+          expanded on set_separator, and the joined service string split on
+          its own commas) is cheapest at the source while the file is being
+          tailed. This is the volume driver of the technology, so shape volume
+          here by sampling rather than trimming columns, attach the
+          sensor->site/segment enrichment that TSV cannot carry in-band (there
+          is no _system_name), and cap the variable-length history and service
+          strings before the boundary. Persistent Queue backpressure on the
+          destination, never Block.
+        elastic: >
+          Run the logs-zeek.connection@custom pipeline on the
+          low-side-extracted fields exactly as on the JSON path: resolve
+          conn_state through the 13-value lookup into event.outcome
+          (SF/S1/S2/S3 success, S0/REJ/RSTO/ RSTR/RSTOS0/RSTRH failure,
+          OTH/SH/SHR unset), multiply duration by 1e9 into nanosecond
+          event.duration, derive network.direction from the
+          local_orig/local_resp pair rather than either column alone, and keep
+          network.protocol to a single protocol keyword (or an explicit array)
+          taken from the split service value. Add custom-namespace mappings
+          for zeek.connection.history (keyword), orig_ip_bytes, resp_ip_bytes
+          and missed_bytes, and record that observer.name comes from the
+          transport, not the record - host.name is permanently unsatisfiable
+          on sensor data.
+        relay: >
+          Cross the extracted NDJSON, not raw TSV: a header-block TSV file is
+          exactly the shape a content filter mishandles, and the sentinel "-"
+          would cross as a literal string. Cap the variable-length history and
+          service values low-side — service is a comma-joined list, so cap it
+          on an element boundary rather than mid-token — and validate the
+          envelope with C.Schema(...) into a dead-letter route before the
+          guard destination. Because uid is the join key every other Zeek log
+          carries, conn must cross whenever any protocol log crosses or the
+          joins silently break; reconcile low-side and high-side counts per
+          (dataset, hour) since the crossing is at-most-once with no
+          acknowledgement.
+      direct:
+        parse_location: low
+        cribl: >
+          High-side sensor with no guard: still split the TSV at the edge and
+          forward structured NDJSON - there is no benefit to carrying the raw
+          header block downstream. Choose the TSV writer OR the JSON writer as
+          the single authoritative feed per sensor (running both double-writes
+          every log), and attach sensor identity here since the TSV record has
+          none.
+        elastic: >
+          The same logs-zeek.connection@custom enrichment applies to the
+          TSV-extracted fields: resolve conn_state through the 13-value lookup
+          into event.outcome, multiply duration by 1e9 into nanosecond
+          event.duration, derive network.direction from the
+          local_orig/local_resp pair, and keep network.protocol to a single
+          protocol keyword (or an explicit array) taken from the split service
+          value. With no boundary the honest recommendation is to prefer the
+          JSON writer: it is the format the stock integration parses natively
+          and it carries _system_name, so TSV is worth choosing only where a
+          sensor or an existing collection lane emits ASCII.
+    fields:
+    - vendor: ts
+      type: timestamp
+      description: time the flow was first seen by the sensor
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        under the default json_timestamps JSON::TS_EPOCH the TSV ts is a
+        double epoch-seconds value with microsecond precision; parse as
+        epoch_second, not as a string date, or the sub-second component is
+        lost
+    - vendor: uid
+      type: string
+      description: sensor-unique flow identifier that every other Zeek log references
+      ecs: event.id
+      status: mapped
+      notes: keep as keyword and never lowercase it - the base62 alphabet is case-significant
+    - vendor: id.orig_h
+      type: ip
+      description: IP address of the connection originator
+      ecs: source.ip
+      status: mapped
+    - vendor: id.orig_p
+      type: port
+      description: transport port of the connection originator
+      ecs: source.port
+      status: mapped
+    - vendor: id.resp_h
+      type: ip
+      description: IP address of the connection responder
+      ecs: destination.ip
+      status: mapped
+    - vendor: id.resp_p
+      type: port
+      description: transport port of the connection responder
+      ecs: destination.port
+      status: mapped
+    - vendor: proto
+      type: enum
+      description: transport protocol of the flow - tcp, udp, or icmp
+      ecs: network.transport
+      status: mapped
+    - vendor: ip_proto
+      type: integer
+      description: numeric IP protocol number taken straight from the IP header
+      ecs: network.iana_number
+      status: partial
+      notes: >-
+        a numeric complement to proto that covers the non-transport IP flows
+        (IGMP, OSPF, ESP) proto does not name, but the column enters
+        Conn::Info in Zeek 7.1 - conn.log on the 6.0 and 7.0 LTS lines this
+        file targets, and on Corelight builds tracking them, has no such
+        column, so the mapping populates only on 7.1+ sensors. Where the
+        column is absent network.iana_number has to be derived from proto,
+        which resolves tcp/udp/icmp only and leaves every other IP protocol
+        without a number
+    - vendor: service
+      type: string
+      description: >-
+        a comma-separated list of confirmed protocol(s) the analyzer
+        identified on the flow (dns, http, ssl, ssh, ...)
+      ecs: network.protocol
+      status: partial
+      transform: >
+        Zeek joins the confirmed protocols in script before logging
+        (c$conn$service = to_lower(join_string_set(c$service, ","))), so the
+        logged column is typed string and its commas are part of the value
+        (e.g. "ssl,http") - the ASCII writer's set_separator handling never
+        applies to it, and the split is an ordinary string split. ECS
+        network.protocol is a single keyword, so take the first element or
+        write the array; carried through whole, a filter for network.protocol:
+        http matches nothing on a layered flow
+      notes: >
+        empty ("-") whenever dynamic protocol detection did not identify the
+        flow, a large share of records on an encrypted segment - an alert
+        filtering on network.protocol silently misses those
+    - vendor: duration
+      type: float
+      description: elapsed time between the first and last packet of the flow, in seconds
+      ecs: event.duration
+      status: partial
+      transform: >
+        interval in fractional seconds; ECS event.duration is nanoseconds, so
+        multiply by 1e9 and round - copying the raw value is off by nine
+        orders of magnitude
+    - vendor: orig_bytes
+      type: long
+      description: application-layer payload bytes sent by the originator
+      ecs: source.bytes
+      status: partial
+      notes: >-
+        payload only - excludes IP/TCP headers, so it disagrees with firewall
+        byte counts; orig_ip_bytes is the comparable figure
+    - vendor: resp_bytes
+      type: long
+      description: application-layer payload bytes sent by the responder
+      ecs: destination.bytes
+      status: partial
+      notes: same payload-only caveat as orig_bytes
+    - vendor: conn_state
+      type: enum
+      description: >-
+        how the flow started and ended - SF, S0, REJ, RSTO, RSTR, OTH, SH,
+        SHR, S1, S2, S3, RSTOS0, RSTRH
+      ecs: event.outcome
+      status: partial
+      transform: >
+        13-value lookup: SF/S1/S2/S3 to success, S0/REJ/RSTO/RSTR/RSTOS0/RSTRH
+        to failure, OTH/SH/SHR left unset (the sensor missed the handshake,
+        not a failed connection). event.action has no vendor equivalent here
+    - vendor: local_orig
+      type: boolean
+      description: whether the originator address falls inside the configured local networks
+      ecs: network.direction
+      status: partial
+      transform: >
+        network.direction must be derived from the local_orig/local_resp pair
+        (true/false outbound, false/true inbound, true/true internal,
+        false/false external); absent ("-") unless Site::local_nets is
+        configured on the sensor
+    - vendor: local_resp
+      type: boolean
+      description: whether the responder address falls inside the configured local networks
+      ecs: network.direction
+      status: partial
+      notes: >-
+        the second half of the direction pair - it is meaningless alone;
+        combine with local_orig, and it is likewise absent unless
+        Site::local_nets is set
+    - vendor: missed_bytes
+      type: long
+      description: bytes the sensor knows it did not capture on this flow
+      ecs: null
+      status: unmapped
+      custom: zeek.connection.missed_bytes
+      notes: >-
+        non-zero means packet loss on the tap - treat any byte-count analytic
+        over such a flow as unreliable
+    - vendor: history
+      type: string
+      description: >-
+        ordered letter string recording the connection state machine
+        (uppercase = originator, lowercase = responder)
+      ecs: null
+      status: unmapped
+      custom: zeek.connection.history
+      notes: >-
+        the single most useful triage field in conn.log and it has no ECS
+        home; index as keyword so wildcard/prefix queries work
+    - vendor: orig_pkts
+      type: long
+      description: number of IP packets sent by the originator
+      ecs: source.packets
+      status: mapped
+    - vendor: orig_ip_bytes
+      type: long
+      description: total IP-layer bytes sent by the originator, headers included
+      ecs: null
+      status: unmapped
+      custom: zeek.connection.orig_ip_bytes
+      notes: >-
+        no ECS field distinguishes wire bytes from payload bytes; kept so
+        volume reconciliation against firewall logs is possible
+    - vendor: resp_pkts
+      type: long
+      description: number of IP packets sent by the responder
+      ecs: destination.packets
+      status: mapped
+    - vendor: resp_ip_bytes
+      type: long
+      description: total IP-layer bytes sent by the responder, headers included
+      ecs: null
+      status: unmapped
+      custom: zeek.connection.resp_ip_bytes
+      notes: the responder-side counterpart to orig_ip_bytes; same wire-vs-payload rationale
+    - vendor: tunnel_parents
+      type: array
+      description: >-
+        set of uids of the encapsulating tunnel connections when the flow is
+        tunnelled (Teredo, GRE, AYIYA, ...)
+      ecs: null
+      status: unmapped
+      custom: zeek.connection.tunnel_parents
+      notes: >-
+        a set, so in TSV a comma-joined column; non-empty means this flow was
+        carried inside another and its addresses are the inner endpoints
+    - vendor: community_id
+      type: string
+      description: >-
+        Community ID v1 flow hash for correlating this flow with the same flow
+        on another sensor
+      ecs: network.community_id
+      status: mapped
+      notes: >-
+        present only with the community-id policy loaded (default on
+        Corelight, opt-in on OSS Zeek); confirm before building cross-sensor
+        correlation on it
+- id: dns
+  name: DNS log (dns.log)
+  description: >
+    One record per DNS transaction (query plus the matched response) seen on
+    the wire, over UDP, TCP, or via the DNS-over-TCP analyzer. The primary
+    source of resolver-independent DNS visibility for beaconing, DGA, and
+    tunnelling analytics.
+  event_categories:
+  - dns
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same sensor JSON stream as conn.log, split by _path, crossing under an
+        allow-list on logs-zeek.dns. The `query` field is attacker-controlled
+        free text and is the obvious covert-channel candidate for the guard's
+        content inspection.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-zeek.dns
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: Same sensor JSON stream as conn.log, split by _path.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-zeek.dns
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: Zeek integration
+    fields:
+    - vendor: ts
+      type: timestamp
+      description: time the DNS query was seen
+      ecs: '@timestamp'
+      status: mapped
+      transform: double epoch-seconds, same parse as conn.log ts
+    - vendor: uid
+      type: string
+      description: flow identifier joining this transaction back to conn.log
+      ecs: event.id
+      status: mapped
+    - vendor: id.orig_h
+      type: ip
+      description: IP address of the client that issued the query
+      ecs: source.ip
+      status: mapped
+    - vendor: id.orig_p
+      type: port
+      description: client source port
+      ecs: source.port
+      status: mapped
+    - vendor: id.resp_h
+      type: ip
+      description: IP address of the resolver that answered
+      ecs: destination.ip
+      status: mapped
+    - vendor: id.resp_p
+      type: port
+      description: resolver port, normally 53 or 5353
+      ecs: destination.port
+      status: mapped
+    - vendor: proto
+      type: enum
+      description: transport carrying the DNS transaction — udp or tcp
+      ecs: network.transport
+      status: mapped
+    - vendor: trans_id
+      type: integer
+      description: 16-bit DNS transaction identifier pairing the query with its response
+      ecs: dns.id
+      status: mapped
+    - vendor: query
+      type: string
+      description: domain name the client asked about
+      ecs: dns.question.name
+      status: mapped
+      notes: >
+        Zeek does not strip the trailing dot consistently across analyzers and
+        does not lowercase the name; normalize both before any lookup against
+        a domain watchlist or the match rate drops
+    - vendor: qtype_name
+      type: string
+      description: human-readable query type — A, AAAA, TXT, MX, SRV, PTR, ...
+      ecs: dns.question.type
+      status: mapped
+    - vendor: qclass_name
+      type: string
+      description: human-readable query class, almost always C_INTERNET
+      ecs: dns.question.class
+      status: partial
+      transform: >-
+        Zeek writes "C_INTERNET" where ECS and every other DNS source write
+        "IN"; map the C_* vocabulary before indexing
+    - vendor: qtype
+      type: integer
+      description: numeric query type code
+      ecs: null
+      status: unmapped
+      custom: zeek.dns.qtype
+      notes: >-
+        kept because unusual/reserved types show up numerically here when
+        qtype_name is empty
+    - vendor: rcode_name
+      type: string
+      description: human-readable response code — NOERROR, NXDOMAIN, SERVFAIL, REFUSED, ...
+      ecs: dns.response_code
+      status: mapped
+    - vendor: rcode
+      type: integer
+      description: numeric DNS response code
+      ecs: null
+      status: unmapped
+      custom: zeek.dns.rcode
+    - vendor: answers
+      type: array
+      description: vector of answer values returned in the response
+      ecs: dns.answers.data
+      status: partial
+      transform: >
+        a flat vector mixing record types — A/AAAA addresses, CNAME targets,
+        TXT strings, MX hosts — with no per-element type. ECS expects
+        dns.answers to be an array of objects, and dns.resolved_ip expects
+        only the address subset, so the elements must be typed (by inspecting
+        each value) and zipped with TTLs before either target is correct
+    - vendor: TTLs
+      type: array
+      description: vector of time-to-live values, positionally parallel to answers
+      ecs: dns.answers.ttl
+      status: partial
+      notes: >-
+        only meaningful zipped element-by-element with answers; loaded as an
+        independent array it is useless for the low-TTL/fast-flux analytics it
+        exists to support
+    - vendor: rtt
+      type: float
+      description: round-trip time in seconds between the query and its response
+      ecs: null
+      status: unmapped
+      custom: zeek.dns.rtt
+      notes: >-
+        absent when the response was never seen, which is itself the signal
+        for a resolver-availability or tap-loss check
+    - vendor: AA, TC, RD, RA
+      type: boolean
+      description: >-
+        the authoritative-answer, truncation, recursion-desired, and
+        recursion-available header bits, each a separate boolean column
+      ecs: dns.header_flags
+      status: partial
+      transform: >
+        ECS wants a single array of set flag names (["RD","RA"]); Zeek emits
+        four independent booleans, so the pipeline must fold the true ones
+        into one array. Zeek has no column for the QR bit.
+    - vendor: rejected
+      type: boolean
+      description: whether the resolver rejected the query outright
+      ecs: null
+      status: unmapped
+      custom: zeek.dns.rejected
+    - vendor: _system_name
+      type: string
+      description: hostname of the sensor that wrote the record
+      ecs: observer.name
+      status: mapped
+      notes: >-
+        the dns alerting profile's host.name requirement is not satisfiable —
+        Zeek sees the querying IP, never the querying host's name
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Route this out of the shared sensor stream on `_path` and otherwise
+          pass it through unparsed with Persistent Queue backpressure; the one
+          hard rule is that no low-side transform may reorder, dedupe, or
+          flatten the answers and TTLs vectors, because their value is
+          entirely positional. Volume shaping, if needed, belongs here as
+          sampling of NOERROR A/AAAA responses rather than field trimming, and
+          _raw can be dropped early since the parsed record loses nothing
+          forensically.
+        elastic: >
+          Add a logs-zeek.dns@custom pipeline that zips answers with TTLs
+          element-by-element into ECS dns.answers objects, types each element
+          so only the address subset populates dns.resolved_ip, folds the four
+          AA/TC/RD/RA booleans into the single dns.header_flags array,
+          translates the C_* class vocabulary (C_INTERNET to IN), and
+          lowercases plus strips the trailing dot from dns.question.name
+          before any watchlist enrichment runs. Map zeek.dns.qtype, rcode,
+          rtt, and rejected in the custom-namespace index template, and treat
+          a missing rtt as the resolver-availability/tap-loss signal it is
+          rather than a null to fill.
+        relay: >
+          Low-side instances cross the guard, where `query` is the obvious
+          covert-channel candidate, so bound its length and normalize it to
+          punycode/ASCII low-side before the guard destination. Keep answers
+          and TTLs crossing as two parallel flat scalar arrays — that
+          satisfies the shallow-nesting constraint on guarded JSON — and do
+          the zipping into objects high-side rather than building nested
+          structures the content filter has to walk.
+      direct:
+        parse_location: high
+        cribl: >
+          Route this out of the shared sensor stream on `_path` and otherwise
+          pass it through unparsed with Persistent Queue backpressure; the one
+          hard rule is that no Cribl transform may reorder, dedupe, or flatten
+          the answers and TTLs vectors, because their value is entirely
+          positional. Volume shaping, if needed, belongs here as sampling of
+          NOERROR A/AAAA responses rather than field trimming, and _raw can be
+          dropped early since the parsed record loses nothing forensically.
+        elastic: >
+          Add a logs-zeek.dns@custom pipeline that zips answers with TTLs
+          element-by-element into ECS dns.answers objects, types each element
+          so only the address subset populates dns.resolved_ip, folds the four
+          AA/TC/RD/RA booleans into the single dns.header_flags array,
+          translates the C_* class vocabulary (C_INTERNET to IN), and
+          lowercases plus strips the trailing dot from dns.question.name
+          before any watchlist enrichment runs. Map zeek.dns.qtype, rcode,
+          rtt, and rejected in the custom-namespace index template, and treat
+          a missing rtt as the resolver-availability/tap-loss signal it is
+          rather than a null to fill.
+  - format: csv-file
+    enable: >
+      As for conn.log: `redef LogAscii::use_json = F;` with
+      json-streaming-logs unloaded on OSS Zeek, or the Corelight TSV export
+      profile. dns.log is a separate file (#path "dns"); a collector tails it
+      directly. The vectors answers and TTLs are written as single
+      comma-joined columns under set_separator ",", and unset scalars (rtt on
+      an unanswered query) render as "-".
+    references:
+    - https://docs.zeek.org/en/master/frameworks/logging.html
+    - https://docs.zeek.org/en/master/logs/dns.html
+    - >-
+      https://docs.zeek.org/en/master/scripts/base/frameworks/logging/writers/ascii.zeek.html
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: Cribl Zeek-TSV parser pipeline, then logs-zeek.dns@custom
+      notes: >
+        No stock integration parses TSV. The custom pipeline reads the
+        #fields/ #types header, and the one hard rule specific to dns.log is
+        that answers and TTLs must be split on set_separator into two arrays
+        and kept positionally aligned - a comma inside a TXT answer value can
+        desync the two vectors, so a TSV split has to honour Zeek's
+        set-quoting rather than a naive comma split. After extraction the
+        logs-zeek.dns@custom pipeline zips answers with TTLs into dns.answers
+        objects and folds the AA/TC/RD/RA booleans into dns.header_flags
+        exactly as on the JSON path.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Split the TSV low-side and cross structured NDJSON. Do NOT reorder,
+          dedupe, or flatten the answers/TTLs vectors during extraction -
+          their value is entirely positional - and bound plus
+          punycode-normalize the attacker-controlled query string before the
+          boundary. Volume shaping, if needed, belongs here as sampling of
+          NOERROR A/AAAA responses rather than column trimming, and
+          observer.name has to be attached from the sensor source since TSV
+          dns.log carries no _system_name. Persistent Queue backpressure on
+          the destination.
+        elastic: >
+          Run logs-zeek.dns@custom on the extracted fields: zip answers with
+          TTLs element-by-element into ECS dns.answers objects, type each
+          element so only the address subset populates dns.resolved_ip, fold
+          AA/TC/RD/RA into the single dns.header_flags array, translate the
+          C_* class vocabulary (C_INTERNET to IN), and lowercase plus strip
+          the trailing dot from dns.question.name before any watchlist
+          enrichment. Map zeek.dns.qtype, qclass, rcode, z, rtt and rejected
+          in the custom index template, and treat a missing ("-") rtt as the
+          resolver-availability/tap-loss signal it is, not a null to fill.
+        relay: >
+          Keep answers and TTLs crossing as two parallel flat scalar arrays -
+          that satisfies the shallow-nesting constraint on guarded JSON - and
+          zip them into objects high-side rather than building nested
+          structures the content filter must walk. query is the obvious
+          covert-channel candidate, so bound its length and normalize it to
+          punycode/ASCII low-side before the guard destination, and validate
+          the envelope into a dead-letter route.
+      direct:
+        parse_location: low
+        cribl: >
+          High-side sensor, no guard: split the TSV at the edge, keeping
+          answers/ TTLs aligned, and forward NDJSON. Run the TSV writer or the
+          JSON writer as the single authoritative feed, and attach sensor
+          identity here since the record has none.
+        elastic: >
+          The same logs-zeek.dns@custom handling applies to the TSV-extracted
+          fields: zip answers with TTLs into ECS dns.answers objects, type
+          each element so only the address subset populates dns.resolved_ip,
+          and fold AA/TC/RD/RA into the single dns.header_flags array. With no
+          boundary, prefer the JSON writer - it is what the stock integration
+          parses and it removes the positional answers/TTLs reconstruction
+          risk that the comma-joined TSV columns introduce.
+    fields:
+    - vendor: ts
+      type: timestamp
+      description: time the DNS query was seen
+      ecs: '@timestamp'
+      status: partial
+      transform: double epoch-seconds, same parse as conn.log ts
+    - vendor: uid
+      type: string
+      description: flow identifier joining this transaction back to conn.log
+      ecs: event.id
+      status: mapped
+    - vendor: id.orig_h
+      type: ip
+      description: IP address of the client that issued the query
+      ecs: source.ip
+      status: mapped
+    - vendor: id.orig_p
+      type: port
+      description: client source port
+      ecs: source.port
+      status: mapped
+    - vendor: id.resp_h
+      type: ip
+      description: IP address of the resolver that answered
+      ecs: destination.ip
+      status: mapped
+    - vendor: id.resp_p
+      type: port
+      description: resolver port, normally 53 or 5353
+      ecs: destination.port
+      status: mapped
+    - vendor: proto
+      type: enum
+      description: transport carrying the DNS transaction - udp or tcp
+      ecs: network.transport
+      status: mapped
+    - vendor: trans_id
+      type: integer
+      description: 16-bit DNS transaction identifier pairing the query with its response
+      ecs: dns.id
+      status: mapped
+    - vendor: rtt
+      type: float
+      description: round-trip seconds between the query and its response
+      ecs: null
+      status: unmapped
+      custom: zeek.dns.rtt
+      notes: >-
+        renders as "-" when the response was never seen, itself the signal for
+        a resolver-availability or tap-loss check
+    - vendor: query
+      type: string
+      description: domain name the client asked about
+      ecs: dns.question.name
+      status: mapped
+      notes: >-
+        Zeek does not consistently strip the trailing dot or lowercase the
+        name; normalize both before any domain-watchlist lookup or the match
+        rate drops
+    - vendor: qclass
+      type: integer
+      description: numeric DNS query class code
+      ecs: null
+      status: unmapped
+      custom: zeek.dns.qclass
+      notes: >-
+        kept because reserved/unusual classes surface numerically here when
+        qclass_name is empty
+    - vendor: qclass_name
+      type: string
+      description: human-readable query class, almost always C_INTERNET
+      ecs: dns.question.class
+      status: partial
+      transform: >-
+        Zeek writes "C_INTERNET" where ECS and every other DNS source write
+        "IN"; map the C_* vocabulary before indexing
+    - vendor: qtype
+      type: integer
+      description: numeric query type code
+      ecs: null
+      status: unmapped
+      custom: zeek.dns.qtype
+      notes: >-
+        kept because unusual/reserved types show up numerically here when
+        qtype_name is empty
+    - vendor: qtype_name
+      type: string
+      description: human-readable query type - A, AAAA, TXT, MX, SRV, PTR, ...
+      ecs: dns.question.type
+      status: mapped
+    - vendor: rcode
+      type: integer
+      description: numeric DNS response code
+      ecs: null
+      status: unmapped
+      custom: zeek.dns.rcode
+    - vendor: rcode_name
+      type: string
+      description: human-readable response code - NOERROR, NXDOMAIN, SERVFAIL, REFUSED, ...
+      ecs: dns.response_code
+      status: mapped
+    - vendor: AA, TC, RD, RA
+      type: boolean
+      description: >-
+        authoritative-answer, truncation, recursion-desired, and
+        recursion-available header bits, each a separate boolean column (T/F
+        in TSV)
+      ecs: dns.header_flags
+      status: partial
+      transform: >
+        ECS wants a single array of set flag names (["RD","RA"]); Zeek emits
+        four independent boolean columns, so the pipeline must fold the true
+        ones into one array. Zeek has no column for the QR bit
+    - vendor: Z
+      type: integer
+      description: reserved/zeroed DNS header bits field
+      ecs: null
+      status: unmapped
+      custom: zeek.dns.z
+      notes: >-
+        rarely non-zero; kept for protocol-anomaly hunting where a set
+        reserved bit is itself the signal
+    - vendor: answers
+      type: array
+      description: vector of answer values returned in the response
+      ecs: dns.answers.data
+      status: partial
+      transform: >
+        a flat vector mixing record types - A/AAAA addresses, CNAME targets,
+        TXT strings, MX hosts - with no per-element type, written comma-joined
+        in TSV. ECS dns.answers expects an array of objects and
+        dns.resolved_ip only the address subset, so elements must be typed and
+        zipped with TTLs before either target is correct
+    - vendor: TTLs
+      type: array
+      description: vector of time-to-live values, positionally parallel to answers
+      ecs: dns.answers.ttl
+      status: partial
+      notes: >-
+        comma-joined in TSV and only meaningful zipped element-by-element with
+        answers; loaded as an independent array it is useless for the
+        low-TTL/fast-flux analytics it exists to support
+    - vendor: rejected
+      type: boolean
+      description: whether the resolver rejected the query outright
+      ecs: null
+      status: unmapped
+      custom: zeek.dns.rejected
+- id: http
+  name: HTTP log (http.log)
+  description: >
+    One record per HTTP request/response pair on any port the HTTP analyzer
+    claims, including pipelined transactions on a single flow. Cleartext HTTP
+    only — TLS-wrapped traffic surfaces in ssl.log instead, so on a modern
+    segment this dataset covers internal services, captive portals, update
+    channels, and C2 that has not bothered with TLS.
+  event_categories:
+  - web
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same sensor JSON stream as conn.log, split by _path. This is the
+        dataset to scrutinize first before the boundary — uri, user_agent, and
+        referrer are all attacker-controlled free text of unbounded length and
+        need capping or stripping to clear content inspection.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-zeek.http
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: Same sensor JSON stream as conn.log, split by _path.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-zeek.http
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: Zeek integration
+    fields:
+    - vendor: ts
+      type: timestamp
+      description: time the request was seen
+      ecs: '@timestamp'
+      status: mapped
+      transform: double epoch-seconds, same parse as conn.log ts
+    - vendor: uid
+      type: string
+      description: flow identifier joining this transaction back to conn.log
+      ecs: event.id
+      status: mapped
+    - vendor: id.orig_h
+      type: ip
+      description: IP address of the requesting client
+      ecs: source.ip
+      status: mapped
+    - vendor: id.resp_h
+      type: ip
+      description: IP address of the responding server
+      ecs: destination.ip
+      status: mapped
+    - vendor: id.resp_p
+      type: port
+      description: server port the request was made to
+      ecs: destination.port
+      status: mapped
+    - vendor: trans_depth
+      type: integer
+      description: 1-based index of this transaction within a keep-alive/pipelined flow
+      ecs: null
+      status: unmapped
+      custom: zeek.http.trans_depth
+      notes: >-
+        needed to disambiguate multiple http.log records sharing one uid;
+        without it, joins to conn.log fan out
+    - vendor: method
+      type: string
+      description: HTTP request verb — GET, POST, CONNECT, ...
+      ecs: http.request.method
+      status: mapped
+    - vendor: host
+      type: string
+      description: value of the HTTP Host header
+      ecs: url.domain
+      status: partial
+      notes: >-
+        attacker-controlled and frequently a bare IP or a non-resolving name;
+        it is the claimed host, not necessarily destination.ip's real identity
+    - vendor: uri
+      type: string
+      description: request target as it appeared on the request line
+      ecs: url.original
+      status: partial
+      transform: >
+        Zeek logs origin-form only — path plus query, no scheme and no
+        authority — so url.original must be assembled as "http://" + host +
+        uri, and url.path/url.query split out of it, before the web alerting
+        profile's url.original requirement is genuinely met
+    - vendor: referrer
+      type: string
+      description: value of the HTTP Referer header
+      ecs: http.request.referrer
+      status: mapped
+    - vendor: version
+      type: string
+      description: HTTP protocol version string, e.g. 1.1
+      ecs: http.version
+      status: mapped
+    - vendor: user_agent
+      type: string
+      description: value of the HTTP User-Agent header
+      ecs: user_agent.original
+      status: mapped
+    - vendor: request_body_len
+      type: long
+      description: uncompressed size in bytes of the request body
+      ecs: http.request.body.bytes
+      status: mapped
+    - vendor: response_body_len
+      type: long
+      description: uncompressed size in bytes of the response body
+      ecs: http.response.body.bytes
+      status: mapped
+    - vendor: status_code
+      type: integer
+      description: numeric HTTP response status returned by the server
+      ecs: http.response.status_code
+      status: mapped
+      transform: >
+        also the only viable source for the web profile's event.outcome —
+        bucket 1xx/2xx/3xx to success and 4xx/5xx to failure; the field is
+        absent entirely when the sensor never saw the response, which must not
+        be collapsed into failure
+    - vendor: username
+      type: string
+      description: username supplied via HTTP basic authentication
+      ecs: url.username
+      status: mapped
+      notes: >
+        also worth copying to user.name for the identity pivot, but the value
+        is a cleartext credential holder — the paired `password` field must be
+        dropped in Cribl before the Elastic destination, not merely left
+        unmapped
+    - vendor: proxied
+      type: array
+      description: >-
+        set of headers indicating the request passed through a proxy
+        (X-Forwarded-For, Via, ...)
+      ecs: null
+      status: unmapped
+      custom: zeek.http.proxied
+      notes: >-
+        when populated, source.ip is the proxy and the real client is inside
+        these header values
+    - vendor: resp_mime_types
+      type: array
+      description: vector of MIME types the file analyzer identified in the response body
+      ecs: http.response.mime_type
+      status: partial
+      notes: >
+        ECS http.response.mime_type is a single value while Zeek emits a
+        vector (one per response entity); take the first element or index as
+        an array deliberately, and note these are sniffed content types, not
+        the declared Content-Type header
+    - vendor: resp_fuids
+      type: array
+      description: >-
+        vector of file identifiers for response bodies, joining to files.log
+        and x509.log
+      ecs: null
+      status: unmapped
+      custom: zeek.http.resp_fuids
+      notes: >-
+        the only bridge from an HTTP transaction to the file hashes in
+        files.log — the malware profile's file.hash.sha256 lives there, not
+        here
+    - vendor: _system_name
+      type: string
+      description: hostname of the sensor that wrote the record
+      ecs: observer.name
+      status: mapped
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          The mandatory low-side work on this dataset is a drop rule for the
+          `password` column (and masking of any credentials embedded in the
+          uri userinfo) applied on the core worker group before the Elastic
+          destination, so the cleartext basic-auth secret never leaves the low
+          side at all. Beyond that, route on `_path`, cap the unbounded uri,
+          user_agent, and referrer values, and run Persistent Queue
+          backpressure; _raw can be dropped once the parser is proven.
+        elastic: >
+          Add a logs-zeek.http@custom pipeline that assembles url.original as
+          "http://" + host + uri and splits url.path and url.query out of it,
+          derives event.outcome by bucketing status_code (1xx/2xx/3xx success,
+          4xx/5xx failure) while leaving it unset when the sensor never saw a
+          response, and copies url.username to user.name for the identity
+          pivot. Take the first element of resp_mime_types (or map it as an
+          explicit array) rather than letting dynamic mapping decide, add
+          custom-namespace mappings for trans_depth, proxied, and resp_fuids,
+          and enrich file hashes in from the files.log data stream on
+          resp_fuids since the malware profile's file.hash.sha256 does not
+          exist on this record.
+        relay: >
+          Low-side instances cross the guard, and this is the dataset to
+          scrutinize first: uri, user_agent, and referrer are
+          attacker-controlled free text of unbounded length and unicode shape
+          that content inspection will cap or reject, so bound and normalize
+          them low-side and validate the envelope with C.Schema(...) into a
+          dead-letter route before the guard destination. The password drop
+          must sit upstream of the guard, not on the high side — a redaction
+          that runs after the crossing has already leaked the credential
+          across the boundary.
+      direct:
+        parse_location: high
+        cribl: >
+          The mandatory work on this dataset is a drop rule for the `password`
+          column (and masking of any credentials embedded in the uri userinfo)
+          applied in Cribl before the Elastic destination, so the cleartext
+          basic-auth secret is never indexed. Beyond that, route on `_path`,
+          cap the unbounded uri, user_agent, and referrer values, and run
+          Persistent Queue backpressure; _raw can be dropped once the parser
+          is proven.
+        elastic: >
+          Add a logs-zeek.http@custom pipeline that assembles url.original as
+          "http://" + host + uri and splits url.path and url.query out of it,
+          derives event.outcome by bucketing status_code (1xx/2xx/3xx success,
+          4xx/5xx failure) while leaving it unset when the sensor never saw a
+          response, and copies url.username to user.name for the identity
+          pivot. Take the first element of resp_mime_types (or map it as an
+          explicit array) rather than letting dynamic mapping decide, add
+          custom-namespace mappings for trans_depth, proxied, and resp_fuids,
+          and enrich file hashes in from the files.log data stream on
+          resp_fuids since the malware profile's file.hash.sha256 does not
+          exist on this record.
+  - format: csv-file
+    enable: >
+      As for conn.log: `redef LogAscii::use_json = F;` with
+      json-streaming-logs unloaded, or the Corelight TSV export profile.
+      http.log is a separate file (#path "http"). The vector columns
+      orig_fuids/orig_filenames/orig_mime_types/
+      resp_fuids/resp_filenames/resp_mime_types and the set columns
+      tags/proxied are comma-joined under set_separator ",". Absent optional
+      columns render as "-" and an empty header value as "(empty)".
+    references:
+    - https://docs.zeek.org/en/master/frameworks/logging.html
+    - https://docs.zeek.org/en/master/scripts/base/protocols/http/main.zeek.html
+    - >-
+      https://docs.zeek.org/en/master/scripts/base/frameworks/logging/writers/ascii.zeek.html
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: Cribl Zeek-TSV parser pipeline (with password drop), then logs-zeek.http@custom
+      notes: >
+        No stock integration parses TSV. The custom pipeline reads the
+        #fields/ #types header, splits the comma-joined vector/set columns,
+        and maps "-" to null. The mandatory http-specific step is that the
+        cleartext password column must be DROPPED in the parser before the
+        record leaves the low side - it is a real column in TSV http.log, not
+        merely unmapped. After extraction, logs-zeek.http@custom assembles
+        url.original as "http://" + host + uri and splits url.path/url.query
+        out, buckets status_code into event.outcome, and enriches file hashes
+        from files.log on resp_fuids.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          The mandatory low-side work is the password drop (and masking of any
+          credentials in the uri userinfo), applied during TSV extraction on
+          the low side so the cleartext basic-auth secret never crosses the
+          boundary - a redaction that runs after the crossing has already
+          leaked it. Beyond that, split the TSV at the edge, cap the unbounded
+          uri/user_agent/ referrer values, and attach sensor identity since
+          TSV http.log has no _system_name. Persistent Queue backpressure on
+          the destination.
+        elastic: >
+          Run logs-zeek.http@custom on the extracted fields: assemble
+          url.original as "http://" + host + uri and split url.path/url.query
+          out of it, derive event.outcome by bucketing status_code
+          (1xx/2xx/3xx success, 4xx/5xx failure) while leaving it unset when
+          the sensor never saw a response, and copy url.username to user.name
+          for the identity pivot. Take the first element of resp_mime_types
+          (or map it as an explicit array), add custom-namespace mappings for
+          trans_depth, proxied, tags, status_msg and resp_fuids, and enrich
+          file.hash.sha256 in from files.log on resp_fuids since it does not
+          exist on this record.
+        relay: >
+          This is the dataset to scrutinize first: uri, user_agent, referrer,
+          and the tags/proxied set values are attacker-controlled free text of
+          unbounded length and unicode shape that content inspection will cap
+          or reject, so bound and normalize them low-side and validate the
+          envelope with C.Schema(...) into a dead-letter route before the
+          guard destination. The password drop must sit upstream of the guard,
+          not on the high side.
+      direct:
+        parse_location: low
+        cribl: >
+          High-side sensor, no guard: split the TSV at the edge and forward
+          NDJSON, still applying the password drop since this is cleartext
+          HTTP. Choose the TSV writer or the JSON writer as the single
+          authoritative HTTP feed and attach sensor identity, which the record
+          lacks.
+        elastic: >
+          The same logs-zeek.http@custom handling applies to the TSV-extracted
+          fields: assemble url.original as "http://" + host + uri with
+          url.path/url.query split out, bucket status_code into event.outcome,
+          and enrich file.hash.sha256 from files.log on resp_fuids. With no
+          boundary, prefer the JSON writer: it is what the stock integration
+          parses and it carries _system_name, whereas TSV requires the custom
+          split plus the manual password drop on every record.
+    fields:
+    - vendor: ts
+      type: timestamp
+      description: time the request was seen
+      ecs: '@timestamp'
+      status: partial
+      transform: double epoch-seconds, same parse as conn.log ts
+    - vendor: uid
+      type: string
+      description: flow identifier joining this transaction back to conn.log
+      ecs: event.id
+      status: mapped
+    - vendor: id.orig_h
+      type: ip
+      description: IP address of the requesting client
+      ecs: source.ip
+      status: mapped
+    - vendor: id.orig_p
+      type: port
+      description: client source port (present in TSV http.log; omitted from the JSON subset)
+      ecs: source.port
+      status: mapped
+    - vendor: id.resp_h
+      type: ip
+      description: IP address of the responding server
+      ecs: destination.ip
+      status: mapped
+    - vendor: id.resp_p
+      type: port
+      description: server port the request was made to
+      ecs: destination.port
+      status: mapped
+    - vendor: trans_depth
+      type: integer
+      description: 1-based index of this transaction within a keep-alive/pipelined flow
+      ecs: null
+      status: unmapped
+      custom: zeek.http.trans_depth
+      notes: >-
+        needed to disambiguate multiple http.log records sharing one uid;
+        without it, joins to conn.log fan out
+    - vendor: method
+      type: string
+      description: HTTP request verb - GET, POST, CONNECT, ...
+      ecs: http.request.method
+      status: mapped
+    - vendor: host
+      type: string
+      description: value of the HTTP Host header
+      ecs: url.domain
+      status: partial
+      notes: >-
+        attacker-controlled and often a bare IP or non-resolving name; the
+        claimed host, not necessarily destination.ip's real identity
+    - vendor: uri
+      type: string
+      description: request target as it appeared on the request line
+      ecs: url.original
+      status: partial
+      transform: >
+        origin-form only - path plus query, no scheme or authority - so
+        url.original must be assembled as "http://" + host + uri, with
+        url.path/url.query split out of it
+    - vendor: referrer
+      type: string
+      description: value of the HTTP Referer header
+      ecs: http.request.referrer
+      status: mapped
+    - vendor: version
+      type: string
+      description: HTTP protocol version string, e.g. 1.1
+      ecs: http.version
+      status: mapped
+    - vendor: user_agent
+      type: string
+      description: value of the HTTP User-Agent header
+      ecs: user_agent.original
+      status: mapped
+    - vendor: origin
+      type: string
+      description: value of the HTTP Origin header
+      ecs: null
+      status: unmapped
+      custom: zeek.http.origin
+      notes: >-
+        useful for CSRF/CORS analysis; no ECS home distinct from url.domain,
+        and it is the header-claimed origin not the observed one
+    - vendor: request_body_len
+      type: long
+      description: uncompressed size in bytes of the request body
+      ecs: http.request.body.bytes
+      status: mapped
+    - vendor: response_body_len
+      type: long
+      description: uncompressed size in bytes of the response body
+      ecs: http.response.body.bytes
+      status: mapped
+    - vendor: status_code
+      type: integer
+      description: numeric HTTP response status returned by the server
+      ecs: http.response.status_code
+      status: mapped
+      transform: >
+        also the only source for the web profile's event.outcome - bucket
+        1xx/2xx/3xx to success and 4xx/5xx to failure; absent ("-") when the
+        sensor never saw the response, which must not collapse to failure
+    - vendor: status_msg
+      type: string
+      description: HTTP reason phrase accompanying status_code, e.g. "OK", "Not Found"
+      ecs: null
+      status: unmapped
+      custom: zeek.http.status_msg
+      notes: >-
+        ECS has no reason-phrase field; the numeric status_code is the
+        analytic value, the phrase is kept only for display
+    - vendor: info_code
+      type: integer
+      description: numeric 1xx informational status seen before the final response
+      ecs: null
+      status: unmapped
+      custom: zeek.http.info_code
+      notes: >-
+        100-Continue / 101-Switching-Protocols and the like; distinct from
+        status_code, which holds the final response
+    - vendor: info_msg
+      type: string
+      description: reason phrase accompanying info_code
+      ecs: null
+      status: unmapped
+      custom: zeek.http.info_msg
+    - vendor: tags
+      type: array
+      description: >-
+        set of indicators Zeek attached to the transaction (e.g. URI_SQLI,
+        EMPTY_REQUEST)
+      ecs: null
+      status: unmapped
+      custom: zeek.http.tags
+      notes: >-
+        a set, comma-joined in TSV; Zeek's own lightweight detection markers
+        on the request, worth keeping as a keyword array for triage
+    - vendor: username
+      type: string
+      description: username supplied via HTTP basic authentication
+      ecs: url.username
+      status: mapped
+      notes: >-
+        worth copying to user.name for the identity pivot; the paired password
+        column below must be dropped in the parser, not merely left unmapped
+    - vendor: password
+      type: string
+      description: cleartext password supplied via HTTP basic authentication
+      ecs: null
+      status: unmapped
+      custom: zeek.http.password
+      notes: >
+        a real TSV column carrying a cleartext credential - it must be DROPPED
+        during low-side extraction before the record leaves the low side,
+        never indexed; listed here only so the drop is explicit, not as a
+        mapping target
+    - vendor: proxied
+      type: array
+      description: >-
+        set of headers indicating the request passed through a proxy
+        (X-Forwarded-For, Via, ...)
+      ecs: null
+      status: unmapped
+      custom: zeek.http.proxied
+      notes: >-
+        a set, comma-joined in TSV; when populated, source.ip is the proxy and
+        the real client is inside these header values
+    - vendor: orig_fuids
+      type: array
+      description: vector of file identifiers for request bodies, joining to files.log
+      ecs: null
+      status: unmapped
+      custom: zeek.http.orig_fuids
+      notes: >-
+        comma-joined in TSV; the bridge from an uploaded body to its files.log
+        entry (uploads, webshell posts)
+    - vendor: orig_filenames
+      type: array
+      description: vector of filenames offered for request-body entities
+      ecs: null
+      status: unmapped
+      custom: zeek.http.orig_filenames
+    - vendor: orig_mime_types
+      type: array
+      description: vector of MIME types the file analyzer identified in the request body
+      ecs: http.request.mime_type
+      status: partial
+      notes: >-
+        ECS http.request.mime_type is single-valued while Zeek emits a
+        comma-joined vector; take the first element or index deliberately as
+        an array, and note these are sniffed types, not the declared
+        Content-Type
+    - vendor: resp_fuids
+      type: array
+      description: >-
+        vector of file identifiers for response bodies, joining to files.log
+        and x509.log
+      ecs: null
+      status: unmapped
+      custom: zeek.http.resp_fuids
+      notes: >-
+        comma-joined in TSV; the only bridge from an HTTP transaction to the
+        file hashes in files.log - the malware profile's file.hash.sha256
+        lives there, not here
+    - vendor: resp_filenames
+      type: array
+      description: vector of filenames offered for response-body entities
+      ecs: null
+      status: unmapped
+      custom: zeek.http.resp_filenames
+    - vendor: resp_mime_types
+      type: array
+      description: vector of MIME types the file analyzer identified in the response body
+      ecs: http.response.mime_type
+      status: partial
+      notes: >-
+        ECS http.response.mime_type is single-valued while Zeek emits a
+        comma-joined vector; take the first element or index as an array
+        deliberately, and note these are sniffed content types, not the
+        declared Content-Type
+- id: notice
+  name: Notice log (notice.log)
+  description: >
+    Zeek's detection output — one record per notice raised by a policy script,
+    package, or the Intel framework (SSL::Invalid_Server_Cert, Intel::Notice,
+    Scan::Port_Scan, HTTP::SQL_Injection_Attacker, ...). Low volume relative
+    to the protocol logs and the natural feed for CSOC detection rules, but
+    the content depends entirely on which scripts and packages a given sensor
+    loads.
+  event_categories:
+  - network
+  - malware
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same sensor JSON stream as conn.log, split by _path, crossing under an
+        allow-list on logs-zeek.notice. `msg` and `sub` carry script-generated
+        free text that can embed observed payload fragments.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-zeek.notice
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: Same sensor JSON stream as conn.log, split by _path.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-zeek.notice
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: Zeek integration
+      notes: >
+        The integration parses the record shape, but the `note` vocabulary is
+        open-ended — every package a sensor loads adds its own values — so a
+        Cribl lookup keyed on `note` is still needed to attach severity and
+        rule metadata that Zeek itself does not emit.
+    fields:
+    - vendor: ts
+      type: timestamp
+      description: time the notice was raised
+      ecs: '@timestamp'
+      status: mapped
+      transform: double epoch-seconds, same parse as conn.log ts
+    - vendor: uid
+      type: string
+      description: flow identifier of the connection that triggered the notice, when there was one
+      ecs: event.id
+      status: partial
+      notes: >-
+        absent for notices raised from a host or file context rather than a
+        connection, so it cannot be relied on as the join key for every record
+    - vendor: note
+      type: enum
+      description: >-
+        the notice type, a namespaced identifier such as
+        SSL::Invalid_Server_Cert or Intel::Notice
+      ecs: rule.name
+      status: mapped
+      notes: >
+        the field CSOC rules key on; treat the vocabulary as open (it grows
+        with every loaded package) and alert on an allow-list of known notes
+        rather than assuming a fixed enumeration
+    - vendor: msg
+      type: string
+      description: human-readable description of what was detected
+      ecs: message
+      status: mapped
+    - vendor: sub
+      type: string
+      description: secondary detail string whose meaning is defined per notice type
+      ecs: null
+      status: unmapped
+      custom: zeek.notice.sub
+      notes: >-
+        often holds the actual indicator (certificate subject, matched intel
+        value, URI), but the semantics vary by `note` so it cannot be mapped
+        to one ECS target
+    - vendor: id.orig_h
+      type: ip
+      description: originator address of the triggering connection
+      ecs: source.ip
+      status: mapped
+    - vendor: id.resp_h
+      type: ip
+      description: responder address of the triggering connection
+      ecs: destination.ip
+      status: mapped
+    - vendor: src
+      type: ip
+      description: address the notice is "about", set independently of the connection tuple
+      ecs: source.ip
+      status: partial
+      notes: >
+        duplicates id.orig_h for connection-scoped notices but is the only
+        address present for host-scoped ones; the pipeline must coalesce src
+        and id.orig_h into source.ip rather than picking one, or a whole class
+        of notices arrives with no source address
+    - vendor: dst
+      type: ip
+      description: peer address the notice is about, for host-scoped notices
+      ecs: destination.ip
+      status: partial
+      notes: same coalescing requirement as src/id.resp_h
+    - vendor: p
+      type: port
+      description: port the notice is about
+      ecs: destination.port
+      status: partial
+      notes: >-
+        which side of the connection this port belongs to is defined by the
+        raising script, not by the schema
+    - vendor: proto
+      type: enum
+      description: transport protocol of the triggering connection — tcp, udp, or icmp
+      ecs: network.transport
+      status: mapped
+    - vendor: actions
+      type: array
+      description: >-
+        set of dispositions applied to the notice — Notice::ACTION_LOG,
+        ACTION_EMAIL, ACTION_DROP, ACTION_ALARM
+      ecs: event.action
+      status: partial
+      notes: >
+        this describes what Zeek did about the notice, not the behaviour that
+        was detected; mapping it to event.action satisfies the alerting
+        profile's field requirement in name only, and rules should key on
+        rule.name (`note`) for the actual detection
+    - vendor: dropped
+      type: boolean
+      description: whether a requested ACTION_DROP was successfully carried out
+      ecs: event.outcome
+      status: partial
+      transform: >
+        boolean to success/failure, but only meaningful when a blocking
+        framework (NetControl or a Corelight blocking integration) is actually
+        wired up; on a passive tap it is always false and must not be read as
+        "the detection failed"
+    - vendor: fuid
+      type: string
+      description: identifier of the file the notice concerns, joining to files.log
+      ecs: null
+      status: unmapped
+      custom: zeek.notice.fuid
+      notes: >-
+        the malware profile's file.hash.sha256 and file.path are not in
+        notice.log — they must be enriched in from files.log on this fuid
+    - vendor: file_mime_type
+      type: string
+      description: sniffed MIME type of the file the notice concerns
+      ecs: file.mime_type
+      status: mapped
+    - vendor: file_desc
+      type: string
+      description: context describing where the file came from, e.g. the source URL
+      ecs: null
+      status: unmapped
+      custom: zeek.notice.file_desc
+      notes: >
+        ECS 9.4 has beta file.origin_url; adopt when GA, and only for the
+        records where this describe-string is actually a URL — the value is
+        free text whose shape depends on the protocol the file was carried
+        over, so it is not a URL on every notice
+    - vendor: suppress_for
+      type: float
+      description: interval in seconds for which duplicate notices of this identity are suppressed
+      ecs: null
+      status: unmapped
+      custom: zeek.notice.suppress_for
+      notes: >
+        the reason notice counts under-report reality — the default is one
+        hour per identity, so rules that count notices are counting
+        suppression windows, not events
+    - vendor: remote_location.country_code
+      type: string
+      description: >-
+        two-letter country code of the remote address, when a GeoIP database
+        is loaded on the sensor
+      ecs: source.geo.country_iso_code
+      status: partial
+      notes: >-
+        only present if the sensor has MaxMind data available, and "remote"
+        may be either side depending on the raising script
+    - vendor: peer_descr
+      type: string
+      description: descriptive name of the Zeek cluster node that raised the notice
+      ecs: observer.name
+      status: partial
+      notes: >-
+        identifies a worker process within a cluster, so it is finer-grained
+        than _system_name; pick one consistently for observer.name across
+        datasets
+    - vendor: community_id
+      type: string
+      description: Community ID v1 hash of the triggering flow
+      ecs: network.community_id
+      status: mapped
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Keep the `note`-keyed lookup table low-side, attaching the severity
+          and rule metadata Zeek does not emit, and treat it as a maintained
+          artifact that has to be extended whenever a sensor loads a new
+          package — an unmatched note must pass through with a default rather
+          than be dropped. This is a low-volume, high-forensic-value detection
+          stream, so retain _raw end-to-end and use Persistent Queue
+          backpressure rather than any sampling.
+        elastic: >
+          Add a logs-zeek.notice@custom pipeline that coalesces src with
+          id.orig_h into source.ip and dst with id.resp_h into destination.ip
+          (picking one column loses every host-scoped notice), sets
+          event.outcome from `dropped` only where a NetControl or Corelight
+          blocking framework is actually wired up and leaves it unset on
+          passive taps, and enriches file.hash and file.path in from the
+          files.log data stream on fuid. Settle observer.name on one source
+          across all four Zeek datasets — peer_descr is per-worker while
+          _system_name is per-appliance — and map zeek.notice.sub, fuid,
+          file_desc, and suppress_for in the custom-namespace index template,
+          with suppress_for documented as the reason notice counts
+          under-report.
+        relay: >
+          Low-side instances cross the guard: the friction is that `msg` and
+          `sub` are script-generated free text that can embed observed payload
+          fragments, so bound their length and normalize unicode low-side
+          before the guard destination. Carry _raw across for this stream — it
+          is IDS-class evidence — and because the volume is low enough that a
+          silently filtered notice is invisible, reconcile low-side and
+          high-side counts per `note` value per hour rather than per dataset.
+      direct:
+        parse_location: high
+        cribl: >
+          Keep the `note`-keyed lookup table in Cribl, attaching the severity
+          and rule metadata Zeek does not emit, and treat it as a maintained
+          artifact that has to be extended whenever a sensor loads a new
+          package — an unmatched note must pass through with a default rather
+          than be dropped. This is a low-volume, high-forensic-value detection
+          stream, so retain _raw end-to-end and use Persistent Queue
+          backpressure rather than any sampling.
+        elastic: >
+          Add a logs-zeek.notice@custom pipeline that coalesces src with
+          id.orig_h into source.ip and dst with id.resp_h into destination.ip
+          (picking one column loses every host-scoped notice), sets
+          event.outcome from `dropped` only where a NetControl or Corelight
+          blocking framework is actually wired up and leaves it unset on
+          passive taps, and enriches file.hash and file.path in from the
+          files.log data stream on fuid. Settle observer.name on one source
+          across all four Zeek datasets — peer_descr is per-worker while
+          _system_name is per-appliance — and map zeek.notice.sub, fuid,
+          file_desc, and suppress_for in the custom-namespace index template,
+          with suppress_for documented as the reason notice counts
+          under-report.
+  - format: csv-file
+    enable: >
+      As for conn.log: `redef LogAscii::use_json = F;` with
+      json-streaming-logs unloaded, or the Corelight TSV export profile.
+      notice.log is a separate file (#path "notice"). The geo_location record
+      remote_location is flattened to
+      remote_location.country_code/.region/.city/.latitude/.longitude columns;
+      the set columns actions and email_dest are comma-joined; the dropped
+      column appears only when policy/frameworks/notice/actions/drop.zeek is
+      loaded, and community_id only with the community-id policy. Absent
+      optional columns render as "-".
+    references:
+    - https://docs.zeek.org/en/master/frameworks/logging.html
+    - https://docs.zeek.org/en/master/scripts/base/frameworks/notice/main.zeek.html
+    - >-
+      https://docs.zeek.org/en/master/scripts/base/frameworks/logging/writers/ascii.zeek.html
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        Cribl Zeek-TSV parser pipeline (note-keyed severity lookup), then
+        logs-zeek.notice@custom
+      notes: >
+        No stock integration parses TSV. The custom pipeline reads the
+        #fields/ #types header and splits the comma-joined actions and
+        email_dest sets, and - as on the JSON path - a note-keyed lookup still
+        attaches the severity and rule metadata Zeek does not emit, because
+        the note vocabulary is open-ended (every loaded package adds its own
+        values). logs-zeek.notice@custom then coalesces src with id.orig_h
+        into source.ip and dst with id.resp_h into destination.ip, and
+        enriches file.hash from files.log on fuid.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Split the TSV low-side and keep the note-keyed lookup table here,
+          attaching the severity and rule metadata Zeek does not emit; treat
+          it as a maintained artifact extended whenever a sensor loads a new
+          package, and pass an unmatched note through with a default rather
+          than dropping it. This is a low-volume, high-forensic-value
+          detection stream, so retain the raw record end-to-end and use
+          Persistent Queue backpressure rather than sampling. Bound the
+          free-text msg and sub before the boundary.
+        elastic: >
+          Run logs-zeek.notice@custom: coalesce src with id.orig_h into
+          source.ip and dst with id.resp_h into destination.ip (picking one
+          column loses every host-scoped notice), set event.outcome from
+          dropped only where a NetControl or Corelight blocking framework is
+          actually wired up and leave it unset on passive taps, and enrich
+          file.hash and file.path from files.log on fuid. Settle observer.name
+          on peer_descr consistently across the Zeek datasets (TSV notice.log
+          has no _system_name, so peer_descr is the only in-band option), and
+          map zeek.notice.sub/fuid/file_desc/n/suppress_for in the custom
+          index template, with suppress_for documented as the reason counts
+          under-report.
+        relay: >
+          msg and sub are script-generated free text that can embed observed
+          payload fragments, so bound their length and normalize unicode
+          low-side before the guard destination. Carry the raw record across
+          for this stream - it is IDS-class evidence - and because a silently
+          filtered notice is invisible at this volume, reconcile low-side and
+          high-side counts per note value per hour rather than per dataset.
+          The crossing is at-most-once with no ack.
+      direct:
+        parse_location: low
+        cribl: >
+          High-side sensor, no guard: split the TSV at the edge, run the
+          note-keyed severity lookup, and forward NDJSON. Choose the TSV
+          writer or the JSON writer as the single authoritative notice feed
+          per sensor.
+        elastic: >
+          The same logs-zeek.notice@custom handling applies to the
+          TSV-extracted fields: coalesce src with id.orig_h into source.ip and
+          dst with id.resp_h into destination.ip, and enrich file.hash and
+          file.path from files.log on fuid. With no boundary, prefer the JSON
+          writer where available - it is what the stock integration parses -
+          but TSV notice.log is the least painful of the four to accept, since
+          peer_descr preserves an in-band sensor identity that conn/dns/http
+          TSV lack.
+    fields:
+    - vendor: ts
+      type: timestamp
+      description: time the notice was raised
+      ecs: '@timestamp'
+      status: partial
+      transform: double epoch-seconds, same parse as conn.log ts
+    - vendor: uid
+      type: string
+      description: flow identifier of the connection that triggered the notice, when there was one
+      ecs: event.id
+      status: partial
+      notes: >-
+        renders as "-" for notices raised from a host or file context rather
+        than a connection, so it cannot be relied on as the join key for every
+        record
+    - vendor: id.orig_h
+      type: ip
+      description: originator address of the triggering connection
+      ecs: source.ip
+      status: mapped
+    - vendor: id.orig_p
+      type: port
+      description: originator port of the triggering connection
+      ecs: source.port
+      status: mapped
+    - vendor: id.resp_h
+      type: ip
+      description: responder address of the triggering connection
+      ecs: destination.ip
+      status: mapped
+    - vendor: id.resp_p
+      type: port
+      description: responder port of the triggering connection
+      ecs: destination.port
+      status: mapped
+    - vendor: fuid
+      type: string
+      description: identifier of the file the notice concerns, joining to files.log
+      ecs: null
+      status: unmapped
+      custom: zeek.notice.fuid
+      notes: >-
+        the malware profile's file.hash.sha256 and file.path are not in
+        notice.log - they must be enriched in from files.log on this fuid
+    - vendor: file_mime_type
+      type: string
+      description: sniffed MIME type of the file the notice concerns
+      ecs: file.mime_type
+      status: mapped
+    - vendor: file_desc
+      type: string
+      description: context describing where the file came from, e.g. the source URL
+      ecs: null
+      status: unmapped
+      custom: zeek.notice.file_desc
+      notes: >-
+        free text whose shape depends on the carrying protocol, so not a URL
+        on every notice; ECS 9.4 beta file.origin_url is a candidate only for
+        the records where it genuinely is one
+    - vendor: proto
+      type: enum
+      description: transport protocol of the triggering connection - tcp, udp, or icmp
+      ecs: network.transport
+      status: mapped
+    - vendor: note
+      type: enum
+      description: >-
+        the notice type, a namespaced identifier such as
+        SSL::Invalid_Server_Cert or Intel::Notice
+      ecs: rule.name
+      status: mapped
+      notes: >-
+        the field CSOC rules key on; treat the vocabulary as open (it grows
+        with every loaded package) and alert on an allow-list of known notes
+    - vendor: msg
+      type: string
+      description: human-readable description of what was detected
+      ecs: message
+      status: mapped
+    - vendor: sub
+      type: string
+      description: secondary detail string whose meaning is defined per notice type
+      ecs: null
+      status: unmapped
+      custom: zeek.notice.sub
+      notes: >-
+        often holds the actual indicator (certificate subject, matched intel
+        value, URI) but the semantics vary by note, so it cannot map to one
+        ECS target
+    - vendor: src
+      type: ip
+      description: address the notice is "about", set independently of the connection tuple
+      ecs: source.ip
+      status: partial
+      notes: >-
+        duplicates id.orig_h for connection-scoped notices but is the only
+        address present for host-scoped ones; coalesce src and id.orig_h into
+        source.ip rather than picking one
+    - vendor: dst
+      type: ip
+      description: peer address the notice is about, for host-scoped notices
+      ecs: destination.ip
+      status: partial
+      notes: same coalescing requirement as src/id.resp_h
+    - vendor: p
+      type: port
+      description: port the notice is about
+      ecs: destination.port
+      status: partial
+      notes: >-
+        which side of the connection this port belongs to is defined by the
+        raising script, not the schema
+    - vendor: 'n'
+      type: integer
+      description: >-
+        numeric count carried by the notice, meaning defined per notice type
+        (e.g. a threshold or observed quantity)
+      ecs: null
+      status: unmapped
+      custom: zeek.notice.n
+      notes: >-
+        script-defined, so it can be a scan count, a byte total, or unused;
+        kept raw because there is no consistent ECS target across note types
+    - vendor: peer_descr
+      type: string
+      description: descriptive name of the Zeek cluster node that raised the notice
+      ecs: observer.name
+      status: partial
+      notes: >-
+        the ONLY in-band sensor identity in TSV notice.log - there is no
+        _system_name column - so settle observer.name on it here; it names a
+        worker process within a cluster, finer-grained than the appliance name
+    - vendor: actions
+      type: array
+      description: >-
+        set of dispositions applied to the notice - Notice::ACTION_LOG,
+        ACTION_EMAIL, ACTION_DROP, ACTION_ALARM
+      ecs: event.action
+      status: partial
+      notes: >-
+        a set, comma-joined in TSV; describes what Zeek did about the notice,
+        not the detected behaviour - rules should key on rule.name (note) for
+        the actual detection
+    - vendor: email_dest
+      type: array
+      description: set of email addresses an ACTION_EMAIL disposition targeted
+      ecs: null
+      status: unmapped
+      custom: zeek.notice.email_dest
+      notes: >-
+        a set, comma-joined in TSV; operational routing metadata, present only
+        when the email action fired
+    - vendor: suppress_for
+      type: float
+      description: interval in seconds for which duplicate notices of this identity are suppressed
+      ecs: null
+      status: unmapped
+      custom: zeek.notice.suppress_for
+      notes: >-
+        the reason notice counts under-report reality - the default is one
+        hour per identity, so rules that count notices are counting
+        suppression windows, not events
+    - vendor: remote_location.country_code
+      type: string
+      description: >-
+        two-letter country code of the remote address, when a GeoIP database
+        is loaded on the sensor
+      ecs: source.geo.country_iso_code
+      status: partial
+      notes: >-
+        present only if the sensor has MaxMind data, and "remote" may be
+        either side depending on the raising script
+    - vendor: remote_location.region
+      type: string
+      description: region/subdivision of the remote address from the GeoIP lookup
+      ecs: source.geo.region_name
+      status: partial
+      notes: same GeoIP-availability and remote-side caveats as country_code
+    - vendor: remote_location.city
+      type: string
+      description: city of the remote address from the GeoIP lookup
+      ecs: source.geo.city_name
+      status: partial
+      notes: same GeoIP-availability and remote-side caveats as country_code
+    - vendor: remote_location.latitude
+      type: float
+      description: latitude of the remote address from the GeoIP lookup
+      ecs: source.geo.location
+      status: partial
+      transform: >-
+        source.geo.location is a geo_point; combine this latitude with
+        remote_location.longitude into one {lat, lon} object rather than
+        mapping either scalar alone
+    - vendor: remote_location.longitude
+      type: float
+      description: longitude of the remote address from the GeoIP lookup
+      ecs: source.geo.location
+      status: partial
+      transform: pair with remote_location.latitude into the single source.geo.location geo_point
+    - vendor: dropped
+      type: boolean
+      description: whether a requested ACTION_DROP was successfully carried out
+      ecs: event.outcome
+      status: partial
+      transform: >
+        boolean to success/failure, but present only when the drop action
+        policy is loaded and meaningful only with a blocking framework
+        (NetControl or a Corelight blocking integration) wired up; on a
+        passive tap it is absent or always false and must not be read as "the
+        detection failed"
+    - vendor: community_id
+      type: string
+      description: Community ID v1 hash of the triggering flow
+      ecs: network.community_id
+      status: mapped
+      notes: present only with the community-id policy loaded

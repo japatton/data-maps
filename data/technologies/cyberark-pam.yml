@@ -1,0 +1,1713 @@
+id: cyberark-pam
+name: CyberArk PAM
+vendor: CyberArk
+versions: PAM Self-Hosted 12.x, 13.x, 14.x (Vault, PVWA, PSM/PSMP)
+draft: true
+references:
+- >-
+  https://docs.cyberark.com/pam-self-hosted/latest/en/content/pasimp/integrating-with-siem-applications.htm
+- https://www.elastic.co/docs/reference/integrations/cyberarkpas
+- https://github.com/elastic/integrations/tree/main/packages/cyberarkpas
+datasets:
+- id: vault-audit
+  name: Vault audit records
+  description: >
+    User and Safe activity written by the Digital Vault: logon/logoff
+    (MessageID 7/8), user authentication (4), password and SSH-key
+    retrieve/store (295/294/427/428), and Safe/owner/user administration
+    (185/32/273/180/265). The Vault emits an XML audit stream that a
+    configurable XSL translator renders to syslog; the shipped Arcsight/CEF
+    translator is the ArcSight-era default this org still runs, so the same
+    underlying audit_record elements arrive as CEF extensions today.
+  event_categories:
+  - authentication
+  - iam
+  route:
+    guarded:
+    - hop: cribl
+      location: edge Cribl worker group, on-prem enclave
+      notes: >
+        Receives syslog over TCP/TLS from the Vault's SyslogServerIP /
+        SyslogTranslatorFile configuration (UDP is discouraged because the
+        Vault has no replay path for dropped audit records). The Vault sits in
+        the same enclave as the privileged infrastructure it protects.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cyberarkpas.audit
+    direct:
+    - hop: cribl
+      location: edge Cribl worker group, on-prem enclave
+      notes: >
+        Receives syslog over TCP/TLS from the Vault's SyslogServerIP /
+        SyslogTranslatorFile configuration (UDP is discouraged because the
+        Vault has no replay path for dropped audit records). The Vault sits in
+        the same enclave as the privileged infrastructure it protects.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cyberarkpas.audit
+  formats:
+  - format: syslog-cef
+    parsing:
+      mechanism: elastic-integration
+      artifact: CyberArk Privileged Access Security (cyberarkpas) integration
+      notes: >
+        The integration parses a JSON envelope produced by CyberArk's
+        elastic-json-v1.0.xsl translator, NOT the shipped CEF translator.
+        Adopting it therefore means repointing SyslogTranslatorFile on the
+        Vault (and setting UseLegacySyslogFormat=No for RFC5424), or
+        converting CEF to that envelope in Cribl. All three datasets in this
+        map share the one cyberarkpas.audit data stream and are separated only
+        by MessageID.
+    fields:
+    - vendor: MessageID
+      type: integer
+      description: numeric Vault audit action code identifying the operation
+      ecs: event.code
+      status: mapped
+      transform: >
+        carried as the CEF signature-ID header field and kept as a keyword
+        string in ECS; this code, not any text column, is what the
+        integration's per-code lookup uses to derive event.action,
+        event.category, event.type and event.outcome
+    - vendor: Desc
+      type: string
+      description: static per-code description of the audit record (CEF Name header)
+      ecs: null
+      status: unmapped
+      custom: cyberarkpas.audit.desc
+      notes: >-
+        fixed label for the MessageID, duplicated in Message; useful for
+        humans, redundant for alerting
+    - vendor: Action
+      type: string
+      description: description of the operation the audit record represents
+      ecs: event.action
+      status: partial
+      transform: >
+        arrives as CEF act=; lowercased into event.action and then overwritten
+        per MessageID with a normalized verb (code 7 becomes
+        authentication_success), so the vendor string alone is not the mapping
+        source for known codes
+    - vendor: Severity
+      type: enum
+      description: severity of the audit record - Info, Error, or Critical
+      ecs: event.severity
+      status: partial
+      transform: >
+        three-value string vocabulary needs a lookup to ECS's numeric scale
+        (Info to 2, Error to 7, Critical to 10); nothing numeric is on the
+        wire, and event.type gains "error" only above 6
+    - vendor: Issuer
+      type: string
+      description: the Vault user who performed the operation and wrote the audit record
+      ecs: user.name
+      status: mapped
+      notes: arrives as CEF duser=; the acting identity on nearly every code
+    - vendor: SourceUser
+      type: string
+      description: name of the Vault user who performed the operation
+      ecs: user.target.name
+      status: partial
+      notes: >
+        role is code-dependent and genuinely ambiguous - the integration
+        treats SourceUser as the acting user on some codes and as the user
+        acted upon on others, and its own source comments flag the
+        disagreement with CyberArk's documentation; verify per MessageID
+        before writing detections that pivot on it
+    - vendor: TargetUser
+      type: string
+      description: name of the Vault user on which the operation was performed
+      ecs: user.target.name
+      status: mapped
+      notes: >-
+        mutually exclusive with SourceUser in practice; arrives as CEF cs1
+        with cs1Label="Affected User Name"
+    - vendor: Station
+      type: ip
+      description: IP address from which the operation was performed
+      ecs: source.ip
+      status: mapped
+      notes: >-
+        arrives as CEF src=; for PVWA-driven operations this is the end user's
+        browser address, not the PVWA server
+    - vendor: GatewayStation
+      type: ip
+      description: IP of the PVWA web application machine that proxied the operation
+      ecs: destination.ip
+      status: partial
+      notes: >
+        the stock integration puts this in destination.ip, but PVWA is AAA
+        infrastructure standing between the user and the Vault rather than the
+        flow's true destination; keep it out of destination-based alerting or
+        move it to a custom field
+    - vendor: Safe
+      type: string
+      description: name of the target Safe the operation acted within
+      ecs: null
+      status: unmapped
+      custom: cyberarkpas.audit.safe
+      notes: >
+        arrives as CEF cs2 with cs2Label="Safe Name". The Safe is CyberArk's
+        core authorization boundary and the primary pivot for PAM detections,
+        but ECS 9.4 has no field modelling a credential-store partition, so it
+        stays custom
+    - vendor: File
+      type: string
+      description: full path of the target account object inside the Safe
+      ecs: file.path
+      status: partial
+      notes: >
+        arrives as CEF fname=; a Vault object path such as Root\Operating
+        System-LINUX-SSH-host-admin2, not a filesystem path, so file.path is a
+        structural fit only - do not build filesystem detections on it
+    - vendor: Reason
+      type: string
+      description: free-text justification the user entered for the operation
+      ecs: event.reason
+      status: mapped
+      notes: operator-supplied and unbounded; the least constrained value on this dataset
+    - vendor: RequestId
+      type: string
+      description: identifier of the dual-control access request the operation belongs to
+      ecs: null
+      status: unmapped
+      custom: cyberarkpas.audit.request_id
+      notes: joins a retrieval back to its approval workflow; no ECS equivalent
+    - vendor: IsoTimestamp
+      type: timestamp
+      description: event time in RFC 3339 / ISO 8601 form
+      ecs: '@timestamp'
+      status: mapped
+      transform: preferred timestamp source; parsed directly to @timestamp
+    - vendor: Timestamp
+      type: string
+      description: event time in MMM DD HH:MM:SS form
+      ecs: '@timestamp'
+      status: partial
+      notes: >-
+        legacy format carrying neither year nor timezone; used only as a
+        fallback when IsoTimestamp is absent
+    - vendor: Hostname
+      type: string
+      description: hostname of the Vault server that wrote the record, in upper case
+      ecs: observer.hostname
+      status: mapped
+      notes: also copied to host.name by the integration so host-scoped dashboards resolve
+    - vendor: Version
+      type: string
+      description: version of the Vault that produced the record
+      ecs: observer.version
+      status: mapped
+      notes: >-
+        paired with static Vendor (Cyber-Ark) and Product (Vault) values that
+        populate observer.vendor and observer.product
+    - vendor: CAProperties:UserName
+      type: string
+      description: username of the privileged account the record concerns
+      ecs: destination.user.name
+      status: partial
+      notes: >
+        the managed account identity, distinct from the Vault user in Issuer;
+        the integration variously sets destination.user.name or
+        user.target.name from it depending on MessageID, so normalize to one
+        of them before alerting
+    - vendor: CAProperties:Address
+      type: string
+      description: address of the managed target device the account belongs to
+      ecs: destination.address
+      status: partial
+      notes: >-
+        hostname or IP of the device the credential unlocks; only becomes
+        destination.ip when it parses as an address
+    - vendor: CAProperties:PolicyID
+      type: string
+      description: platform/policy identifier governing the managed account
+      ecs: null
+      status: unmapped
+      custom: cyberarkpas.audit.ca_properties.policy_id
+      notes: CyberArk platform name (LINUX-SSH, MSSql, WinServerLocal); no ECS equivalent
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Keep the edge worker group thin for this route, but own the format
+          cut: parse the CEF the Vault emits today (including
+          cs1Label/cs2Label indirection) and re-emit the elastic-json envelope
+          the integration expects, so CEF stops at the enclave edge and the
+          Vault-side translator change becomes optional rather than blocking.
+          Attach the Vault-to-owner and Safe-to-mission-system enrichment here
+          where the inventory lookup already lives, and run Persistent Queue
+          backpressure on the Elastic destination — never Block, because a
+          blocked Vault syslog target silently loses audit records with no
+          replay path.
+        elastic: >
+          Let the cyberarkpas integration's ingest pipeline parse, and add a
+          logs-cyberarkpas.audit@custom pipeline for the three gaps this map
+          records: confirm the Info/Error/Critical to numeric event.severity
+          lookup covers every severity string the deployed Vault version
+          emits, assert event.outcome is present for the MessageID codes the
+          stock per-code lookup does not cover (it derives outcome from the
+          code table, not from any vendor column), and stop GatewayStation
+          from landing in destination.ip where PVWA is merely AAA
+          infrastructure in the path. Map the custom-namespace fields as
+          keyword in the index template — cyberarkpas.audit.safe above all,
+          since the Safe is the authorization boundary every PAM detection
+          pivots on and has no ECS home.
+        relay: >
+          Only the elastic-json envelope crosses — never CEF, which is
+          converted low-side regardless. The content-filter friction to settle
+          with the guard owner is the operator-supplied Reason free text and
+          the Vault object path in File, both unbounded and both carrying
+          site-specific naming; cap and normalize them low-side so a custom
+          NDJSON filter can stay simple. Hold the JSON to two levels of
+          nesting with short ASCII keys, treat the crossing as at-most-once,
+          and reconcile low-side and high-side counts per (dataset, hour) —
+          Vault audit volume is low enough that a silent drop is individually
+          significant.
+      direct:
+        parse_location: high
+        cribl: >
+          For a high-side Vault emitting CEF whose collector and Elastic stack
+          sit on the same enclave, own the format cut on the edge worker
+          group: parse the CEF the Vault emits today (including
+          cs1Label/cs2Label indirection) and re-emit the elastic-json envelope
+          the integration expects, or repoint the Vault-side translator to
+          skip the conversion entirely. Attach the Vault-to-owner and
+          Safe-to-mission-system enrichment here where the inventory lookup
+          already lives, and run Persistent Queue backpressure on the Elastic
+          destination — never Block, because a blocked Vault syslog target
+          silently loses audit records with no replay path.
+        elastic: >
+          Let the cyberarkpas integration's ingest pipeline parse, and add a
+          logs-cyberarkpas.audit@custom pipeline for the three gaps this map
+          records: confirm the Info/Error/Critical to numeric event.severity
+          lookup covers every severity string the deployed Vault version
+          emits, assert event.outcome is present for the MessageID codes the
+          stock per-code lookup does not cover (it derives outcome from the
+          code table, not from any vendor column), and stop GatewayStation
+          from landing in destination.ip where PVWA is merely AAA
+          infrastructure in the path. Map the custom-namespace fields as
+          keyword in the index template — cyberarkpas.audit.safe above all,
+          since the Safe is the authorization boundary every PAM detection
+          pivots on and has no ECS home.
+  - format: json
+    enable: >
+      Repoint the Vault's syslog translator at the JSON renderer: copy
+      elastic-json-v1.0.xsl into the Vault's Server\Syslog folder and set
+      SyslogTranslatorFile=Syslog\elastic-json-v1.0.xsl in DBParm.ini, leaving
+      SyslogServerIP / SyslogServerPort / SyslogServerProtocol (TCP or TLS,
+      never UDP - the Vault has no replay path for a dropped audit record)
+      pointed at the same collector as today. Set UseLegacySyslogFormat=No so
+      the record is framed as RFC5424, which the integration expects, and keep
+      SyslogMessageCodeFilter unchanged so the same MessageID set (7/8/4,
+      295/294/427/428, 185/32/273/180/265) continues to flow. The translator
+      wraps every audit_record as a JSON object under syslog.audit_record with
+      native CamelCase keys, so the cs1Label/cs2Label header indirection of
+      the CEF feed disappears and the full CAProperties set is emitted as a
+      real {Name,Value} array rather than the three cs fields CEF surfaced.
+    references:
+    - >-
+      https://docs.cyberark.com/pam-self-hosted/latest/en/content/pasimp/integrating-with-siem-applications.htm
+    - https://www.elastic.co/docs/reference/integrations/cyberarkpas
+    - >-
+      https://github.com/elastic/integrations/blob/main/packages/cyberarkpas/data_stream/audit/elasticsearch/ingest_pipeline/audit.yml
+    parsing:
+      mechanism: elastic-integration
+      artifact: CyberArk Privileged Access Security (cyberarkpas) integration
+      notes: >
+        This is the format the integration is actually built for: its ingest
+        pipeline renames json.syslog.audit_record.* straight into
+        cyberarkpas.audit.* and pivots CAProperties.CAProperty[] (an array of
+        {Name,Value} objects) into named sub-fields, so no CEF header parsing
+        or cs*Label dereferencing runs at all. One honest caveat carries over
+        from the syslog-cef feed: even in JSON, ExtraDetails is still a single
+        'Key=Value;...' string the pipeline kv-splits on unescaped ';' and '='
+        - the translator does not structure it - so the PSM datasets gain
+        nothing structurally from JSON on that field. The per-MessageID
+        SourceUser/TargetUser role ambiguity and the Info/Error/Critical to
+        numeric event.severity lookup are properties of the audit data, not
+        the envelope, and persist here unchanged.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Adopting JSON at the Vault is the cleanest way to make the edge
+          worker group genuinely thin on this route: the Vault emits the
+          elastic-json envelope the integration wants, so the CEF-parse and
+          re-emit step the syslog-cef map runs at the enclave edge is deleted
+          rather than merely relocated. Keep only the enrichment that has to
+          live low-side - the Vault-to-owner and Safe-to-mission-system
+          inventory lookups - and attach them to cyberarkpas.audit.safe on the
+          already-structured document. Run Persistent Queue backpressure on
+          the crossing destination and never Block, because a blocked Vault
+          syslog target loses audit records with no replay path; if the Vault
+          cannot be repointed, produce this same envelope in Cribl instead,
+          but prefer the translator change so there is one fewer
+          hand-maintained transform.
+        elastic: >
+          Let the stock ingest pipeline parse and add a
+          logs-cyberarkpas.audit@custom pipeline for the same gaps the
+          syslog-cef feed has, since they are envelope-independent: confirm
+          the severity string lookup covers every value the Vault version
+          emits, assert event.outcome is set for the MessageID codes the
+          per-code table does not cover, and stop GatewayStation from
+          anchoring destination-based alerts where PVWA is only AAA
+          infrastructure in the path. JSON adds one opportunity: because the
+          full CAProperties array now arrives, map the extra properties
+          (CPMStatus, DeviceType, Database) as keyword under
+          cyberarkpas.audit.ca_properties.* instead of losing them at the CEF
+          cs-field boundary. Map cyberarkpas.audit.safe as keyword above all -
+          it is the authorization boundary every PAM detection pivots on and
+          has no ECS home.
+        relay: >
+          This is the format that most simplifies the crossing: the envelope
+          the guard would forward is already the two-level NDJSON the plan of
+          record calls for, so there is no CEF-to-JSON conversion straddling
+          the boundary. The content-filter friction to settle with the guard
+          owner is unchanged and intrinsic to the data, not the format - the
+          operator-supplied Reason free text and the Vault object path in File
+          are both unbounded and site-specific, so cap and normalize them
+          low-side. Hold the JSON to two levels of nesting with short ASCII
+          keys (flattening CAProperties into ca_properties.<name> low-side
+          keeps depth down), treat the crossing as at-most-once, and reconcile
+          low-side and high-side counts per (dataset, hour) - Vault audit
+          volume is low enough that a silent drop is individually significant.
+      direct:
+        parse_location: high
+        cribl: >
+          For a high-side Vault whose collector and Elastic stack sit on the
+          same enclave, repointing SyslogTranslatorFile to
+          elastic-json-v1.0.xsl lets the edge group do essentially nothing but
+          forward: the Vault speaks the integration's native format, so there
+          is no CEF parse to own at all. Keep the Safe and owner enrichment
+          here if the inventory lookup is co-located, and run Persistent Queue
+          backpressure rather than Block on the Elastic destination for the
+          same no-replay reason.
+        elastic: >
+          Let the stock ingest pipeline parse and add a
+          logs-cyberarkpas.audit@custom pipeline for the envelope-independent
+          gaps: confirm the severity string lookup covers every value the
+          Vault version emits, assert event.outcome is set for the MessageID
+          codes the per-code table does not cover, and stop GatewayStation
+          from anchoring destination-based alerts where PVWA is only AAA
+          infrastructure in the path. The one format-specific win to capture
+          is the expanded CAProperties array - type ca_properties.* as keyword
+          in the index template so the CPM status and platform metadata the
+          CEF feed dropped become available to detections, and set a
+          distinguishing input tag if a JSON-fed Vault is indexed alongside
+          any still-CEF Vault so the two are separable in the shared data
+          stream.
+    fields:
+    - vendor: MessageID
+      type: integer
+      description: Numeric Vault audit action code identifying the operation
+      ecs: event.code
+      status: mapped
+      transform: >-
+        arrives as the JSON number syslog.audit_record.MessageID (not a CEF
+        signature-ID header); still the sole driver of the integration's
+        per-code event.action/category/type/outcome lookup
+    - vendor: Desc
+      type: string
+      description: Static per-code description of the audit record
+      ecs: null
+      custom: cyberarkpas.audit.desc
+      status: unmapped
+      notes: >-
+        native JSON key Desc rather than the CEF Name header; fixed label for
+        the MessageID, redundant for alerting
+    - vendor: Action
+      type: string
+      description: Description of the operation the audit record represents
+      ecs: event.action
+      status: partial
+      transform: >
+        native JSON Action key; lowercased into event.action then overwritten
+        per MessageID with a normalized verb, so the vendor string is not the
+        mapping source for known codes
+    - vendor: Severity
+      type: enum
+      description: Severity of the audit record - Info, Error, or Critical
+      ecs: event.severity
+      status: partial
+      transform: >-
+        three-value string vocabulary needs the same numeric-scale lookup as
+        the syslog-cef feed (Info->2, Error->7, Critical->10); nothing numeric
+        is on the wire
+    - vendor: Issuer
+      type: string
+      description: Vault user who performed the operation and wrote the record
+      ecs: user.name
+      status: mapped
+      notes: >-
+        native JSON key Issuer, no CEF duser= indirection; the acting identity
+        on nearly every code
+    - vendor: SourceUser
+      type: string
+      description: Name of the Vault user who performed the operation
+      ecs: user.target.name
+      status: partial
+      notes: >
+        same code-dependent role ambiguity as the syslog-cef feed - the
+        integration treats SourceUser as actor on some codes and as the user
+        acted upon on others, and its own comments flag the disagreement with
+        CyberArk's documentation; verify per MessageID
+    - vendor: TargetUser
+      type: string
+      description: Vault user the operation was performed on
+      ecs: user.target.name
+      status: mapped
+      notes: >-
+        native JSON key rather than CEF cs1/cs1Label='Affected User Name';
+        mutually exclusive with SourceUser in practice
+    - vendor: Station
+      type: ip
+      description: IP address the operation was performed from
+      ecs: source.ip
+      status: mapped
+      notes: >-
+        native JSON Station key (CEF src=); for PVWA-driven operations this is
+        the end user's browser address, not the PVWA server
+    - vendor: GatewayStation
+      type: ip
+      description: IP of the PVWA web application machine that proxied the operation
+      ecs: destination.ip
+      status: partial
+      notes: >
+        the stock integration puts this in destination.ip, but PVWA is AAA
+        infrastructure between the user and the Vault, not the flow's true
+        destination; keep it out of destination-based alerting or move it to a
+        custom field
+    - vendor: Safe
+      type: string
+      description: Name of the target Safe the operation acted within
+      ecs: null
+      custom: cyberarkpas.audit.safe
+      status: unmapped
+      notes: >
+        native JSON Safe key (CEF cs2/cs2Label='Safe Name'). The Safe is
+        CyberArk's core authorization boundary and the primary PAM-detection
+        pivot, but ECS 9.4 has no field for a credential-store partition, so
+        it stays custom
+    - vendor: File
+      type: string
+      description: Full path of the target account object inside the Safe
+      ecs: file.path
+      status: partial
+      notes: >
+        native JSON File key (CEF fname=); a Vault object path such as
+        Root\Operating System-LINUX-SSH-host-admin2, not a filesystem path, so
+        file.path is a structural fit only
+    - vendor: Reason
+      type: string
+      description: Free-text justification the user entered for the operation
+      ecs: event.reason
+      status: mapped
+      notes: >-
+        operator-supplied and unbounded; the least constrained value on this
+        dataset and a primary content-filter concern at the guard
+    - vendor: RequestId
+      type: string
+      description: Identifier of the dual-control access request the operation belongs to
+      ecs: null
+      custom: cyberarkpas.audit.request_id
+      status: unmapped
+      notes: joins a retrieval back to its approval workflow; no ECS equivalent
+    - vendor: IsoTimestamp
+      type: timestamp
+      description: Event time in RFC 3339 / ISO 8601 form
+      ecs: '@timestamp'
+      status: mapped
+      transform: preferred timestamp source; parsed directly to @timestamp
+    - vendor: Timestamp
+      type: string
+      description: Event time in MMM DD HH:MM:SS form
+      ecs: '@timestamp'
+      status: partial
+      notes: >-
+        legacy form carrying neither year nor timezone; fallback only when
+        IsoTimestamp is absent
+    - vendor: Hostname
+      type: string
+      description: Hostname of the Vault server that wrote the record, upper case
+      ecs: observer.hostname
+      status: mapped
+      notes: also copied to host.name by the integration so host-scoped dashboards resolve
+    - vendor: Vendor
+      type: string
+      description: Static vendor string Cyber-Ark
+      ecs: observer.vendor
+      status: mapped
+      notes: native JSON key carrying the fixed vendor value
+    - vendor: Product
+      type: string
+      description: Static product string Vault
+      ecs: observer.product
+      status: mapped
+      notes: >-
+        the integration branches on Product!=VaultMonitor to separate audit
+        records from Vault health telemetry
+    - vendor: Version
+      type: string
+      description: Version of the Vault that produced the record
+      ecs: observer.version
+      status: mapped
+    - vendor: Category
+      type: string
+      description: Audit category the record belongs to, emitted as a JSON key
+      ecs: null
+      custom: cyberarkpas.audit.category
+      status: unmapped
+      notes: surfaced natively in the JSON envelope; groups codes but has no ECS home
+    - vendor: Location
+      type: string
+      description: Vault Location the target object resides under
+      ecs: null
+      custom: cyberarkpas.audit.location
+      status: unmapped
+      notes: the Vault directory location, distinct from the Safe; JSON-exposed and unmapped
+    - vendor: CAProperties:UserName
+      type: string
+      description: Username of the privileged account the record concerns
+      ecs: destination.user.name
+      status: partial
+      notes: >
+        arrives inside the CAProperties.CAProperty[] array as a {Name,Value}
+        pair the pipeline pivots to a named key; the managed-account identity,
+        distinct from the Vault user in Issuer - the integration sets
+        destination.user.name or user.target.name from it by MessageID
+    - vendor: CAProperties:Address
+      type: string
+      description: Address of the managed target device the account belongs to
+      ecs: destination.address
+      status: partial
+      notes: >-
+        CAProperties array member; only becomes destination.ip when it parses
+        as an address
+    - vendor: CAProperties:PolicyID
+      type: string
+      description: Platform/policy identifier governing the managed account
+      ecs: null
+      custom: cyberarkpas.audit.ca_properties.policy_id
+      status: unmapped
+      notes: CyberArk platform name (LINUX-SSH, MSSql, WinServerLocal); no ECS equivalent
+    - vendor: CAProperties:CPMStatus
+      type: string
+      description: Central Policy Manager rotation status of the managed account
+      ecs: null
+      custom: cyberarkpas.audit.ca_properties.cpm_status
+      status: unmapped
+      notes: >
+        surfaced only because JSON emits the whole CAProperties array - the
+        CEF feed's three cs fields dropped it. Flags whether the credential is
+        under active rotation, a real detection signal, with no ECS home
+    - vendor: CAProperties:DeviceType
+      type: string
+      description: >-
+        CyberArk device type of the managed account (Operating System,
+        Database, Application)
+      ecs: null
+      custom: cyberarkpas.audit.ca_properties.device_type
+      status: unmapped
+      notes: >-
+        another CAProperties member the JSON array exposes and the CEF feed
+        did not; classifies the credential's target class
+  - format: syslog-leef
+    enable: >
+      Point the Vault's syslog translator at the QRadar/JSA renderer: copy
+      LEEF.xsl into the Vault's Server\Syslog folder and set
+      SyslogTranslatorFile to that path in DBParm.ini, with SyslogServerIP /
+      SyslogServerPort (default 514) / SyslogServerProtocol pointed at the
+      QRadar or JSA collector and SyslogMessageCodeFilter left at the default
+      so all user- and safe-activity codes are sent (the filter takes a
+      comma/range list such as 1,2,3,5-10,30 when a subset is wanted). The
+      translator renders each audit_record as a LEEF event: a pipe-delimited
+      header (LEEF:Version|Cyber-Ark|Vault|<version>|<MessageID>|) followed by
+      tab-separated Key=Value attributes carrying the audit body.
+    references:
+    - >-
+      https://docs.cyberark.com/pam-self-hosted/latest/en/content/pasimp/integrating-with-siem-applications.htm
+    - https://www.ibm.com/docs/en/dsm?topic=cyberark-vault
+    - >-
+      https://www.juniper.net/documentation/us/en/software/jsa7.5.0/jsa-dsm/topics/concept/concept-jsa-dsm-cyberark-vault.html
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        custom Cribl LEEF-to-cyberarkpas.audit pipeline (the stock cyberarkpas
+        integration ingests CEF/JSON only, not LEEF)
+      notes: >
+        The stock Elastic integration has no LEEF path - it parses the CEF
+        header extensions or the elastic-json envelope - so LEEF would need a
+        hand-built Cribl LEEF parser mapping the tab-separated attributes back
+        into cyberarkpas.audit.* before the integration's per-code lookups
+        could run. The material honesty on this format is that CyberArk does
+        NOT publicly document the attribute-key names its LEEF.xsl emits: the
+        LEEF header (version, Cyber-Ark, Vault, product version, MessageID as
+        the EventID) and the LEEF-standard devTime attribute are the only
+        fields sourceable from vendor/DSM documentation. The body attributes
+        carrying Issuer, Safe, File, Station and the rest must be recovered
+        from a live LEEF sample or the LEEF.xsl itself before a parser can be
+        trusted - so this table is intentionally limited to the header rather
+        than guessing key names. Given the CEF feed and the native JSON
+        alternate both parse cleanly, LEEF is only worth adopting where a
+        QRadar/JSA estate already standardizes on it.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          If LEEF is unavoidable (a QRadar estate that must also feed Elastic
+          across the guard), parse it to the cyberarkpas.audit shape at the
+          low-side edge group rather than crossing raw LEEF, because the
+          tab-separated attribute layout is exactly the kind of positional
+          format a guard content filter reasons about poorly. Build and pin
+          the LEEF-attribute-to-field map against a captured live sample,
+          carry the same Safe/owner enrichment as the other formats, and
+          re-emit the two-level NDJSON envelope the plan of record crosses -
+          so LEEF never leaves the enclave and the high side sees the same
+          JSON as every other feed. Run Persistent Queue backpressure, never
+          Block, for the no-replay reason.
+        elastic: >
+          Take the low-side-shaped documents into logs-cyberarkpas.audit and
+          keep a logs-cyberarkpas.audit@custom pipeline for the same
+          severity/outcome assertions as the other formats. Because the LEEF
+          parse is hand-built, add a schema check that quarantines any record
+          missing event.code or @timestamp, since a drifted LEEF.xsl or an
+          unmapped attribute would silently null those before they reach the
+          stock per-code lookups.
+        relay: >
+          Never cross raw LEEF: its tab-separated header-plus-attributes shape
+          is the least filter-friendly of the three translators, and the same
+          unbounded Reason and File values need the same low-side cap and
+          normalization as on the CEF and JSON feeds. Convert to the two-level
+          NDJSON envelope low-side, hold it to short ASCII keys, treat the
+          crossing as at-most-once, and reconcile counts per (dataset, hour).
+      direct:
+        parse_location: low
+        cribl: >
+          For a same-side Vault feeding both QRadar and Elastic, run the LEEF
+          parse and full cyberarkpas.audit shaping in one low pass. The
+          standing decision is that LEEF buys nothing over the CEF or the
+          native JSON for the Elastic path - both parse without a custom LEEF
+          map - so adopt it only to avoid running a second translator where
+          QRadar already consumes LEEF, and accept the hand-built parser as
+          the cost.
+        elastic: >
+          Take the parsed documents into logs-cyberarkpas.audit and keep a
+          logs-cyberarkpas.audit@custom pipeline for the same severity/outcome
+          assertions the other formats need. Because the LEEF parse is
+          hand-built, add a schema check that quarantines any record missing
+          event.code or @timestamp, since a drifted LEEF.xsl or an unmapped
+          attribute would silently null those before they reach the stock
+          per-code lookups. Tag the input so LEEF-sourced records are
+          separable from CEF- or JSON-sourced records of the same events in
+          the shared data stream, since a hand-built LEEF parse is the most
+          likely of the three to drift from the stock field semantics.
+    fields:
+    - vendor: EventID
+      type: integer
+      description: The Vault MessageID, carried as the LEEF header EventID field
+      ecs: event.code
+      status: mapped
+      notes: >-
+        IBM/JSA document that the LEEF header EventID plus cat map the event
+        to a QID; it carries the same audit code as the CEF signature-ID
+    - vendor: devTime
+      type: string
+      description: >-
+        LEEF-standard event-time attribute the translator emits for QRadar to
+        timestamp the event
+      ecs: '@timestamp'
+      status: partial
+      notes: >
+        the LEEF spec's event-time attribute (paired with devTimeFormat);
+        CyberArk's LEEF.xsl emits the audit record time here, but the exact
+        time format string must be confirmed against a live sample
+    - vendor: Vendor
+      type: string
+      description: LEEF header vendor field, static Cyber-Ark
+      ecs: observer.vendor
+      status: mapped
+      notes: fixed value in the LEEF header, as on the CEF and JSON feeds
+    - vendor: Product
+      type: string
+      description: LEEF header product field, static Vault
+      ecs: observer.product
+      status: mapped
+    - vendor: Version
+      type: string
+      description: LEEF header product-version field
+      ecs: observer.version
+      status: mapped
+      notes: >-
+        the Vault version in the header; the body-attribute keys carrying
+        Issuer/Safe/File/Station are not publicly documented and are omitted
+        rather than guessed
+- id: psm-session
+  name: PSM privileged session
+  description: >
+    Session start and end records from the Privileged Session Manager and its
+    SSH proxy - PSM Connect (300), PSM Disconnect (302) and PSM Upload
+    Recording (304). These carry the ExtraDetails key=value block that
+    identifies the proxied connection: who connected, through which PSM, to
+    which target host, as which privileged account.
+  event_categories:
+  - authentication
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge Cribl worker group, on-prem enclave
+      notes: >
+        Same Vault syslog feed as the vault-audit dataset - PSM session
+        records are written to the Vault audit stream, not shipped separately
+        by the PSM servers.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cyberarkpas.audit
+    direct:
+    - hop: cribl
+      location: edge Cribl worker group, on-prem enclave
+      notes: >
+        Same Vault syslog feed as the vault-audit dataset - PSM session
+        records are written to the Vault audit stream, not shipped separately
+        by the PSM servers.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cyberarkpas.audit
+  formats:
+  - format: syslog-cef
+    parsing:
+      mechanism: elastic-integration
+      artifact: CyberArk Privileged Access Security (cyberarkpas) integration
+      notes: >
+        The integration splits the ExtraDetails string on unescaped ';' and
+        '=' into a key-value object, then applies per-MessageID mappings for
+        300/302/304. Escaped separators inside values are handled by the kv
+        processor, so a low-side reimplementation must match that escaping
+        rule exactly.
+    fields:
+    - vendor: MessageID
+      type: integer
+      description: >-
+        numeric Vault audit action code - 300 PSM Connect, 302 PSM Disconnect,
+        304 PSM Upload Recording
+      ecs: event.code
+      status: mapped
+      transform: >-
+        drives event.type start/end and sets event.outcome to success; there
+        is no separate outcome column
+    - vendor: Issuer
+      type: string
+      description: Vault user who opened the privileged session
+      ecs: source.user.name
+      status: mapped
+      notes: the human identity behind the session; also copied to user.name
+    - vendor: ExtraDetails:User
+      type: string
+      description: privileged account the session was established as on the target
+      ecs: destination.user.name
+      status: mapped
+      notes: >-
+        the account actually used on the target host - the pair (Issuer, User)
+        is the accountability link PAM exists to provide
+    - vendor: ExtraDetails:SrcHost
+      type: string
+      description: address or hostname the user connected from
+      ecs: source.address
+      status: partial
+      notes: >
+        promoted to source.ip only when the value parses as an address; for
+        PSMP sessions it is frequently 127.0.0.1 because the proxy sees its
+        own loopback, so prefer Station for real client attribution
+    - vendor: ExtraDetails:DstHost
+      type: string
+      description: target host the privileged session was established to
+      ecs: destination.address
+      status: partial
+      notes: >
+        resolved to destination.ip or destination.domain by the integration.
+        host.target.* was considered — the target is genuinely a host being
+        administered — but this record is also the session's flow destination,
+        and the repo convention reserves host.target.* for administered
+        devices that are not flow endpoints
+    - vendor: ExtraDetails:Protocol
+      type: string
+      description: protocol carried by the proxied session (SSH, RDP, SQLNet)
+      ecs: network.application
+      status: partial
+      notes: >
+        the stock integration puts the protocol in network.application;
+        network.protocol is the correct ECS home and network.application
+        should hold the application riding it, so this needs correcting before
+        protocol-based dashboards are trustworthy
+    - vendor: ExtraDetails:SessionID
+      type: string
+      description: GUID uniquely identifying the PSM session
+      ecs: null
+      status: unmapped
+      custom: cyberarkpas.audit.extra_details.session_id
+      notes: >
+        the join key linking connect, disconnect and every in-session
+        keystroke/command record. ECS 9.4 has no generic session.id — only
+        process.session_leader.*, which models a Linux process session and not
+        a proxied remote session — so this stays custom
+    - vendor: ExtraDetails:PSMID
+      type: string
+      description: identifier of the PSM server that proxied the session
+      ecs: null
+      status: unmapped
+      custom: cyberarkpas.audit.extra_details.psmid
+      notes: >
+        names the PSM component, which is the mediating infrastructure;
+        deliberately not observer.name, which the map reserves for the Vault
+        that emitted the audit record
+    - vendor: ExtraDetails:SessionDuration
+      type: string
+      description: elapsed length of the session, as an HH:MM:SS string
+      ecs: event.duration
+      status: partial
+      transform: >
+        HH:MM:SS text is parsed to seconds and multiplied to nanoseconds for
+        ECS event.duration; present only on the disconnect (302) record
+    - vendor: ExtraDetails:ApplicationType
+      type: string
+      description: PSM flavour that brokered the session (PSM-RDP, PSMP-SSH)
+      ecs: null
+      status: unmapped
+      custom: cyberarkpas.audit.extra_details.application_type
+    - vendor: ExtraDetails:ConnectionComponentId
+      type: string
+      description: >-
+        connection component used to launch the session (PSM-SSH,
+        PSM-SQLServerMgmtStudio)
+      ecs: null
+      status: unmapped
+      custom: cyberarkpas.audit.extra_details.connection_component_id
+      notes: >-
+        identifies which client application PSM launched; the closest thing
+        this dataset has to a true network.application value
+    - vendor: ExtraDetails:ManagedAccount
+      type: enum
+      description: whether the account used was managed by the Vault (Yes/No)
+      ecs: null
+      status: unmapped
+      custom: cyberarkpas.audit.extra_details.managed_account
+      notes: >-
+        a No here means a privileged session ran with a credential the Vault
+        does not rotate - high detection value, no ECS equivalent
+    - vendor: ExtraDetails:LogonAccount
+      type: string
+      description: separate logon account used to reach the target before elevation
+      ecs: null
+      status: unmapped
+      custom: cyberarkpas.audit.extra_details.logon_account
+    - vendor: Station
+      type: ip
+      description: IP address the session request was issued from
+      ecs: source.ip
+      status: mapped
+      notes: more reliable than ExtraDetails:SrcHost for client attribution on PSMP sessions
+    - vendor: Safe
+      type: string
+      description: Safe holding the account the session used
+      ecs: null
+      status: unmapped
+      custom: cyberarkpas.audit.safe
+      notes: same authorization-boundary gap as the vault-audit dataset
+    - vendor: File
+      type: string
+      description: full path of the account object inside the Safe
+      ecs: file.path
+      status: partial
+      notes: >-
+        Vault object path rather than a filesystem path; identifies which
+        stored credential opened the session
+    - vendor: Severity
+      type: enum
+      description: severity of the audit record - Info, Error, or Critical
+      ecs: event.severity
+      status: partial
+      notes: same three-value string vocabulary and numeric lookup as the vault-audit dataset
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Keep the edge group to format conversion and enrichment: parse the
+          CEF into the elastic-json envelope as on the vault-audit route, and
+          resolve the target host in DstHost to a site and system owner
+          low-side, where the CMDB lookup already lives and where a PSM target
+          name is still unambiguous. Do not attempt ExtraDetails splitting
+          here — its escaped ';' and '=' handling is the one piece the
+          integration does precisely, and a divergent low-side implementation
+          would silently corrupt command values on the sibling activity
+          dataset.
+        elastic: >
+          Parse with the stock integration and add a
+          logs-cyberarkpas.audit@custom pipeline that fixes the two mappings
+          this map flags: move the SSH/RDP/ SQLNet Protocol value out of
+          network.application into network.protocol (leaving the connection
+          component in network.application if anything), and verify the
+          HH:MM:SS SessionDuration conversion to nanosecond event.duration
+          handles sessions crossing 24 hours. Map
+          cyberarkpas.audit.extra_details.session_id as keyword in the index
+          template and build the connect/disconnect/activity correlation on it
+          — it is the only join key across the three datasets.
+        relay: >
+          On the guarded crossing the elastic-json envelope crosses, not CEF.
+          Content-filter friction is lower here than on the sibling datasets
+          because every ExtraDetails value is a bounded identifier —
+          hostnames, GUIDs, protocol names — so an allowlist of ExtraDetails
+          keys is a realistic custom filter rule and worth specifying low-side
+          rather than passing the block through opaquely. Crossing is
+          at-most-once with no return channel: reconcile counts per (dataset,
+          hour), and treat a connect without a matching disconnect as a
+          reconciliation signal rather than evidence of a hung session.
+      direct:
+        parse_location: high
+        cribl: >
+          Keep the edge group to format conversion and enrichment: parse the
+          CEF into the elastic-json envelope as on the vault-audit route, and
+          resolve the target host in DstHost to a site and system owner here,
+          where the CMDB lookup already lives and where a PSM target name is
+          still unambiguous. Do not attempt ExtraDetails splitting here — its
+          escaped ';' and '=' handling is the one piece the integration does
+          precisely, and a divergent local reimplementation would silently
+          corrupt command values on the sibling activity dataset.
+        elastic: >
+          Parse with the stock integration and add a
+          logs-cyberarkpas.audit@custom pipeline that fixes the two mappings
+          this map flags: move the SSH/RDP/ SQLNet Protocol value out of
+          network.application into network.protocol (leaving the connection
+          component in network.application if anything), and verify the
+          HH:MM:SS SessionDuration conversion to nanosecond event.duration
+          handles sessions crossing 24 hours. Map
+          cyberarkpas.audit.extra_details.session_id as keyword in the index
+          template and build the connect/disconnect/activity correlation on it
+          — it is the only join key across the three datasets.
+  - format: json
+    enable: >
+      Same translator change as the vault-audit dataset - PSM session records
+      (300 PSM Connect, 302 PSM Disconnect, 304 Upload Recording) are written
+      to the one Vault audit stream, not shipped separately by the PSM
+      servers, so repointing SyslogTranslatorFile to elastic-json-v1.0.xsl
+      (UseLegacySyslogFormat=No, TCP/TLS transport) renders these codes as the
+      same syslog.audit_record JSON envelope. The connection detail still
+      arrives in the ExtraDetails value, which the JSON translator leaves as a
+      single 'Key=Value;...' string rather than structuring it.
+    references:
+    - >-
+      https://docs.cyberark.com/pam-self-hosted/latest/en/content/pasimp/integrating-with-siem-applications.htm
+    - https://www.elastic.co/docs/reference/integrations/cyberarkpas
+    - >-
+      https://github.com/elastic/integrations/blob/main/packages/cyberarkpas/data_stream/audit/elasticsearch/ingest_pipeline/audit.yml
+    parsing:
+      mechanism: elastic-integration
+      artifact: CyberArk Privileged Access Security (cyberarkpas) integration
+      notes: >
+        The integration parses the JSON envelope, then splits
+        cyberarkpas.audit.ExtraDetails on unescaped ';' and '=' into a
+        key-value object exactly as it does on the CEF feed - the JSON
+        translator does NOT pre-split ExtraDetails, so the escaped-separator
+        handling is identical and a low-side reimplementation must match it
+        precisely. Adopting JSON here removes the CEF header parse but does
+        not simplify the ExtraDetails handling, which is where this dataset's
+        complexity lives. The Protocol-into-network.application mismapping and
+        the HH:MM:SS SessionDuration-to-nanosecond conversion are
+        envelope-independent and carry over unchanged.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Repointing the Vault to JSON lets the edge group drop the CEF parse
+          on this route as on vault-audit, but keep doing the two things that
+          must stay low-side: resolve the target host in DstHost to a site and
+          owner via the CMDB lookup while a PSM target name is still
+          unambiguous, and do NOT attempt the ExtraDetails split here - its
+          escaped ';'/'=' handling is the one piece the integration does
+          precisely, and a divergent low-side split would corrupt command
+          values on the sibling activity dataset. Emit the native JSON
+          envelope onward.
+        elastic: >
+          Parse with the stock integration and add a
+          logs-cyberarkpas.audit@custom pipeline for the two mappings this
+          dataset needs regardless of format: move the SSH/RDP/SQLNet Protocol
+          value out of network.application into network.protocol, and verify
+          the SessionDuration-to-event.duration conversion handles sessions
+          crossing 24 hours. Map cyberarkpas.audit.extra_details.session_id as
+          keyword and build the connect/disconnect/activity correlation on it
+          - it is the only join key across the three datasets.
+        relay: >
+          The JSON envelope is already the NDJSON shape the plan of record
+          crosses, so no format conversion straddles the guard. Content-filter
+          friction is low here because every ExtraDetails value is a bounded
+          identifier - hostnames, GUIDs, protocol names - so an allowlist of
+          ExtraDetails keys is a realistic custom filter rule worth specifying
+          low-side. Crossing is at-most-once with no return channel: reconcile
+          per (dataset, hour) and treat a connect without a matching
+          disconnect as a reconciliation signal, not evidence of a hung
+          session.
+      direct:
+        parse_location: high
+        cribl: >
+          For a same-side Vault, repointing to elastic-json-v1.0.xsl lets the
+          edge group forward with no CEF parse to own; keep the
+          DstHost-to-site enrichment here if the CMDB lookup is co-located,
+          and still leave ExtraDetails splitting to the stock pipeline.
+        elastic: >
+          Add a logs-cyberarkpas.audit@custom pipeline for the two mappings
+          this dataset needs regardless of format: move the SSH/RDP/SQLNet
+          Protocol value out of network.application into network.protocol, and
+          verify the SessionDuration-to-event.duration conversion handles
+          sessions crossing 24 hours. Map
+          cyberarkpas.audit.extra_details.session_id as keyword and build the
+          connect/disconnect/activity correlation on it - it is the only join
+          key across the three datasets. Set an input tag if a JSON-fed PSM
+          Vault is indexed beside any still-CEF Vault so the two renderings of
+          the same session records stay separable.
+    fields:
+    - vendor: MessageID
+      type: integer
+      description: >-
+        Numeric Vault audit code - 300 PSM Connect, 302 PSM Disconnect, 304
+        Upload Recording
+      ecs: event.code
+      status: mapped
+      transform: >-
+        JSON number; drives event.type start/end and sets event.outcome
+        success - there is no separate outcome key
+    - vendor: Issuer
+      type: string
+      description: Vault user who opened the privileged session
+      ecs: source.user.name
+      status: mapped
+      notes: native JSON key; the human identity behind the session, also copied to user.name
+    - vendor: ExtraDetails:User
+      type: string
+      description: Privileged account the session was established as on the target
+      ecs: destination.user.name
+      status: mapped
+      notes: >-
+        kv-split from the ExtraDetails string; the (Issuer, User) pair is the
+        accountability link PAM exists to provide
+    - vendor: ExtraDetails:SrcHost
+      type: string
+      description: Address or hostname the user connected from
+      ecs: source.address
+      status: partial
+      notes: >
+        promoted to source.ip only when it parses as an address; for PSMP
+        sessions frequently 127.0.0.1 because the proxy sees its own loopback,
+        so prefer Station for real client attribution
+    - vendor: ExtraDetails:DstHost
+      type: string
+      description: Target host the privileged session was established to
+      ecs: destination.address
+      status: partial
+      notes: >
+        resolved to destination.ip or destination.domain; host.target.* was
+        considered but this record is also the session's flow destination, and
+        the repo convention reserves host.target.* for administered devices
+        that are not flow endpoints
+    - vendor: ExtraDetails:Protocol
+      type: string
+      description: Protocol carried by the proxied session (SSH, RDP, SQLNet)
+      ecs: network.application
+      status: partial
+      notes: >
+        the stock integration puts the protocol in network.application;
+        network.protocol is the correct ECS home, so this needs the same
+        correction as on the CEF feed before protocol dashboards are trusted
+    - vendor: ExtraDetails:SessionID
+      type: string
+      description: GUID uniquely identifying the PSM session
+      ecs: null
+      custom: cyberarkpas.audit.extra_details.session_id
+      status: unmapped
+      notes: >-
+        the join key across connect, disconnect and in-session records; ECS
+        9.4 has no generic session.id
+    - vendor: ExtraDetails:PSMID
+      type: string
+      description: Identifier of the PSM server that proxied the session
+      ecs: null
+      custom: cyberarkpas.audit.extra_details.psmid
+      status: unmapped
+      notes: >-
+        the mediating infrastructure; deliberately not observer.name, reserved
+        for the Vault that emitted the record
+    - vendor: ExtraDetails:SessionDuration
+      type: string
+      description: Elapsed session length as an HH:MM:SS string
+      ecs: event.duration
+      status: partial
+      transform: >-
+        parsed to seconds then multiplied to nanoseconds for ECS
+        event.duration; present only on the disconnect (302) record
+    - vendor: ExtraDetails:ApplicationType
+      type: string
+      description: PSM flavour that brokered the session (PSM-RDP, PSMP-SSH)
+      ecs: null
+      custom: cyberarkpas.audit.extra_details.application_type
+      status: unmapped
+    - vendor: ExtraDetails:ConnectionComponentId
+      type: string
+      description: >-
+        Connection component used to launch the session (PSM-SSH,
+        PSM-SQLServerMgmtStudio)
+      ecs: null
+      custom: cyberarkpas.audit.extra_details.connection_component_id
+      status: unmapped
+      notes: the closest thing this dataset has to a true network.application value
+    - vendor: ExtraDetails:ManagedAccount
+      type: enum
+      description: Whether the account used was managed by the Vault (Yes/No)
+      ecs: null
+      custom: cyberarkpas.audit.extra_details.managed_account
+      status: unmapped
+      notes: >-
+        a No means a privileged session ran with a credential the Vault does
+        not rotate - high detection value, no ECS equivalent
+    - vendor: ExtraDetails:LogonAccount
+      type: string
+      description: Separate logon account used to reach the target before elevation
+      ecs: null
+      custom: cyberarkpas.audit.extra_details.logon_account
+      status: unmapped
+    - vendor: Station
+      type: ip
+      description: IP address the session request was issued from
+      ecs: source.ip
+      status: mapped
+      notes: >-
+        native JSON key; more reliable than ExtraDetails:SrcHost for client
+        attribution on PSMP sessions
+    - vendor: Safe
+      type: string
+      description: Safe holding the account the session used
+      ecs: null
+      custom: cyberarkpas.audit.safe
+      status: unmapped
+      notes: same authorization-boundary gap as vault-audit
+    - vendor: File
+      type: string
+      description: Full path of the account object inside the Safe
+      ecs: file.path
+      status: partial
+      notes: >-
+        Vault object path, not a filesystem path; identifies which stored
+        credential opened the session
+    - vendor: Severity
+      type: enum
+      description: Severity of the audit record - Info, Error, or Critical
+      ecs: event.severity
+      status: partial
+      notes: same three-value string vocabulary and numeric lookup as vault-audit
+- id: psm-session-activity
+  name: PSM session command and keystroke activity
+  description: >
+    In-session auditing records emitted while a PSM session is open, when
+    keystroke or command auditing is enabled on the connection component -
+    Keystroke logging (361 and 412), SQL Command (359) and Window title (411).
+    Each record carries the typed command or window text plus the SessionID
+    that ties it back to the PSM Connect record, and offsets into the text and
+    video recordings.
+  event_categories:
+  - process
+  route:
+    guarded:
+    - hop: cribl
+      location: edge Cribl worker group, on-prem enclave
+      notes: >
+        Same Vault syslog feed as the other two datasets. Of the three this is
+        the most sensitive, because the records carry operator-typed text that
+        can include credentials.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cyberarkpas.audit
+    direct:
+    - hop: cribl
+      location: edge Cribl worker group, on-prem enclave
+      notes: >
+        Same Vault syslog feed as the other two datasets. Of the three this is
+        the most sensitive, because the records carry operator-typed text that
+        can include credentials.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cyberarkpas.audit
+  formats:
+  - format: syslog-cef
+    parsing:
+      mechanism: elastic-integration
+      artifact: CyberArk Privileged Access Security (cyberarkpas) integration
+      notes: >
+        The integration recognizes codes 359/361/411/412 and key-value splits
+        their ExtraDetails, but leaves the Command value unmapped and
+        unredacted. The recommendation below therefore moves document
+        construction for these codes low-side, reducing the stock pipeline to
+        an @custom-assisted pass-through for them while the other two datasets
+        continue to use it as the parser.
+    fields:
+    - vendor: MessageID
+      type: integer
+      description: >-
+        numeric Vault audit action code - 359 SQL Command, 361 and 412
+        Keystroke logging, 411 Window title
+      ecs: event.code
+      status: mapped
+      notes: >
+        361 and 412 are both Keystroke logging and differ by Vault version;
+        detections must match either, and the integration's own source
+        questions whether they are genuinely distinct
+    - vendor: ExtraDetails:Command
+      type: string
+      description: the command text, keystroke stream, or window title captured in session
+      ecs: null
+      status: unmapped
+      custom: cyberarkpas.audit.extra_details.command
+      transform: >
+        mask credential-bearing patterns and apply an explicit, flagged length
+        cap before the value leaves the enclave; a keystroke stream can
+        contain a password typed at a prompt in cleartext
+      notes: >
+        the dataset's central value and its biggest ECS gap.
+        process.command_line is the tempting home but is wrong: it models the
+        invocation that started a process, whereas these records are a typed
+        keystroke stream, an SQL statement, or a GUI window title, none of
+        which is a process start. Left custom rather than overloading a
+        process field that downstream process analytics would then misread
+    - vendor: Issuer
+      type: string
+      description: Vault user whose session produced the activity
+      ecs: source.user.name
+      status: mapped
+      notes: also copied to user.name; the accountable human identity for the typed command
+    - vendor: ExtraDetails:User
+      type: string
+      description: privileged account the command ran as on the target
+      ecs: destination.user.name
+      status: mapped
+    - vendor: ExtraDetails:SessionID
+      type: string
+      description: GUID of the PSM session this activity belongs to
+      ecs: null
+      status: unmapped
+      custom: cyberarkpas.audit.extra_details.session_id
+      notes: joins back to the PSM Connect record; no generic session.id exists in ECS 9.4
+    - vendor: ExtraDetails:DstHost
+      type: string
+      description: target host the command was executed against
+      ecs: destination.address
+      status: partial
+      notes: >-
+        resolved to destination.ip or destination.domain depending on whether
+        the value parses as an address
+    - vendor: ExtraDetails:SrcHost
+      type: string
+      description: address the session originated from
+      ecs: source.address
+      status: partial
+      notes: >-
+        often the PSM proxy's own loopback rather than the real client; use
+        Station for client attribution
+    - vendor: ExtraDetails:Protocol
+      type: string
+      description: protocol of the session carrying the command (SSH, RDP, SQLNet)
+      ecs: network.application
+      status: partial
+      notes: same mismapping as the psm-session dataset - belongs in network.protocol
+    - vendor: ExtraDetails:DataBase
+      type: string
+      description: database context the SQL command executed against
+      ecs: null
+      status: unmapped
+      custom: cyberarkpas.audit.extra_details.database
+      notes: >-
+        present on SQL Command (359) records; no ECS field models a database
+        session context
+    - vendor: ExtraDetails:ConnectionComponentId
+      type: string
+      description: >-
+        connection component that produced the activity
+        (PSM-SQLServerMgmtStudio, PSMP-SSH)
+      ecs: null
+      status: unmapped
+      custom: cyberarkpas.audit.extra_details.connection_component_id
+      notes: >-
+        determines whether Command holds keystrokes, an SQL statement, or a
+        window title - the field that makes the value interpretable
+    - vendor: ExtraDetails:PSMID
+      type: string
+      description: identifier of the PSM server that recorded the activity
+      ecs: null
+      status: unmapped
+      custom: cyberarkpas.audit.extra_details.psmid
+    - vendor: ExtraDetails:TXTOffset
+      type: string
+      description: 'offset of this activity within the session''s text recording'
+      ecs: null
+      status: unmapped
+      custom: cyberarkpas.audit.extra_details.txt_offset
+      notes: >-
+        byte offset (e.g. 702B) used to jump to the moment in the stored
+        transcript; no ECS equivalent
+    - vendor: ExtraDetails:VIDOffset
+      type: string
+      description: 'offset of this activity within the session''s video recording'
+      ecs: null
+      status: unmapped
+      custom: cyberarkpas.audit.extra_details.vid_offset
+      notes: >-
+        time offset (e.g. 33T) into the session recording; the pivot an
+        analyst uses to watch what happened
+    - vendor: Station
+      type: ip
+      description: IP address the session was driven from
+      ecs: source.ip
+      status: mapped
+    - vendor: Safe
+      type: string
+      description: Safe holding the account the session used
+      ecs: null
+      status: unmapped
+      custom: cyberarkpas.audit.safe
+    - vendor: Severity
+      type: enum
+      description: severity of the audit record - Info, Error, or Critical
+      ecs: event.severity
+      status: partial
+      notes: >
+        in-session activity is always emitted at Info regardless of what was
+        typed, so severity carries no signal on this dataset - detection must
+        come from the command content, not the vendor severity
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Build the ECS document for these four codes on the edge worker
+          group, because the one thing that must happen before the record
+          leaves the enclave cannot be done at Elastic: mask
+          credential-bearing patterns in the Command value — mysql -p, psql,
+          sqlcmd -P, curl -u, sshpass, su and passwd follow-on keystrokes, and
+          the bare password line that follows a prompt in a keystroke stream.
+          Cap Command at an explicit, flagged length rather than letting the
+          value run to kilobytes, reproduce the integration's
+          unescaped-';'/'=' ExtraDetails split exactly so masking does not
+          straddle a field boundary, and gate the destination with
+          C.Schema(...).validate plus a dead-letter route that alerts on its
+          own rate. Never carry _raw on this route: the raw record is
+          precisely the unredacted copy the masking exists to eliminate.
+        elastic: >
+          Take pre-shaped documents into logs-cyberarkpas.audit and keep
+          high-side work to a logs-cyberarkpas.audit@custom pipeline that
+          asserts the redaction flag is present on every 359/361/412 document
+          and quarantines any that arrive without it. Add explicitly typed
+          custom-namespace mappings for
+          cyberarkpas.audit.extra_details.command as a non-aggregatable text
+          field with a keyword sub-field for exact-match hunting, and
+          session_id, database, txt_offset and vid_offset as keyword, so
+          analysts can pivot from a matched command straight to the recording
+          offset. Apply the same Protocol to network.protocol correction as
+          the psm-session dataset.
+        relay: >
+          Redacted, full ECS JSON crosses — never _raw and never CEF. This is
+          the least bounded content on the technology and the guard's real
+          friction point: Command is arbitrary operator-typed text that can
+          carry non-ASCII bytes, control characters, embedded quotes and
+          separators, and kilobyte-scale pastes, so normalize encoding and
+          enforce the length cap low-side to keep a custom NDJSON content
+          filter simple enough to be certifiable. Hold the JSON to two levels
+          of nesting with short ASCII keys and no duplicate keys, treat the
+          crossing as at-most-once, and reconcile counts per (dataset, hour) —
+          an unnoticed gap here is a gap in the session record a
+          privileged-access audit depends on.
+      direct:
+        parse_location: low
+        cribl: >
+          Build the ECS document for these four codes on the edge worker
+          group, because the masking is a data-safety obligation rather than a
+          crossing artifact and applies even when no guard is in the path:
+          mask credential-bearing patterns in the Command value — mysql -p,
+          psql, sqlcmd -P, curl -u, sshpass, su and passwd follow-on
+          keystrokes, and the bare password line that follows a prompt in a
+          keystroke stream. Cap Command at an explicit, flagged length rather
+          than letting the value run to kilobytes, reproduce the integration's
+          unescaped-';'/'=' ExtraDetails split exactly so masking does not
+          straddle a field boundary, and gate the destination with
+          C.Schema(...).validate plus a dead-letter route that alerts on its
+          own rate. Never carry _raw onward: the raw record is precisely the
+          unredacted copy the masking exists to eliminate.
+        elastic: >
+          Take pre-shaped documents into logs-cyberarkpas.audit and keep
+          high-side work to a logs-cyberarkpas.audit@custom pipeline that
+          asserts the redaction flag is present on every 359/361/412 document
+          and quarantines any that arrive without it. Add explicitly typed
+          custom-namespace mappings for
+          cyberarkpas.audit.extra_details.command as a non-aggregatable text
+          field with a keyword sub-field for exact-match hunting, and
+          session_id, database, txt_offset and vid_offset as keyword, so
+          analysts can pivot from a matched command straight to the recording
+          offset. Apply the same Protocol to network.protocol correction as
+          the psm-session dataset.
+  - format: json
+    enable: >
+      Same translator change as the sibling datasets - the in-session codes
+      (359 SQL Command, 361 and 412 Keystroke logging, 411 Window title) ride
+      the one Vault audit stream, so elastic-json-v1.0.xsl renders them as the
+      syslog.audit_record JSON envelope. Critically, the JSON translator does
+      NOT structure or redact ExtraDetails: the typed Command still arrives as
+      an unredacted 'Key=Value;...' substring, so the credential-masking
+      obligation is identical to the CEF feed and equally must happen before
+      the record leaves the enclave.
+    references:
+    - >-
+      https://docs.cyberark.com/pam-self-hosted/latest/en/content/pasimp/integrating-with-siem-applications.htm
+    - https://www.elastic.co/docs/reference/integrations/cyberarkpas
+    - >-
+      https://github.com/elastic/integrations/blob/main/packages/cyberarkpas/data_stream/audit/elasticsearch/ingest_pipeline/audit.yml
+    parsing:
+      mechanism: elastic-integration
+      artifact: CyberArk Privileged Access Security (cyberarkpas) integration
+      notes: >
+        The integration recognizes 359/361/411/412 and kv-splits their
+        ExtraDetails, but - exactly as on the CEF feed - leaves the Command
+        value unmapped and unredacted. Switching the Vault to JSON changes the
+        envelope, not this exposure: Command is still cleartext in the
+        ExtraDetails string. The recommendation therefore stays as on the
+        syslog-cef feed - build the document for these codes low-side and
+        reduce the stock pipeline to an @custom-assisted pass-through for them
+        - and the JSON alternate's only benefit is removing the CEF header
+        parse, not the masking or the ExtraDetails split.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Even with the Vault emitting JSON, build the ECS document for these
+          four codes on the edge worker group, because the one thing that must
+          happen before the record leaves the enclave cannot be done at
+          Elastic: mask credential-bearing patterns in the Command value -
+          mysql -p, psql, sqlcmd -P, curl -u, sshpass, su and passwd follow-on
+          keystrokes, and the bare password line after a prompt in a keystroke
+          stream. Cap Command at an explicit, flagged length, reproduce the
+          integration's unescaped-';'/'=' ExtraDetails split exactly so
+          masking does not straddle a field boundary, and gate the destination
+          with a schema validate plus a dead-letter route that alerts on its
+          own rate. Never carry the raw JSON record on this route - it is
+          precisely the unredacted copy the masking exists to eliminate.
+        elastic: >
+          Take pre-shaped, redacted documents into logs-cyberarkpas.audit and
+          keep high-side work to a logs-cyberarkpas.audit@custom pipeline that
+          asserts the redaction flag is present on every 359/361/412 document
+          and quarantines any that arrive without it. Type
+          cyberarkpas.audit.extra_details.command as a non-aggregatable text
+          field with a keyword sub-field for exact-match hunting, and
+          session_id, database, txt_offset and vid_offset as keyword, so
+          analysts can pivot from a matched command to the recording offset.
+          Apply the same Protocol-to-network.protocol correction as the
+          psm-session dataset.
+        relay: >
+          Redacted, full ECS JSON crosses - never the raw record and never
+          CEF. This is the least bounded content on the technology and the
+          guard's real friction point regardless of translator: Command is
+          arbitrary operator-typed text that can carry non-ASCII bytes,
+          control characters, embedded quotes and separators, and
+          kilobyte-scale pastes, so normalize encoding and enforce the length
+          cap low-side. Hold the JSON to two levels of nesting with short
+          ASCII keys and no duplicate keys, treat the crossing as
+          at-most-once, and reconcile counts per (dataset, hour) - an
+          unnoticed gap here is a gap in the session record a
+          privileged-access audit depends on.
+      direct:
+        parse_location: low
+        cribl: >
+          For a same-side Vault, the JSON envelope still does not redact
+          Command, so build and mask these four codes' documents in one low
+          pass - the masking is a data-safety obligation, not a crossing
+          artifact, and applies even when no guard is in the path. Mask
+          credential-bearing patterns in the Command value - mysql -p, psql,
+          sqlcmd -P, curl -u, sshpass, su and passwd follow-on keystrokes, and
+          the bare password line after a prompt - cap Command at an explicit,
+          flagged length, reproduce the integration's unescaped-';'/'='
+          ExtraDetails split so masking does not straddle a field boundary,
+          and never carry the raw JSON record onward, since it is the
+          unredacted copy the masking exists to eliminate.
+        elastic: >
+          Keep high-side work to a logs-cyberarkpas.audit@custom pipeline that
+          asserts the redaction flag is present on every 359/361/412 document
+          and quarantines any that arrive without it. Type
+          cyberarkpas.audit.extra_details.command as a non-aggregatable text
+          field with a keyword sub-field for exact-match hunting, and
+          session_id, database, txt_offset and vid_offset as keyword, so
+          analysts can pivot from a matched command to the recording offset.
+          Apply the same Protocol-to-network.protocol correction as the
+          psm-session dataset. Tag the input so JSON-fed activity records are
+          separable from any CEF-fed records of the same codes.
+    fields:
+    - vendor: MessageID
+      type: integer
+      description: >-
+        Numeric Vault audit code - 359 SQL Command, 361 and 412 Keystroke
+        logging, 411 Window title
+      ecs: event.code
+      status: mapped
+      notes: >-
+        361 and 412 are both Keystroke logging and differ by Vault version;
+        detections must match either
+    - vendor: ExtraDetails:Command
+      type: string
+      description: The command text, keystroke stream, or window title captured in session
+      ecs: null
+      custom: cyberarkpas.audit.extra_details.command
+      status: unmapped
+      transform: >
+        mask credential-bearing patterns and apply an explicit, flagged length
+        cap before the value leaves the enclave; the JSON translator carries
+        it as cleartext inside ExtraDetails just as the CEF feed does
+      notes: >
+        the dataset's central value and biggest ECS gap. process.command_line
+        is the tempting home but wrong - these records are a typed keystroke
+        stream, an SQL statement, or a window title, none of which is a
+        process start - so it stays custom rather than misleading process
+        analytics
+    - vendor: Issuer
+      type: string
+      description: Vault user whose session produced the activity
+      ecs: source.user.name
+      status: mapped
+      notes: >-
+        native JSON key; also copied to user.name - the accountable human
+        identity for the typed command
+    - vendor: ExtraDetails:User
+      type: string
+      description: Privileged account the command ran as on the target
+      ecs: destination.user.name
+      status: mapped
+    - vendor: ExtraDetails:SessionID
+      type: string
+      description: GUID of the PSM session this activity belongs to
+      ecs: null
+      custom: cyberarkpas.audit.extra_details.session_id
+      status: unmapped
+      notes: joins back to the PSM Connect record; no generic session.id in ECS 9.4
+    - vendor: ExtraDetails:DstHost
+      type: string
+      description: Target host the command was executed against
+      ecs: destination.address
+      status: partial
+      notes: >-
+        resolved to destination.ip or destination.domain depending on whether
+        it parses as an address
+    - vendor: ExtraDetails:SrcHost
+      type: string
+      description: Address the session originated from
+      ecs: source.address
+      status: partial
+      notes: 'often the PSM proxy''s own loopback; use Station for client attribution'
+    - vendor: ExtraDetails:Protocol
+      type: string
+      description: Protocol of the session carrying the command (SSH, RDP, SQLNet)
+      ecs: network.application
+      status: partial
+      notes: same mismapping as psm-session - belongs in network.protocol
+    - vendor: ExtraDetails:DataBase
+      type: string
+      description: Database context the SQL command executed against
+      ecs: null
+      custom: cyberarkpas.audit.extra_details.database
+      status: unmapped
+      notes: >-
+        present on SQL Command (359) records; no ECS field models a database
+        session context
+    - vendor: ExtraDetails:ConnectionComponentId
+      type: string
+      description: >-
+        Connection component that produced the activity
+        (PSM-SQLServerMgmtStudio, PSMP-SSH)
+      ecs: null
+      custom: cyberarkpas.audit.extra_details.connection_component_id
+      status: unmapped
+      notes: >-
+        determines whether Command holds keystrokes, SQL, or a window title -
+        the field that makes the value interpretable
+    - vendor: ExtraDetails:PSMID
+      type: string
+      description: Identifier of the PSM server that recorded the activity
+      ecs: null
+      custom: cyberarkpas.audit.extra_details.psmid
+      status: unmapped
+    - vendor: ExtraDetails:TXTOffset
+      type: string
+      description: 'Offset of this activity within the session''s text recording'
+      ecs: null
+      custom: cyberarkpas.audit.extra_details.txt_offset
+      status: unmapped
+      notes: >-
+        byte offset (e.g. 702B) to jump to the moment in the transcript; no
+        ECS equivalent
+    - vendor: ExtraDetails:VIDOffset
+      type: string
+      description: 'Offset of this activity within the session''s video recording'
+      ecs: null
+      custom: cyberarkpas.audit.extra_details.vid_offset
+      status: unmapped
+      notes: >-
+        time offset (e.g. 33T) into the recording; the pivot an analyst uses
+        to watch what happened
+    - vendor: Station
+      type: ip
+      description: IP address the session was driven from
+      ecs: source.ip
+      status: mapped
+    - vendor: Safe
+      type: string
+      description: Safe holding the account the session used
+      ecs: null
+      custom: cyberarkpas.audit.safe
+      status: unmapped
+    - vendor: Severity
+      type: enum
+      description: Severity of the audit record - Info, Error, or Critical
+      ecs: event.severity
+      status: partial
+      notes: >
+        in-session activity is always emitted at Info regardless of what was
+        typed, so severity carries no signal here - detection must come from
+        the command content, not the vendor severity

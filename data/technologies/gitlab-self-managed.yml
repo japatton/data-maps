@@ -1,0 +1,1820 @@
+id: gitlab-self-managed
+name: GitLab (self-managed)
+vendor: GitLab
+versions: GitLab CE/EE 17.x, 18.x (Linux package and Docker installs)
+draft: true
+references:
+- https://docs.gitlab.com/administration/logs/
+- https://www.elastic.co/docs/reference/integrations/gitlab
+- https://github.com/elastic/integrations/tree/main/packages/gitlab
+- https://docs.gitlab.com/api/audit_events/
+- https://docs.gitlab.com/security/tokens/
+datasets:
+- id: audit
+  name: Audit event log (audit_json.log)
+  description: >
+    The primary security dataset for the agency's own source control.
+    /var/log/gitlab/gitlab-rails/audit_json.log records one JSON object per
+    audit event: group/project setting and membership changes, protected
+    branch and protected environment changes, deploy key and token
+    (personal/project/group access token) creation and revocation, runner
+    registration and unregistration, and impersonation. This is the
+    supply-chain control plane — a loosened protected branch, a new instance
+    runner, or a fresh long-lived access token are the events that let an
+    attacker inject code into a build, and audit_json.log is the only log that
+    records them with an author and a before/after value.
+  event_categories:
+  - iam
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Crosses the Everfox HSG as the thin-envelope hybrid described in this
+        dataset's relay recommendation.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-gitlab.audit
+    direct:
+    - hop: cribl
+      location: edge worker group
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-gitlab.audit
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: Elastic GitLab integration, audit data stream
+      notes: >
+        The GitLab integration ships an audit data stream whose ingest
+        pipeline already renames author_id/author_name to user.id/user.name,
+        meta.remote_ip to client.ip (copied to source), and
+        details.custom_message_object.action/protocol to
+        event.action/network.protocol. Files are read from disk by Elastic
+        Agent; a Cribl File Monitor or syslog relay produces the same JSON.
+    fields:
+    - vendor: time
+      type: timestamp
+      description: ISO 8601 UTC time the audit event was recorded
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: severity
+      type: string
+      description: Rails log level of the record, normally INFO for audit events
+      ecs: log.level
+      status: mapped
+    - vendor: author_id
+      type: integer
+      description: numeric id of the user who performed the audited action
+      ecs: user.id
+      status: mapped
+      transform: >
+        numeric in the log, converted to string for ECS user.id; a negative or
+        unusual id indicates an internal/system author rather than a human
+    - vendor: author_name
+      type: string
+      description: display name of the user who performed the audited action
+      ecs: user.name
+      status: mapped
+    - vendor: entity_type
+      type: string
+      description: class of object the audit event is scoped to (Project, Group, User)
+      ecs: null
+      status: unmapped
+      custom: gitlab.audit.entity_type
+      notes: >-
+        scoping object for the event; combined with change it is the closest
+        thing GitLab emits to an audit event type
+    - vendor: entity_id
+      type: integer
+      description: numeric id of the scoping project, group, or user
+      ecs: null
+      status: unmapped
+      custom: gitlab.audit.entity_id
+    - vendor: change
+      type: string
+      description: >-
+        name of the attribute or setting that was changed, e.g. visibility or
+        protected branch
+      ecs: null
+      status: unmapped
+      custom: gitlab.audit.change
+      notes: >
+        primary supply-chain signal — protected-branch, protected-
+        environment, and project-visibility changes are identified here rather
+        than by a numeric event code; deliberately kept custom because it
+        names an attribute, not an action verb
+    - vendor: from
+      type: string
+      description: value of the changed attribute before the change
+      ecs: null
+      status: unmapped
+      custom: gitlab.audit.from
+      notes: pair with to for before/after diffing; may be an empty string on creation events
+    - vendor: to
+      type: string
+      description: value of the changed attribute after the change
+      ecs: null
+      status: unmapped
+      custom: gitlab.audit.to
+    - vendor: target_id
+      type: integer
+      description: numeric id of the object the action was performed on
+      ecs: null
+      status: unmapped
+      custom: gitlab.audit.target_id
+    - vendor: target_type
+      type: string
+      description: >-
+        class of the object acted on, e.g. Project, User, DeployKey,
+        Ci::Runner, PersonalAccessToken
+      ecs: null
+      status: unmapped
+      custom: gitlab.audit.target_type
+      notes: >-
+        the discriminator that separates token, deploy-key, and runner events
+        from ordinary membership changes
+    - vendor: target_details
+      type: string
+      description: >-
+        human-readable identifier of the object acted on - a project path,
+        username, token name, or runner description
+      ecs: null
+      status: unmapped
+      custom: gitlab.audit.target_details
+      notes: >
+        heterogeneous by target_type, so it is not safe to map to
+        user.target.name — on a membership event it is a username, but on a
+        runner or token event it is a free-text description; split by
+        target_type in an ingest pipeline before any ECS target mapping
+    - vendor: with
+      type: string
+      description: >-
+        authentication method used for the action on sign-in audit events,
+        e.g. standard or two-factor
+      ecs: null
+      status: unmapped
+      custom: gitlab.audit.with
+      notes: >
+        only populated on authentication-flavoured audit events; there is no
+        GA ECS field for the authentication method used, so it stays custom
+    - vendor: details.custom_message
+      type: string
+      description: >-
+        free-text description of the audit event for event types that do not
+        use the change/from/to shape
+      ecs: event.action
+      status: partial
+      notes: >
+        emitted either as a plain sentence (custom_message_string) or as an
+        object; only the object form carries a stable action verb, so the
+        string form needs normalising into a controlled event.action
+        vocabulary before it can drive detections
+    - vendor: details.custom_message.protocol
+      type: string
+      description: protocol used for the audited repository access, ssh or http
+      ecs: network.protocol
+      status: mapped
+    - vendor: correlation_id
+      type: string
+      description: request correlation identifier shared by every log line produced for one request
+      ecs: event.id
+      status: partial
+      notes: >
+        the integration renames this to event.id, but it identifies a request
+        rather than a single event and repeats across audit/api/auth lines;
+        trace.id is the semantically correct home and the value should be
+        copied there for cross-log pivoting
+    - vendor: meta.remote_ip
+      type: ip
+      description: IP address the request that produced the audit event came from
+      ecs: source.ip
+      status: mapped
+      transform: >
+        the integration parses it to client.ip and copies the whole client
+        object to source; behind a reverse proxy this is the proxy address
+        unless GitLab's trusted-proxy list is configured correctly
+    - vendor: meta.caller_id
+      type: string
+      description: >-
+        Rails controller action or Sidekiq worker that produced the event,
+        e.g. ProjectsController#update
+      ecs: null
+      status: unmapped
+      custom: gitlab.audit.meta.caller_id
+      notes: >
+        distinguishes UI, API, and background-job authors of the same audit
+        event; the api data stream maps the equivalent field to
+        event.provider, so align the two at ingest
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Keep the core worker group a pass-through for this route — the log
+          is already one JSON object per line, so re-parsing it low-side only
+          risks breaking the integration's schema contract. Limit low-side
+          work to Persistent Queue backpressure on the Elastic destination, a
+          project-path-to-owning-team lookup that is cheaper near the source
+          than in an enrich policy, and dropping the Sidekiq/database
+          performance keys that ride along on audit lines but have no SOC
+          value. Carry _raw end-to-end: audit events are the forensic record
+          of who changed the build system and are the last thing to trim.
+        elastic: >
+          The stock audit ingest pipeline is the parser; layer a
+          logs-gitlab.audit@custom pipeline that derives a stable event.action
+          for the string-form custom_message (a free-text sentence such as
+          "Added deploy key" or "Changed protected branch") so detections do
+          not regex English prose, and that sets event.category/event.type
+          from the entity_type + change pair rather than leaving every audit
+          row uncategorized. Add explicitly typed custom-namespace
+          index-template mappings for gitlab.audit.change, .from, .to,
+          .target_type, .target_details and .with as keyword and
+          .entity_id/.target_id as long, so before/after comparisons on
+          protected-branch and token events stay queryable instead of relying
+          on dynamic mapping.
+        relay: >
+          Low-side instances cross as thin-envelope NDJSON ({_dataId,
+          @timestamp, host, _raw}) so the integration's audit pipeline stays
+          the parser on the high side — UTF-8, LF-terminated, compression
+          disabled, nesting depth capped at 2. The content-filter friction to
+          settle with the guard owner is target_details and
+          details.custom_message: operator-supplied, unbounded free text that
+          carries project paths, branch name globs, token descriptions and
+          non-ASCII characters, and should be length-capped and flagged
+          low-side rather than silently truncated by the filter. The feed is
+          native JSON rather than CEF, so nothing CEF-shaped crosses; with no
+          return channel, detect silent drops by reconciling low-side and
+          high-side counts per (dataset, hour).
+      direct:
+        parse_location: high
+        cribl: >
+          Keep the collector a pass-through for this route — the log is
+          already one JSON object per line, so re-parsing it before the
+          integration parser only risks breaking its schema contract. Limit
+          collector work to Persistent Queue backpressure on the Elastic
+          destination, a project-path-to-owning-team lookup that is cheaper
+          near the source than in an enrich policy, and dropping the
+          Sidekiq/database performance keys that ride along on audit lines but
+          have no SOC value. Carry _raw end-to-end: audit events are the
+          forensic record of who changed the build system and are the last
+          thing to trim.
+        elastic: >
+          The stock audit ingest pipeline is the parser; layer a
+          logs-gitlab.audit@custom pipeline that derives a stable event.action
+          for the string-form custom_message (a free-text sentence such as
+          "Added deploy key" or "Changed protected branch") so detections do
+          not regex English prose, and that sets event.category/event.type
+          from the entity_type + change pair rather than leaving every audit
+          row uncategorized. Add explicitly typed custom-namespace
+          index-template mappings for gitlab.audit.change, .from, .to,
+          .target_type, .target_details and .with as keyword and
+          .entity_id/.target_id as long, so before/after comparisons on
+          protected-branch and token events stay queryable instead of relying
+          on dynamic mapping.
+  - format: webhook
+    enable: >
+      On an Ultimate-tier instance, configure an HTTP streaming destination
+      under Admin > Monitoring > Audit events > Streams (or via the GraphQL
+      instanceExternalAuditEventDestinationCreate mutation), giving a
+      destination URL, an optional owner-supplied verification token, and up
+      to 20 custom request headers. GitLab then POSTs one structured JSON
+      object per audit event to that URL as events occur. The payload is a
+      DIFFERENT shape from audit_json.log: the timestamp key is created_at
+      (not time), the stable machine-readable event key is event_type (not a
+      free-text custom_message), the source address is a top-level ip_address
+      (not meta.remote_ip), and the change/from/to before-after detail present
+      in the file is not carried on the streamed body. Every POST includes an
+      X-Gitlab-Audit-Event-Type header naming the event (for example
+      repository_git_operation, project_fork_operation, audit_operation) and
+      an X-Gitlab-Event-Streaming-Token header carrying the verification
+      token, so a receiver can authenticate the sender and route on event type
+      without parsing the body. The id key is the audit event's unique
+      identifier and is the intended deduplication key, because at-least-once
+      delivery can repeat a POST. This is the push transport for the same
+      audit events audit_json.log records, and its event_type field is a
+      materially better action signal than the file's free-text
+      custom_message.
+    references:
+    - https://docs.gitlab.com/administration/compliance/audit_event_streaming/
+    - >-
+      https://docs.gitlab.com/administration/compliance/audit_event_streaming/examples/
+    - >-
+      https://github.com/kartikguptaofficial/gitlab/blob/master/doc/administration/audit_event_streaming/examples.md
+    parsing:
+      mechanism: elastic-ingest-pipeline
+      artifact: >-
+        logs-gitlab.audit@custom mapping the streaming schema onto the
+        integration's ECS targets (the stock audit pipeline does not fit)
+      notes: >
+        The Elastic GitLab integration's audit ingest pipeline is written for
+        the audit_json.log field names (it renames author_id/author_name,
+        meta.remote_ip, and details.custom_message_object), so a streaming
+        POST body does not parse cleanly through it: created_at, event_type,
+        top-level ip_address and the nested details object have no
+        corresponding rename in the stock pipeline. A streaming feed is landed
+        by receiving the POST on a Cribl HTTP Source (or an Elastic HTTP
+        endpoint), extracting the JSON body, and running a custom pipeline
+        that maps the streaming keys onto the same ECS fields the file path
+        targets so streamed and file-sourced audit records are one queryable
+        corpus. The single genuine win to preserve is event_type: it is the
+        stable action verb the file format never emits, so map it to
+        event.action rather than re-deriving an action from custom_message.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          A low-side instance cannot POST across the Everfox guard directly,
+          so point the streaming destination at a low-side Cribl HTTP Source
+          on the edge worker group and treat the received body exactly as the
+          file feed is treated at the crossing: normalise the streaming schema
+          to the integration's key names near the source (created_at to
+          @timestamp, event_type to event.action, ip_address to source/client,
+          flatten the details object), so a clean, shallow NDJSON object
+          approaches the guard rather than the raw streamed shape. Carry the
+          X-Gitlab-Audit-Event-Type header value into a field before the body
+          is detached from its request so event-type routing survives the
+          crossing, and deduplicate on the id key low-side because the
+          streaming delivery is at-least-once and a replayed POST must not
+          become a second indexed event. Cap and control-strip the free-text
+          details.custom_message and target_details as on the file path, and
+          run the guard destination on Persistent Queue backpressure.
+        elastic: >
+          Land the normalised record in the same logs-gitlab.audit data stream
+          and the same logs-gitlab.audit@custom pipeline the file feed uses,
+          so there is one set of mappings and one detection surface regardless
+          of transport. The custom pipeline must set event.action from
+          event_type directly (the streamed schema's advantage over the file),
+          copy ip_address to client.ip and source.ip, convert author_id to a
+          string user.id, and map the streaming-only details.author_class
+          (User, DeployKey, DeployToken) and top-level entity_path as keyword
+          custom fields so token- and deploy-key-actor events stay filterable.
+          Add a parse-failure and a duplicate-id monitor, because on this
+          transport a malformed POST or a redelivered event fails differently
+          from a truncated log line.
+        relay: >
+          The streamed body is native JSON, so nothing CEF-shaped crosses and
+          the crossing shape is the same thin-envelope NDJSON the file feed
+          uses; reconstitute and normalise before the boundary so the guard
+          sees a shallow, well-formed object with short ASCII keys. The
+          content-filter friction is identical to the file path -
+          details.custom_message and target_details are operator-supplied,
+          unbounded, and can carry project paths, token descriptions and
+          non-ASCII bytes, so length-cap and flag them low-side rather than
+          letting the filter truncate silently. The one transport-specific
+          rail is that streaming is at-least-once with no cross-boundary
+          acknowledgement, so reconcile the id-key set low-side versus
+          high-side per (dataset, hour): a gap is a dropped audit event and a
+          collision is a replayed one, and both are only visible on that key.
+      direct:
+        parse_location: high
+        cribl: >
+          For a high-side instance, point the streaming destination straight
+          at the core worker group's Cribl HTTP Source and pass the extracted
+          body through with only the schema normalisation the custom pipeline
+          needs - there is no guard to shape for, so the decision is purely
+          whether to adopt streaming at all. Streaming is the right choice
+          when the instance cannot expose its filesystem to an agent or when
+          near-real-time delivery matters; where audit_json.log is already
+          tailed by Elastic Agent, the file path is lower effort and carries
+          the change/from/to before-after detail the stream omits, so run
+          streaming as an addition for latency-sensitive detections rather
+          than a replacement. Deduplicate on id regardless.
+        elastic: >
+          Land through the same logs-gitlab.audit@custom pipeline the file and
+          API-pull feeds use, mapping event_type to event.action and
+          preserving author_class and entity_path as custom keyword fields.
+          Because the stream drops the change/from/to trio, a high-side
+          detection that needs before-after values on protected-branch or
+          token settings must fall back to the file feed or the audit_events
+          API pull, so keep whichever of those also feeds this instance
+          aligned to the same namespace rather than forking the audit mapping
+          by transport.
+    fields:
+    - vendor: id
+      type: integer
+      description: >-
+        unique identifier of the audit event, intended as the deduplication
+        key for at-least-once streamed delivery
+      ecs: event.id
+      status: mapped
+      notes: >
+        unlike the file feed, which has no per-event id and reuses the request
+        correlation_id for event.id, the streamed payload carries a true
+        unique event id here; use it to dedupe replayed POSTs and as the
+        count-reconciliation key across the crossing
+    - vendor: event_type
+      type: string
+      description: >-
+        stable machine-readable name of the audited action, e.g.
+        repository_git_operation, project_fork_operation, audit_operation
+      ecs: event.action
+      status: mapped
+      notes: >
+        the streaming transport's principal advantage over audit_json.log,
+        which identifies the action only through a free-text custom_message or
+        a change attribute name; also duplicated in the
+        X-Gitlab-Audit-Event-Type request header for routing without body
+        parsing
+    - vendor: author_id
+      type: integer
+      description: numeric id of the user who performed the audited action
+      ecs: user.id
+      status: mapped
+      transform: numeric in the payload, converted to string for ECS user.id
+    - vendor: author_name
+      type: string
+      description: display name of the user who performed the audited action
+      ecs: user.name
+      status: mapped
+    - vendor: created_at
+      type: timestamp
+      description: ISO 8601 UTC time the audit event occurred
+      ecs: '@timestamp'
+      status: mapped
+      notes: >-
+        the streaming schema names the timestamp created_at, not the time key
+        the file feed and the integration's audit pipeline expect
+    - vendor: ip_address
+      type: ip
+      description: IP address the request that produced the audit event came from
+      ecs: source.ip
+      status: mapped
+      transform: >
+        carried as a top-level ip_address on the streamed body rather than as
+        meta.remote_ip; copy to client.ip and source.ip to match the file
+        path, and treat it as the proxy address unless GitLab's trusted-proxy
+        list is configured
+    - vendor: entity_type
+      type: string
+      description: >-
+        class of object the audit event is scoped to (Project, Group, User,
+        Gitlab::Audit::InstanceScope)
+      ecs: null
+      status: unmapped
+      custom: gitlab.audit.entity_type
+    - vendor: entity_id
+      type: integer
+      description: numeric id of the scoping project, group, or user
+      ecs: null
+      status: unmapped
+      custom: gitlab.audit.entity_id
+    - vendor: entity_path
+      type: string
+      description: full path of the scoping entity, e.g. flightjs/flight
+      ecs: null
+      status: unmapped
+      custom: gitlab.audit.entity_path
+      notes: >
+        a human-readable scope path carried on the streamed body (and inside
+        details); the file feed does not surface it at top level, so it is a
+        small enrichment the streaming transport adds
+    - vendor: target_type
+      type: string
+      description: >-
+        class of the object acted on, e.g. Project, DeployKey,
+        PersonalAccessToken, Ci::Runner
+      ecs: null
+      status: unmapped
+      custom: gitlab.audit.target_type
+    - vendor: target_id
+      type: integer
+      description: numeric id of the object the action was performed on
+      ecs: null
+      status: unmapped
+      custom: gitlab.audit.target_id
+    - vendor: target_details
+      type: string
+      description: >-
+        human-readable identifier of the object acted on - a project path,
+        username, token name, or runner description
+      ecs: null
+      status: unmapped
+      custom: gitlab.audit.target_details
+      notes: >-
+        heterogeneous by target_type as on the file feed; split by target_type
+        before any ECS target mapping and cap the free text before a guard
+        crossing
+    - vendor: details.custom_message
+      type: string
+      description: >-
+        free-text description of the audit event for event types that do not
+        use a change/from/to shape
+      ecs: message
+      status: partial
+      notes: >
+        on the streamed payload the stable action is carried by event_type, so
+        custom_message is best kept as the human-readable message rather than
+        mapped to event.action; it may still arrive as a plain sentence or as
+        a structured object depending on event type
+    - vendor: details.author_class
+      type: string
+      description: class of the acting principal - User, DeployKey, or DeployToken
+      ecs: null
+      status: unmapped
+      custom: gitlab.audit.author_class
+      notes: >
+        streaming-only discriminator (added in GitLab 15.3) that separates a
+        human author from a deploy key or deploy token acting on the instance;
+        there is no ECS field for the actor class, so keep it custom and use
+        it to flag non-human authors of supply-chain changes
+  - format: api-pull
+    enable: >
+      GitLab exposes audit events over the REST API at GET /audit_events
+      (instance scope, administrator PRIVATE-TOKEN required), GET
+      /groups/:id/audit_events (Owner role) and GET /projects/:id/audit_events
+      (Maintainer role). A collector pulls pages of JSON audit records on a
+      schedule, using keyset pagination (offset-based pagination was
+      deprecated in GitLab 17.8) and a created_after / created_before window
+      to bound each poll. The response schema is close to the streaming
+      payload but richer: the details object carries the change/from/to
+      before-after trio and an add member for creation events, plus
+      author_email, so a pull recovers the protected-branch and token
+      before/after diffs that the streaming body drops. The id key is
+      monotonic and is both the deduplication key and the natural high-water
+      cursor between polls. This is the pull transport for the same audit
+      events audit_json.log records, useful where an agent cannot read the
+      instance filesystem but the API is reachable.
+    references:
+    - https://docs.gitlab.com/api/audit_events/
+    - https://docs.gitlab.com/administration/logs/
+    parsing:
+      mechanism: elastic-ingest-pipeline
+      artifact: >-
+        httpjson/REST collector input + logs-gitlab.audit@custom mapping the
+        API schema onto the integration's ECS targets
+      notes: >
+        The Elastic GitLab integration reads log files and has no audit-events
+        REST data stream, so an API pull is collected with an httpjson input
+        (Elastic Agent) or a Cribl REST Collector and then run through a
+        custom pipeline that maps the API keys onto the same ECS fields the
+        file path targets. The API nests most detail inside details
+        (custom_message, change/from/to, target_*, author_email, ip_address,
+        entity_path), so the pipeline flattens details before mapping. The
+        cursor and dedup discipline is the API-specific work: page on the id
+        key with keyset pagination, persist the last id per scope, and bound
+        each request with created_after so a poll cannot silently skip or
+        replay a window.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Run the REST Collector on the low-side edge worker group against the
+          instance's own API, flatten the details object, and normalise to the
+          integration's key names before the crossing so the guard sees the
+          same shallow NDJSON the file and streaming paths produce. The
+          collector schedule and cursor state live low-side: persist the last
+          id per scope and pull with keyset pagination and a created_after
+          bound, so a missed poll is recoverable rather than a permanent gap.
+          Mask and length-cap details.custom_message, target_details and the
+          change/from/to values low-side, since the before-after diff can
+          carry branch-name globs and token descriptions in operator free
+          text. Run the guard destination on Persistent Queue backpressure.
+        elastic: >
+          Land through the same logs-gitlab.audit@custom pipeline as the file
+          and streaming feeds so all three transports share one mapping: set
+          event.action from event_type where present and otherwise from the
+          custom_message normalisation, map author_email to user.email (a
+          field neither the file nor the streaming body carries), convert
+          author_id to a string user.id, copy ip_address to client.ip and
+          source.ip, and keep gitlab.audit.change/.from/.to as explicitly
+          typed keyword custom fields so the before-after comparisons on
+          protected-branch and token events stay queryable. Add a dedup on id
+          so a re-pulled page does not double-index.
+        relay: >
+          The pulled records are native JSON and shallow once details is
+          flattened, so the crossing is the standard thin-envelope NDJSON with
+          no CEF-shaped content. The content-filter friction is the details
+          free text - custom_message, target_details and the change/from/to
+          diff - which is operator-supplied and unbounded and must be
+          length-capped and control-stripped low-side. Because the pull is a
+          scheduled at-most-once crossing with no return channel, reconcile
+          the contiguity of the id sequence low-side versus high-side per
+          (dataset, hour): a missing id is a dropped audit event and a broken
+          keyset cursor is a skipped window, and both are only detectable on
+          that monotonic key.
+      direct:
+        parse_location: high
+        cribl: >
+          For a high-side instance, run the REST Collector on the core worker
+          group and pass the flattened, normalised records straight to the
+          Elastic destination. The pull transport is the right choice when the
+          filesystem cannot be exposed to an agent but the API is reachable,
+          or when the change/from/to before-after detail (which the streaming
+          body omits) is needed and file tailing is unavailable; where
+          audit_json.log is already tailed, the file feed is lower effort and
+          lower latency, so reserve the API pull for backfill and for the
+          before-after diff. Keep the cursor persisted so a collector restart
+          resumes rather than rescans.
+        elastic: >
+          Land through the same logs-gitlab.audit@custom pipeline, mapping
+          author_email to user.email and preserving the change/from/to trio as
+          typed keyword custom fields. Align event.action derivation with the
+          file and streaming paths so a detection written against one
+          transport fires on all three, and use the API's id as the
+          authoritative event identifier when the same event also arrives by
+          file (which carries only a correlation_id).
+    fields:
+    - vendor: id
+      type: integer
+      description: >-
+        unique, monotonic identifier of the audit event; the deduplication key
+        and the keyset pagination cursor
+      ecs: event.id
+      status: mapped
+      notes: >-
+        the high-water value a collector persists between polls; also the
+        reconciliation key across the crossing
+    - vendor: author_id
+      type: integer
+      description: numeric id of the user who triggered the event
+      ecs: user.id
+      status: mapped
+      transform: numeric in the response, converted to string for ECS user.id
+    - vendor: author_name
+      type: string
+      description: display name of the acting user, carried both top-level and inside details
+      ecs: user.name
+      status: mapped
+    - vendor: details.author_email
+      type: string
+      description: email address of the acting user
+      ecs: user.email
+      status: mapped
+      notes: >-
+        an actor attribute the API exposes that neither audit_json.log nor the
+        streaming body carries, useful for correlating an author across
+        identity systems
+    - vendor: created_at
+      type: timestamp
+      description: ISO 8601 UTC time the audit event occurred
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: entity_type
+      type: string
+      description: class of the scoping entity (User, Group, Project, Gitlab::Audit::InstanceScope)
+      ecs: null
+      status: unmapped
+      custom: gitlab.audit.entity_type
+    - vendor: entity_id
+      type: integer
+      description: numeric id of the scoping project, group, or user
+      ecs: null
+      status: unmapped
+      custom: gitlab.audit.entity_id
+    - vendor: details.entity_path
+      type: string
+      description: full path of the scoping entity, e.g. flightjs/flight
+      ecs: null
+      status: unmapped
+      custom: gitlab.audit.entity_path
+    - vendor: details.custom_message
+      type: string
+      description: >-
+        free-text description of the audit event, e.g. "Project archived" or
+        "Added deploy key"
+      ecs: event.action
+      status: partial
+      notes: >
+        same caveat as the file feed - the string form carries no stable
+        action verb and must be normalised into a controlled event.action
+        vocabulary; where the record also carries event_type, prefer that
+      transform: >-
+        normalise the free-text sentence into a controlled event.action value,
+        or defer to event_type when the response includes it
+    - vendor: details.change
+      type: string
+      description: >-
+        name of the attribute or setting that was changed, e.g. visibility or
+        protected branch
+      ecs: null
+      status: unmapped
+      custom: gitlab.audit.change
+      notes: >-
+        the primary supply-chain signal; recovered from the API details object
+        where the streaming body drops it
+    - vendor: details.from
+      type: string
+      description: value of the changed attribute before the change
+      ecs: null
+      status: unmapped
+      custom: gitlab.audit.from
+      notes: >-
+        pair with details.to for before/after diffing; empty on creation
+        events, where an add member appears instead
+    - vendor: details.to
+      type: string
+      description: value of the changed attribute after the change
+      ecs: null
+      status: unmapped
+      custom: gitlab.audit.to
+    - vendor: details.target_type
+      type: string
+      description: >-
+        class of the object acted on, e.g. Project, DeployKey,
+        PersonalAccessToken, Ci::Runner
+      ecs: null
+      status: unmapped
+      custom: gitlab.audit.target_type
+    - vendor: details.target_id
+      type: string
+      description: >-
+        id of the object the action was performed on (string or integer
+        depending on target)
+      ecs: null
+      status: unmapped
+      custom: gitlab.audit.target_id
+    - vendor: details.target_details
+      type: string
+      description: >-
+        human-readable identifier of the object acted on - a project path,
+        username, or token name
+      ecs: null
+      status: unmapped
+      custom: gitlab.audit.target_details
+    - vendor: ip_address
+      type: ip
+      description: IP address the request came from, carried both top-level and inside details
+      ecs: source.ip
+      status: mapped
+      transform: >-
+        copy to client.ip and source.ip; may be null when GitLab could not
+        determine the caller address
+    - vendor: event_type
+      type: string
+      description: stable machine-readable event name, present on newer records
+      ecs: event.action
+      status: partial
+      notes: >
+        not populated on every historical record returned by the API, so it is
+        a partial source for event.action - prefer it when present and fall
+        back to the custom_message normalisation when it is absent
+- id: api
+  name: API and web request log (api_json.log)
+  description: >
+    /var/log/gitlab/gitlab-rails/api_json.log records one Lograge JSON object
+    per HTTP request to the GitLab REST/GraphQL API; production_json.log
+    carries the same shape for Rails controller (web UI) requests and adds
+    controller/action. This is the dataset that shows token-authenticated
+    automation actually using the API - cloning, creating pipelines, reading
+    CI variables - and the one that carries the user agent and source address
+    for every programmatic caller.
+  event_categories:
+  - web
+  - authentication
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        This is the highest-volume GitLab dataset, so its volume budget is the
+        binding constraint on the crossing.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-gitlab.api
+    direct:
+    - hop: cribl
+      location: edge worker group
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-gitlab.api
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: Elastic GitLab integration, api data stream
+      notes: >
+        The integration's api ingest pipeline maps method/path/status/host/ua
+        to ECS HTTP and URL fields and splits remote_ip. There is no
+        production data stream in the integration, so web-UI requests either
+        reuse this pipeline (identical Lograge shape) or need a small @custom
+        variant that also keeps controller/action.
+    fields:
+    - vendor: time
+      type: timestamp
+      description: ISO 8601 UTC time the request completed
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: severity
+      type: string
+      description: Rails log level of the request record
+      ecs: log.level
+      status: mapped
+    - vendor: method
+      type: string
+      description: HTTP method of the request
+      ecs: http.request.method
+      status: mapped
+    - vendor: path
+      type: string
+      description: concrete request path including resolved ids
+      ecs: url.path
+      status: mapped
+    - vendor: status
+      type: integer
+      description: HTTP response status code returned to the caller
+      ecs: http.response.status_code
+      status: mapped
+    - vendor: host
+      type: string
+      description: hostname the request was served by
+      ecs: url.domain
+      status: mapped
+      transform: the integration also copies this value to host.name
+    - vendor: remote_ip
+      type: string
+      description: >-
+        client address of the caller, taken from the connection or the
+        forwarded-for chain
+      ecs: source.ip
+      status: partial
+      notes: >
+        documented as a string because it can hold a comma-separated
+        X-Forwarded-For chain; the integration splits it and keeps the first
+        entry, which is only trustworthy if GitLab's trusted-proxy list is
+        configured
+    - vendor: ua
+      type: string
+      description: >-
+        User-Agent string of the caller, the main signal for CI runners, git
+        clients, and scripted API use
+      ecs: user_agent.original
+      status: mapped
+    - vendor: user_id
+      type: integer
+      description: numeric id of the authenticated user, absent for unauthenticated requests
+      ecs: user.id
+      status: mapped
+      transform: numeric in the log, converted to string for ECS user.id
+    - vendor: username
+      type: string
+      description: login name of the authenticated user
+      ecs: user.name
+      status: mapped
+    - vendor: route
+      type: string
+      description: >-
+        templated API route the request matched, e.g.
+        /api/:version/projects/:id/pipeline
+      ecs: null
+      status: unmapped
+      custom: gitlab.api.route
+      notes: >
+        the aggregation key that makes this dataset usable - path contains
+        per-object ids, route does not, so pipeline-trigger and CI-variable
+        endpoints can only be counted on this field
+    - vendor: duration_s
+      type: float
+      description: total wall-clock time to serve the request, in seconds
+      ecs: event.duration
+      status: partial
+      notes: >-
+        ECS event.duration is a long in nanoseconds; the float seconds value
+        must be multiplied by 1e9 and rounded
+    - vendor: correlation_id
+      type: string
+      description: >-
+        request correlation identifier propagated across all GitLab components
+        for one request
+      ecs: event.id
+      status: partial
+      notes: >
+        same caveat as the audit dataset - it identifies a request, not an
+        event, and should also be copied to trace.id so api, auth, audit, and
+        gitlab-shell lines for one operation can be joined
+    - vendor: params
+      type: string
+      description: array of filtered request parameter key/value objects
+      ecs: null
+      status: partial
+      custom: gitlab.api.params
+      notes: >
+        GitLab filters known-sensitive parameter names, but the array is
+        caller-controlled, unbounded, and of variable shape; keep it flattened
+        rather than dynamically mapped and mask token-shaped values before
+        ingest
+    - vendor: pid
+      type: integer
+      description: operating system process id of the Puma worker that served the request
+      ecs: process.pid
+      status: mapped
+    - vendor: meta.caller_id
+      type: string
+      description: API endpoint or controller action identifier that handled the request
+      ecs: event.provider
+      status: mapped
+      notes: >-
+        aligns with gitlab.audit.meta.caller_id, which the audit pipeline
+        leaves custom - normalise both to event.provider
+    - vendor: exception.class
+      type: string
+      description: Ruby exception class raised while serving the request, present only on errors
+      ecs: error.type
+      status: mapped
+    - vendor: exception.message
+      type: string
+      description: exception message text raised while serving the request
+      ecs: error.message
+      status: mapped
+    - vendor: controller
+      type: string
+      description: Rails controller class that handled the request (production_json.log only)
+      ecs: null
+      status: unmapped
+      custom: gitlab.production.controller
+      notes: >
+        present on web-UI request records in production_json.log alongside an
+        action field; the Elastic integration has no production data stream,
+        so these two keys survive only if the api pipeline is reused with a
+        custom addition
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Pass through on the core worker group with Persistent Queue
+          backpressure and do the volume shaping low-side, where it is
+          cheapest: drop the twenty-odd db_*/redis_*/mem_* performance keys
+          that Lograge emits on every line and that no detection uses, and
+          sample or drop health-check and asset paths before they consume
+          ingest budget. Mask credential-shaped values in the params array
+          near the source - private tokens, job tokens, and secret_token
+          appear as query parameters on older API paths - so they never leave
+          the enclave. This is the first GitLab dataset where dropping _raw is
+          acceptable once the integration parser is proven.
+        elastic: >
+          Parse with the stock api ingest pipeline and add a
+          logs-gitlab.api@custom pipeline that derives event.outcome from the
+          status code (2xx/3xx success, 4xx/5xx failure) rather than leaving
+          it unset, converts duration_s from float seconds into event.duration
+          nanoseconds, and copies correlation_id into trace.id so a request
+          can be joined across the api, auth, audit, and shell datasets. Map
+          gitlab.api.route as keyword so pipeline-trigger and CI-variable
+          endpoints can be aggregated by templated route instead of by per-id
+          path, and keep gitlab.api.params as flattened rather than
+          dynamically mapped so a caller-controlled parameter name cannot
+          explode the field count.
+        relay: >
+          Low-side instances cross as thin-envelope NDJSON so the api ingest
+          pipeline stays the parser high-side, and do the performance-key drop
+          and params masking before the crossing so the content filter sees a
+          small, bounded object. The friction to raise with the guard owner is
+          the params array and the ua string: both are caller-controlled,
+          unbounded, and can carry non-ASCII bytes and kilobyte-scale values,
+          which argues for a low-side length cap with an explicit truncation
+          flag. Sheer volume is the second constraint - this dataset should
+          have its own rate budget and low-side versus high-side count
+          reconciliation per (dataset, hour), since the crossing is
+          at-most-once and has no acknowledgements.
+      direct:
+        parse_location: high
+        cribl: >
+          Pass through on the collector with Persistent Queue backpressure and
+          do the volume shaping near the source, where it is cheapest: drop
+          the twenty-odd db_*/redis_*/mem_* performance keys that Lograge
+          emits on every line and that no detection uses, and sample or drop
+          health-check and asset paths before they consume ingest budget. Mask
+          credential-shaped values in the params array near the source -
+          private tokens, job tokens, and secret_token appear as query
+          parameters on older API paths - so they never reach the index. This
+          is the first GitLab dataset where dropping _raw is acceptable once
+          the integration parser is proven.
+        elastic: >
+          Parse with the stock api ingest pipeline and add a
+          logs-gitlab.api@custom pipeline that derives event.outcome from the
+          status code (2xx/3xx success, 4xx/5xx failure) rather than leaving
+          it unset, converts duration_s from float seconds into event.duration
+          nanoseconds, and copies correlation_id into trace.id so a request
+          can be joined across the api, auth, audit, and shell datasets. Map
+          gitlab.api.route as keyword so pipeline-trigger and CI-variable
+          endpoints can be aggregated by templated route instead of by per-id
+          path, and keep gitlab.api.params as flattened rather than
+          dynamically mapped so a caller-controlled parameter name cannot
+          explode the field count.
+  - format: syslog-raw
+    enable: >
+      production.log is written unconditionally alongside production_json.log
+      at /var/log/gitlab/gitlab-rails/production.log and carries the same
+      Rails-controller (web UI) request events in GitLab's original multi-line
+      text format rather than one JSON object per line. Each request produces
+      a block: a "Started GET \"/path\" for <ip> at <timestamp>" line, a
+      "Processing by <Controller>#<action> as <FORMAT>" line, a filtered
+      "Parameters: {...}" line, interleaved SQL and cache lines, and a
+      terminating "Completed <status> <reason> in <n>ms (Views: <v>ms |
+      ActiveRecord: <a>ms)" line. To use it as a feed a collector tails
+      production.log instead of production_json.log; no configuration change
+      enables it because it is always present. It is a strictly lossier source
+      than production_json.log for the same events - the text block carries no
+      correlation_id, no authenticated user id or name, and no User-Agent, and
+      its timestamp is rendered in the server's local zone with an offset
+      rather than UTC - so it is documented as the format a node inherited
+      without a JSON collector would emit, not as a format to prefer.
+    references:
+    - https://docs.gitlab.com/administration/logs/
+    - https://docs.gitlab.com/omnibus/settings/logs/
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        custom production.log grok/reassembly pipeline (no Elastic integration
+        data stream parses the Rails text format)
+      notes: >
+        The Elastic GitLab integration has no production data stream even for
+        the JSON form, and nothing parses the multi-line text form, so this
+        needs a hand-built pipeline that first reassembles the multi-line
+        request block into a single event (line-merge on the
+        Started..Completed boundary), then groks the Started, Processing and
+        Completed lines into fields. The grammar is fragile: the Parameters
+        line contains a Ruby hash literal rather than JSON, the block can be
+        interleaved with SQL and cache lines under concurrency, and multi-line
+        reassembly is the main failure mode. Because the text form omits user,
+        correlation_id and user agent, the record cannot be joined to the
+        api/auth/audit datasets the way the JSON form can, so treat it as a
+        degraded web-request feed rather than a drop-in substitute for
+        production_json.log.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Do the multi-line reassembly and grok at the low-side edge worker
+          group, never at or after the guard - a half-merged Rails block is
+          far worse to filter than a single structured object, so the crossing
+          must see one flattened event per request, not raw interleaved text
+          lines. Merge on the Started..Completed boundary with a timeout guard
+          so a request whose Completed line never arrives is dead-lettered
+          rather than merged into the next request, grok the three key lines
+          into ECS fields, convert the Completed duration from milliseconds to
+          event.duration nanoseconds, and rewrite the local-zone Started
+          timestamp to UTC. Cap the Parameters hash length and strip control
+          characters before the guard, because it is caller-influenced free
+          text. Prefer, where the node can be changed, switching the collector
+          to production_json.log and eliminating this format rather than
+          carrying the fragile text grammar across the boundary at all.
+        elastic: >
+          With no integration data stream, own a logs-gitlab.production index
+          template and a custom pipeline that lands these records alongside
+          the JSON web-request data under the same field names the api path
+          uses where they overlap (http.request.method, url.path,
+          http.response.status_code, event.duration), and declare
+          gitlab.production.controller, .action, .format and .params as
+          explicit keyword/flattened mappings since no package template will
+          create them. Set event.outcome from the status code as on the api
+          path. Record explicitly that source.ip here is the connection
+          address from the Started line with no X-Forwarded-For handling, and
+          that user identity is absent, so detections that need an
+          authenticated actor must use production_json.log or api_json.log
+          instead of this feed.
+        relay: >
+          The friction this format adds at the crossing is structural, not
+          just content: the guard should never see the multi-line text, so the
+          reassembly-and-grok must complete low-side and only a shallow,
+          single-object NDJSON record crosses. The content-filter concerns are
+          the url path and the Parameters hash, which carry operator- and
+          caller-supplied strings and non-ASCII bytes and must be
+          length-capped and control-stripped low-side. Because the crossing is
+          at-most-once and this feed's multi-line merge can silently drop or
+          corrupt a request under load, reconcile web-request counts low-side
+          versus high-side per (dataset, hour) and alert on the grok/merge
+          failure rate as its own signal - a merge failure here is an
+          invisible hole, not a flagged parse error.
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side instance the operative decision is the collector
+          source, not the parsing: production_json.log carries the identical
+          web-UI request events with user, correlation_id and user agent
+          intact and in UTC, so point the collector there and treat
+          production.log only as a fallback for a node where the JSON log is
+          unavailable. Where production.log is the only source, do the
+          multi-line reassembly, grok and local-zone-to-UTC timestamp
+          normalisation on the collector and pass the structured record to
+          Elastic.
+        elastic: >
+          Land in the locally-owned logs-gitlab.production template and
+          pipeline, mapping the groked fields to the api path's ECS targets
+          where they overlap and keeping the controller/action/format/params
+          as custom fields. Document the honest gaps - no user identity, no
+          correlation_id, local-zone timestamp - so an analyst does not expect
+          this feed to join to the other GitLab datasets, and prefer the JSON
+          web-request source wherever both are present.
+    fields:
+    - vendor: timestamp
+      type: timestamp
+      description: request start time from the Started line, e.g. 2015-02-12 19:34:53 +0200
+      ecs: '@timestamp'
+      status: partial
+      transform: >-
+        rendered in the server's local zone with a numeric offset rather than
+        UTC, so it must be parsed with the offset and normalised to UTC to
+        align with the JSON feeds
+    - vendor: method
+      type: string
+      description: HTTP method from the Started line (Started GET/POST/...)
+      ecs: http.request.method
+      status: mapped
+    - vendor: path
+      type: string
+      description: request path from the Started line, e.g. /gitlabhq/yaml_db/tree/master
+      ecs: url.path
+      status: mapped
+    - vendor: remote_ip
+      type: ip
+      description: client address from the Started line ("for <ip>")
+      ecs: source.ip
+      status: partial
+      notes: >
+        the raw connection address as Rails saw it, with no X-Forwarded-For
+        parsing - behind a reverse proxy this is the proxy address, and unlike
+        the JSON feed's remote_ip there is no forwarded chain to recover the
+        real client from
+    - vendor: controller
+      type: string
+      description: Rails controller class from the Processing line, e.g. Projects::TreeController
+      ecs: null
+      status: unmapped
+      custom: gitlab.production.controller
+      notes: >-
+        aligns with the gitlab.production.controller field the api dataset
+        already carries from production_json.log
+    - vendor: action
+      type: string
+      description: controller action from the Processing line, e.g. show
+      ecs: null
+      status: unmapped
+      custom: gitlab.production.action
+    - vendor: format
+      type: string
+      description: response format from the Processing line ("as HTML", "as JSON")
+      ecs: null
+      status: unmapped
+      custom: gitlab.production.format
+    - vendor: params
+      type: string
+      description: >-
+        filtered request parameters from the Parameters line, rendered as a
+        Ruby hash literal
+      ecs: null
+      status: partial
+      custom: gitlab.production.params
+      notes: >
+        a Ruby hash literal, not JSON, so it cannot be JSON-parsed directly;
+        GitLab filters known-sensitive names but the value is caller-
+        influenced and unbounded, so keep it flattened and length-capped
+        rather than dynamically mapped
+    - vendor: status
+      type: integer
+      description: HTTP status code from the Completed line, e.g. 200
+      ecs: http.response.status_code
+      status: mapped
+    - vendor: duration
+      type: float
+      description: >-
+        total request time in milliseconds from the Completed line ("Completed
+        200 OK in 166ms")
+      ecs: event.duration
+      status: partial
+      transform: >-
+        ECS event.duration is a long in nanoseconds; the millisecond value
+        must be multiplied by 1e6 and rounded
+    - vendor: view_duration
+      type: float
+      description: 'view-rendering time in milliseconds from the Completed line (Views: 117.4ms)'
+      ecs: null
+      status: unmapped
+      custom: gitlab.production.view_duration_ms
+      notes: >-
+        a performance breakdown with no SOC value; keep custom or drop, but do
+        not let it dynamically map
+    - vendor: db_duration
+      type: float
+      description: >-
+        ActiveRecord (database) time in milliseconds from the Completed line
+        (ActiveRecord: 27.2ms)
+      ecs: null
+      status: unmapped
+      custom: gitlab.production.db_duration_ms
+- id: auth
+  name: Auth and rate-limit log (auth_json.log)
+  description: >
+    /var/log/gitlab/gitlab-rails/auth_json.log records requests that tripped
+    GitLab's Rack::Attack protections - rate-limit throttles, protected-path
+    abuse, and IP blocklist hits. This is the brute-force and credential-
+    stuffing view of the instance, and the log that shows automation hammering
+    token-authenticated endpoints; application_json.log carries the related
+    account-lifecycle and ban/unban messages and shares the same
+    severity/time/correlation_id envelope.
+  event_categories:
+  - authentication
+  - web
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Volume is low and value is high, so this dataset goes first across
+        where the crossing is capacity constrained.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-gitlab.auth
+    direct:
+    - hop: cribl
+      location: edge worker group
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-gitlab.auth
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: Elastic GitLab integration, auth data stream
+      notes: >
+        The integration's auth ingest pipeline maps request_method, path,
+        status, user_id, pid and remote_ip to ECS and derives event.severity
+        from the textual severity; application_json.log has its own
+        application data stream in the same integration.
+    fields:
+    - vendor: time
+      type: timestamp
+      description: ISO 8601 UTC time the throttled or blocked request was recorded
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: severity
+      type: string
+      description: Rails log level of the record, typically ERROR for blocklist and throttle hits
+      ecs: log.level
+      status: mapped
+      transform: >-
+        the integration also derives the numeric ECS event.severity from this
+        textual level
+    - vendor: correlation_id
+      type: string
+      description: request correlation identifier propagated across GitLab components
+      ecs: event.id
+      status: partial
+      notes: >-
+        identifies a request rather than an event; copy to trace.id to join
+        with the api and audit datasets
+    - vendor: message
+      type: string
+      description: >-
+        description of the protection that fired, e.g. Rack_Attack or a
+        rate-limit notice
+      ecs: message
+      status: partial
+      notes: >
+        the integration moves the raw JSON line into event.original and keeps
+        this text as gitlab.auth.message, leaving ECS message unowned; choose
+        one owner at ingest so analysts have a consistent human-readable field
+    - vendor: env
+      type: string
+      description: which Rack::Attack protection fired - blocklist, throttle, or track
+      ecs: null
+      status: unmapped
+      custom: gitlab.auth.env
+      notes: >-
+        the primary triage discriminator for this dataset; there is no ECS
+        field for a rate-limit protection class
+    - vendor: remote_ip
+      type: ip
+      description: IP address of the client that was throttled or blocked
+      ecs: source.ip
+      status: mapped
+      transform: >
+        the integration parses it to client.ip and copies the client object to
+        source; behind a reverse proxy it is the proxy address unless the
+        trusted-proxy list is configured
+    - vendor: request_method
+      type: string
+      description: HTTP method of the throttled or blocked request
+      ecs: http.request.method
+      status: mapped
+    - vendor: path
+      type: string
+      description: >-
+        request path that tripped the protection, often /users/sign_in or an
+        API endpoint
+      ecs: url.path
+      status: mapped
+    - vendor: matched
+      type: string
+      description: name of the Rack::Attack rule or throttle that matched the request
+      ecs: null
+      status: unmapped
+      custom: gitlab.auth.matched
+      notes: >
+        the specific throttle name (for example throttle_authenticated_api);
+        kept custom rather than on rule.name because GitLab emits no companion
+        rule id describing the same object
+    - vendor: status
+      type: integer
+      description: HTTP status returned to the throttled caller, normally 429 or 403
+      ecs: http.response.status_code
+      status: mapped
+    - vendor: user_id
+      type: integer
+      description: >-
+        numeric id of the authenticated user when the throttled request
+        carried credentials
+      ecs: user.id
+      status: mapped
+      transform: numeric in the log, converted to string for ECS user.id
+    - vendor: meta.user
+      type: string
+      description: login name of the authenticated user on the throttled request
+      ecs: user.name
+      status: mapped
+    - vendor: pid
+      type: integer
+      description: operating system process id of the Puma worker that handled the request
+      ecs: process.pid
+      status: mapped
+    - vendor: controller
+      type: string
+      description: Rails controller that would have handled the request
+      ecs: null
+      status: unmapped
+      custom: gitlab.auth.controller
+    - vendor: location
+      type: string
+      description: >-
+        redirect target returned to the client when the protection redirects
+        rather than rejects
+      ecs: null
+      status: unmapped
+      custom: gitlab.auth.location
+    - vendor: request_urgency
+      type: string
+      description: GitLab request urgency class assigned to the endpoint, e.g. default or low
+      ecs: null
+      status: unmapped
+      custom: gitlab.auth.request_urgency
+    - vendor: rate_limiting_gates
+      type: string
+      description: list of rate-limiting gates evaluated for the request
+      ecs: null
+      status: unmapped
+      custom: gitlab.auth.rate_limiting_gates
+      notes: >-
+        array of gate names; keep as keyword so a single request can be
+        attributed to several concurrent limits
+    - vendor: worker_id
+      type: string
+      description: logical identifier of the Puma worker that handled the request
+      ecs: null
+      status: unmapped
+      custom: gitlab.auth.worker_id
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Pass through on the core worker group with Persistent Queue
+          backpressure and no low-side extraction - the volume is small enough
+          that shaping it buys nothing and re-parsing risks the integration's
+          schema. The one worthwhile low-side job is a
+          source-IP-to-network-zone lookup (agency ranges, VPN pools, runner
+          subnets) that is far cheaper near the source than as an enrich
+          policy, because triage of a rate-limit burst turns almost entirely
+          on whether the caller is internal. Keep _raw end-to-end: this
+          dataset is small and is the evidence trail for credential attacks.
+        elastic: >
+          The stock auth ingest pipeline parses the record; add a
+          logs-gitlab.auth@custom pipeline that resolves the ECS message
+          ownership collision - the pipeline moves the raw line to
+          event.original while keeping the GitLab message text as
+          gitlab.auth.message, so pick one owner for ECS message explicitly
+          instead of leaving the field empty - and that sets event.outcome to
+          failure for throttle and blocklist records, which are by definition
+          denials. Map gitlab.auth.matched, .env, .location and
+          .rate_limiting_gates as keyword in the custom-namespace index
+          template so throttle-name aggregations work, and drop the several
+          dozen db_*/redis_*/mem_* Lograge performance keys from the template
+          rather than letting dynamic mapping create them.
+        relay: >
+          This dataset is small and structurally simple enough to cross as
+          thin-envelope NDJSON with the integration parsing high-side, and it
+          should get crossing priority over the api dataset. Content-filter
+          friction is limited to the message and location strings, which can
+          carry caller-supplied URL fragments and non-ASCII bytes and should
+          be length-capped low-side. The feed is native JSON rather than CEF,
+          so nothing CEF-shaped crosses; because a throttle burst is exactly
+          the moment the crossing is most likely to drop records, the low-side
+          versus high-side count reconciliation per (dataset, hour) matters
+          more here than anywhere else.
+      direct:
+        parse_location: high
+        cribl: >
+          Pass through on the collector with Persistent Queue backpressure and
+          no near-source extraction - the volume is small enough that shaping
+          it buys nothing and re-parsing risks the integration's schema. The
+          one worthwhile near-source job is a source-IP-to-network-zone lookup
+          (agency ranges, VPN pools, runner subnets) that is far cheaper near
+          the source than as an enrich policy, because triage of a rate-limit
+          burst turns almost entirely on whether the caller is internal. Keep
+          _raw end-to-end: this dataset is small and is the evidence trail for
+          credential attacks.
+        elastic: >
+          The stock auth ingest pipeline parses the record; add a
+          logs-gitlab.auth@custom pipeline that resolves the ECS message
+          ownership collision - the pipeline moves the raw line to
+          event.original while keeping the GitLab message text as
+          gitlab.auth.message, so pick one owner for ECS message explicitly
+          instead of leaving the field empty - and that sets event.outcome to
+          failure for throttle and blocklist records, which are by definition
+          denials. Map gitlab.auth.matched, .env, .location and
+          .rate_limiting_gates as keyword in the custom-namespace index
+          template so throttle-name aggregations work, and drop the several
+          dozen db_*/redis_*/mem_* Lograge performance keys from the template
+          rather than letting dynamic mapping create them.
+- id: gitlab-shell
+  name: GitLab Shell log (gitlab-shell.log)
+  description: >
+    /var/log/gitlab/gitlab-shell/gitlab-shell.log records SSH access to Git
+    repositories and the Git commands GitLab Shell executes on their behalf.
+    It is the only log that shows repository read versus write over SSH -
+    git-upload-pack for clone/fetch, git-receive-pack for push - attributed to
+    a user and a project path, which makes it the direct evidence of code
+    actually leaving or entering the agency's repositories. It also records
+    the internal /api/v4/internal/allowed authorization checks that gate every
+    SSH operation.
+  event_categories:
+  - authentication
+  - process
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Unlike the Rails logs this one has no Elastic integration data stream,
+        so the Cribl pipeline is the only parser wherever it sits.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-gitlab.shell
+      notes: >
+        custom data stream - the Elastic GitLab integration ships api,
+        application, audit, and auth streams only, so index templates and
+        mappings for this one are owned locally
+    direct:
+    - hop: cribl
+      location: edge worker group
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-gitlab.shell
+      notes: >
+        custom data stream - the Elastic GitLab integration ships api,
+        application, audit, and auth streams only, so index templates and
+        mappings for this one are owned locally
+  formats:
+  - format: json
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom gitlab-shell pipeline
+      notes: >
+        No Elastic integration data stream and no Cribl pack covers
+        gitlab-shell.log; the lines are already JSON, so the pipeline is
+        mostly normalisation (user id prefix, duration units, ECS field
+        naming) rather than grammar parsing.
+    fields:
+    - vendor: time
+      type: timestamp
+      description: ISO 8601 UTC time the SSH operation or internal API call was logged
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: level
+      type: string
+      description: log level of the record, e.g. info or error
+      ecs: log.level
+      status: mapped
+    - vendor: msg
+      type: string
+      description: record description, e.g. executing git command or Finished HTTP request
+      ecs: message
+      status: mapped
+    - vendor: command
+      type: string
+      description: >-
+        Git wire-protocol command GitLab Shell executed, e.g. git-upload-pack
+        or git-receive-pack
+      ecs: event.action
+      status: mapped
+      notes: >
+        the read-versus-write discriminator for repository access -
+        git-upload-pack is a clone or fetch, git-receive-pack is a push;
+        mapped to event.action rather than process.name because it names the
+        operation the SOC cares about, and a keyword copy should be retained
+        for exact-match detections
+    - vendor: gl_project_path
+      type: string
+      description: namespace and project path the Git command targeted, e.g. root/example
+      ecs: null
+      status: unmapped
+      custom: gitlab.shell.project_path
+      notes: >-
+        the only human-readable repository identifier on the record; the join
+        key to project criticality
+    - vendor: gl_repository
+      type: string
+      description: internal repository identifier, e.g. project-1
+      ecs: null
+      status: unmapped
+      custom: gitlab.shell.repository
+    - vendor: user_id
+      type: string
+      description: identifier of the user performing the Git operation, emitted with a user- prefix
+      ecs: user.id
+      status: partial
+      notes: >
+        emitted as a prefixed string such as user-1, unlike the bare numeric
+        user_id in api_json.log and audit_json.log; the prefix must be
+        stripped or the same person will not correlate across GitLab datasets
+    - vendor: username
+      type: string
+      description: login name of the user performing the Git operation
+      ecs: user.name
+      status: mapped
+    - vendor: git_protocol
+      type: string
+      description: Git wire protocol version requested by the client
+      ecs: null
+      status: unmapped
+      custom: gitlab.shell.git_protocol
+      notes: >-
+        empty string when the client does not request protocol v2; useful only
+        as a client-fingerprint hint
+    - vendor: duration_ms
+      type: float
+      description: wall-clock duration of the internal API request in milliseconds
+      ecs: event.duration
+      status: partial
+      notes: >-
+        ECS event.duration is a long in nanoseconds; the millisecond float
+        must be multiplied by 1e6 and rounded
+    - vendor: method
+      type: string
+      description: HTTP method of the internal API request GitLab Shell made
+      ecs: http.request.method
+      status: mapped
+    - vendor: url
+      type: string
+      description: >-
+        internal API endpoint GitLab Shell called, e.g.
+        http://127.0.0.1:8080/api/v4/internal/allowed
+      ecs: url.original
+      status: mapped
+      notes: >
+        the authorization check that gates every SSH operation, not the user's
+        Git remote; its host is always a GitLab-internal loopback or service
+        address, so it should not be treated as a network destination of
+        interest
+    - vendor: correlation_id
+      type: string
+      description: >-
+        request correlation identifier propagated from GitLab Shell into the
+        Rails internal API
+      ecs: event.id
+      status: partial
+      notes: >
+        not shown in the abbreviated samples in the log-system documentation
+        but propagated by GitLab's correlation-id mechanism; confirm presence
+        on the deployed version, and copy to trace.id so an SSH push can be
+        joined to the api_json.log lines it triggered
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Own the full ECS shaping in the core worker group since nothing
+          downstream will do it: strip the user- prefix from user_id so it
+          joins the numeric user.id used by the api and audit datasets,
+          convert duration_ms into event.duration nanoseconds, and split the
+          two record shapes - the "executing git command" lines and the
+          "Finished HTTP request" internal-API lines - onto distinct
+          event.action values so they can be counted separately. Suppress the
+          high-volume /api/v4/internal/allowed success lines to a sampled rate
+          while keeping every failure, and run the Elastic destination on
+          Persistent Queue backpressure. Because this is a hand-built pipeline
+          with no vendor pack tracking GitLab Shell's log format across
+          upgrades, gate the destination with C.Schema(...).validate and a
+          dead-letter route that alerts on its own rate.
+        elastic: >
+          No integration exists, so own a logs-gitlab.shell index template and
+          ingest pipeline that finishes only what the low side cannot: enrich
+          gl_project_path with project criticality and owning team, and set
+          event.category/event.type consistently for read (git-upload-pack)
+          versus write (git-receive-pack) operations. Map
+          gitlab.shell.project_path, .repository and .git_protocol as keyword
+          and declare the ECS core fields explicitly rather than relying on
+          dynamic mapping, since no package template will create them. The
+          honest gap to close here is source address: gitlab-shell.log carries
+          no client IP, so SSH source attribution requires correlating on time
+          and username with the host's own sshd auth log, which should be
+          ingested alongside this dataset.
+        relay: >
+          Low-side instances cross full ECS-shaped NDJSON (envelope mode B)
+          rather than a thin envelope, because there is no high-side
+          integration to parse a raw payload - one event per line, UTF-8,
+          LF-terminated, compression disabled, nesting depth capped at 2 with
+          short ASCII keys, so a custom guard content filter can stay simple.
+          The friction to settle with the guard owner is gl_project_path and
+          the internal API url, which carry operator-chosen path segments that
+          may include non-ASCII characters and should be allowlisted or
+          length-capped low-side. The feed is native JSON rather than CEF, and
+          with no return channel the at-most-once crossing needs low-side
+          versus high-side count reconciliation per (dataset, hour) - a
+          dropped git-receive-pack record is a push nobody can see.
+      direct:
+        parse_location: low
+        cribl: >
+          Own the full ECS shaping in the core worker group since nothing
+          downstream will do it: strip the user- prefix from user_id so it
+          joins the numeric user.id used by the api and audit datasets,
+          convert duration_ms into event.duration nanoseconds, and split the
+          two record shapes - the "executing git command" lines and the
+          "Finished HTTP request" internal-API lines - onto distinct
+          event.action values so they can be counted separately. Suppress the
+          high-volume /api/v4/internal/allowed success lines to a sampled rate
+          while keeping every failure, and run the Elastic destination on
+          Persistent Queue backpressure. Because this is a hand-built pipeline
+          with no vendor pack tracking GitLab Shell's log format across
+          upgrades, gate the destination with C.Schema(...).validate and a
+          dead-letter route that alerts on its own rate.
+        elastic: >
+          No integration exists, so own a logs-gitlab.shell index template and
+          ingest pipeline that finishes only what the collector cannot: enrich
+          gl_project_path with project criticality and owning team, and set
+          event.category/event.type consistently for read (git-upload-pack)
+          versus write (git-receive-pack) operations. Map
+          gitlab.shell.project_path, .repository and .git_protocol as keyword
+          and declare the ECS core fields explicitly rather than relying on
+          dynamic mapping, since no package template will create them. The
+          honest gap to close here is source address: gitlab-shell.log carries
+          no client IP, so SSH source attribution requires correlating on time
+          and username with the host's own sshd auth log, which should be
+          ingested alongside this dataset.
+  - format: syslog-kv
+    enable: >
+      GitLab Shell's logger honours a log_format setting that is json by
+      default but can be set to text. On a Linux package installation set
+      gitlab_shell['log_format'] = 'text' in /etc/gitlab/gitlab.rb and run
+      gitlab-ctl reconfigure; on a self-compiled or containerised install set
+      log_format: text in the gitlab-shell config.yml. gitlab-shell.log then
+      carries the same SSH access and internal-API authorization events, but
+      rendered by logrus's text formatter as a single line of space-separated
+      key=value pairs (time="..." level=info msg="executing git command"
+      command=git-upload-pack gl_project_path=root/example user_id=user-1 ...)
+      instead of one JSON object per line. The key names are identical to the
+      JSON form - only the line grammar changes from a JSON object to
+      logfmt-style key=value tokens - so this is a transport reshaping of the
+      json field set rather than a different field inventory. Quoting of
+      values that contain spaces (notably msg) is the parser's main hazard.
+    references:
+    - https://docs.gitlab.com/administration/logs/
+    - https://docs.gitlab.com/omnibus/settings/logs/
+    - https://github.com/gitlabhq/gitlab-shell/blob/main/config.yml.example
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        KV-extract pipeline feeding the same custom gitlab-shell normalisation
+        as the JSON form
+      notes: >
+        The gitlab-shell dataset already has no Elastic integration data
+        stream and is normalised by a hand-built Cribl pipeline, so the text
+        form needs only a KV extractor in front of that same pipeline:
+        tokenise the space-separated key=value pairs (handling quoted values
+        with embedded spaces such as msg and gl_project_path) back into the
+        named keys, then hand off to the existing normalisation (strip the
+        user- prefix from user_id, convert duration_ms to nanoseconds, split
+        the "executing git command" and "Finished HTTP request" record
+        shapes). The key names logrus emits in text mode are byte-identical to
+        the JSON keys already inventoried on the json format, so the field
+        table below is intentionally empty - a KV extraction recovers the same
+        command, gl_project_path, gl_repository, user_id, username,
+        git_protocol, duration_ms, method, url, correlation_id, level, msg and
+        time fields under the same names, with the identical ECS mapping and
+        the identical source-IP gap. The only added work versus the JSON form
+        is robust KV tokenisation of quoted, space-bearing values, and the
+        loss of JSON's type information so numeric coercions (duration_ms,
+        user_id after de-prefixing) must be explicit.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Run a KV extractor at the low-side edge worker group in front of the
+          existing gitlab-shell normalisation pipeline, then do exactly the
+          ECS shaping the JSON form's recommendation already prescribes: strip
+          the user- prefix from user_id so it joins the numeric user.id used
+          by the api and audit datasets, convert duration_ms to event.duration
+          nanoseconds, split the git-command and internal-API record shapes
+          onto distinct event.action values, and sample the high-volume
+          /api/v4/internal/allowed success lines while keeping every failure.
+          The text-specific risk is tokenisation: msg and gl_project_path are
+          quoted and can contain spaces and non-ASCII bytes, so extract them
+          with quote-aware parsing rather than naive whitespace splitting, and
+          dead-letter any line the KV extractor cannot fully tokenise so a
+          logrus format change surfaces instead of silently dropping fields.
+          Gate the destination with C.Schema(...).validate as on the JSON form
+          and run it on Persistent Queue backpressure.
+        elastic: >
+          Land through the same locally-owned logs-gitlab.shell index template
+          and pipeline as the JSON form - there is one destination schema
+          regardless of the on-disk grammar - enriching gl_project_path with
+          project criticality and owning team and setting event.category and
+          event.type for read (git-upload-pack) versus write
+          (git-receive-pack) operations. Because KV tokens arrive as strings,
+          make the numeric coercions explicit (duration_ms, the de-prefixed
+          user_id) rather than relying on JSON typing. The honest gap is
+          unchanged and independent of format: gitlab-shell.log carries no
+          client IP in either grammar, so SSH source attribution still
+          requires correlating on time and username with the host's sshd auth
+          log.
+        relay: >
+          A single flat key=value line crosses a shallow-nesting content
+          filter at least as comfortably as the JSON object, and since there
+          is no high-side integration to parse a raw payload, cross full
+          ECS-shaped NDJSON (envelope mode B) as the json form does - reshape
+          the KV line to the same one-event-per-line NDJSON low-side, UTF-8,
+          LF-terminated, nesting capped at 2 with short ASCII keys. The
+          content-filter friction is the same gl_project_path and internal-API
+          url that the JSON form flags: operator-chosen path segments that may
+          include non-ASCII characters, to be allowlisted or length-capped
+          low-side. With no return channel the at-most-once crossing needs the
+          same low-side versus high-side count reconciliation per (dataset,
+          hour) - a dropped git-receive-pack record is a push nobody can see -
+          and the KV tokenisation failure rate is an additional low-side
+          signal to watch that the JSON form does not have.
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side instance run a KV extractor in front of the
+          gitlab-shell normalisation pipeline on the collector. The decision
+          that matters is whether to leave gitlab-shell on its default json
+          log_format: the JSON form preserves value types and is less fragile
+          to tokenise, so text mode is worth carrying only on a node already
+          configured that way or where a downstream specifically wants logfmt;
+          there is no parsing or enrichment advantage to switching to text,
+          only the tokenisation cost.
+        elastic: >
+          Land through the same logs-gitlab.shell template and pipeline as the
+          JSON form with explicit numeric coercions to compensate for KV's
+          loss of type information, and the identical read-versus-write
+          event.category/type shaping and project-path enrichment. The
+          source-IP gap and the correlation_id-to-trace.id copy are unchanged
+          from the JSON form, since text mode reshapes the line grammar but
+          not the field set.
+    fields_omitted: >
+      logrus text mode emits the same key names as JSON, so a KV extraction
+      recovers exactly the command, gl_project_path, gl_repository, user_id,
+      username, git_protocol, duration_ms, method, url, correlation_id, level,
+      msg and time fields the json entry already inventories, under identical
+      names and the identical ECS mapping — only the line grammar and JSON's
+      type information differ.
+    fields: []

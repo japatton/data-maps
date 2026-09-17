@@ -1,0 +1,1362 @@
+id: juniper-srx
+name: Juniper SRX
+vendor: Juniper
+versions: Junos OS 21.4, 22.4, 23.4 (SRX Series services gateways)
+draft: true
+references:
+- >-
+  https://www.juniper.net/documentation/us/en/software/junos/flow-packet-processing/topics/topic-map/security-flow-session-and-error-handling.html
+- >-
+  https://www.juniper.net/documentation/en_US/junos/topics/reference/configuration-statement/structured-data-edit-system.html
+- https://www.elastic.co/docs/reference/integrations/juniper_srx
+- https://github.com/elastic/integrations/tree/main/packages/juniper_srx
+datasets:
+- id: flow
+  name: RT_FLOW session log
+  description: >
+    Session lifecycle records from the SRX flow module -
+    RT_FLOW_SESSION_CREATE at session setup, RT_FLOW_SESSION_CLOSE at teardown
+    (the only variant carrying byte, packet and duration counters), and
+    RT_FLOW_SESSION_DENY when a security policy drops the first packet.
+    Emitted in Junos structured-data format (RFC 5424 with a junos@
+    structured-data element of name="value" pairs), which is strongly
+    preferred over the legacy text format: the legacy grammar is positional
+    and differs per message tag, while structured-data is self-describing
+    key/value. Note that Junos emits literal placeholder strings - "N/A",
+    "None", "UNKNOWN", "-" - rather than omitting an attribute, so every
+    consumer has to strip them or it will index millions of documents whose
+    source.user.name is the string "N/A".
+  event_categories:
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        SRX syslog (structured-data + brief) arrives over UDP/TCP 514 from the
+        `set system syslog host` stanza. RT_FLOW is by far the highest-volume
+        feed on the estate, so the low-side crossing dominates the design of
+        this route.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-juniper_srx.log
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        SRX syslog (structured-data + brief) arrives over UDP/TCP 514 from the
+        `set system syslog host` stanza. RT_FLOW is by far the highest-volume
+        feed on the estate.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-juniper_srx.log
+  formats:
+  - format: syslog-kv
+    parsing:
+      mechanism: elastic-integration
+      artifact: Juniper SRX integration (juniper_srx)
+      notes: >
+        The integration ships a single `log` data stream whose default ingest
+        pipeline groks the syslog envelope, kv-splits the junos@
+        structured-data element, rewrites kebab-case attribute names to
+        snake_case under juniper.srx.*, and then fans out to per-process
+        sub-pipelines (flow, idp, ids, utm, secintel, atp, system) selected on
+        the RT_* process name. It supports the "structured-data + brief"
+        syslog format only - a device left on the legacy text format will fall
+        through to the unstructured branch and lose nearly every field.
+    fields:
+    - vendor: source-address
+      type: ip
+      description: IP address of the host that opened the session
+      ecs: source.ip
+      status: mapped
+    - vendor: source-port
+      type: port
+      description: source port of the session
+      ecs: source.port
+      status: mapped
+    - vendor: destination-address
+      type: ip
+      description: IP address the session was opened to
+      ecs: destination.ip
+      status: mapped
+    - vendor: destination-port
+      type: port
+      description: destination port of the session
+      ecs: destination.port
+      status: mapped
+    - vendor: nat-source-address
+      type: ip
+      description: translated source IP address after source NAT
+      ecs: source.nat.ip
+      status: partial
+      notes: >
+        emitted on every CREATE/CLOSE record even when no NAT was performed,
+        in which case it repeats the untranslated address (or the literal
+        "0.0.0.0"); suppress it when it equals source-address so NAT
+        dashboards do not count every session as translated
+    - vendor: nat-source-port
+      type: port
+      description: translated source port after source NAT
+      ecs: source.nat.port
+      status: mapped
+    - vendor: nat-destination-address
+      type: ip
+      description: translated destination IP address after destination NAT
+      ecs: destination.nat.ip
+      status: mapped
+    - vendor: nat-destination-port
+      type: port
+      description: translated destination port after destination NAT
+      ecs: destination.nat.port
+      status: mapped
+    - vendor: protocol-id
+      type: integer
+      description: IANA protocol number of the session (1 ICMP, 6 TCP, 17 UDP)
+      ecs: network.iana_number
+      status: partial
+      transform: >
+        the numeric value maps straight to network.iana_number, but
+        network.transport (the field most alerting actually filters on) needs
+        a number-to-name lookup - the stock integration pipeline does not
+        populate it for this dataset
+    - vendor: service-name
+      type: string
+      description: >-
+        Junos predefined application/service object matched for the session,
+        e.g. junos-ftp, icmp, None
+      ecs: network.protocol
+      status: partial
+      transform: >
+        strip the "junos-" prefix and lowercase before writing
+        network.protocol; the raw value is a Junos application-object name,
+        not a wire protocol, and the literal "None" must be dropped rather
+        than indexed
+    - vendor: application
+      type: string
+      description: application identified by AppID for the session
+      ecs: network.application
+      status: partial
+      notes: >
+        carries the literal "UNKNOWN" whenever AppID did not classify the
+        session, which is the majority of records on an SRX without
+        application identification licensed; nested-application holds the
+        sub-application and is dropped here
+    - vendor: policy-name
+      type: string
+      description: name of the security policy that permitted or denied the session
+      ecs: rule.name
+      status: mapped
+    - vendor: source-zone-name
+      type: string
+      description: security zone the session entered from
+      ecs: observer.ingress.zone
+      status: mapped
+    - vendor: destination-zone-name
+      type: string
+      description: security zone the session was destined to
+      ecs: observer.egress.zone
+      status: mapped
+    - vendor: packet-incoming-interface
+      type: string
+      description: >-
+        logical interface the first packet of the session arrived on, e.g.
+        ge-0/0/1.0, reth0.0, st0.0
+      ecs: observer.ingress.interface.name
+      status: mapped
+    - vendor: session-id-32
+      type: string
+      description: >-
+        32-bit flow session identifier assigned by the SRX, unique per device
+        until the session table wraps
+      ecs: null
+      status: unmapped
+      custom: juniper.srx.flow.session_id
+      notes: >
+        device-local session identifier with no ECS equivalent; it is the only
+        join key between an RT_FLOW record and the RT_IDP/RT_UTM records
+        raised on the same session, so it must be kept and mapped as keyword.
+        Newer Junos releases emit the same value as `session-id` on some
+        message tags - normalize both spellings onto this custom field
+    - vendor: bytes-from-client
+      type: long
+      description: bytes sent by the session initiator (CLOSE records only)
+      ecs: source.bytes
+      status: mapped
+    - vendor: bytes-from-server
+      type: long
+      description: bytes sent by the session responder (CLOSE records only)
+      ecs: destination.bytes
+      status: mapped
+    - vendor: packets-from-client
+      type: long
+      description: packets sent by the session initiator (CLOSE records only)
+      ecs: source.packets
+      status: mapped
+    - vendor: packets-from-server
+      type: long
+      description: packets sent by the session responder (CLOSE records only)
+      ecs: destination.packets
+      status: mapped
+    - vendor: elapsed-time
+      type: integer
+      description: session duration in whole seconds (CLOSE records only)
+      ecs: event.duration
+      status: partial
+      transform: >
+        multiply by 1_000_000_000 to get the nanoseconds ECS event.duration
+        expects, then derive event.start from the record timestamp and
+        event.end from start plus duration; note the syslog timestamp is the
+        CLOSE time, so event.start is a back-calculation and is only
+        second-accurate
+    - vendor: reason
+      type: string
+      description: >-
+        why the session was torn down, e.g. "response received", "TCP FIN",
+        "idle Timeout", "application failure or action"
+      ecs: event.reason
+      status: mapped
+      notes: present on CLOSE records only; DENY and CREATE records carry no reason attribute
+    - vendor: username
+      type: string
+      description: firewall-authenticated user associated with the session
+      ecs: source.user.name
+      status: partial
+      notes: >
+        only populated where firewall authentication or the Junos user
+        identity feed is in use; otherwise carries the literal "N/A" or
+        "unknown-user", both of which must be stripped rather than indexed as
+        a username
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Keep the core worker group a pass-through for this route and let the
+          integration pipeline do the extraction; the only low-side work worth
+          paying for is volume control and enrichment that the SIEM cannot do.
+          Concretely: confirm every SRX is set to structured-data + brief and
+          route any device still emitting the legacy text format to a
+          dead-letter destination rather than letting it silently degrade,
+          suppress RT_FLOW_SESSION_CREATE where the CLOSE record already
+          carries the same five-tuple (create/close doubles the volume and
+          only close has the counters), and attach the device-to-site/owner
+          lookup here where the inventory data already lives. Run Persistent
+          Queue backpressure on the Elastic destination, never Block.
+        elastic: >
+          The stock juniper_srx flow sub-pipeline is the parser. Layer a
+          logs-juniper_srx.log@custom pipeline for the three gaps this map
+          records: strip the literal "N/A"/"None"/"UNKNOWN" placeholders
+          before they reach source.user.name, network.application and the NAT
+          fields; resolve protocol-id through an IANA number-to-name lookup
+          into network.transport, since the stock pipeline populates only
+          network.iana_number; and derive event.outcome from the message tag
+          (CREATE/CLOSE are success, DENY is failure) instead of the blanket
+          success the stock pipeline sets whenever a tag is present. Add
+          custom-namespace keyword mappings for the flow session id so
+          flow-to-IDP correlation resolves, and assert the elapsed-time to
+          event.duration conversion lands in nanoseconds.
+        relay: >
+          Low-side instances cross the guard: use the thin-envelope hybrid
+          shape rather than shipping raw syslog - emit {_dataId, @timestamp,
+          host, _raw} as NDJSON - UTF-8, LF-terminated, compression disabled -
+          so the guard inspects one stable schema instead of the Junos
+          structured-data grammar, and keep the extraction on the Elastic side
+          where the integration already does it. The specific content-filter
+          friction here is the policy-name and application attributes, which
+          are operator-supplied free text of unbounded length, and the fact
+          that Junos escapes embedded quotes inside the structured-data
+          element; cap both and normalize the escaping low-side. Drop _raw on
+          this route first - it is the highest-volume and
+          lowest-forensic-value of the three datasets. The crossing is
+          at-most-once with no return channel, so detect drops by reconciling
+          low-side and high-side session counts per hour.
+      direct:
+        parse_location: high
+        cribl: >
+          Keep the core worker group a pass-through for this route and let the
+          integration pipeline do the extraction; the only work worth paying
+          for at the edge worker group is volume control and enrichment that
+          the SIEM cannot do. Concretely: confirm every SRX is set to
+          structured-data + brief and route any device still emitting the
+          legacy text format to a dead-letter destination rather than letting
+          it silently degrade, suppress RT_FLOW_SESSION_CREATE where the CLOSE
+          record already carries the same five-tuple (create/close doubles the
+          volume and only close has the counters), and attach the
+          device-to-site/owner lookup here where the inventory data already
+          lives. Run Persistent Queue backpressure on the Elastic destination,
+          never Block.
+        elastic: >
+          The stock juniper_srx flow sub-pipeline is the parser. Layer a
+          logs-juniper_srx.log@custom pipeline for the three gaps this map
+          records: strip the literal "N/A"/"None"/"UNKNOWN" placeholders
+          before they reach source.user.name, network.application and the NAT
+          fields; resolve protocol-id through an IANA number-to-name lookup
+          into network.transport, since the stock pipeline populates only
+          network.iana_number; and derive event.outcome from the message tag
+          (CREATE/CLOSE are success, DENY is failure) instead of the blanket
+          success the stock pipeline sets whenever a tag is present. Add
+          custom-namespace keyword mappings for the flow session id so
+          flow-to-IDP correlation resolves, and assert the elapsed-time to
+          event.duration conversion lands in nanoseconds.
+  - format: netflow
+    enable: >
+      SRX inline J-Flow, configured in two halves. Define the export template
+      under `set services flow-monitoring version-ipfix template <name>
+      ipv4-template` (use `version9 template <name> ipv4-template` for NetFlow
+      v9), with flow-active-timeout / flow-inactive-timeout and a
+      template-refresh-rate. Then wire the sampler under `set
+      forwarding-options sampling instance <inst> input rate <N>` (rate is
+      1-in-N sampling, not full capture), `set forwarding-options sampling
+      instance <inst> family inet output flow-server <collector> port 4739`
+      (2055/9996 for v9), `... output flow-server <collector> version-ipfix
+      template <name>`, and `... output inline-jflow source-address <srx-ip>`;
+      finally apply `set interfaces <intf> unit 0 family inet sampling input`
+      on the transit interfaces. IPFIX formatting for SRX J-Flow is supported
+      from Junos 19.4R1 on the high-end/SRX4x00/vSRX line and 20.1R1 on the
+      SRX3xx/550HM branch line; NetFlow v9 predates it. Because it is sampled
+      and forwarding-plane-sourced, this feed is a statistical throughput
+      view, not a 1:1 replacement for the RT_FLOW session log.
+    references:
+    - >-
+      https://www.juniper.net/documentation/en_US/junos/topics/topic-map/ipfix-formatting-for-srx-jflow.html
+    - >-
+      https://www.juniper.net/documentation/us/en/software/junos/flow-monitoring/topics/concept/services-ipfix-flow-template-flow-aggregation-configuring.html
+    - >-
+      https://www.juniper.net/documentation/us/en/software/junos/flow-monitoring/topics/concept/inline-sampling-overview.html
+    - >-
+      https://www.tspcom.net/blog/security-optimal-configuration-1/configuring-j-flow-v9-0-for-monitoring-juniper-srx-1
+    parsing:
+      mechanism: elastic-integration
+      artifact: Elastic NetFlow Records integration (netflow), data stream logs-netflow.log
+      notes: >
+        J-Flow is binary NetFlow v9 / IPFIX over UDP - it needs a NetFlow
+        decoder, not a syslog parser, and the stock juniper_srx integration
+        (written against sd-syslog text) cannot read it. The Elastic Agent
+        netflow input decodes the IANA-standard elements this template emits
+        (8/12 addresses, 7/11 ports, 4 protocol, 1/2 byte/packet counts, 10/14
+        ingress/egress ifIndex, 152/153 flow start/end) onto netflow.* and ECS
+        automatically. Cribl Stream does not natively decode binary NetFlow
+        v9/IPFIX, so on a Cribl-first path a collector or the Elastic Agent
+        netflow input must terminate the UDP stream first. v9/IPFIX template
+        packets are sent on a separate cadence from the data records, so a
+        decoder that has not yet seen the template drops data records until it
+        arrives. SRX J-Flow uses standard IANA elements (no heavy
+        enterprise-PEN fields), so the decode is clean.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          The hard constraint is that J-Flow is binary UDP whose v9/IPFIX
+          template packets arrive on a separate cadence from the data records:
+          a naive byte relay strands every data record whose template never
+          crossed. Decode J-Flow to structured records LOW-SIDE (Elastic Agent
+          netflow input or a collector in the low enclave), resolve the
+          ifIndex-to-interface-name lookup while the appliance is reachable,
+          then hand NDJSON to Cribl for the crossing. Treat this feed as the
+          volume-control lever it is: where the CSOC needs only
+          throughput/tuple telemetry, sampled J-Flow can replace the
+          RT_FLOW_SESSION_CREATE half of the flow feed and cut the
+          highest-volume crossing on the estate - but keep RT_FLOW_CLOSE as
+          the authoritative, counter-bearing session record.
+        elastic: >
+          Run the netflow integration for the standard sockets and counters
+          and add a logs-netflow.log@custom pipeline that derives
+          network.transport from the numeric protocolIdentifier (the decoder
+          lands only network.iana_number) and folds the flow into the same
+          device-to-site/owner enrichment the kv RT_FLOW dataset uses. There
+          is no policy name, application, NAT translation or session outcome
+          in J-Flow, so cross-dataset joins to the RT_IDP/RT_UTM records are
+          impossible from this feed - it is a throughput signal, not a
+          substitute for the session log, and must not be pointed at the same
+          logs-juniper_srx.log data stream.
+        relay: >
+          Cross decoded NDJSON, never the raw J-Flow - the binary form is both
+          un-inspectable at the guard and template-dependent, so it would
+          strand records the moment a template packet is filtered. Once
+          decoded, the content-inspection surface is tiny: J-Flow carries no
+          free text, only typed numeric/address elements, so the custom NDJSON
+          content filter is trivial compared with the RT_FLOW structured-data
+          grammar. At-most-once crossing with no return channel - reconcile
+          low-side and high-side flow-record counts per hour to detect drops.
+      direct:
+        parse_location: high
+        cribl: >
+          High-side instances still need the UDP stream terminated by a
+          NetFlow decoder (Elastic Agent netflow input) before Cribl; there is
+          no pass-through option for binary J-Flow. Run the decoder with
+          Persistent Queue backpressure on the onward destination.
+        elastic: >
+          Run the netflow integration and add a logs-netflow.log@custom
+          pipeline that derives network.transport from the numeric
+          protocolIdentifier (the decoder lands only network.iana_number) and
+          folds the flow into the same device-to-site/owner enrichment the kv
+          RT_FLOW dataset uses. There is no policy name, application, NAT
+          translation or session outcome in J-Flow, so it is a throughput
+          signal, not a substitute for the session log, and must not be
+          pointed at the same logs-juniper_srx.log data stream.
+    fields:
+    - vendor: sourceIPv4Address
+      type: ip
+      description: IPFIX/v9 element 8 - flow source address
+      ecs: source.ip
+      status: mapped
+    - vendor: destinationIPv4Address
+      type: ip
+      description: IPFIX/v9 element 12 - flow destination address
+      ecs: destination.ip
+      status: mapped
+    - vendor: sourceTransportPort
+      type: port
+      description: IPFIX/v9 element 7 - L4 source port
+      ecs: source.port
+      status: partial
+      notes: >
+        for ICMP flows this slot is overloaded to carry the ICMP type/code
+        rather than a real port, so gate the source.port mapping on
+        protocolIdentifier not being 1 (ICMP) or 58 (ICMPv6)
+    - vendor: destinationTransportPort
+      type: port
+      description: IPFIX/v9 element 11 - L4 destination port
+      ecs: destination.port
+      status: mapped
+    - vendor: protocolIdentifier
+      type: integer
+      description: IPFIX/v9 element 4 - numeric IANA protocol number
+      ecs: network.iana_number
+      status: partial
+      transform: >
+        numeric only; network.transport (the field most alerting filters on)
+        must be derived by a protocol-number-to-name lookup, exactly as the kv
+        RT_FLOW dataset needs - the decoder populates only network.iana_number
+    - vendor: ipClassOfService
+      type: integer
+      description: IPFIX/v9 element 5 - IPv4 type-of-service / DSCP byte
+      ecs: null
+      status: unmapped
+      custom: juniper.srx.flow.ip_tos
+      notes: no ECS home for the raw ToS byte; keep as a short for DSCP/QoS pivots
+    - vendor: tcpControlBits
+      type: integer
+      description: IPFIX/v9 element 6 - cumulative OR of the TCP flags seen across the flow
+      ecs: null
+      status: unmapped
+      custom: juniper.srx.flow.tcp_flags
+      notes: >-
+        bitfield, not present on non-TCP flows; keep as a short rather than
+        exploding to booleans
+    - vendor: icmpTypeCodeIPv4
+      type: integer
+      description: IPFIX/v9 element 32 - combined ICMP type*256 + code for ICMP flows
+      ecs: null
+      status: unmapped
+      custom: juniper.srx.flow.icmp_type_code
+      notes: >-
+        only meaningful when protocolIdentifier is 1; split into type and code
+        downstream if needed
+    - vendor: ingressInterface
+      type: integer
+      description: IPFIX/v9 element 10 - SNMP ifIndex of the ingress interface
+      ecs: observer.ingress.interface.id
+      status: partial
+      notes: >
+        numeric ifIndex, not a name; resolve to
+        observer.ingress.interface.name via a per-device ifIndex lookup
+        low-side while the appliance is reachable
+    - vendor: egressInterface
+      type: integer
+      description: IPFIX/v9 element 14 - SNMP ifIndex of the egress interface
+      ecs: observer.egress.interface.id
+      status: partial
+      notes: same ifIndex-to-name resolution as ingressInterface
+    - vendor: ipNextHopIPv4Address
+      type: ip
+      description: IPFIX/v9 element 15 - forwarding next-hop address for the flow
+      ecs: null
+      status: unmapped
+      custom: juniper.srx.flow.ip_next_hop
+      notes: forwarding-plane routing detail with no ECS equivalent
+    - vendor: bgpNextHopIPv4Address
+      type: ip
+      description: IPFIX/v9 element 18 - BGP next-hop address for the flow
+      ecs: null
+      status: unmapped
+      custom: juniper.srx.flow.bgp_next_hop
+    - vendor: sourceIPv4PrefixLength
+      type: integer
+      description: IPFIX/v9 element 9 - source route prefix length (netmask bits)
+      ecs: null
+      status: unmapped
+      custom: juniper.srx.flow.source_mask
+    - vendor: destinationIPv4PrefixLength
+      type: integer
+      description: IPFIX/v9 element 13 - destination route prefix length (netmask bits)
+      ecs: null
+      status: unmapped
+      custom: juniper.srx.flow.destination_mask
+    - vendor: bgpSourceAsNumber
+      type: integer
+      description: IPFIX/v9 element 16 - source autonomous system number from the route lookup
+      ecs: source.as.number
+      status: mapped
+    - vendor: bgpDestinationAsNumber
+      type: integer
+      description: IPFIX/v9 element 17 - destination autonomous system number from the route lookup
+      ecs: destination.as.number
+      status: mapped
+    - vendor: octetDeltaCount
+      type: long
+      description: IPFIX/v9 element 1 - bytes counted in this flow direction
+      ecs: source.bytes
+      status: partial
+      notes: >
+        J-Flow exports unidirectional flows, so the forward record maps to
+        source.bytes and the matching reverse record to destination.bytes; a
+        consumer expecting a single bidirectional session (as RT_FLOW CLOSE
+        provides) must pair the two records itself
+    - vendor: packetDeltaCount
+      type: long
+      description: IPFIX/v9 element 2 - packets counted in this flow direction
+      ecs: source.packets
+      status: partial
+      notes: >-
+        directional in the same way as octetDeltaCount; the reverse-flow
+        record carries destination.packets
+    - vendor: minimumTTL
+      type: integer
+      description: IPFIX/v9 element 52 - minimum IP TTL observed on the flow
+      ecs: null
+      status: unmapped
+      custom: juniper.srx.flow.min_ttl
+    - vendor: maximumTTL
+      type: integer
+      description: IPFIX/v9 element 53 - maximum IP TTL observed on the flow
+      ecs: null
+      status: unmapped
+      custom: juniper.srx.flow.max_ttl
+    - vendor: flowStartMilliseconds
+      type: timestamp
+      description: >-
+        IPFIX element 152 - flow start as milliseconds since epoch (v9 uses
+        flowStartSysUpTime relative to device boot)
+      ecs: event.start
+      status: partial
+      transform: >
+        IPFIX carries an absolute epoch-millisecond value that parses
+        directly; NetFlow v9 instead expresses start as ms since device boot
+        and needs the sysUpTime/export epoch to become absolute. This is the
+        forwarding-plane flow clock, not the RFC 5424 syslog header time
+    - vendor: flowEndMilliseconds
+      type: timestamp
+      description: >-
+        IPFIX element 153 - flow end as milliseconds since epoch (v9 uses
+        flowEndSysUpTime)
+      ecs: event.end
+      status: partial
+      transform: >
+        same absolute-vs-sysUpTime conversion as flowStartMilliseconds;
+        event.duration is derived as event.end minus event.start
+  - format: other
+    enable: >
+      Switch the security log to stream mode and set the binary (or protobuf)
+      format on the stream: `set security log mode stream`, `set security log
+      source-address <srx-ip>`, `set security log stream <name> format binary`
+      (or `format protobuf`), `set security log stream <name> host
+      <collector-ip> port <port>`. The binary/protobuf formats are the
+      performance option for high-volume estates - they conserve CPU and log
+      space versus sd-syslog text - and apply stream-wide to every security-
+      log category (RT_FLOW here, RT_IDP and RT_UTM on the other datasets).
+      The stream is sent over UDP; JSA's default receive port for Juniper
+      binary events is 40798, deliberately distinct from the syslog port
+      because a syslog listener cannot read binary frames.
+    references:
+    - >-
+      https://www.juniper.net/documentation/us/en/software/junos/utm/topics/ref/statement/security-edit-format-logging-format-2.html
+    - >-
+      https://www.juniper.net/documentation/us/en/software/junos/network-mgmt/topics/topic-map/system-logging-for-a-security-device.html
+    - >-
+      https://www.juniper.net/documentation/us/en/software/jsa7.5.0/jsa-dsm/topics/concept/concept-jsa-dsm-juniper-networks-security-binary-log.html
+    parsing:
+      mechanism: none
+      notes: >
+        Neither the Elastic juniper_srx integration nor any stock Elastic
+        ingest processor decodes the Juniper binary or protobuf security-log
+        format - the integration expects sd-syslog text, and Cribl Stream has
+        no Juniper-binary reader either. The format is readable only by
+        Juniper Secure Analytics (JSA) / QRadar (Security Threat Response
+        Manager) through the Security Binary Log Collector protocol. On our
+        pipeline it is effectively opaque: landing it would produce
+        undecodable payloads. The field inventory is the same RT_FLOW set as
+        the sd-syslog form, but Junos publishes no third-party binary schema,
+        so it is recorded here as a gap.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Cribl cannot decode Juniper binary/protobuf, so there is no
+          pass-through that yields fields. Do not select this format for any
+          Elastic-bound SRX: if an estate already streams binary to JSA, add a
+          parallel sd-syslog destination (event mode `set system syslog host`,
+          or a second `set security log stream ... format sd-syslog`) and
+          route that copy to Cribl rather than attempting a conversion.
+        elastic: >
+          No Elastic integration or ingest pipeline parses the binary/
+          protobuf format; keep the Elastic-bound flow feed on sd-syslog so
+          the juniper_srx flow sub-pipeline can run. Binary is appropriate
+          only for a JSA/QRadar consumer, not for this pipeline.
+        relay: >
+          Never cross the binary/protobuf stream through the guard - it is
+          opaque UDP a content filter cannot inspect and nothing downstream
+          can parse, and the JSA-oriented framing gives no reconciliation
+          handle. If a low-side SRX must stream binary to a local JSA, add a
+          separate sd-syslog stream and relay that as the thin NDJSON envelope
+          used by the syslog-kv route instead.
+      direct:
+        parse_location: low
+        cribl: >
+          The Cribl/Elastic stack has no decoder for the binary/protobuf
+          frame, so keep the feed on sd-syslog and reserve binary/protobuf for
+          a JSA/QRadar destination only.
+        elastic: >
+          No Elastic-side parse is possible; the sd-syslog form remains the
+          only Elastic-consumable option for this dataset.
+    fields_omitted: >
+      The binary/protobuf stream re-encodes the same RT_FLOW
+      session-accounting set the syslog-kv (sd-syslog) entry inventories, but
+      Junos publishes no third-party schema for the frame - only JSA/QRadar
+      decodes it, over the Security Binary Log Collector protocol - so there
+      are no key names to record on this entry.
+    fields: []
+- id: idp
+  name: RT_IDP attack log
+  description: >
+    Intrusion detection and prevention events from the SRX IDP module -
+    IDP_ATTACK_LOG_EVENT for signature and anomaly matches, and
+    IDP_APPDDOS_APP_STATE_EVENT / IDP_APPDDOS_APP_ATTACK_EVENT for
+    application-level DDoS detections. Emitted under the RT_IDP process in the
+    same Junos structured-data format as RT_FLOW, and correlatable back to the
+    session record through the five-tuple. This is the forensically valuable
+    half of the SRX feed and the one a CSOC actually alerts on.
+  event_categories:
+  - network
+  - malware
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Arrives on the same syslog listener as RT_FLOW and is separated by the
+        RT_IDP process name in the message header.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-juniper_srx.log
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Arrives on the same syslog listener as RT_FLOW and is separated by the
+        RT_IDP process name in the message header.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-juniper_srx.log
+  formats:
+  - format: syslog-kv
+    parsing:
+      mechanism: elastic-integration
+      artifact: Juniper SRX integration (juniper_srx), idp sub-pipeline
+      notes: >
+        The default pipeline routes records whose syslog process is RT_IDP
+        into the idp sub-pipeline, which sets event.kind to alert and appends
+        event.category intrusion_detection for the IDP_ATTACK_LOG_EVENT and
+        IDP_APPDDOS_* tags.
+    fields:
+    - vendor: attack-name
+      type: string
+      description: >-
+        IDP signature or anomaly name that matched, e.g.
+        HTTP:MISC:GENERIC-DIR-TRAVERSAL, TROJAN:ZMEU-BOT-SCAN
+      ecs: null
+      status: unmapped
+      custom: juniper.srx.idp.attack_name
+      notes: >
+        the detection signature identity, and the single most important field
+        in the dataset. It is deliberately NOT mapped to rule.name: in this
+        dataset rule.name already holds the IDP policy rule (`rule-name`), so
+        pairing a signature name with a policy-rule id under one rule.* object
+        would mislead any consumer reading them as a name/id pair - unlike
+        Suricata, where rule.name and rule.id describe the same signature. It
+        is also not threat.indicator.* - those fields model an indicator
+        identity issued by a threat-intel provider, not a vendor detection
+    - vendor: threat-severity
+      type: enum
+      description: severity assigned to the attack - INFO, LOW, MEDIUM, HIGH or CRITICAL
+      ecs: event.severity
+      status: partial
+      transform: >
+        vendor emits uppercase strings; needs a lookup into the numeric ECS
+        event.severity scale before alerting thresholds can compare it. Note
+        the AppDDoS state events carry threat-severity="INFO", so a naive
+        severity filter picks them up as real detections
+    - vendor: action
+      type: enum
+      description: >-
+        what IDP did with the offending traffic - DROP, DROP_PACKET, CLOSE,
+        CLOSE_CLIENT, CLOSE_SERVER, IGNORE, NONE, RECOMMENDED
+      ecs: event.action
+      status: mapped
+      transform: >
+        copied to event.action verbatim, and additionally drives event.outcome
+        through a lookup - DROP, DROP_PACKET and the CLOSE* values are blocks
+        (failure for the attacker), NONE and IGNORE are detections only; the
+        stock integration pipeline sets event.outcome to success
+        unconditionally and needs overriding
+    - vendor: rule-name
+      type: string
+      description: >-
+        name of the IDP rule inside the rulebase that fired, frequently just
+        an ordinal such as "3" or "9"
+      ecs: rule.name
+      status: mapped
+      notes: >
+        this is the rule identity in the ECS sense; the stock integration
+        pipeline instead writes it to rule.id and puts rulebase-name in
+        rule.name, which is the deviation this map corrects
+    - vendor: policy-name
+      type: string
+      description: IDP policy the firing rule belongs to, e.g. Recommended
+      ecs: rule.ruleset
+      status: mapped
+      notes: the parent policy the rule is a member of, which is what ECS rule.ruleset models
+    - vendor: rulebase-name
+      type: string
+      description: which IDP rulebase raised the event - IPS, exempt, or DDOS
+      ecs: null
+      status: unmapped
+      custom: juniper.srx.idp.rulebase
+      notes: >
+        the rulebase is a container between the policy and the rule and has no
+        ECS home once rule.ruleset holds the policy. Beware: the
+        IDP_APPDDOS_APP_ATTACK_EVENT tag misspells this attribute as
+        `ruleebase-name` in shipping Junos releases, and the Elastic
+        integration carries the typo verbatim - normalize both spellings
+    - vendor: epoch-time
+      type: timestamp
+      description: device-side event time as Unix epoch seconds
+      ecs: null
+      status: partial
+      custom: juniper.srx.idp.epoch_time
+      transform: >
+        multiply to milliseconds and parse to a date; this is the SRX's own
+        clock for the detection, whereas @timestamp comes from the RFC 5424
+        syslog header. Keep both and reconcile - a divergence between them is
+        the cheapest available signal that a device's NTP has drifted
+    - vendor: message-type
+      type: enum
+      description: >-
+        detection engine that produced the record, e.g. SIG for a signature
+        match or ANOMALY for a protocol anomaly
+      ecs: null
+      status: unmapped
+      custom: juniper.srx.idp.message_type
+    - vendor: source-address
+      type: ip
+      description: attacker/source IP address of the offending session
+      ecs: source.ip
+      status: mapped
+    - vendor: source-port
+      type: port
+      description: source port of the offending session
+      ecs: source.port
+      status: mapped
+    - vendor: destination-address
+      type: ip
+      description: target IP address of the offending session
+      ecs: destination.ip
+      status: mapped
+    - vendor: destination-port
+      type: port
+      description: target port of the offending session
+      ecs: destination.port
+      status: mapped
+    - vendor: protocol-name
+      type: string
+      description: transport protocol of the offending session, uppercase, e.g. TCP or UDP
+      ecs: network.transport
+      status: partial
+      transform: >
+        lowercase before writing network.transport; ECS expects lowercase and
+        the stock integration pipeline maps this attribute to network.protocol
+        instead, which puts a transport value in the application-protocol
+        field
+    - vendor: application-name
+      type: string
+      description: application AppID identified on the attacked session, e.g. HTTP
+      ecs: network.application
+      status: partial
+      notes: carries the literal "NONE" or "N/A" when AppID did not classify the session
+    - vendor: source-zone-name
+      type: string
+      description: security zone the attack traffic entered from
+      ecs: observer.ingress.zone
+      status: mapped
+    - vendor: destination-zone-name
+      type: string
+      description: security zone the attack traffic was destined to
+      ecs: observer.egress.zone
+      status: mapped
+    - vendor: source-interface-name
+      type: string
+      description: logical interface the attack traffic arrived on, e.g. reth1.24
+      ecs: observer.ingress.interface.name
+      status: mapped
+    - vendor: destination-interface-name
+      type: string
+      description: logical interface the attack traffic was forwarded to, e.g. reth2.21
+      ecs: observer.egress.interface.name
+      status: mapped
+    - vendor: username
+      type: string
+      description: firewall-authenticated user on the attacked session
+      ecs: source.user.name
+      status: partial
+      notes: >-
+        usually the literal "N/A" or "unknown-user"; strip the placeholders
+        before mapping
+    - vendor: repeat-count
+      type: integer
+      description: number of times this attack was seen and suppressed into a single record
+      ecs: null
+      status: unmapped
+      custom: juniper.srx.idp.repeat_count
+      notes: >
+        ECS 9.4 has no event count field, so this stays custom; it must be
+        carried, because ignoring it undercounts attack volume by whatever the
+        device's IDP log suppression is configured to collapse
+    - vendor: packet-log-id
+      type: integer
+      description: identifier tying the record to the packet capture IDP stored for the detection
+      ecs: null
+      status: unmapped
+      custom: juniper.srx.idp.packet_log_id
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Pass through to the integration and keep _raw end-to-end on this
+          route - IDP events are IDS-class and the packet-log correlation
+          depends on the original record surviving. The low-side work worth
+          doing is enrichment and hygiene rather than parsing: attach the
+          device-to-site/owner lookup, and alert on the rate of
+          IDP_APPDDOS_APP_ATTACK_EVENT records that carry the misspelled
+          `ruleebase-name` attribute, which is how you detect a Junos release
+          whose structured-data grammar the pipeline has not caught up with.
+          Persistent Queue backpressure on the Elastic destination.
+        elastic: >
+          Use the stock idp sub-pipeline and override its rule handling in a
+          logs-juniper_srx.log@custom pipeline: the stock version writes
+          rulebase-name into rule.name and rule-name into rule.id, which pairs
+          two different objects under one rule.* document, so any dashboard
+          reading them as a name/id pair is wrong. Also translate
+          threat-severity from the INFO/LOW/MEDIUM/HIGH/CRITICAL string into
+          the numeric ECS event.severity scale so alert thresholds work, and
+          derive event.outcome from the action vocabulary rather than the
+          blanket success the pipeline sets - DROP, DROP_PACKET and CLOSE are
+          blocks, NONE and IGNORE are not. Add custom-namespace keyword
+          mappings for the attack name, rulebase and message type so
+          signature-frequency dashboards aggregate without relying on dynamic
+          mapping.
+        relay: >
+          Low-side instances cross the guard as a thin NDJSON envelope
+          ({_dataId, @timestamp, host, _raw}, UTF-8, LF-terminated,
+          compression disabled, nesting depth two) and keep _raw for this
+          dataset even though it is dropped on the flow route - attack records
+          are the ones an analyst will need to re-read verbatim. The
+          content-filter friction to settle with the guard owner is the
+          free-text attributes on the AppDDoS variants, `context-value` and
+          `message`, which carry attacker-controlled HTTP context (URLs,
+          headers) of unbounded length and arbitrary encoding; cap and
+          normalize them low-side so a custom NDJSON filter rule can stay
+          simple. At-most-once crossing - reconcile counts per (dataset,
+          hour).
+      direct:
+        parse_location: high
+        cribl: >
+          Pass through to the integration and keep _raw end-to-end on this
+          route - IDP events are IDS-class and the packet-log correlation
+          depends on the original record surviving. The work worth doing at
+          the edge worker group is enrichment and hygiene rather than parsing:
+          attach the device-to-site/owner lookup, and alert on the rate of
+          IDP_APPDDOS_APP_ATTACK_EVENT records that carry the misspelled
+          `ruleebase-name` attribute, which is how you detect a Junos release
+          whose structured-data grammar the pipeline has not caught up with.
+          Persistent Queue backpressure on the Elastic destination.
+        elastic: >
+          Use the stock idp sub-pipeline and override its rule handling in a
+          logs-juniper_srx.log@custom pipeline: the stock version writes
+          rulebase-name into rule.name and rule-name into rule.id, which pairs
+          two different objects under one rule.* document, so any dashboard
+          reading them as a name/id pair is wrong. Also translate
+          threat-severity from the INFO/LOW/MEDIUM/HIGH/CRITICAL string into
+          the numeric ECS event.severity scale so alert thresholds work, and
+          derive event.outcome from the action vocabulary rather than the
+          blanket success the pipeline sets - DROP, DROP_PACKET and CLOSE are
+          blocks, NONE and IGNORE are not. Add custom-namespace keyword
+          mappings for the attack name, rulebase and message type so
+          signature-frequency dashboards aggregate without relying on dynamic
+          mapping.
+  - format: other
+    enable: >
+      The same stream-wide setting as the flow dataset: `set security log mode
+      stream` with `set security log stream <name> format binary` (or `format
+      protobuf`) and `set security log stream <name> host <collector-ip> port
+      <port>`. Selecting binary/protobuf on the stream re-encodes every
+      security-log category, so the RT_IDP IDP_ATTACK_LOG_EVENT and
+      IDP_APPDDOS_* records are streamed in the binary frame alongside RT_FLOW
+      and RT_UTM; JSA classifies them as the IDP/IPS category on ingest. Sent
+      over UDP to the JSA binary port (default 40798), which cannot be a
+      syslog port.
+    references:
+    - >-
+      https://www.juniper.net/documentation/us/en/software/junos/utm/topics/ref/statement/security-edit-format-logging-format-2.html
+    - >-
+      https://www.juniper.net/documentation/us/en/software/junos/network-mgmt/topics/topic-map/system-logging-for-a-security-device.html
+    - >-
+      https://www.juniper.net/documentation/us/en/software/jsa7.5.0/jsa-dsm/topics/concept/concept-jsa-dsm-juniper-networks-security-binary-log.html
+    parsing:
+      mechanism: none
+      notes: >
+        As with the flow binary stream, no Elastic integration, Elastic ingest
+        processor, or Cribl function decodes the Juniper binary/ protobuf
+        format; it is readable only by JSA / QRadar via the Security Binary
+        Log Collector protocol. The underlying field set is the same RT_IDP
+        inventory as the sd-syslog form (attack name, severity, action,
+        rulebase, five-tuple), but there is no published third-party binary
+        schema, so it is recorded as a gap. IDP events are the forensically
+        valuable half of the SRX feed, which makes an un-parseable binary form
+        a poor choice for a SIEM-bound stream.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          No Cribl decoder exists for the binary/protobuf frame, so it cannot
+          be parsed or usefully forwarded on the Elastic path. Do not select
+          binary for an Elastic-bound IDP feed; keep RT_IDP on sd-syslog (the
+          format the idp sub-pipeline is written against) and reserve binary
+          for a JSA/QRadar consumer. Where both consumers exist, run a
+          parallel sd-syslog stream for the Cribl/Elastic path.
+        elastic: >
+          The juniper_srx idp sub-pipeline expects sd-syslog text and cannot
+          read binary/protobuf; landing the binary stream would lose every
+          attack field. Keep the IDP feed on sd-syslog.
+        relay: >
+          Do not cross the binary/protobuf stream - it is opaque to the
+          content filter and un-parseable high-side, and losing IDP records to
+          an undecodable format is the worst outcome for the one dataset a
+          CSOC actually alerts on. Relay the sd-syslog form as the thin NDJSON
+          envelope instead, keeping _raw as the syslog-kv route does.
+      direct:
+        parse_location: low
+        cribl: >
+          No decoder in the Cribl/Elastic stack reads the binary/protobuf
+          frame, so keep RT_IDP on sd-syslog and use binary only for a
+          JSA/QRadar destination.
+        elastic: >
+          No Elastic-side parse is possible; sd-syslog is the only
+          Elastic-consumable option for the IDP dataset.
+    fields_omitted: >
+      Selecting binary/protobuf on the stream re-encodes the same RT_IDP
+      attack name, severity, action, rulebase and five-tuple the syslog-kv
+      (sd-syslog) entry inventories, but Junos documents no third-party schema
+      for the binary frame - it is readable only by JSA/QRadar via the
+      Security Binary Log Collector protocol - so no key-level list can be
+      given here.
+    fields: []
+- id: utm
+  name: RT_UTM content security log
+  description: >
+    Unified Threat Management events from the SRX content security suite -
+    WEBFILTER_URL_BLOCKED / WEBFILTER_URL_PERMITTED from enhanced web
+    filtering, AV_VIRUS_DETECTED_MT and the AV_*_DROPPED_MT family from the
+    antivirus engine, plus CONTENT_FILTERING_BLOCKED_MT and
+    ANTISPAM_SPAM_DETECTED_MT. All arrive under the RT_UTM process in Junos
+    structured-data format. The attribute set differs noticeably between
+    message tags within this one process - webfilter uses `profile` and
+    `source-zone`, antivirus uses `profile-name` and `source-zone-name` -
+    which is the main parsing hazard here.
+  event_categories:
+  - web
+  - malware
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same syslog listener as the other two datasets, separated by the
+        RT_UTM process name.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-juniper_srx.log
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Same syslog listener as the other two datasets, separated by the
+        RT_UTM process name.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-juniper_srx.log
+  formats:
+  - format: syslog-kv
+    parsing:
+      mechanism: elastic-integration
+      artifact: Juniper SRX integration (juniper_srx), utm sub-pipeline
+    fields:
+    - vendor: source-address
+      type: ip
+      description: IP address of the client that made the request
+      ecs: source.ip
+      status: mapped
+    - vendor: source-port
+      type: port
+      description: source port of the client request
+      ecs: source.port
+      status: mapped
+    - vendor: destination-address
+      type: ip
+      description: IP address of the server the request was made to
+      ecs: destination.ip
+      status: mapped
+    - vendor: destination-port
+      type: port
+      description: destination port of the request, typically 80 or 443
+      ecs: destination.port
+      status: mapped
+    - vendor: source-zone
+      type: string
+      description: security zone the request originated in
+      ecs: observer.ingress.zone
+      status: partial
+      notes: >
+        spelled `source-zone` on the webfilter, antispam and content-filtering
+        tags but `source-zone-name` on the antivirus tags; both spellings have
+        to be normalized onto the same ECS field
+    - vendor: destination-zone
+      type: string
+      description: security zone the request was destined to
+      ecs: observer.egress.zone
+      status: partial
+      notes: same `-zone` versus `-zone-name` inconsistency as source-zone
+    - vendor: url
+      type: string
+      description: hostname of the requested resource, e.g. dsp.adfarm1.adition.com
+      ecs: url.domain
+      status: partial
+      notes: >
+        despite the attribute name this carries only the host, not a URL; on
+        the AV_VIRUS_DETECTED_MT tag the same attribute is reused for the
+        virus signature name, so the mapping must be gated on the message tag
+    - vendor: obj
+      type: string
+      description: path portion of the requested resource, e.g. /css/homepage2012.css
+      ecs: url.path
+      status: mapped
+      transform: >-
+        concatenate with the `url` attribute to populate url.full, which no
+        single vendor attribute provides
+    - vendor: category
+      type: string
+      description: >-
+        enhanced web filtering category of the requested site, e.g.
+        Enhanced_Advertisements
+      ecs: null
+      status: unmapped
+      custom: juniper.srx.utm.category
+      notes: >
+        vendor URL taxonomy with no ECS equivalent; deliberately not mapped to
+        rule.category, which models the category of the detection rule rather
+        than of the requested resource
+    - vendor: reason
+      type: string
+      description: >-
+        why the request was blocked or permitted, e.g. BY_BLACK_LIST,
+        BY_SITE_REPUTATION_SUSPICIOUS, "exceeding maximum content size"
+      ecs: event.reason
+      status: mapped
+      notes: >-
+        an enum on the webfilter tags but free-text prose on the antivirus and
+        content-filtering tags
+    - vendor: action
+      type: enum
+      description: what the UTM engine did, e.g. BLOCKED, drop, permit
+      ecs: event.action
+      status: partial
+      transform: >
+        case is inconsistent across message tags (BLOCKED uppercase on
+        antivirus, drop lowercase on antispam) so lowercase before mapping,
+        and drive event.outcome from it - no attribute in this dataset carries
+        an outcome. The WEBFILTER_URL_BLOCKED/PERMITTED tags carry no action
+        attribute at all and the outcome has to come from the tag name
+    - vendor: profile
+      type: string
+      description: UTM profile that made the decision, e.g. WCF1 for a web filtering profile
+      ecs: null
+      status: unmapped
+      custom: juniper.srx.utm.profile
+      notes: >
+        spelled `profile-name` on the antivirus, antispam and
+        content-filtering tags. Kept custom rather than mapped to rule.name -
+        a UTM profile is a configuration object applied to a policy, not the
+        rule that generated the event
+    - vendor: name
+      type: string
+      description: >-
+        antivirus signature name of the detected malware, e.g. EICAR-Test-File
+        (AV tags only)
+      ecs: null
+      status: unmapped
+      custom: juniper.srx.utm.virus_name
+      notes: >
+        the AV detection signature name. Not threat.indicator.* - that models
+        threat-intel provider indicator identity, not a vendor detection - and
+        not rule.name, which would conflate the malware signature with the UTM
+        profile object that applied it. ECS 9.4 offers no scanner-verdict
+        field, so this stays custom
+    - vendor: filename
+      type: string
+      description: file the antivirus or content filter acted on
+      ecs: file.name
+      status: partial
+      notes: >
+        on the AV tags this is not a bare filename but a host-plus-path string
+        such as www.eicar.org/download/eicar.com, so it needs splitting before
+        file.name is meaningful; the host portion belongs in url.domain and
+        the trailing component in file.name
+    - vendor: protocol
+      type: string
+      description: application protocol the filtered traffic used, e.g. http
+      ecs: network.protocol
+      status: mapped
+      notes: >-
+        present on the content-filtering tags; absent from the webfilter tags
+        where it is implied
+    - vendor: username
+      type: string
+      description: authenticated user who made the request
+      ecs: source.user.name
+      status: partial
+      notes: >
+        the most likely place in the whole technology for a real username to
+        appear, but still carries the literal "N/A" when firewall
+        authentication is not in use; values may be UPN-shaped
+        (user01@testuser.com) and need no further parsing
+    - vendor: roles
+      type: string
+      description: firewall authentication roles assigned to the user
+      ecs: source.user.roles
+      status: partial
+      notes: >
+        a single comma-separated string that has to be split into the array
+        ECS expects; almost always the literal "N/A" outside a Junos user
+        identity deployment
+    - vendor: session-id
+      type: string
+      description: flow session identifier the UTM event was raised on
+      ecs: null
+      status: unmapped
+      custom: juniper.srx.utm.session_id
+      notes: >
+        joins the record back to the RT_FLOW session; note the flow dataset
+        spells the same value session-id-32, so both must land on a
+        consistently mapped keyword field for the correlation to work
+    - vendor: error-code
+      type: integer
+      description: >-
+        antivirus engine error code when a file could not be scanned, e.g. 7
+        for oversize content or 14 for a scan engine that is not ready
+      ecs: null
+      status: unmapped
+      custom: juniper.srx.utm.error_code
+      notes: >
+        numeric scanner failure code; these records represent traffic that was
+        NOT inspected, so a nonzero error-code is a detection-coverage gap and
+        should be alerted on separately rather than folded in with virus hits
+    - vendor: urlcategory-risk
+      type: integer
+      description: numeric risk score the enhanced web filtering feed assigns to the URL category
+      ecs: event.risk_score
+      status: partial
+      notes: >-
+        vendor scale is small-integer (0 for safe, 3 for suspicious in
+        observed records) and is not the 0-100 scale most ECS risk-score
+        consumers assume
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Pass through and let the integration parse, but normalize the two
+          attribute-name inconsistencies low-side where a rename is a single
+          line rather than a conditional in an ingest pipeline: fold
+          `profile-name` onto `profile` and
+          `source-zone-name`/`destination-zone-name` onto
+          `source-zone`/`destination-zone` across the RT_UTM message tags.
+          Drop the WEBFILTER_URL_PERMITTED tag at the source or low-side
+          unless the CSOC has a stated use for permitted-browsing telemetry -
+          it is most of this dataset's volume and almost none of its value.
+          Persistent Queue backpressure on the Elastic destination.
+        elastic: >
+          Run the stock utm sub-pipeline and add a logs-juniper_srx.log@custom
+          pipeline that reassembles a usable URL: the vendor splits the
+          request across `url` (host only, despite the field name) and `obj`
+          (path), so concatenate them into url.full rather than leaving
+          analysts to join url.domain and url.path by hand. Derive
+          event.outcome from the tag family and the action vocabulary (BLOCKED
+          and drop are failures, PERMITTED is success) since no attribute
+          carries it, and add custom-namespace keyword mappings for the URL
+          category, the profile name and the antivirus signature name so
+          web-category and malware dashboards aggregate correctly.
+        relay: >
+          Low-side instances cross the guard as the same thin NDJSON envelope
+          used by the other two datasets so the guard sees one schema for all
+          of Juniper SRX. This is the dataset with the worst content-filter
+          profile on the technology: URLs and antivirus filenames are
+          attacker-influenced, kilobyte-scale, and routinely carry
+          percent-encoded and non-ASCII bytes, so cap their length and
+          normalize the encoding low-side before the guard destination rather
+          than relying on the filter to cope. Keep _raw for the antivirus tags
+          and drop it for WEBFILTER_URL_PERMITTED. At-most-once crossing -
+          reconcile counts per (dataset, hour).
+      direct:
+        parse_location: high
+        cribl: >
+          Pass through and let the integration parse, but normalize the two
+          attribute-name inconsistencies at the edge worker group where a
+          rename is a single line rather than a conditional in an ingest
+          pipeline: fold `profile-name` onto `profile` and
+          `source-zone-name`/`destination-zone-name` onto
+          `source-zone`/`destination-zone` across the RT_UTM message tags.
+          Drop the WEBFILTER_URL_PERMITTED tag at the source unless the CSOC
+          has a stated use for permitted-browsing telemetry - it is most of
+          this dataset's volume and almost none of its value. Persistent Queue
+          backpressure on the Elastic destination.
+        elastic: >
+          Run the stock utm sub-pipeline and add a logs-juniper_srx.log@custom
+          pipeline that reassembles a usable URL: the vendor splits the
+          request across `url` (host only, despite the field name) and `obj`
+          (path), so concatenate them into url.full rather than leaving
+          analysts to join url.domain and url.path by hand. Derive
+          event.outcome from the tag family and the action vocabulary (BLOCKED
+          and drop are failures, PERMITTED is success) since no attribute
+          carries it, and add custom-namespace keyword mappings for the URL
+          category, the profile name and the antivirus signature name so
+          web-category and malware dashboards aggregate correctly.
+  - format: other
+    enable: >
+      The same stream-wide setting as the other two datasets: `set security
+      log mode stream` with `set security log stream <name> format binary` (or
+      `format protobuf`) and `set security log stream <name> host
+      <collector-ip> port <port>`. Because the format is a property of the
+      stream and not of the message tag, the RT_UTM WEBFILTER_*,
+      AV_VIRUS_DETECTED_MT, CONTENT_FILTERING_* and ANTISPAM_* records are all
+      re-encoded into the binary frame; JSA maps them onto its content-
+      security categories on ingest. Streamed over UDP to the JSA binary port
+      (default 40798).
+    references:
+    - >-
+      https://www.juniper.net/documentation/us/en/software/junos/utm/topics/ref/statement/security-edit-format-logging-format-2.html
+    - >-
+      https://www.juniper.net/documentation/us/en/software/junos/network-mgmt/topics/topic-map/system-logging-for-a-security-device.html
+    - >-
+      https://www.juniper.net/documentation/us/en/software/jsa7.5.0/jsa-dsm/topics/concept/concept-jsa-dsm-juniper-networks-security-binary-log.html
+    parsing:
+      mechanism: none
+      notes: >
+        No Elastic integration, Elastic ingest processor, or Cribl function
+        decodes the Juniper binary/protobuf format; only JSA / QRadar reads it
+        via the Security Binary Log Collector protocol. The field set is the
+        same RT_UTM inventory as the sd-syslog form (the split url/obj URL
+        parts, category, action, profile, antivirus signature name, session
+        id), but there is no published third-party binary schema, so it is
+        recorded as a gap. The RT_UTM tags already differ in their attribute
+        spellings between message tags; the binary form offers no relief there
+        because it is un-parseable on our side at all.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          No Cribl decoder exists for the binary/protobuf frame. Do not select
+          binary for an Elastic-bound UTM feed; keep RT_UTM on sd-syslog so
+          the utm sub-pipeline (and the low-side profile-name/source-zone-name
+          normalization the deployed map calls for) can run. Reserve binary
+          for a JSA/QRadar consumer, running a parallel sd-syslog stream where
+          both are needed.
+        elastic: >
+          The juniper_srx utm sub-pipeline expects sd-syslog text and cannot
+          read binary/protobuf; the URL-reassembly and category work the
+          deployed map specifies all depend on the parsed sd-syslog fields.
+          Keep the UTM feed on sd-syslog.
+        relay: >
+          Do not cross the binary/protobuf stream - it is opaque to the
+          content filter and un-parseable high-side. This dataset already has
+          the worst content-filter profile (kilobyte-scale, attacker-
+          influenced URLs and filenames); an opaque binary frame removes the
+          ability to cap and normalize that content low-side, which the
+          deployed relay depends on. Relay the sd-syslog form as the thin
+          NDJSON envelope instead.
+      direct:
+        parse_location: low
+        cribl: >
+          No decoder in the Cribl/Elastic stack reads the binary/protobuf
+          frame, so keep RT_UTM on sd-syslog and use binary only for a
+          JSA/QRadar destination.
+        elastic: >
+          No Elastic-side parse is possible; sd-syslog is the only
+          Elastic-consumable option for the UTM dataset.
+    fields_omitted: >
+      The binary/protobuf frame carries the same RT_UTM content the syslog-kv
+      (sd-syslog) entry inventories - the split url/obj URL parts, category,
+      action, profile, antivirus signature name and session id - but Junos
+      publishes no third-party schema for it, and only JSA/QRadar reads it
+      over the Security Binary Log Collector protocol, so there are no per-tag
+      key names to list.
+    fields: []

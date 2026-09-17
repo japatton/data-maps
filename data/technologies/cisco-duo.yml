@@ -1,0 +1,1024 @@
+id: cisco-duo
+name: Cisco Duo MFA
+vendor: Cisco
+versions: >-
+  Duo Admin API v1/v2 (Duo Essentials, Advantage, Premier; Duo Federal
+  Essentials/Advantage)
+draft: true
+references:
+- https://duo.com/docs/adminapi
+- https://duo.com/docs/administration-reporting
+- https://duo.com/docs/duo-federal-guide
+- https://www.elastic.co/docs/reference/integrations/cisco_duo
+- https://github.com/elastic/integrations/tree/main/packages/cisco_duo
+datasets:
+- id: auth
+  name: Authentication log
+  description: >
+    Second-factor authentication attempts pulled from the Duo Admin API v2
+    authentication log endpoint (/admin/v2/logs/authentication). One record
+    per 2FA attempt or enrollment, carrying the access device (the endpoint
+    the user came from), the auth device (the phone or token that answered),
+    the protected application, and the allow/deny verdict with its policy
+    reason. This is the primary Duo dataset a SOC ingests: it is where MFA
+    fatigue/push-bombing, user-reported fraud, impossible-travel, and
+    bypass-code abuse are visible. Duo is SaaS, so the collector polls an
+    api-XXXXXXXX.duosecurity.com host over HTTPS; Duo Federal (FedRAMP)
+    tenants use the api-XXXXXXXX.duofederal.com domain instead, which changes
+    the collector's endpoint and its egress allow-list but not the record
+    schema.
+  event_categories:
+  - authentication
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        A Cribl REST/API collector polls the Duo Admin API directly. Because
+        Duo is internet-facing SaaS, the poller can only run on a worker group
+        with outbound internet reachability, so on the guarded path the
+        collector is necessarily low-side even though the vendor emits no
+        syslog.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cisco_duo.auth
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        A Cribl REST/API collector polls the Duo Admin API directly. Because
+        Duo is internet-facing SaaS, the poller runs on a worker group with
+        outbound internet reachability.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cisco_duo.auth
+  formats:
+  - format: api-pull
+    parsing:
+      mechanism: elastic-integration
+      artifact: Cisco Duo integration (auth data stream)
+      notes: >
+        The Elastic cisco_duo integration is genuine and actively maintained,
+        with data streams for activity, admin, auth, offline_enrollment,
+        summary, telephony, telephony_v2 and trust_monitor. Its auth ingest
+        pipeline already renames the v2 JSON into cisco_duo.auth.*,
+        geo/ASN-enriches both device IPs, and builds user_agent.* from the
+        access_device browser/OS strings without a user_agent processor.
+    fields:
+    - vendor: timestamp
+      type: integer
+      description: Unix epoch seconds at which the authentication attempt was recorded
+      ecs: '@timestamp'
+      status: mapped
+      transform: >-
+        epoch seconds; the integration's date processor parses it as UNIX. The
+        record also carries an ISO8601 isotimestamp with the same value, which
+        is kept only as a redundant copy
+    - vendor: user.name
+      type: string
+      description: Duo username of the account that attempted the second factor
+      ecs: user.name
+      status: mapped
+    - vendor: user.key
+      type: string
+      description: 'Duo''s opaque unique identifier for the user object'
+      ecs: user.id
+      status: mapped
+    - vendor: email
+      type: string
+      description: email address of the user if known to Duo, otherwise empty
+      ecs: user.email
+      status: mapped
+    - vendor: alias
+      type: string
+      description: >-
+        the username alias the subject actually typed at login, when it
+        differs from the canonical Duo username
+      ecs: null
+      status: unmapped
+      custom: cisco_duo.auth.alias
+      notes: >-
+        alias-vs-canonical mismatch is a useful correlation key; ECS has no
+        alias-of-user field, so user.name stays the canonical value
+    - vendor: result
+      type: enum
+      description: verdict of the authentication attempt - success, denied, or fraud
+      ecs: event.outcome
+      status: partial
+      transform: success maps to success; denied and fraud both map to failure
+      notes: >
+        three vendor values collapse into two ECS values. "fraud" means the
+        user explicitly reported the push as fraudulent and is materially
+        different from a policy denial, so the raw value must be retained in
+        cisco_duo.auth.result and alerted on separately
+    - vendor: reason
+      type: enum
+      description: >-
+        policy or user reason behind the result, e.g. user_approved,
+        user_denied, location_restricted, out_of_date, bypass_user
+      ecs: event.reason
+      status: mapped
+    - vendor: factor
+      type: enum
+      description: >-
+        second-factor method used - duo_push, sms_passcode, phone_call,
+        u2f_token, hardware_token, bypass_code, remembered_device, and similar
+      ecs: null
+      status: unmapped
+      custom: cisco_duo.auth.factor
+      notes: >
+        ECS has no MFA-factor field. This is the discriminator for weak-factor
+        and bypass-code alerting, so it needs an explicit keyword mapping
+        rather than dynamic typing
+    - vendor: event_type
+      type: enum
+      description: kind of activity logged - authentication or enrollment
+      ecs: event.action
+      status: mapped
+      notes: >-
+        only two values, so event.action is coarse; the operationally
+        interesting verb is the factor field, not this
+    - vendor: txid
+      type: string
+      description: transaction ID uniquely identifying this authentication event
+      ecs: event.id
+      status: mapped
+      notes: >-
+        the same txid appears on the telephony_v2 record for any SMS or phone
+        call this attempt generated, making it the join key between the two
+        datasets
+    - vendor: application.name
+      type: string
+      description: >-
+        name of the Duo-protected application or integration the user was
+        authenticating into
+      ecs: null
+      status: unmapped
+      custom: cisco_duo.auth.application.name
+      notes: >
+        not service.name, which describes the service the data was collected
+        from (Duo itself); this is the relying party being accessed and there
+        is no ECS field for it
+    - vendor: access_device.ip
+      type: ip
+      description: IP address of the endpoint the user accessed the protected application from
+      ecs: source.ip
+      status: mapped
+    - vendor: access_device.hostname
+      type: string
+      description: >-
+        hostname of the access endpoint, populated only where Duo Desktop or
+        trusted endpoints reporting is deployed
+      ecs: source.address
+      status: partial
+      notes: >
+        the stock integration writes this to source.address and appends it to
+        related.hosts but never to host.name, so the authentication alerting
+        profile's required host.name is empty on every Duo record; it is also
+        sparse, present only for managed endpoints
+    - vendor: access_device.browser
+      type: string
+      description: 'browser name reported by the access device''s user agent'
+      ecs: user_agent.name
+      status: mapped
+    - vendor: access_device.os
+      type: string
+      description: operating system of the access device, e.g. "Mac OS X", "Windows"
+      ecs: user_agent.os.name
+      status: mapped
+      transform: >-
+        copied straight from the vendor string; no user_agent parser runs, so
+        the value is Duo's own label rather than a parsed UA token
+    - vendor: access_device.location.country
+      type: string
+      description: 'country Duo attributes to the access device''s IP address'
+      ecs: source.geo.country_name
+      status: partial
+      notes: >
+        Duo's own geolocation, which is resolved independently of the geoip
+        processor the integration also runs against access_device.ip; the two
+        can disagree and the vendor value is a country name, not an ISO code
+    - vendor: auth_device.ip
+      type: ip
+      description: IP address of the device that answered the second factor
+      ecs: null
+      status: unmapped
+      custom: cisco_duo.auth.auth_device.ip
+      notes: >
+        deliberately not source.ip - that belongs to the access device.
+        Comparing this against access_device.ip is the basis of access/auth
+        device geo-mismatch detections
+    - vendor: auth_device.name
+      type: string
+      description: >-
+        display name of the authenticating device, commonly a masked or full
+        phone number
+      ecs: null
+      status: unmapped
+      custom: cisco_duo.auth.auth_device.name
+      notes: >-
+        frequently carries PII in the form of a subscriber phone number; mask
+        or hash before it leaves the collector
+    - vendor: trusted_endpoint_status
+      type: enum
+      description: >-
+        whether the access device was recognised as a managed/trusted endpoint
+        at the time of the attempt
+      ecs: null
+      status: unmapped
+      custom: cisco_duo.auth.trusted_endpoint_status
+      notes: >-
+        primary signal for "MFA succeeded from an unmanaged device"
+        detections; no ECS device-trust field exists
+    - vendor: adaptive_trust_assessments.more_secure_auth.trust_level
+      type: enum
+      description: >-
+        risk-based authentication trust level assigned to the attempt - one of
+        ERROR, LOW, NORMAL, UNKNOWN, UNSET
+      ecs: null
+      status: unmapped
+      custom: cisco_duo.auth.adaptive_trust_assessments.more_secure_auth.trust_level
+      notes: >
+        three levels deep in the vendor JSON; flatten to a dotted single-level
+        key before any guard crossing, and note the value is absent entirely
+        on tenants without risk-based auth licensed
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Keep the worker group a pass-through for the API collector's JSON -
+          the integration pipeline is the parser - and spend low-side effort
+          on collection correctness instead: checkpoint the poll window on
+          mintime/maxtime so a restart neither gaps nor double-counts, and run
+          Persistent Queue backpressure on the Elastic destination so Duo's
+          API rate limits never turn into dropped pages. Redact or hash the
+          auth_device.name value here, since it frequently contains a full
+          phone number, and pin the collector endpoint per tenant domain
+          (duosecurity.com vs duofederal.com) rather than hardcoding one.
+        elastic: >
+          Parse with the stock cisco_duo integration and add a
+          logs-cisco_duo.auth@custom pipeline that fixes the outcome collapse:
+          the shipped pipeline sets event.outcome to success only when result
+          equals "success", so denied and fraud both land as failure and
+          user-reported fraud - the single highest-signal Duo event - becomes
+          unqueryable without reading cisco_duo.auth.result. Populate
+          host.name from access_device.hostname (the stock pipeline only
+          writes source.address and related.hosts), because the authentication
+          alerting profile requires host.name and it is otherwise empty on
+          every Duo record. Add explicitly typed custom-namespace mappings for
+          cisco_duo.auth.factor, .trusted_endpoint_status, .application.name
+          and the adaptive-trust trust_level so push-fatigue and
+          untrusted-endpoint detections index as keyword rather than by
+          dynamic mapping.
+        relay: >
+          Low-side instances cross as a thin envelope (mode A) - {_dataId,
+          @timestamp, host, _raw} with the Duo JSON in _raw and extraction
+          left to the integration - since a good Elastic integration exists.
+          The specific friction to settle with the guard owner is shape, not
+          volume: Duo v2 auth records nest three levels deep
+          (adaptive_trust_assessments.more_secure_auth.trust_level) and carry
+          a free-form security_agents array that Elastic types as flattened,
+          both of which break the shallow-nesting, allowlisted-key constraint
+          a custom NDJSON content filter needs. Flatten those two subtrees to
+          dotted single-level keys low-side before the crossing. Nothing
+          CEF-shaped is involved - this is an API pull, not syslog - and with
+          no return channel, reconcile low-side and high-side record counts
+          per (dataset, hour) against the Duo API's own page counts.
+      direct:
+        parse_location: high
+        cribl: >
+          Keep the worker group a pass-through for the API collector's JSON -
+          the integration pipeline is the parser - and spend that effort on
+          collection correctness instead: checkpoint the poll window on
+          mintime/maxtime so a restart neither gaps nor double-counts, and run
+          Persistent Queue backpressure on the Elastic destination so Duo's
+          API rate limits never turn into dropped pages. Redact or hash the
+          auth_device.name value here, since it frequently contains a full
+          phone number, and pin the collector endpoint per tenant domain
+          (duosecurity.com vs duofederal.com) rather than hardcoding one.
+        elastic: >
+          Parse with the stock cisco_duo integration and add a
+          logs-cisco_duo.auth@custom pipeline that fixes the outcome collapse:
+          the shipped pipeline sets event.outcome to success only when result
+          equals "success", so denied and fraud both land as failure and
+          user-reported fraud - the single highest-signal Duo event - becomes
+          unqueryable without reading cisco_duo.auth.result. Populate
+          host.name from access_device.hostname (the stock pipeline only
+          writes source.address and related.hosts), because the authentication
+          alerting profile requires host.name and it is otherwise empty on
+          every Duo record. Add explicitly typed custom-namespace mappings for
+          cisco_duo.auth.factor, .trusted_endpoint_status, .application.name
+          and the adaptive-trust trust_level so push-fatigue and
+          untrusted-endpoint detections index as keyword rather than by
+          dynamic mapping.
+  - format: syslog-cef
+    enable: >
+      Install the official Duo agent with "pip install duologsync" on a host
+      that has outbound HTTPS to the tenant's api-XXXXXXXX.duosecurity.com (or
+      .duofederal.com) endpoint and network reach to the syslog collector. In
+      the Duo Admin Panel create an Admin API application with the "Grant read
+      log" permission and put its integration key, secret key and API hostname
+      in the DLS config.yml. Set dls_settings.log_format to CEF (the default
+      is JSON), then under endpoint_server_mappings list "auth" against a
+      named server, and define that server's protocol (TCP, TCPSSL, or UDP),
+      hostname and port. Run "duologsync -c config.yml": DLS polls the v2
+      authentication endpoint on the mintime/maxtime contract and writes one
+      CEF line per 2FA record to the collector. The CEF header is fixed as
+      "CEF:0|Duo Security|DuoLogSync|<ver>|<eventtype>|<eventtype>|5|", with
+      the fields below carried in the extension; custom keys ride in cs1..cs3
+      with a matching cs1Label..cs3Label naming each one.
+    references:
+    - https://github.com/duosecurity/duo_log_sync/blob/master/README.md
+    - >-
+      https://github.com/duosecurity/duo_log_sync/blob/master/duologsync/consumer/authlog_consumer.py
+    - >-
+      https://github.com/duosecurity/duo_log_sync/blob/master/duologsync/consumer/cef.py
+    - >-
+      https://community.cisco.com/t5/duo-release-notes/announcing-duo-log-sync-fetch-duo-logs-for-ingestion-into-a-siem/ta-p/4878802
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Duo CEF unroll pipeline (no stock cisco_duo CEF path)
+      notes: >
+        The Elastic cisco_duo integration parses only the JSON Admin API
+        record; it has no CEF ingest pipeline, so the CEF variant cannot ride
+        the stock integration. A generic CEF/Elastic-CEF decode yields
+        cef.extensions.* keyed by the raw CEF labels (src, dhost, duser, cs1
+        with cs1Label=integration, and so on), not the cisco_duo.auth.*
+        namespace, so a hand-built Cribl pipeline (or a bespoke ingest
+        pipeline) must decode the header and extension and re-map the cs#/
+        cs#Label pairs by name. This format is materially LOSSY: DLS's CEF
+        mapping carries only eight values (timestamp, user.name,
+        access_device.ip, access_device host, application.name, eventtype,
+        factor, result) and drops the entire high-signal remainder of the v2
+        record - reason, auth_device.ip/name, trusted_endpoint_status, the
+        adaptive_trust trust_level, access_device os/browser/location, alias,
+        email, user.key and txid - none of which are recoverable downstream.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Prefer the api-pull path; only adopt this CEF feed if a downstream
+          CEF-only consumer forces it, and even then run DLS in its default
+          JSON mode rather than CEF unless the consumer specifically demands
+          CEF, because CEF discards most of the record. If CEF is unavoidable,
+          decode it at the edge worker group: split the header on "|" to
+          recover the CEF version, device vendor/product and the eventtype
+          signature, extract the extension into fields, then resolve every
+          cs1..cs3 value against its cs#Label so "integration", "event_type"
+          and "factor" become stable named keys before anything crosses - the
+          positional cs# slots are not self-describing and must not be carried
+          raw. Convert rt from CEF milliseconds back to the event time, and
+          redact any subscriber phone number that appears in a device value
+          here, exactly as on the JSON path. Keep the DLS agent's own
+          checkpoint file durable so a restart neither gaps nor double-counts,
+          since DLS owns the poll window in this topology, not Cribl.
+        elastic: >
+          There is no cisco_duo CEF pipeline to inherit, so if these records
+          land as CEF they need a dedicated logs-cisco_duo.auth@custom (or a
+          generic CEF) ingest pipeline that maps duser to user.name, src to
+          source.ip, dhost to source.address, rt to @timestamp and outcome to
+          event.outcome, and lifts the cs1/cs2/cs3 values into
+          cisco_duo.auth.application.name, event.action and
+          cisco_duo.auth.factor. Replicate the JSON path's event.outcome fix:
+          CEF's "outcome" is the raw result string, so denied and fraud must
+          be split out rather than both flattened to failure - but note the
+          CEF feed cannot distinguish a user-reported fraud from a policy
+          denial as richly as the JSON reason field does, which is the
+          strongest argument for not migrating this dataset to CEF at all.
+        relay: >
+          A CEF line is a single flat string, which is friendlier to a
+          shallow-nesting content filter than the three-levels-deep JSON
+          record - that is CEF's one advantage on the crossing. But the
+          cs#/cs#Label indirection is the friction: an allowlisted-key filter
+          sees opaque cs1/cs2/cs3 slots whose meaning lives in the paired
+          label field, so resolve those to named keys low-side before the
+          guard rather than asking the filter to reason about positional
+          custom-string columns. Cap the extension length, and because CEF has
+          already discarded the deep adaptive_trust and security_agents
+          subtrees, the specific nested-structure friction that the JSON feed
+          carries does not arise here. With no return channel, reconcile
+          low-side and high-side record counts per (dataset, hour); DLS's
+          per-endpoint checkpoint gives the low-side count to reconcile
+          against.
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side tenant whose Elastic stack is on the same side,
+          decode the CEF at the edge worker group: split the header on "|" to
+          recover the CEF version, device vendor/product and the eventtype
+          signature, extract the extension into fields, then resolve every
+          cs1..cs3 value against its cs#Label so "integration", "event_type"
+          and "factor" become stable named keys. The decision that matters
+          here is simply whether to run DLS at all - the api-pull path with
+          the stock integration is richer and lower-effort, so CEF is
+          justified only when an existing CEF collector must be reused. If it
+          is, shape toward the cisco_duo.auth.* names in Cribl so the record
+          lines up with any JSON-sourced Duo data already indexed.
+        elastic: >
+          Build a dedicated logs-cisco_duo.auth@custom (or generic CEF) ingest
+          pipeline that maps duser to user.name, src to source.ip, dhost to
+          source.address, rt to @timestamp and outcome to event.outcome, and
+          lifts the cs1/cs2/cs3 values into cisco_duo.auth.application.name,
+          event.action and cisco_duo.auth.factor, splitting denied from fraud
+          rather than flattening both to failure. Because there is no
+          boundary, this is the place to make the loss explicit: set
+          observer.vendor "Duo Security" and observer.product "DuoLogSync" so
+          the CEF-sourced records are distinguishable from any api-pull Duo
+          data in the same index, since the two feeds carry a different field
+          set for the same events.
+    fields:
+    - vendor: rt
+      type: integer
+      description: 'CEF receipt-time extension, populated from the record''s timestamp'
+      ecs: '@timestamp'
+      status: mapped
+      transform: >
+        DLS multiplies the Admin API's epoch-seconds timestamp by 1000 because
+        CEF's rt field expects milliseconds; convert back to event time on
+        ingest
+    - vendor: duser
+      type: string
+      description: Duo username of the account that attempted the second factor, from user.name
+      ecs: user.name
+      status: mapped
+    - vendor: src
+      type: ip
+      description: IP address of the endpoint the user accessed from, from access_device.ip
+      ecs: source.ip
+      status: mapped
+    - vendor: dhost
+      type: string
+      description: hostname of the access device
+      ecs: source.address
+      status: partial
+      notes: >
+        DLS reads the access_device host value into the CEF dhost key; like
+        the JSON path it is sparse (present only for managed/Duo Desktop
+        endpoints) and populates source.address, not host.name, so the
+        authentication alerting profile's required host.name is still empty
+    - vendor: outcome
+      type: enum
+      description: verdict of the authentication attempt, from result - success, denied, or fraud
+      ecs: event.outcome
+      status: partial
+      transform: success maps to success; denied and fraud both map to failure
+      notes: >
+        CEF carries only this raw result string and no reason field, so the
+        user-reported "fraud" signal cannot be separated from a policy
+        "denied" as cleanly as on the JSON feed, where reason disambiguates
+        them - the raw value must still be retained and denied/fraud alerted
+        on separately
+    - vendor: event_type (cs2)
+      type: enum
+      description: kind of activity logged - authentication or enrollment, from eventtype
+      ecs: event.action
+      status: mapped
+      notes: >-
+        emitted in cs2 with cs2Label=event_type; also drives the CEF header
+        signature and name fields
+    - vendor: integration (cs1)
+      type: string
+      description: >-
+        name of the Duo-protected application the user was authenticating
+        into, from application.name
+      ecs: null
+      status: unmapped
+      custom: cisco_duo.auth.application.name
+      notes: >-
+        emitted in cs1 with cs1Label=integration; the relying party being
+        accessed, for which ECS has no field, exactly as on the JSON feed
+    - vendor: factor (cs3)
+      type: enum
+      description: >-
+        second-factor method used - duo_push, sms_passcode, phone_call, and
+        similar, from factor
+      ecs: null
+      status: unmapped
+      custom: cisco_duo.auth.factor
+      notes: >
+        emitted in cs3 with cs3Label=factor; the discriminator for weak-factor
+        and bypass-code alerting, needing an explicit keyword mapping. This is
+        the last of the eight values CEF preserves - the richer JSON fields
+        (auth_device, trusted_endpoint_status, adaptive_trust trust_level,
+        reason) have no CEF counterpart and are lost in this format
+- id: admin
+  name: Administrator activity log
+  description: >
+    Duo Admin Panel change history pulled from the Admin API administrator log
+    endpoint (/admin/v1/logs/administrator). One record per administrative
+    action - admin logins, user and group create/update/delete, policy and
+    application integration changes, bypass-code issuance. This is the
+    accountability trail for the MFA control itself: an attacker who reaches
+    the Duo Admin Panel can disable enforcement or enrol their own device
+    without ever generating a failed authentication, so this dataset covers
+    the blind spot the authentication log leaves.
+  event_categories:
+  - iam
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same API-collector path as the authentication dataset. Volume here is
+        orders of magnitude lower than the auth log, so this dataset is a
+        cheap candidate to cross first when validating the route.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cisco_duo.admin
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Same API-collector path as the authentication dataset. Volume here is
+        orders of magnitude lower than the auth log.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cisco_duo.admin
+  formats:
+  - format: api-pull
+    parsing:
+      mechanism: elastic-integration
+      artifact: Cisco Duo integration (admin data stream)
+      notes: >
+        The integration's admin pipeline maps action to event.action, username
+        to user.name, object to user.target.name, and description to both
+        message and event.reason, additionally storing description in
+        cisco_duo.admin.flattened when it parses as an object.
+    fields:
+    - vendor: timestamp
+      type: integer
+      description: Unix epoch seconds at which the administrative action was performed
+      ecs: '@timestamp'
+      status: mapped
+      transform: 'epoch seconds, parsed as UNIX by the integration''s date processor'
+    - vendor: isotimestamp
+      type: timestamp
+      description: ISO8601 rendering of the same event time
+      ecs: null
+      status: unmapped
+      custom: cisco_duo.admin.isotimestamp
+      notes: redundant with timestamp; retained only as a drift check against the epoch value
+    - vendor: username
+      type: string
+      description: full name of the administrator who performed the action in the Duo Admin Panel
+      ecs: user.name
+      status: mapped
+    - vendor: action
+      type: enum
+      description: >-
+        type of change performed, e.g. admin_login, user_create, user_update,
+        integration_create, bypass_create
+      ecs: event.action
+      status: mapped
+    - vendor: object
+      type: string
+      description: >-
+        the object the action was performed on - a username, group name,
+        integration name, or policy name depending on the action
+      ecs: user.target.name
+      status: partial
+      notes: >
+        the stock integration copies this to user.target.name unconditionally,
+        but the value is only a user principal for user-scoped actions; for
+        integration, policy, and group actions it is an application or policy
+        name and belongs solely in cisco_duo.admin.action_performed_on
+    - vendor: description
+      type: string
+      description: >-
+        details of the change, either a sentence or a JSON object enumerating
+        the changed attributes
+      ecs: message
+      status: partial
+      notes: >
+        the integration writes this to message and event.reason and, when it
+        parses as an object, also to cisco_duo.admin.flattened; the varying
+        type makes it awkward to query and it can carry secrets such as newly
+        issued bypass codes
+    - vendor: status
+      type: string
+      description: status of the administrative event as reported by Duo
+      ecs: null
+      status: unmapped
+      custom: cisco_duo.admin.status
+      notes: >
+        sparsely populated; the best available basis for deriving
+        event.outcome, which the stock pipeline never sets on this data stream
+    - vendor: errors
+      type: string
+      description: set of errors reported for the event, where the action failed
+      ecs: null
+      status: unmapped
+      custom: cisco_duo.admin.errors
+      notes: >-
+        presence of this field is the reliable failure indicator for a derived
+        event.outcome
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Pass through unparsed with Persistent Queue backpressure and share
+          the authentication dataset's collector checkpointing, since both
+          endpoints page on the same mintime/maxtime contract. The one piece
+          of low-side work worth doing is dropping or masking any bypass-code
+          value that surfaces in the description blob before it is forwarded,
+          because a readable bypass code in the log is a live credential.
+        elastic: >
+          The stock cisco_duo admin pipeline parses this; add a
+          logs-cisco_duo.admin@custom pipeline that derives event.outcome,
+          which no processor currently sets on this data stream even though
+          the configuration and iam alerting profiles both require it - drive
+          it off the status/errors fields and default to success for actions
+          that logged no error. Constrain user.target.name to records whose
+          object is genuinely a user principal and route integration, policy,
+          and group targets to cisco_duo.admin.action_performed_on instead, so
+          identity analytics are not polluted by application names. Map the
+          description blob's parsed form (cisco_duo.admin.flattened) as
+          flattened in the index template rather than letting dynamic mapping
+          create a field per changed attribute.
+        relay: >
+          This dataset crosses as the same thin envelope (mode A) as the
+          authentication log, and its low volume makes it the right first
+          candidate for proving the crossing end to end. The content-filter
+          friction is the description field: unbounded free text whose shape
+          varies per action - sometimes a sentence, sometimes a JSON object of
+          changed attributes - so cap its length and normalise it to a single
+          consistent type low-side before the filter has to reason about it.
+          Carry _raw here indefinitely; this is a low-rate accountability
+          trail where forensic fidelity outweighs the bytes.
+      direct:
+        parse_location: high
+        cribl: >
+          Pass through unparsed with Persistent Queue backpressure and share
+          the authentication dataset's collector checkpointing, since both
+          endpoints page on the same mintime/maxtime contract. The one piece
+          of work worth doing is dropping or masking any bypass-code value
+          that surfaces in the description blob before it is forwarded,
+          because a readable bypass code in the log is a live credential.
+        elastic: >
+          The stock cisco_duo admin pipeline parses this; add a
+          logs-cisco_duo.admin@custom pipeline that derives event.outcome,
+          which no processor currently sets on this data stream even though
+          the configuration and iam alerting profiles both require it - drive
+          it off the status/errors fields and default to success for actions
+          that logged no error. Constrain user.target.name to records whose
+          object is genuinely a user principal and route integration, policy,
+          and group targets to cisco_duo.admin.action_performed_on instead, so
+          identity analytics are not polluted by application names. Map the
+          description blob's parsed form (cisco_duo.admin.flattened) as
+          flattened in the index template rather than letting dynamic mapping
+          create a field per changed attribute.
+- id: telephony
+  name: Telephony log (v2)
+  description: >
+    Thin starter over the Admin API v2 telephony endpoint
+    (/admin/v2/logs/telephony) - one record per SMS or voice call Duo placed
+    on the account's behalf, with the credits it consumed. Value to a SOC is
+    narrow but real: it is the billing-side view of out-of-band factor
+    delivery, so a spike in credits to unfamiliar country codes is the
+    cheapest available signal for toll fraud or SMS pumping against the MFA
+    endpoint. Note that Duo Federal editions exclude the Telephony Log report,
+    so this dataset may not exist on a FedRAMP tenant.
+  event_categories:
+  - authentication
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same API-collector path as the other two datasets; deployment must
+        first confirm the tenant edition exposes the telephony endpoint at
+        all.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cisco_duo.telephony_v2
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Same API-collector path as the other two datasets; deployment must
+        first confirm the tenant edition exposes the telephony endpoint at
+        all.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cisco_duo.telephony_v2
+  formats:
+  - format: api-pull
+    parsing:
+      mechanism: elastic-integration
+      artifact: Cisco Duo integration (telephony_v2 data stream)
+      notes: >
+        The integration ships both a legacy telephony and a telephony_v2 data
+        stream; v2 is the current endpoint and is the one modelled here. Its
+        pipeline renames the v2 keys into cisco_duo.telephony_v2.* and sets
+        event.id from the telephony id.
+    fields:
+    - vendor: ts
+      type: timestamp
+      description: ISO8601 time at which the SMS or call was placed
+      ecs: '@timestamp'
+      status: mapped
+      transform: >-
+        ISO8601 string parsed by the integration's date processor, unlike the
+        auth and admin logs which use epoch seconds
+    - vendor: telephony_id
+      type: string
+      description: unique identifier for the telephony event
+      ecs: event.id
+      status: mapped
+    - vendor: txid
+      type: string
+      description: >-
+        identifier relating this telephony event to the authentication attempt
+        that triggered it
+      ecs: null
+      status: unmapped
+      custom: cisco_duo.telephony_v2.txid
+      notes: >-
+        joins to the authentication dataset's event.id; kept custom because
+        event.id on this record is already the telephony id
+    - vendor: type
+      type: enum
+      description: delivery channel used - either "sms" or "phone"
+      ecs: null
+      status: unmapped
+      custom: cisco_duo.telephony_v2.type
+      notes: >-
+        no ECS field models an out-of-band delivery channel; pairs with the
+        auth log's factor field
+    - vendor: phone
+      type: string
+      description: destination phone number the message or call was sent to
+      ecs: null
+      status: unmapped
+      custom: cisco_duo.telephony_v2.phone_number
+      notes: >
+        subscriber PII in E.164 form; mask or truncate to the country and area
+        code low-side, and derive a country-code keyword from it for
+        toll-fraud rate rules
+    - vendor: context
+      type: string
+      description: >-
+        context the telephony event was used under, e.g. "Administrator Login"
+        or "Authentication"
+      ecs: null
+      status: unmapped
+      custom: cisco_duo.telephony_v2.event_type
+      notes: >-
+        the vendor key is context but the integration stores it as event_type;
+        keep the vendor name in queries against raw data
+    - vendor: credits
+      type: integer
+      description: number of Duo telephony credits this event consumed
+      ecs: null
+      status: unmapped
+      custom: cisco_duo.telephony_v2.credits
+      notes: map as a numeric, not keyword, so per-country credit-rate aggregations work
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Pass through unparsed on the shared collector with Persistent Queue
+          backpressure. The one decision worth making low-side is phone-number
+          handling: keep only the country and area code, or hash the
+          subscriber digits, since the full destination number is the only PII
+          this dataset carries and nothing downstream needs it in the clear to
+          spot a credit spike.
+        elastic: >
+          Parse with the stock telephony_v2 pipeline and add a
+          logs-cisco_duo.telephony_v2@custom pipeline that supplies the
+          event.category, event.action, and event.outcome the shipped pipeline
+          leaves unset - it only sets event.kind and event.id - so these
+          records are not invisible to the authentication alerting profile.
+          Derive a country-code keyword from the phone number and map credits
+          as a numeric so a per-country credit-rate rule can run, and index
+          the txid as keyword so it joins to the authentication log's
+          event.id.
+        relay: >
+          This is the smallest and flattest of the three datasets - six scalar
+          keys, no nesting - so it crosses as a thin envelope with no
+          reshaping needed and makes a good smoke test for the NDJSON
+          crossing. The only content-filter consideration is the phone number,
+          which should already be masked or truncated low-side; drop _raw on
+          this dataset first, since it has the lowest forensic value of the
+          three.
+      direct:
+        parse_location: high
+        cribl: >
+          Pass through unparsed on the shared collector with Persistent Queue
+          backpressure. The one decision worth making is phone-number
+          handling: keep only the country and area code, or hash the
+          subscriber digits, since the full destination number is the only PII
+          this dataset carries and nothing downstream needs it in the clear to
+          spot a credit spike.
+        elastic: >
+          Parse with the stock telephony_v2 pipeline and add a
+          logs-cisco_duo.telephony_v2@custom pipeline that supplies the
+          event.category, event.action, and event.outcome the shipped pipeline
+          leaves unset - it only sets event.kind and event.id - so these
+          records are not invisible to the authentication alerting profile.
+          Derive a country-code keyword from the phone number and map credits
+          as a numeric so a per-country credit-rate rule can run, and index
+          the txid as keyword so it joins to the authentication log's
+          event.id.
+  - format: syslog-cef
+    enable: >
+      Same duologsync agent and Admin API application ("Grant read log") as
+      the authentication feed; only the endpoint mapping differs. Set
+      dls_settings.log_format to CEF and, under endpoint_server_mappings, list
+      "telephony" against a syslog server whose protocol (TCP / TCPSSL / UDP),
+      host and port are defined in the servers block. DLS polls the v2
+      telephony endpoint and writes one CEF line per SMS or voice call, with
+      the header "CEF:0|Duo Security|DuoLogSync|<ver>|<eventtype>|<eventtype>|
+      5|" and the extension fields below; the telephony custom values ride in
+      cs1..cs5 with matching cs#Label keys. Confirm first that the tenant
+      edition exposes the telephony endpoint at all - Duo Federal editions
+      exclude the Telephony Log, so this feed may not exist on a FedRAMP
+      tenant.
+    references:
+    - https://github.com/duosecurity/duo_log_sync/blob/master/README.md
+    - >-
+      https://github.com/duosecurity/duo_log_sync/blob/master/duologsync/consumer/telephony_consumer.py
+    - >-
+      https://github.com/duosecurity/duo_log_sync/blob/master/duologsync/consumer/cef.py
+    - https://duo.com/docs/administration-reporting
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Duo telephony CEF unroll pipeline (no stock cisco_duo CEF path)
+      notes: >
+        As with the auth CEF feed, the Elastic cisco_duo integration has no
+        CEF pipeline, so a generic CEF decode yields cef.extensions.* keyed by
+        the raw labels and a hand-built pipeline must re-map the cs#/cs#Label
+        pairs into cisco_duo.telephony_v2.*. Two DLS quirks matter here: the
+        telephony CEF mapping reads a "timestamp" key into rt, but the v2
+        telephony record's time field is "ts" (ISO8601) with no "timestamp"
+        key, so DLS emits the literal string "None" for rt on a v2 tenant and
+        @timestamp must be derived from ts instead; and the CEF form omits the
+        telephony_id and txid identifiers entirely, so the join key back to
+        the authentication log that the JSON feed carries is not present in
+        CEF.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          This is the smallest Duo dataset and its whole SOC value is spotting
+          a credit spike to unfamiliar country codes, which the CEF feed still
+          supports - but prefer the api-pull path, and if CEF is used, run the
+          edge decode: split the header, extract the extension, and resolve
+          cs1..cs5 against their cs#Label so context, credits, event_type,
+          phone and type become named keys. Do the phone-number handling here
+          exactly as on the JSON path - keep only the country and area code or
+          hash the subscriber digits, and derive a country-code keyword for
+          the toll-fraud rate rule - since the destination number is the only
+          PII this dataset carries. Because the CEF form drops txid, note that
+          a low-side join back to the authentication attempt is not possible
+          on this feed; if that correlation is needed, collect telephony as
+          JSON instead.
+        elastic: >
+          Route these into a dedicated logs-cisco_duo.telephony_v2@custom (or
+          generic CEF) pipeline that maps the cs# values to
+          cisco_duo.telephony_v2.event_type (from context),
+          cisco_duo.telephony_v2.credits, cisco_duo.telephony_v2.phone_number
+          and cisco_duo.telephony_v2.type, casts credits to a numeric so the
+          per-country credit-rate aggregation works, and - because the shipped
+          telephony pipeline sets only event.kind and event.id - supplies the
+          event.category, event.action and event.outcome this data stream
+          otherwise lacks. Handle the rt/ts mismatch: rt arrives as the
+          literal string "None" on a v2 tenant, so set @timestamp from the
+          ISO8601 ts the decode recovers rather than from rt.
+        relay: >
+          Six flat scalar keys with no nesting make this the easiest Duo feed
+          to cross, and CEF's single flat string is if anything simpler still
+          than the JSON. The only real content-filter items are the cs#/
+          cs#Label indirection, which should be resolved to named keys
+          low-side, and the phone number, which should already be masked or
+          truncated before the crossing. Drop _raw on this dataset first if
+          retention pressure demands it - it has the lowest forensic value of
+          the Duo feeds - and reconcile counts per (dataset, hour) against the
+          DLS telephony checkpoint, since there is no return channel.
+      direct:
+        parse_location: low
+        cribl: >
+          For a same-side high tenant, decode the CEF at the edge: split the
+          header, extract the extension, and resolve cs1..cs5 against their
+          cs#Label so context, credits, event_type, phone and type become
+          named keys. The governing decision is again whether CEF buys
+          anything: the api-pull path preserves txid and telephony_id for
+          correlation and needs no bespoke pipeline, so CEF is worth it only
+          to feed an existing CEF collector. If used, mask the phone number
+          and derive the country-code keyword in Cribl before indexing.
+        elastic: >
+          Build a dedicated telephony CEF-decode pipeline that maps the cs#
+          values to cisco_duo.telephony_v2.event_type (from context),
+          cisco_duo.telephony_v2.credits, cisco_duo.telephony_v2.phone_number
+          and cisco_duo.telephony_v2.type, casts credits to a numeric, and
+          backfills the event.category, event.action and event.outcome the
+          shipped telephony pipeline leaves unset. Because there is no
+          boundary, set observer.product "DuoLogSync" so these CEF-sourced
+          telephony records are distinguishable from any api-pull telephony
+          data indexed for the same tenant, which carries the telephony_id and
+          txid this feed omits.
+    fields:
+    - vendor: rt
+      type: integer
+      description: CEF receipt-time extension, mapped by DLS from a "timestamp" key
+      ecs: '@timestamp'
+      status: partial
+      notes: >
+        DLS's telephony CEF mapping reads a "timestamp" field into rt, but the
+        v2 telephony record's time field is "ts" (ISO8601) and carries no
+        "timestamp" key, so DLS emits the literal string "None" for rt on a v2
+        tenant; derive @timestamp from the recovered ts, since rt never
+        carries a usable time
+    - vendor: context (cs1)
+      type: string
+      description: >-
+        context the telephony event was used under, e.g. "Administrator Login"
+        or "Authentication"
+      ecs: null
+      status: unmapped
+      custom: cisco_duo.telephony_v2.event_type
+      notes: >-
+        emitted in cs1 with cs1Label=context; the integration stores the JSON
+        context key as event_type, so the custom name is kept consistent with
+        the JSON feed
+    - vendor: credits (cs2)
+      type: integer
+      description: number of Duo telephony credits this event consumed
+      ecs: null
+      status: unmapped
+      custom: cisco_duo.telephony_v2.credits
+      notes: >-
+        emitted in cs2 with cs2Label=credits; map as a numeric, not keyword,
+        so per-country credit-rate aggregations work
+    - vendor: event_type (cs3)
+      type: enum
+      description: 'event-type value from the record''s eventtype key'
+      ecs: null
+      status: unmapped
+      custom: cisco_duo.telephony_v2.eventtype
+      notes: >
+        emitted in cs3 with cs3Label=event_type; the v2 telephony record has
+        no eventtype key (that field belonged to the legacy v1 telephony
+        schema), so this is frequently empty on a v2 tenant
+    - vendor: phone (cs4)
+      type: string
+      description: destination phone number the message or call was sent to
+      ecs: null
+      status: unmapped
+      custom: cisco_duo.telephony_v2.phone_number
+      notes: >
+        emitted in cs4 with cs4Label=phone; subscriber PII in E.164 form -
+        mask or truncate to the country and area code low-side and derive a
+        country-code keyword for toll-fraud rate rules
+    - vendor: type (cs5)
+      type: enum
+      description: delivery channel used - either "sms" or "phone"
+      ecs: null
+      status: unmapped
+      custom: cisco_duo.telephony_v2.type
+      notes: >
+        emitted in cs5 with cs5Label=type; no ECS field models an out-of-band
+        delivery channel, and it pairs with the auth log's factor field. Note
+        the CEF form omits telephony_id and txid, so the event.id and the join
+        key to the authentication log that the JSON feed carries are both
+        absent in this format

@@ -1,0 +1,1851 @@
+id: exchange
+name: Microsoft Exchange
+vendor: Microsoft
+versions: Exchange Server 2016, Exchange Server 2019, Exchange Server Subscription Edition
+draft: true
+references:
+- >-
+  https://learn.microsoft.com/en-us/exchange/mail-flow/transport-logs/message-tracking
+- >-
+  https://learn.microsoft.com/en-us/exchange/policy-and-compliance/admin-audit-logging/log-structure
+- >-
+  https://learn.microsoft.com/en-us/exchange/policy-and-compliance/mailbox-audit-logging/mailbox-audit-logging
+- >-
+  https://learn.microsoft.com/en-us/powershell/module/exchangepowershell/search-mailboxauditlog
+- https://www.elastic.co/docs/reference/integrations/microsoft_exchange_server
+- >-
+  https://github.com/elastic/integrations/tree/main/packages/microsoft_exchange_server
+datasets:
+- id: message-tracking
+  name: Message tracking log
+  description: >
+    One CSV line per message event as mail moves through the transport
+    pipeline on Mailbox and Edge Transport servers, written to
+    %ExchangeInstallPath%TransportRoles\Logs\MessageTracking as
+    MSGTRK*yyyyMMdd-nnnn.log. Four file prefixes cover the four services
+    (MSGTRK transport, MSGTRKMD delivery, MSGTRKMS submission, MSGTRKMA
+    moderation) and every file opens with #Software / #Version / #Log-Type /
+    #Fields header lines that a parser must skip. A single message normally
+    produces a chain of events (RECEIVE, SUBMIT, HAREDIRECT, AGENTINFO, SEND,
+    DELIVER) correlated by network-message-id, so the unit of analysis for a
+    SOC is the chain, not the row. This is the primary mail-flow forensic
+    record on-prem; no message body is stored, but the subject line is unless
+    subject logging has been turned off.
+  event_categories:
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Elastic Agent tails the MessageTracking log directory on each
+        Mailbox/Edge Transport server and ships to Cribl. Edge Transport
+        servers commonly sit in a perimeter enclave on the low side, so they
+        are the instances that cross the guard on this route.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-microsoft_exchange_server.messagetracking
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Elastic Agent tails the MessageTracking log directory on each
+        Mailbox/Edge Transport server and ships to Cribl. High-side Mailbox
+        servers take this direct route with no guard crossing.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-microsoft_exchange_server.messagetracking
+  formats:
+  - format: other
+    parsing:
+      mechanism: elastic-integration
+      artifact: Microsoft Exchange Server integration (messagetracking data stream)
+      notes: >
+        The on-prem microsoft_exchange_server package is community-developed,
+        not Elastic-supported, and its messagetracking pipeline is a single
+        positional CSV processor over a fixed 30-column target list. It is not
+        the microsoft_exchange_online_message_trace package, which is cloud
+        only and does not apply here. Because the parse is positional, any
+        schema-version drift in the #Fields header silently shifts every
+        column, so the header must be pinned and monitored rather than
+        assumed.
+    fields:
+    - vendor: date-time
+      type: timestamp
+      description: >-
+        UTC date-time of the message tracking event, ISO 8601 with
+        milliseconds and a trailing Z
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: client-ip
+      type: ip
+      description: IPv4/IPv6 address of the messaging server or client that submitted the message
+      ecs: client.ip
+      status: mapped
+    - vendor: client-hostname
+      type: string
+      description: host name or FQDN of the messaging server or client that submitted the message
+      ecs: client.domain
+      status: partial
+      notes: >
+        the integration lands this on client.domain, but the value is a host
+        name or FQDN rather than a registered domain; treat it as the
+        submitting host identity and do not feed it to domain-reputation logic
+    - vendor: server-ip
+      type: ip
+      description: IPv4/IPv6 address of the source or destination Exchange server for this event
+      ecs: server.ip
+      status: mapped
+    - vendor: source
+      type: enum
+      description: >-
+        transport component responsible for the event (SMTP, STOREDRIVER,
+        AGENT, ROUTING, QUEUE, DSN, MAILBOXRULE, PICKUP, REDUNDANCY,
+        SAFETYNET, ...)
+      ecs: null
+      status: unmapped
+      custom: microsoft.exchange.source
+      notes: >
+        the component that raised the event; pairs with event-id to
+        disambiguate (a RECEIVE from SMTP is an inbound connection, a RECEIVE
+        from STOREDRIVER is a mailbox submission). MAILBOXRULE is the
+        auto-forward signal a SOC watches
+    - vendor: event-id
+      type: enum
+      description: >-
+        message event type (RECEIVE, SEND, DELIVER, SUBMIT, FAIL, DROP, DEFER,
+        EXPAND, REDIRECT, AGENTINFO, HARECEIVE, THROTTLE, ...)
+      ecs: event.action
+      status: partial
+      transform: >
+        copy the vendor value verbatim to event.action and drive event.outcome
+        from the failure family (FAIL, DELIVERFAIL, SUBMITFAIL, RESUBMITFAIL,
+        HAREDIRECTFAIL, MODERATORSALLNDR, BADMAIL, DROP, MODERATORREJECT map
+        to failure; DELIVER, SEND, RECEIVE, PROCESS, SUBMIT map to success;
+        DEFER, THROTTLE and the AGENTINFO bookkeeping events are neither and
+        should be left unknown)
+      notes: >
+        the stock Elastic pipeline stores this only as
+        microsoft.exchange.eventid and never populates event.action or
+        event.outcome, so an @custom pipeline is required before any detection
+        rule can key on mail-flow actions
+    - vendor: source-context
+      type: string
+      description: >-
+        extra context for the source component, e.g. the SMTP response text or
+        the MDB/Mailbox/Event/MessageClass/CreationTime/ClientType blob on
+        SUBMIT events
+      ecs: null
+      status: partial
+      custom: microsoft.exchange.sourcecontext
+      notes: >
+        semi-structured free text whose grammar varies by source; on SUBMIT it
+        carries ClientType (User, OWA, ActiveSync), which is the cheapest way
+        to tell a human send from an automated one and is worth extracting
+        into its own custom field
+    - vendor: connector-id
+      type: string
+      description: >-
+        name of the Send or Receive connector that accepted the message, as
+        ServerName\ConnectorName or ConnectorName
+      ecs: null
+      status: unmapped
+      custom: microsoft.exchange.connectorid
+      notes: >-
+        identifies the ingress/egress path; the pivot for spotting mail
+        leaving through an unexpected connector
+    - vendor: message-id
+      type: string
+      description: >-
+        value of the Message-Id: header, constant for the lifetime of the
+        message across all servers
+      ecs: email.message_id
+      status: mapped
+    - vendor: network-message-id
+      type: string
+      description: >-
+        unique message id that persists across copies created by bifurcation
+        or distribution-group expansion
+      ecs: email.local_id
+      status: mapped
+      transform: >
+        copied to email.local_id by the integration pipeline; this is the join
+        key for reconstructing the RECEIVE/SUBMIT/SEND/DELIVER chain and is
+        more reliable than message-id, which an external sender controls
+    - vendor: recipient-address
+      type: string
+      description: >-
+        email addresses of the message's recipients, multiple addresses
+        separated by semicolons
+      ecs: email.to.address
+      status: partial
+      notes: >
+        the pipeline splits on ";" into the email.to.address array, but the
+        field conflates To, Cc and Bcc recipients - the actual header
+        disposition is only recoverable from the parallel recipient-status
+        values, so per-recipient To/Cc/Bcc analysis is not possible from this
+        field alone
+    - vendor: recipient-status
+      type: string
+      description: >-
+        per-recipient status strings separated by semicolons, positionally
+        aligned with recipient-address (e.g. "250 2.1.5 Recipient OK", "550
+        4.4.7 QUEUE.Expired")
+      ecs: null
+      status: partial
+      custom: microsoft.exchange.recipientstatus
+      notes: >
+        the real per-recipient delivery outcome lives here, not in event-id; a
+        single row can be success for one recipient and a 550 rejection for
+        another. Positional alignment with the split recipient-address array
+        must be preserved or the outcome attaches to the wrong mailbox
+    - vendor: total-bytes
+      type: bytes
+      description: total size of the message in bytes including all attachments
+      ecs: network.bytes
+      status: mapped
+    - vendor: message-subject
+      type: string
+      description: 'message subject from the Subject: header field'
+      ecs: email.subject
+      status: mapped
+      notes: >
+        attacker-controlled free text of arbitrary length and encoding;
+        logging can be disabled estate-wide with
+        MessageTrackingLogSubjectLoggingEnabled on Set-TransportService, so
+        absence of this field is a configuration state, not a parse failure
+    - vendor: sender-address
+      type: string
+      description: 'address from the Sender: header, or the From: header when Sender: is absent'
+      ecs: email.sender.address
+      status: mapped
+    - vendor: return-path
+      type: string
+      description: >-
+        envelope return address from the MAIL FROM command, never empty but
+        may be the null sender <>
+      ecs: null
+      status: unmapped
+      custom: microsoft.exchange.returnpath
+      notes: >
+        envelope sender, distinct from both the Sender: and From: headers that
+        ECS models as email.sender.address and email.from.address; ECS 9.4 has
+        no envelope-sender field. Worth keeping because a return-path that
+        disagrees with the header sender is a first-order spoofing signal
+    - vendor: directionality
+      type: enum
+      description: direction of the message - Incoming, Originating, or Undefined
+      ecs: email.direction
+      status: partial
+      transform: >
+        vendor vocabulary (Incoming, Originating, Undefined) does not match
+        the ECS email.direction values (inbound, outbound, internal,
+        external); map Incoming to inbound and Originating to outbound, and
+        leave Undefined unset rather than guessing - internal mailbox-to-
+        mailbox flow is not distinguishable from this column alone and needs a
+        sender/recipient domain comparison
+    - vendor: original-client-ip
+      type: ip
+      description: IPv4/IPv6 address of the original client, preserved across intermediate hops
+      ecs: null
+      status: partial
+      custom: microsoft.exchange.originalclientip
+      notes: >
+        the true originating client where client-ip has been rewritten by a
+        smart host or edge relay; this is the best available candidate for
+        source.ip, which the network alerting profile requires and which no
+        other column in this dataset supplies. Populated inconsistently
+        depending on the upstream path, so promote it conditionally rather
+        than unconditionally
+    - vendor: message-info
+      type: string
+      description: >-
+        message origination date-time in UTC for DELIVER and SEND events, or
+        an authentication error code and mechanism when authentication failed
+      ecs: email.origination_timestamp
+      status: partial
+      notes: >
+        dual-purpose column - a timestamp on DELIVER/SEND events and an
+        authentication error token (e.g. 11a plus the auth type) otherwise, so
+        it must be promoted to email.origination_timestamp only when the
+        event-id is DELIVER or SEND and routed to a custom auth-error field in
+        every other case
+    - vendor: custom-data
+      type: string
+      description: >-
+        event-type-specific data, notably the GUID of the mail flow rule or
+        DLP policy that acted on the message
+      ecs: null
+      status: partial
+      custom: microsoft.exchange.customdata
+      notes: >
+        the integration dissects the S:OriginalFromAddress= token out of this
+        blob into email.from.address; the transport-rule and DLP policy GUIDs
+        it also carries are left unparsed and are the only record in this
+        dataset that a mail flow rule fired
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Keep the core worker group a pass-through with the raw CSV line in
+          _raw and let the integration's positional parser do the extraction,
+          but assert the #Fields header and schema-version low-side as a
+          routing tag so a build upgrade that reorders columns is caught
+          before it corrupts a day of mail flow rather than after. Mask
+          nothing by default here except where local policy forbids subject
+          retention, in which case drop message-subject near the source
+          instead of relying on the server-side
+          MessageTrackingLogSubjectLoggingEnabled switch, and run Persistent
+          Queue backpressure (never Block) on the Elastic destination. This is
+          the highest-volume dataset in the map but also the primary mail-flow
+          forensic record, so keep _raw until the parser is proven against
+          every event-id the estate emits.
+        elastic: >
+          Take the stock messagetracking ingest pipeline and layer a
+          logs-microsoft_exchange_server.messagetracking@custom pipeline for
+          the three gaps the field table records: copy the event-id value into
+          event.action (the stock pipeline leaves it only in
+          microsoft.exchange.eventid, so no alert rule can key on the action
+          today), derive event.outcome from the failure event-id family (FAIL,
+          DELIVERFAIL, SUBMITFAIL, HAREDIRECTFAIL, BADMAIL, DROP,
+          MODERATORREJECT) rather than from any single column, and normalize
+          the Incoming/Originating/Undefined directionality vocabulary onto
+          the ECS email.direction values. Zip recipient-status against the
+          split email.to.address array so the per-recipient SMTP response
+          survives as a structured pair instead of two positionally-aligned
+          strings, and add custom-namespace keyword mappings for
+          microsoft.exchange.networkmessageid, .eventid, .source and
+          .connectorid so chain reconstruction and connector-scoped dashboards
+          aggregate without dynamic mapping.
+        relay: >
+          The low-side Edge Transport leg crosses the guard: ship the thin
+          envelope (_dataId, @timestamp, host, _raw) rather than a full
+          low-side ECS build, because a good integration pipeline already
+          exists high-side and the guard should see one stable JSON schema
+          instead of the 30-column CSV grammar. The content filter's friction
+          here is attacker-controlled and unbounded: message-subject is
+          arbitrary UTF-8 chosen by the sender, recipient-address is a
+          semicolon-delimited list that grows with distribution-group
+          expansion, and custom-data carries transport-rule GUID blobs - cap
+          each, strip control characters and normalize unicode before the
+          guard destination. The crossing is at-most-once with no return
+          channel, so detect silent drops by reconciling low-side and
+          high-side counts per (dataset, hour), which is unusually tractable
+          here because network-message-id gives an exact join key.
+      direct:
+        parse_location: high
+        cribl: >
+          Keep the core worker group a pass-through with the raw CSV line in
+          _raw and let the integration's positional parser do the extraction,
+          but assert the #Fields header and schema-version at the edge worker
+          group as a routing tag so a build upgrade that reorders columns is
+          caught before it corrupts a day of mail flow rather than after. Mask
+          nothing by default here except where local policy forbids subject
+          retention, in which case drop message-subject near the source
+          instead of relying on the server-side
+          MessageTrackingLogSubjectLoggingEnabled switch, and run Persistent
+          Queue backpressure (never Block) on the Elastic destination. This is
+          the highest-volume dataset in the map but also the primary mail-flow
+          forensic record, so keep _raw until the parser is proven against
+          every event-id the estate emits.
+        elastic: >
+          Take the stock messagetracking ingest pipeline and layer a
+          logs-microsoft_exchange_server.messagetracking@custom pipeline for
+          the three gaps the field table records: copy the event-id value into
+          event.action (the stock pipeline leaves it only in
+          microsoft.exchange.eventid, so no alert rule can key on the action
+          today), derive event.outcome from the failure event-id family (FAIL,
+          DELIVERFAIL, SUBMITFAIL, HAREDIRECTFAIL, BADMAIL, DROP,
+          MODERATORREJECT) rather than from any single column, and normalize
+          the Incoming/Originating/Undefined directionality vocabulary onto
+          the ECS email.direction values. Zip recipient-status against the
+          split email.to.address array so the per-recipient SMTP response
+          survives as a structured pair instead of two positionally-aligned
+          strings, and add custom-namespace keyword mappings for
+          microsoft.exchange.networkmessageid, .eventid, .source and
+          .connectorid so chain reconstruction and connector-scoped dashboards
+          aggregate without dynamic mapping.
+  - format: api-pull
+    enable: >
+      Message tracking is on by default (MessageTrackingLogEnabled is True on
+      Set-TransportService and Set-MailboxTransportService), so no server-side
+      toggle is needed to produce the data - only a collector that reads it
+      through the cmdlet instead of tailing the files. Run
+      Get-MessageTrackingLog on a schedule against each Mailbox and Edge
+      Transport server (-Server <name>), bounding every run with -Start and
+      -End over the previous window and -ResultSize Unlimited so a busy hour
+      is not truncated at the 1000-row default, and deliver the resulting
+      objects to Cribl (ConvertTo-Json in the collector, or a Cribl
+      PowerShell/exec collector). Subject inclusion is governed by
+      MessageTrackingLogSubjectLoggingEnabled on Set-TransportService exactly
+      as on the file feed, and -MessageSubject / -Sender / -Recipients /
+      -EventId / -NetworkMessageId narrow the pull if only a subset is wanted.
+      Because the cmdlet reads the same underlying logs, the arbitration
+      between this path and the file tail is a collection decision, not a
+      data-scope one.
+    references:
+    - >-
+      https://learn.microsoft.com/en-us/powershell/module/exchangepowershell/get-messagetrackinglog
+    - >-
+      https://learn.microsoft.com/en-us/exchange/mail-flow/transport-logs/message-tracking
+    - >-
+      https://learn.microsoft.com/en-us/exchange/mail-flow/transport-logs/search-message-tracking-logs
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Get-MessageTrackingLog pull pipeline (no Elastic integration data stream)
+      notes: >
+        The microsoft_exchange_server integration's messagetracking data
+        stream is a positional CSV parser over the on-disk log line and does
+        not accept the cmdlet object shape, so this transport cannot reuse it
+        - the pipeline is bespoke. The upside is that the record arrives
+        already field-split with named PascalCase properties, so no positional
+        #Fields-header pinning is required and the schema-version drift risk
+        that dominates the file feed disappears; the pipeline only has to
+        rename the properties to the ECS targets and re-apply the same value
+        transforms (failure-family outcome, directionality vocabulary,
+        dual-purpose MessageInfo) the high-side integration pipeline applies
+        to the CSV feed. A pull source has no file position to resume from, so
+        the collector owns a checkpoint on the (server, End) window and the
+        pipeline must deduplicate on NetworkMessageId + EventId + Timestamp
+        across overlapping windows.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Shape the cmdlet objects to ECS in the low-side pipeline: the
+          properties are already discrete, so this is a rename-and-transform
+          step, not a parse. Copy EventId verbatim to event.action and derive
+          event.outcome from the failure family (FAIL, DELIVERFAIL,
+          SUBMITFAIL, RESUBMITFAIL, HAREDIRECTFAIL, MODERATORSALLNDR, BADMAIL,
+          DROP, MODERATORREJECT) rather than from any single property, split
+          Recipients and RecipientStatus on the semicolon into
+          positionally-aligned arrays, and normalize the
+          Incoming/Originating/Undefined Directionality onto the ECS
+          email.direction values. Deduplicate on NetworkMessageId + EventId +
+          Timestamp because the pull windows overlap by design, cap
+          MessageSubject and the Recipients list before the guard, strip
+          control characters and normalize unicode on the same
+          attacker-controlled values the file feed flags (MessageSubject,
+          Recipients, CustomData), and validate against a Schema Library
+          schema with a dead-letter route before the destination. Carry
+          SchemaVersion as a routing tag so a build change is visible even
+          though it no longer shifts columns.
+        elastic: >
+          There is no integration to inherit on this transport, so land the
+          pre-shaped documents in the
+          logs-microsoft_exchange_server.messagetracking data stream (or a
+          sibling keyed off the same package mappings) via a dedicated ingest
+          pipeline. Map the same targets the file feed's @custom pipeline sets
+          - event.action and event.outcome from EventId, email.local_id from
+          NetworkMessageId as the chain join key, email.to.address from the
+          split Recipients, network.bytes from TotalBytes - and keep
+          microsoft.exchange.recipientstatus, .connectorid, .source and
+          .customdata in the custom namespace as keyword so chain
+          reconstruction and connector-scoped dashboards reconcile with the
+          file-sourced events from other servers. Because MessageInfo is
+          dual-purpose, promote it to email.origination_timestamp only on
+          DELIVER and SEND events and route the authentication-error form to a
+          custom field, exactly as on the file feed, so the two transports
+          produce interchangeable documents.
+        relay: >
+          Full flattened ECS JSON crosses the guard rather than a thin _raw
+          envelope, because the parse happens low-side here (no high-side
+          integration exists for the cmdlet shape) and the guard should see
+          one field-aware schema. The unbounded, content-inspection-relevant
+          values are the same three the file feed identifies - MessageSubject
+          is arbitrary sender-chosen UTF-8, Recipients grows with
+          distribution-group expansion, and CustomData carries transport-rule
+          GUID blobs - so cap each to a declared length, hold nesting to two
+          levels, and normalize encoding before the crossing. The transport is
+          at-most-once with no return channel; reconcile per (dataset, hour)
+          counts using NetworkMessageId as the exact join key, and note that
+          the pull collector's own deduplication also moves the low-side
+          count, so reconcile after dedup rather than at ingest.
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side transport server whose Elastic stack is on the same
+          side, shaping the cmdlet objects to ECS is a rename-and-transform
+          step with no length-capping or dead-letter discipline, since there
+          is no guard to force it: rename the properties, derive event.outcome
+          from the failure family, split Recipients / RecipientStatus into
+          positionally-aligned arrays, and deduplicate on NetworkMessageId +
+          EventId + Timestamp. The one decision that matters here is not
+          double-counting against any file-tail feed for the same server - if
+          both the Elastic Agent file input and a cmdlet collector run against
+          one transport server, pick one transport per server rather than
+          reconciling two copies of every event downstream.
+        elastic: >
+          Land the pre-shaped documents in the
+          logs-microsoft_exchange_server.messagetracking data stream (or a
+          sibling keyed off the same package mappings) via a dedicated ingest
+          pipeline, since no integration exists to inherit on this transport.
+          Map event.action and event.outcome from EventId, email.local_id from
+          NetworkMessageId as the chain join key, email.to.address from the
+          split Recipients and network.bytes from TotalBytes, and keep
+          microsoft.exchange.recipientstatus, .connectorid, .source and
+          .customdata in the custom namespace as keyword; because MessageInfo
+          is dual-purpose, promote it to email.origination_timestamp only on
+          DELIVER and SEND events and route the authentication-error form to a
+          custom field. With no boundary, retain CustomData and
+          RecipientStatus in full for chain and mail-flow-rule forensics
+          rather than capping them, and treat a cmdlet-sourced event as
+          interchangeable with a file-sourced one so a single detection rule
+          keyed on event.action and email.local_id fires regardless of which
+          transport delivered the record.
+    fields:
+    - vendor: Timestamp
+      type: timestamp
+      description: >-
+        UTC date-time of the message tracking event, ISO 8601 with
+        milliseconds and a trailing Z (the object rename of the date-time
+        field)
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: ClientIp
+      type: ip
+      description: IPv4/IPv6 address of the messaging server or client that submitted the message
+      ecs: client.ip
+      status: mapped
+    - vendor: ClientHostname
+      type: string
+      description: host name or FQDN of the messaging server or client that submitted the message
+      ecs: client.domain
+      status: partial
+      notes: >
+        a host name or FQDN rather than a registered domain; treat it as the
+        submitting host identity and do not feed it to domain-reputation
+        logic, exactly as on the file feed's client-hostname
+    - vendor: ServerIp
+      type: ip
+      description: IPv4/IPv6 address of the source or destination Exchange server for this event
+      ecs: server.ip
+      status: mapped
+    - vendor: ServerHostname
+      type: string
+      description: host name or FQDN of the destination server
+      ecs: server.domain
+      status: partial
+      notes: >
+        the file feed carries only server-ip; this transport also exposes the
+        destination host name, kept on server.domain as an unresolved host
+        identity rather than a registered domain
+    - vendor: Source
+      type: enum
+      description: >-
+        transport component responsible for the event (SMTP, STOREDRIVER,
+        AGENT, ROUTING, QUEUE, DSN, MAILBOXRULE, PICKUP, REDUNDANCY,
+        SAFETYNET, ...)
+      ecs: null
+      status: unmapped
+      custom: microsoft.exchange.source
+      notes: >-
+        pairs with EventId to disambiguate a mailbox submission from an
+        inbound SMTP connection; MAILBOXRULE is the auto-forward signal a SOC
+        watches
+    - vendor: EventId
+      type: enum
+      description: >-
+        message event type (RECEIVE, SEND, DELIVER, SUBMIT, FAIL, DROP, DEFER,
+        EXPAND, REDIRECT, AGENTINFO, HARECEIVE, THROTTLE, ...)
+      ecs: event.action
+      status: partial
+      transform: >
+        copy verbatim to event.action and drive event.outcome from the failure
+        family (FAIL, DELIVERFAIL, SUBMITFAIL, RESUBMITFAIL, HAREDIRECTFAIL,
+        MODERATORSALLNDR, BADMAIL, DROP, MODERATORREJECT map to failure;
+        DELIVER, SEND, RECEIVE, PROCESS, SUBMIT map to success; DEFER,
+        THROTTLE and the AGENTINFO bookkeeping events are neither and stay
+        unknown)
+      notes: >-
+        the object property is EventId (dash removed) but carries the
+        identical vocabulary as the file feed's event-id
+    - vendor: SourceContext
+      type: string
+      description: >-
+        extra information associated with the Source field, e.g. the SMTP
+        response text or the
+        MDB/Mailbox/Event/MessageClass/CreationTime/ClientType blob on SUBMIT
+        events
+      ecs: null
+      status: partial
+      custom: microsoft.exchange.sourcecontext
+      notes: >-
+        on SUBMIT it carries ClientType (User, OWA, ActiveSync), the cheapest
+        way to separate a human send from an automated one and worth
+        extracting to its own field
+    - vendor: ConnectorId
+      type: string
+      description: >-
+        name of the Send or Receive connector that accepted the message, as
+        ServerName\ConnectorName or ConnectorName
+      ecs: null
+      status: unmapped
+      custom: microsoft.exchange.connectorid
+      notes: the pivot for spotting mail leaving through an unexpected connector
+    - vendor: InternalMessageId
+      type: string
+      description: >-
+        message identifier assigned by the Exchange server currently
+        processing the message; different on every server in the delivery path
+      ecs: null
+      status: unmapped
+      custom: microsoft.exchange.internalmessageid
+      notes: >
+        a per-server handle, not a stable cross-server id - use
+        NetworkMessageId for chain reconstruction; InternalMessageId is the
+        value the Reference field points at for DSN and forked-message
+        correlation on a single server
+    - vendor: MessageId
+      type: string
+      description: >-
+        value of the Message-Id: header, constant for the lifetime of the
+        message across all servers
+      ecs: email.message_id
+      status: mapped
+    - vendor: NetworkMessageId
+      type: string
+      description: >-
+        unique message id that persists across copies created by bifurcation
+        or distribution-group expansion
+      ecs: email.local_id
+      status: mapped
+      transform: >
+        the join key for reconstructing the RECEIVE/SUBMIT/SEND/DELIVER chain
+        and more reliable than MessageId, which an external sender controls;
+        copied to email.local_id
+    - vendor: Recipients
+      type: string
+      description: >-
+        email addresses of the message's recipients, multiple addresses
+        separated by semicolons (the object rename of recipient-address)
+      ecs: email.to.address
+      status: partial
+      notes: >
+        split on ";" into the email.to.address array, but the field conflates
+        To, Cc and Bcc recipients - the header disposition is only recoverable
+        from the parallel RecipientStatus values, so per-recipient To/Cc/Bcc
+        analysis is not possible from this field alone
+    - vendor: RecipientStatus
+      type: string
+      description: >-
+        per-recipient status strings separated by semicolons, positionally
+        aligned with Recipients (e.g. "250 2.1.5 Recipient OK", "550 4.4.7
+        QUEUE.Expired")
+      ecs: null
+      status: partial
+      custom: microsoft.exchange.recipientstatus
+      notes: >
+        the real per-recipient delivery outcome lives here, not in EventId;
+        positional alignment with the split Recipients array must be preserved
+        or the outcome attaches to the wrong mailbox
+    - vendor: TotalBytes
+      type: bytes
+      description: total size of the message in bytes including all attachments
+      ecs: network.bytes
+      status: mapped
+    - vendor: RecipientCount
+      type: integer
+      description: total number of recipients on the message
+      ecs: null
+      status: unmapped
+      custom: microsoft.exchange.recipientcount
+      notes: >-
+        not surfaced as a distinct field on the file feed's positional parse;
+        a cheap fan-out signal for distribution-group blasts
+    - vendor: RelatedRecipientAddress
+      type: string
+      description: >-
+        other recipient addresses associated with the message, populated on
+        EXPAND, REDIRECT and RESOLVE events
+      ecs: null
+      status: unmapped
+      custom: microsoft.exchange.relatedrecipientaddress
+      notes: >-
+        the expansion/redirection target; on EXPAND it names the members a
+        distribution group resolved to, which is where a single external send
+        becomes many internal deliveries
+    - vendor: Reference
+      type: string
+      description: >-
+        additional context for specific event types - the DSN report link, the
+        EXPAND related-recipient value, or the InternalMessageId of a forked
+        or rule-generated message
+      ecs: null
+      status: unmapped
+      custom: microsoft.exchange.reference
+      notes: >-
+        usually blank; on DSN and SEND it holds the InternalMessageId that
+        ties a bounce or forked copy back to its originating event on the same
+        server
+    - vendor: MessageSubject
+      type: string
+      description: 'message subject from the Subject: header field'
+      ecs: email.subject
+      status: mapped
+      notes: >
+        attacker-controlled free text of arbitrary length and encoding; absent
+        when MessageTrackingLogSubjectLoggingEnabled is False, which is a
+        configuration state rather than a collection failure
+    - vendor: Sender
+      type: string
+      description: >-
+        address from the Sender: header, or the From: header when Sender: is
+        absent (the object rename of sender-address)
+      ecs: email.sender.address
+      status: mapped
+    - vendor: ReturnPath
+      type: string
+      description: >-
+        envelope return address from the MAIL FROM command, never empty but
+        may be the null sender <>
+      ecs: null
+      status: unmapped
+      custom: microsoft.exchange.returnpath
+      notes: >
+        envelope sender, distinct from the Sender: and From: headers; a
+        return-path that disagrees with the header sender is a first-order
+        spoofing signal, and ECS 9.4 has no envelope-sender field
+    - vendor: MessageInfo
+      type: string
+      description: >-
+        message origination date-time in UTC for DELIVER and SEND events, or
+        an authentication error code and mechanism when authentication failed
+      ecs: email.origination_timestamp
+      status: partial
+      notes: >
+        dual-purpose - a timestamp on DELIVER/SEND and an authentication error
+        token (e.g. 11a plus the auth type) otherwise, so promote to
+        email.origination_timestamp only when EventId is DELIVER or SEND and
+        route to a custom auth-error field in every other case
+    - vendor: Directionality
+      type: enum
+      description: direction of the message - Incoming, Originating, or Undefined
+      ecs: email.direction
+      status: partial
+      transform: >
+        vendor vocabulary (Incoming, Originating, Undefined) does not match
+        the ECS email.direction values (inbound, outbound, internal,
+        external); map Incoming to inbound and Originating to outbound and
+        leave Undefined unset - internal mailbox-to-mailbox flow is not
+        distinguishable from this column alone
+    - vendor: OriginalClientIp
+      type: ip
+      description: IPv4/IPv6 address of the original client, preserved across intermediate hops
+      ecs: null
+      status: partial
+      custom: microsoft.exchange.originalclientip
+      notes: >
+        the true originating client where ClientIp has been rewritten by a
+        smart host or edge relay; the best available candidate for source.ip,
+        populated inconsistently depending on the upstream path, so promote
+        conditionally rather than unconditionally
+    - vendor: OriginalServerIp
+      type: ip
+      description: IPv4/IPv6 address of the original server
+      ecs: null
+      status: unmapped
+      custom: microsoft.exchange.originalserverip
+      notes: >-
+        the pre-rewrite server address, the server-side analog of
+        OriginalClientIp; low value on-prem but present in the object
+    - vendor: CustomData
+      type: string
+      description: >-
+        event-type-specific data, notably the GUID of the mail flow rule or
+        DLP policy that acted on the message
+      ecs: null
+      status: partial
+      custom: microsoft.exchange.customdata
+      notes: >
+        carries the S:OriginalFromAddress= token (dissect to
+        email.from.address) alongside transport-rule and DLP policy GUIDs; the
+        GUID blobs are the only record in this dataset that a mail flow rule
+        fired and are left unparsed unless a rule inventory is joined
+    - vendor: TenantId
+      type: string
+      description: tenant identifier - not used in on-premises Exchange organizations
+      ecs: null
+      status: unmapped
+      custom: microsoft.exchange.tenantid
+      notes: >-
+        documented as unused on-prem; expect it empty and drop it rather than
+        indexing an always-null column
+    - vendor: TransportTrafficType
+      type: string
+      description: traffic classification - blank or the value Email in on-premises Exchange
+      ecs: null
+      status: unmapped
+      custom: microsoft.exchange.transporttraffictype
+      notes: no discriminating value on-prem (blank or Email); carried for completeness only
+    - vendor: LogId
+      type: string
+      description: unique identifier for a row in the message tracking log
+      ecs: null
+      status: unmapped
+      custom: microsoft.exchange.logid
+      notes: >-
+        documented as unimportant on-prem, but a stable per-row id that is
+        useful as a dedup tiebreaker for the overlapping pull windows this
+        transport creates
+    - vendor: SchemaVersion
+      type: string
+      description: >-
+        version number of the Exchange server that created the entry, in the
+        format 15.01.nnnn.nnn
+      ecs: null
+      status: unmapped
+      custom: microsoft.exchange.schemaversion
+      notes: >
+        on the file feed a schema-version change silently shifts columns; on
+        this transport the properties are named so drift no longer corrupts
+        the parse, but carry the value as a routing tag so a build upgrade is
+        still observable
+- id: httpproxy
+  name: HTTPProxy log
+  description: >
+    Per-request CSV records written by the Exchange front-end HTTP proxy to
+    %ExchangeInstallPath%Logging\HttpProxy\<Protocol>, with one directory and
+    log set per virtual directory (Owa, Ecp, Autodiscover, Mapi, Ews, RpcHttp,
+    ActiveSync, PowerShell). This is the Exchange-specific proxy layer, not
+    the web-server layer: the raw HTTP request lines for the same OWA/ECP
+    traffic are covered by the iis map and are deliberately not duplicated
+    here. The forensic value this dataset adds over IIS is the
+    front-end/back-end split - AuthenticatedUser, AnchorMailbox, BackEndStatus
+    and TargetServer show whether a request was authenticated before it was
+    proxied and which mailbox server served it, which is exactly the evidence
+    that distinguishes ProxyLogon (CVE-2021-26855 SSRF via a forged back-end
+    cookie) and ProxyShell (CVE-2021-34473 Autodiscover path confusion into
+    the PowerShell back end) from ordinary traffic.
+  event_categories:
+  - web
+  - authentication
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Elastic Agent tails the per-protocol HttpProxy directories on each
+        Client Access/Mailbox server and ships to Cribl. Internet-facing
+        Exchange front ends are the low-side instances that cross the guard on
+        this route, where the relay guidance applies.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-microsoft_exchange_server.httpproxy
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Elastic Agent tails the per-protocol HttpProxy directories on each
+        Client Access/Mailbox server and ships to Cribl. Internal high-side
+        front ends take this direct route with no guard crossing.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-microsoft_exchange_server.httpproxy
+  formats:
+  - format: other
+    parsing:
+      mechanism: elastic-integration
+      artifact: Microsoft Exchange Server integration (httpproxy data stream)
+      notes: >
+        The community microsoft_exchange_server package parses this stream
+        positionally across roughly seventy columns, the great majority of
+        which are latency counters of no detection value. The column count and
+        order differ between Exchange 2016, 2019 and SE builds, so the
+        deployed #Fields header must be matched to the package's target list
+        or the parse shifts silently.
+    fields:
+    - vendor: DateTime
+      type: timestamp
+      description: UTC date-time the front-end proxy handled the request
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: Protocol
+      type: enum
+      description: >-
+        Exchange virtual directory that served the request (Owa, Ecp,
+        Autodiscover, Mapi, Ews, RpcHttp, ActiveSync, PowerShell)
+      ecs: null
+      status: unmapped
+      custom: microsoft.exchange.protocol
+      notes: >
+        the primary triage axis - Autodiscover and PowerShell entries are the
+        ProxyShell exploitation path, Ecp the ProxyLogon webshell drop path.
+        Not mapped to service.name, which models the service emitting the log
+        rather than the endpoint being called
+    - vendor: UrlHost
+      type: string
+      description: host header value of the request as received by the front end
+      ecs: url.domain
+      status: mapped
+    - vendor: UrlStem
+      type: string
+      description: path portion of the requested URL
+      ecs: url.path
+      status: mapped
+      notes: >
+        fully attacker-controlled; the ProxyShell path-confusion string
+        (/autodiscover/autodiscover.json with an embedded @ and a PowerShell
+        back-end target) appears here verbatim and must survive parsing
+        without normalization that would erase the anomaly
+    - vendor: UrlQuery
+      type: string
+      description: query-string portion of the requested URL
+      ecs: url.query
+      status: mapped
+    - vendor: Method
+      type: string
+      description: HTTP request method
+      ecs: http.request.method
+      status: mapped
+    - vendor: AuthenticationType
+      type: string
+      description: >-
+        authentication mechanism used for the request (Basic, Negotiate,
+        Kerberos, Ntlm, Oauth, or empty)
+      ecs: null
+      status: unmapped
+      custom: microsoft.exchange.authenticationtype
+      notes: >-
+        Basic on an internet-facing virtual directory is itself a finding;
+        empty means the request was never authenticated
+    - vendor: IsAuthenticated
+      type: boolean
+      description: whether the request was authenticated before being proxied
+      ecs: event.outcome
+      status: partial
+      transform: >
+        true maps to success and false to failure only in combination with
+        HttpStatus - an unauthenticated request answered with 200 is not a
+        failed authentication, it is the ProxyLogon/ProxyShell signature and
+        must not be collapsed into event.outcome=failure
+    - vendor: AuthenticatedUser
+      type: string
+      description: >-
+        authenticated principal in DOMAIN\username form, empty when the
+        request was not authenticated
+      ecs: user.name
+      status: partial
+      notes: >
+        the integration groks the account leaf out of the DOMAIN\user value
+        and discards the domain component, which is left unmapped; emptiness
+        here is the load-bearing signal on this dataset and must be preserved
+        rather than defaulted
+    - vendor: AnchorMailbox
+      type: string
+      description: >-
+        routing hint identifying the mailbox the request targets, as a UPN,
+        SMTP address, or SID-form value
+      ecs: null
+      status: unmapped
+      custom: microsoft.exchange.anchormailbox
+      notes: >
+        ProxyLogon SSRF sets this to a SID or an internal system mailbox on an
+        unauthenticated request; a SID-shaped AnchorMailbox paired with an
+        empty AuthenticatedUser is the highest-fidelity single indicator in
+        this map
+    - vendor: UserAgent
+      type: string
+      description: User-Agent header supplied by the client
+      ecs: user_agent.original
+      status: mapped
+    - vendor: ClientIpAddress
+      type: string
+      description: >-
+        client IP address as seen by the front end; may contain two addresses
+        separated by a double space (external then internal)
+      ecs: source.ip
+      status: partial
+      transform: >
+        split on the double-space separator before use - the raw value is not
+        a valid IP when both addresses are present, and only the first
+        (external) address is the true client; the integration keeps both
+        halves in microsoft.exchange.clientipaddress_external and _internal
+    - vendor: ServerHostName
+      type: string
+      description: hostname of the Exchange front-end server that handled the request
+      ecs: observer.hostname
+      status: mapped
+    - vendor: HttpStatus
+      type: integer
+      description: HTTP status code the front end returned to the client
+      ecs: http.response.status_code
+      status: mapped
+    - vendor: BackEndStatus
+      type: integer
+      description: HTTP status code the back-end mailbox server returned to the proxy
+      ecs: null
+      status: unmapped
+      custom: microsoft.exchange.backendstatus
+      notes: >
+        no ECS field models a second, inner response status; the
+        front-end/back-end disagreement (a 200 to the client over a 500 or 241
+        from the back end) is a documented ProxyShell artifact and is only
+        visible by comparing this against HttpStatus
+    - vendor: TargetServer
+      type: string
+      description: back-end mailbox server the request was proxied to
+      ecs: destination.address
+      status: partial
+      notes: >
+        a server hostname rather than an address; kept on destination.address
+        because it is unresolved, and it supplies the destination the web
+        alerting profile expects where destination.ip is never present in this
+        log
+    - vendor: ProxyAction
+      type: string
+      description: routing decision the proxy took for the request (e.g. Proxy, Redirect)
+      ecs: event.action
+      status: partial
+      notes: >
+        describes the proxy's own decision, not the user's action; the
+        meaningful action for detection is the Method plus UrlStem pair, so
+        alerting should not treat this as the primary event.action even though
+        it is the only column that fits the field
+    - vendor: GenericErrors
+      type: string
+      description: exception and error detail recorded for failed proxy requests
+      ecs: null
+      status: unmapped
+      custom: microsoft.exchange.genericerrors
+      notes: >
+        semicolon-delimited exception text of unbounded length; carries the
+        back-end failure reason that BackEndStatus only numbers, and is the
+        main size risk on this line after UrlQuery
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Pass the raw line through the core worker group with _raw intact and
+          let the integration parse, but tag each event low-side with the
+          source protocol directory (Owa, Ecp, Autodiscover, Mapi, PowerShell)
+          taken from the file path, because the Protocol column alone does not
+          survive a positional shift and protocol is the primary triage axis
+          for ProxyLogon/ProxyShell hunting. Drop the fifty-odd latency
+          counters near the source rather than indexing them - they are the
+          bulk of the line and have no detection value - and run Persistent
+          Queue backpressure on the Elastic destination. Keep _raw on the
+          Autodiscover and PowerShell directories even after the parser is
+          proven; those are the exploitation paths where the unparsed request
+          is the evidence.
+        elastic: >
+          Add a logs-microsoft_exchange_server.httpproxy@custom pipeline that
+          composes url.original from UrlHost, UrlStem and UrlQuery so the web
+          alerting profile has its required field, derives event.outcome from
+          HttpStatus and IsAuthenticated together rather than either alone,
+          and splits the ClientIpAddress column on its double-space separator
+          before promoting the external address to source.ip. Map
+          microsoft.exchange.anchormailbox, .backendstatus, .protocol,
+          .authenticationtype and .targetserver as keyword in the custom
+          namespace and build the ProxyLogon/ProxyShell detections off the
+          combination the stock mapping leaves inert: an empty
+          AuthenticatedUser with a 200 front-end status, an AnchorMailbox
+          holding a SID or an Autodiscover path containing an embedded @, and
+          a BackEndStatus that disagrees with the front-end HttpStatus.
+        relay: >
+          Low-side front ends cross the guard: ship the thin envelope with
+          _raw, so the guard sees the same JSON schema as every other Exchange
+          dataset rather than a seventy-column CSV grammar. This is the worst
+          content-filter case in the map because UrlStem and UrlQuery are
+          fully attacker-controlled and are precisely where percent-encoded
+          traversal, embedded @ hostnames and multi-kilobyte payloads appear -
+          cap their length, normalize percent- and unicode-encoding, and strip
+          control characters before the guard destination, accepting that a
+          custom NDJSON filter rule can only stay simple if the shape is
+          constrained low-side. At-most-once crossing: reconcile per (dataset,
+          hour) counts, and treat a gap on the Autodiscover or PowerShell
+          protocol as an incident rather than a transport nuisance.
+      direct:
+        parse_location: high
+        cribl: >
+          Pass the raw line through the core worker group with _raw intact and
+          let the integration parse, but tag each event at the edge worker
+          group with the source protocol directory (Owa, Ecp, Autodiscover,
+          Mapi, PowerShell) taken from the file path, because the Protocol
+          column alone does not survive a positional shift and protocol is the
+          primary triage axis for ProxyLogon/ProxyShell hunting. Drop the
+          fifty-odd latency counters near the source rather than indexing them
+          - they are the bulk of the line and have no detection value - and
+          run Persistent Queue backpressure on the Elastic destination. Keep
+          _raw on the Autodiscover and PowerShell directories even after the
+          parser is proven; those are the exploitation paths where the
+          unparsed request is the evidence.
+        elastic: >
+          Add a logs-microsoft_exchange_server.httpproxy@custom pipeline that
+          composes url.original from UrlHost, UrlStem and UrlQuery so the web
+          alerting profile has its required field, derives event.outcome from
+          HttpStatus and IsAuthenticated together rather than either alone,
+          and splits the ClientIpAddress column on its double-space separator
+          before promoting the external address to source.ip. Map
+          microsoft.exchange.anchormailbox, .backendstatus, .protocol,
+          .authenticationtype and .targetserver as keyword in the custom
+          namespace and build the ProxyLogon/ProxyShell detections off the
+          combination the stock mapping leaves inert: an empty
+          AuthenticatedUser with a 200 front-end status, an AnchorMailbox
+          holding a SID or an Autodiscover path containing an embedded @, and
+          a BackEndStatus that disagrees with the front-end HttpStatus.
+- id: admin-audit
+  name: Administrator audit log
+  description: >
+    A record of every cmdlet and parameter run through the Exchange Management
+    Shell, the Exchange admin center, and remote PowerShell - the on-prem
+    answer to "who changed what" on the mail platform. Entries are stored in
+    the organization's arbitration mailbox and are surfaced as XML by
+    New-AdminAuditLogSearch or Search-AdminAuditLog; the same activity is also
+    written per-server to the MSExchange Management Windows event log channel
+    (event ID 1 for success, 6 for failure) in a rendered text form, which is
+    the alternative collection path where an agent is already on the box.
+    Read-only Get-* cmdlets are excluded by default, and ModifiedProperties is
+    only populated when Set-AdminAuditLogConfig -LogLevel is set to Verbose -
+    both are configuration decisions a SOC must verify before trusting
+    coverage.
+  event_categories:
+  - configuration
+  - iam
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        A scheduled New-AdminAuditLogSearch export (or an Elastic Agent
+        tailing the MSExchange Management channel) delivers entries to Cribl.
+        Deployment must still settle which of the two collection paths is
+        authoritative before the field names below are treated as stable - the
+        event-log rendering does not use the XML attribute names.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-microsoft_exchange_server.admin_audit
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        A scheduled New-AdminAuditLogSearch export (or an Elastic Agent
+        tailing the MSExchange Management channel) delivers entries to Cribl.
+        Deployment must still settle which of the two collection paths is
+        authoritative before the field names below are treated as stable - the
+        event-log rendering does not use the XML attribute names.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-microsoft_exchange_server.admin_audit
+  formats:
+  - format: other
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Cribl pipeline (no Elastic integration data stream)
+      notes: >
+        The microsoft_exchange_server package ships only httpproxy,
+        imap4_pop3, messagetracking and smtp data streams - there is no
+        integration coverage for the admin audit log on-prem, and the
+        Microsoft 365 / Exchange Online audit packages do not apply to an
+        on-prem organization. Parsing is therefore bespoke: XML with repeating
+        CmdletParameters/Parameter and ModifiedProperties/Property children
+        that must be flattened into bounded arrays, or a regex over the
+        MSExchange Management event message if that path is chosen.
+    fields:
+    - vendor: Caller
+      type: string
+      description: >-
+        user account that ran the cmdlet, recorded as a canonical
+        distinguished name (e.g. corp.contoso.com/Users/Administrator)
+      ecs: user.name
+      status: partial
+      transform: >
+        extract the trailing leaf of the canonical DN into user.name and keep
+        the full DN in the custom namespace; the value is not a sAMAccountName
+        or UPN, so it will not join to Windows or Entra identity events
+        without normalization
+    - vendor: Cmdlet
+      type: string
+      description: name of the cmdlet that was run
+      ecs: event.action
+      status: mapped
+    - vendor: ObjectModified
+      type: string
+      description: distinguished name of the Exchange object the cmdlet modified
+      ecs: null
+      status: unmapped
+      custom: microsoft.exchange.admin_audit.object_modified
+      notes: >
+        any Exchange object - mailbox, connector, transport rule, role
+        assignment - so it is only a user principal some of the time.
+        Deliberately not mapped to user.target.name: doing so would make every
+        connector and transport-rule change look like an identity operation to
+        the iam alerting profile
+    - vendor: RunDate
+      type: timestamp
+      description: date and time the cmdlet was run
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        recorded in the originating server's local time with a UTC offset
+        (e.g. 2015-10-18T15:48:15-07:00), unlike the message tracking and
+        HTTPProxy logs which are already UTC; normalize to UTC on ingest or
+        admin activity will be skewed against every other Exchange dataset
+    - vendor: Succeeded
+      type: boolean
+      description: whether the cmdlet completed successfully - True or False
+      ecs: event.outcome
+      status: mapped
+      transform: >-
+        True maps to success and False to failure; this is the only outcome
+        source in the dataset
+    - vendor: Error
+      type: string
+      description: >-
+        error message generated when the cmdlet failed, or the literal string
+        None when no error occurred
+      ecs: error.message
+      status: partial
+      notes: >
+        the literal "None" is a sentinel for absence, not an error text - it
+        must be dropped rather than indexed, or every successful change
+        acquires a populated error.message and error-rate dashboards become
+        meaningless
+    - vendor: OriginatingServer
+      type: string
+      description: >-
+        Exchange server on which the cmdlet was run, recorded as hostname plus
+        the parenthesised build number (e.g. "WIN8MBX (15.01.0396.030)")
+      ecs: host.name
+      status: partial
+      transform: >
+        strip the parenthesised build number into a separate custom field
+        before assigning host.name, otherwise the composite string will not
+        join to any other host-keyed dataset
+    - vendor: CmdletParameters
+      type: string
+      description: >-
+        repeating Parameter child elements carrying the Name and Value of
+        every parameter supplied to the cmdlet
+      ecs: null
+      status: unmapped
+      custom: microsoft.exchange.admin_audit.cmdlet_parameters
+      notes: >
+        the substance of the audit record - what was actually changed lives
+        here, not in Cmdlet. Values are unbounded and may contain cleartext
+        credentials, connection strings and forwarding addresses, so this
+        field drives the redaction requirement for the whole dataset
+    - vendor: ModifiedProperties
+      type: string
+      description: >-
+        repeating Property child elements carrying the Name, OldValue and
+        NewValue of each property the cmdlet changed
+      ecs: null
+      status: unmapped
+      custom: microsoft.exchange.admin_audit.modified_properties
+      notes: >
+        only populated when Set-AdminAuditLogConfig -LogLevel is Verbose; on a
+        default installation this field is empty and before/after
+        reconstruction is impossible, which is a coverage decision to confirm
+        with the platform owner rather than a mapping gap
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Parse the XML low-side into flat ECS-shaped JSON: extract the Event
+          attributes, flatten CmdletParameters/Parameter into a bounded
+          name/value array and ModifiedProperties/Property into a bounded
+          name/old/new array, and hold the result to two levels of nesting
+          with short ASCII keys. Redact before anything leaves the pipeline -
+          the parameter values carry cleartext secrets whenever an
+          administrator ran Set-Mailbox, New-User or a credential cmdlet with
+          -Password, -AccessToken or a connection string, and this is the one
+          dataset in the map where the log itself is a credential store. Split
+          the OriginatingServer value into a hostname and the parenthesised
+          build number, normalize RunDate from local time with offset to UTC,
+          and validate against a Schema Library schema with a dead-letter
+          route before the destination.
+        elastic: >
+          Land pre-shaped documents in a custom
+          logs-microsoft_exchange_server.admin_audit data stream with an
+          explicit index template - nothing is inherited here because no
+          integration exists. Map the Cmdlet value to event.action and derive
+          event.action_detail from the verb, and keep ObjectModified in the
+          custom namespace as keyword rather than forcing it onto
+          user.target.name, because it holds a distinguished name for any
+          Exchange object and is a user principal only for the mailbox
+          cmdlets. Build the high-value detections off the cmdlet vocabulary
+          rather than the outcome: New-ManagementRoleAssignment,
+          Add-MailboxPermission, Set-Mailbox -ForwardingSmtpAddress,
+          New-InboxRule, New-TransportRule and New-JournalRule are the
+          persistence and exfiltration paths, and Search-AdminAuditLog's own
+          default exclusion of Get-* cmdlets means reconnaissance is invisible
+          unless that configuration is changed.
+        relay: >
+          Full redacted ECS JSON crosses the guard rather than a thin
+          envelope, because the redaction must happen before the boundary and
+          a content filter cannot make that decision over an opaque _raw blob.
+          The parameter and modified-property values are the friction: they
+          are unbounded free text, can contain XML-escaped markup, and in the
+          Verbose case hold entire before/after property values - cap each
+          value, cap the array lengths, and drop _raw entirely once redaction
+          is proven, since unredacted cmdlet parameters are exactly what must
+          not cross. Volume is low and each record is individually
+          significant, so the per (dataset, hour) count reconciliation matters
+          more here than anywhere else in the map.
+      direct:
+        parse_location: low
+        cribl: >
+          Parse the XML at the edge worker group into flat ECS-shaped JSON:
+          extract the Event attributes, flatten CmdletParameters/Parameter
+          into a bounded name/value array and ModifiedProperties/Property into
+          a bounded name/old/new array, and hold the result to two levels of
+          nesting with short ASCII keys. Redact before anything leaves the
+          pipeline - the parameter values carry cleartext secrets whenever an
+          administrator ran Set-Mailbox, New-User or a credential cmdlet with
+          -Password, -AccessToken or a connection string, and this is the one
+          dataset in the map where the log itself is a credential store. Split
+          the OriginatingServer value into a hostname and the parenthesised
+          build number, normalize RunDate from local time with offset to UTC,
+          and validate against a Schema Library schema with a dead-letter
+          route before the destination.
+        elastic: >
+          Land pre-shaped documents in a custom
+          logs-microsoft_exchange_server.admin_audit data stream with an
+          explicit index template - nothing is inherited here because no
+          integration exists. Map the Cmdlet value to event.action and derive
+          event.action_detail from the verb, and keep ObjectModified in the
+          custom namespace as keyword rather than forcing it onto
+          user.target.name, because it holds a distinguished name for any
+          Exchange object and is a user principal only for the mailbox
+          cmdlets. Build the high-value detections off the cmdlet vocabulary
+          rather than the outcome: New-ManagementRoleAssignment,
+          Add-MailboxPermission, Set-Mailbox -ForwardingSmtpAddress,
+          New-InboxRule, New-TransportRule and New-JournalRule are the
+          persistence and exfiltration paths, and Search-AdminAuditLog's own
+          default exclusion of Get-* cmdlets means reconnaissance is invisible
+          unless that configuration is changed.
+  - format: windows-event
+    enable: >
+      Administrator audit logging is enabled by default
+      (Set-AdminAuditLogConfig -AdminAuditLogEnabled $true), and while that is
+      on, every non-Get cmdlet run through the Exchange Management Shell, the
+      EAC and remote PowerShell is written to the local "MSExchange
+      Management" event-log channel by the "MSExchange CmdletLogs" provider as
+      event ID 1 (Cmdlet succeeded) or 6 (Cmdlet failed) in addition to the
+      arbitration-mailbox store. To collect this path, point the Elastic Agent
+      Windows integration (or Winlogbeat) at the "MSExchange Management"
+      channel on each Exchange server and filter to provider "MSExchange
+      CmdletLogs", event IDs 1 and 6. Nothing needs to be exported from the
+      arbitration mailbox on this path and the same Get-* exclusion applies
+      (read-only cmdlets are not audited), but note that the
+      ModifiedProperties before/after detail that the XML path can carry under
+      Set-AdminAuditLogConfig -LogLevel Verbose has no equivalent in this
+      rendered event, so choosing this transport is also choosing the thinner
+      record.
+    references:
+    - >-
+      https://learn.microsoft.com/en-us/exchange/policy-and-compliance/admin-audit-logging/admin-audit-logging
+    - >-
+      https://learn.microsoft.com/en-us/powershell/module/exchangepowershell/set-adminauditlogconfig
+    - https://www.myeventlog.com/search/show/785
+    parsing:
+      mechanism: elastic-integration
+      artifact: >-
+        Windows integration (custom event log input, MSExchange Management
+        channel) + logs-windows@custom pipeline
+      notes: >
+        The stock Windows integration collects the winlog envelope
+        (TimeCreated, EventID, provider, Computer, the executing security
+        identity) but does not grok the Exchange cmdlet message, so a
+        logs-windows.*@custom or a dedicated ingest pipeline must regex the
+        "Cmdlet <name>, parameters {<Name>=<Value>, ...}" body to recover
+        event.action and the parameter set. The rendered form is lossy
+        relative to the XML path: there is no discrete Caller, ObjectModified
+        or ModifiedProperties element - the executing account is only the
+        event's security context (frequently the Exchange system identity
+        rather than the human operator), the object acted on is not named
+        outside the parameter blob, and Verbose before/after values do not
+        appear at all. Treat this transport as an availability fallback for
+        boxes where the arbitration-mailbox export cannot run, not as an
+        equivalent of the XML feed.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          The winlog envelope arrives structured, but the audit substance is
+          inside the rendered message, so the split is genuinely hybrid: keep
+          the envelope (TimeCreated, EventID, Computer, provider) as landed
+          and regex the message body into event.action (the cmdlet name) and a
+          bounded parameter name/value array low-side, before the crossing,
+          because the parameter values are the same credential store the XML
+          path is - an administrator who ran Set-Mailbox, New-User or any
+          credential cmdlet with -Password or a connection string put
+          cleartext into this message. Redact those values in the pipeline,
+          cap the parameter blob and its element count, map EventID 1/6 to
+          event.outcome, and validate against a Schema Library schema with a
+          dead-letter route before the destination. Stamp observer.hostname
+          from Computer, since unlike the XML path this event does carry the
+          originating server natively.
+        elastic: >
+          Land the events through the Windows integration but attach a
+          logs-windows@custom (or a dedicated
+          logs-microsoft_exchange_server.admin_audit sibling) ingest pipeline
+          that groks the cmdlet message: set event.action from the parsed
+          cmdlet name, event.code from the numeric EventID, and event.outcome
+          from the 1/6 split, and keep the extracted parameters as
+          microsoft.exchange.admin_audit.cmdlet_parameters keyword rather than
+          forcing them onto typed fields. Build the same persistence and
+          exfiltration detections the XML feed targets off the cmdlet
+          vocabulary (New-ManagementRoleAssignment, Add-MailboxPermission,
+          Set-Mailbox -ForwardingSmtpAddress, New-InboxRule,
+          New-TransportRule, New-JournalRule), but pin observer.product to
+          "MSExchange CmdletLogs" so an analyst can tell a thin
+          event-log-sourced record from a full XML-sourced one, since the
+          object-modified and before/after context simply is not present here.
+        relay: >
+          What crosses the guard is redacted, field-shaped JSON, not the raw
+          rendered event, because the redaction of cleartext parameter values
+          must happen before the boundary and a content filter cannot make
+          that call over an opaque message string. The one unbounded,
+          inspection-relevant value is the parameter blob (arbitrary operator
+          input, may contain XML-escaped markup and full property values), so
+          cap each value and the array length and drop the raw message once
+          the grok and redaction are proven. Volume is low and each record is
+          individually significant, so per (dataset, hour) count
+          reconciliation matters as much here as on the XML path; reconcile on
+          EventID-bearing counts, and treat a gap against the arbitration feed
+          for the same server as a coverage question, not transport noise,
+          since the two paths should agree on cmdlet volume.
+      direct:
+        parse_location: hybrid
+        cribl: >
+          For a high-side Exchange server whose Elastic stack is on the same
+          side, keep the envelope structured and grok the cmdlet message, but
+          with no crossing to force a capping discipline retain the full
+          parameter blob for forensics - subject only to redaction of the
+          cleartext parameter values, which is a data-protection requirement
+          rather than a transport one and still applies. Stamp
+          observer.hostname from Computer and deduplicate against any
+          arbitration-mailbox feed for the same server on cmdlet + TimeCreated
+          so a change collected on both paths is one event, not two, in the
+          audit timeline.
+        elastic: >
+          Land the events through the Windows integration with a
+          logs-windows@custom (or a dedicated
+          logs-microsoft_exchange_server.admin_audit sibling) ingest pipeline
+          that groks the cmdlet message: set event.action from the parsed
+          cmdlet name, event.code from the numeric EventID, and event.outcome
+          from the 1/6 split, and keep the extracted parameters as
+          microsoft.exchange.admin_audit.cmdlet_parameters keyword rather than
+          forcing them onto typed fields. Build the persistence and
+          exfiltration detections off the cmdlet vocabulary
+          (New-ManagementRoleAssignment, Add-MailboxPermission, Set-Mailbox
+          -ForwardingSmtpAddress, New-InboxRule, New-TransportRule,
+          New-JournalRule) and pin observer.product to "MSExchange CmdletLogs"
+          so an analyst can tell a thin event-log-sourced record from a full
+          XML-sourced one. Because there is no boundary, keep the raw rendered
+          message alongside the parsed fields for the cmdlets where the
+          parameter detail is the evidence, and treat this feed as
+          complementary to the XML path - the arbitration-mailbox record still
+          carries the ObjectModified DN and, under Verbose, the before/after
+          property values that this event-log rendering cannot supply.
+    fields:
+    - vendor: TimeCreated
+      type: timestamp
+      description: time the cmdlet-audit event was written to the MSExchange Management channel
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: EventID
+      type: integer
+      description: >-
+        numeric event id classifying the cmdlet outcome - 1 for a succeeded
+        cmdlet, 6 for a failed cmdlet
+      ecs: event.code
+      status: partial
+      transform: >
+        store the numeric value in event.code and derive event.outcome from it
+        - 1 maps to success, 6 to failure; this is the only outcome source on
+        this transport, as the rendered message has no discrete Succeeded
+        field
+    - vendor: Provider Name
+      type: string
+      description: event provider that wrote the record - the constant value MSExchange CmdletLogs
+      ecs: null
+      status: unmapped
+      custom: microsoft.exchange.admin_audit.provider_name
+      notes: >-
+        the routing discriminator that isolates cmdlet-audit events from the
+        other Exchange sources on the MSExchange Management channel; a
+        constant, kept for filtering rather than analysis
+    - vendor: Computer
+      type: string
+      description: host name of the Exchange server that ran the cmdlet and wrote the event
+      ecs: observer.hostname
+      status: mapped
+      notes: >
+        unlike the XML path, whose OriginatingServer is a composite
+        hostname-plus-build string needing a split, this transport supplies
+        the server name natively in the event envelope
+    - vendor: Security UserID
+      type: string
+      description: >-
+        security identifier of the account under which the cmdlet event was
+        written, from the event's System/Security element
+      ecs: user.id
+      status: partial
+      notes: >
+        the process security context, which is frequently the Exchange system
+        identity rather than the human operator who ran the cmdlet; this
+        transport has no reliable discrete Caller field, so do not treat this
+        SID as the actor without corroboration - the operator identity the XML
+        path records in Caller is not dependably present here
+    - vendor: Cmdlet
+      type: string
+      description: >-
+        name of the cmdlet that was run, carried inside the rendered event
+        message (e.g. "Cmdlet New-Mailbox")
+      ecs: event.action
+      status: partial
+      transform: >
+        regex the cmdlet name out of the "Cmdlet <name>, parameters {...}"
+        message body into event.action; it is not a discrete event field on
+        this transport and must be extracted from the rendered text
+    - vendor: parameters
+      type: string
+      description: >-
+        the supplied cmdlet parameters as a rendered {Name=Value, ...} list
+        inside the event message (e.g. {Name=Johnny Test,
+        UserPrincipalName=..., Password=System.Security.SecureString})
+      ecs: null
+      status: partial
+      custom: microsoft.exchange.admin_audit.cmdlet_parameters
+      notes: >
+        the substance of the audit record - what was actually changed lives
+        here, not in the cmdlet name - but it is a single rendered string that
+        must be regexed into a name/value array. Values are unbounded and can
+        contain cleartext credentials, connection strings and forwarding
+        addresses (SecureString parameters render as a placeholder, but many
+        do not), so this field drives the redaction requirement for the whole
+        transport
+    - vendor: Message
+      type: string
+      description: >-
+        the full rendered event message text, prefixed "Cmdlet
+        succeeded."/"Cmdlet failed." and carrying the cmdlet name and
+        parameter list
+      ecs: message
+      status: mapped
+      notes: >
+        kept as the raw evidence from which Cmdlet and parameters are
+        extracted; the "succeeded"/"failed" prefix is redundant with the 1/6
+        EventID and should not be parsed as a second outcome source
+- id: mailbox-audit
+  name: Mailbox audit log
+  description: >
+    Per-mailbox records of who opened, moved, deleted or sent from a mailbox,
+    classified by whether the actor was the Owner, a Delegate (including any
+    administrator holding Full Access), or an Admin. Entries are written into
+    the audited mailbox itself, under Recoverable Items\Audits, and are
+    retrieved with Search-MailboxAuditLog or an asynchronous
+    New-MailboxAuditLogSearch that mails XML results - there is no flat file
+    on disk to tail. Non-owner access is the reason a SOC wants this feed:
+    SendAs, delegate FolderBind and HardDelete are the mailbox-compromise and
+    insider-exfiltration signals that message tracking cannot see. Coverage is
+    per-mailbox and per-action opt-in, owner actions are off unless explicitly
+    enabled, delegate FolderBind entries are consolidated to one per folder
+    per 24 hours, and accounts can be configured to bypass auditing entirely.
+  event_categories:
+  - iam
+  - authentication
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        A scheduled Search-MailboxAuditLog or New-MailboxAuditLogSearch
+        collector runs against the organization and posts results to Cribl;
+        the low-side collector runs in that enclave and pushes across. Its
+        checkpoint must be owned separately because a pull-based source has no
+        file position to resume from.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-microsoft_exchange_server.mailbox_audit
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        A scheduled Search-MailboxAuditLog or New-MailboxAuditLogSearch
+        collector runs against the organization and posts results to Cribl.
+        Its checkpoint must be owned separately because a pull-based source
+        has no file position to resume from.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-microsoft_exchange_server.mailbox_audit
+  formats:
+  - format: api-pull
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Cribl pipeline (no Elastic integration data stream)
+      notes: >
+        No Elastic integration covers on-prem mailbox auditing; the
+        microsoft_365 and Exchange Online audit packages read the unified
+        audit log, which does not exist in an on-prem organization. The
+        collector emits PowerShell objects or the XML attachment from
+        New-MailboxAuditLogSearch, so the pipeline owns both the extraction
+        and the deduplication of overlapping search windows.
+    fields:
+    - vendor: Operation
+      type: enum
+      description: >-
+        audited mailbox action - Copy, Create, FolderBind, HardDelete,
+        MailboxLogin, MessageBind, Move, MoveToDeletedItems, SendAs,
+        SendOnBehalf, SoftDelete, Update
+      ecs: event.action
+      status: mapped
+    - vendor: OperationResult
+      type: enum
+      description: result of the operation - Succeeded, PartiallySucceeded, or Failed
+      ecs: event.outcome
+      status: partial
+      transform: >
+        Succeeded and Failed map to the ECS success and failure values, but
+        PartiallySucceeded has no ECS equivalent; map it to unknown and
+        preserve the distinction in a custom field rather than folding it into
+        success, which would hide partially completed bulk operations
+    - vendor: LogonType
+      type: enum
+      description: type of user who performed the operation - Owner, Delegate, or Admin
+      ecs: null
+      status: unmapped
+      custom: microsoft.exchange.mailbox_audit.logon_type
+      notes: >
+        the discriminator the whole dataset exists for - Delegate and Admin
+        are non-owner access. No ECS field models actor-relationship-to-
+        target, and this is not an authentication logon type in the Windows
+        sense despite the name
+    - vendor: LastAccessed
+      type: timestamp
+      description: time the audited operation was performed
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: MailboxOwnerUPN
+      type: string
+      description: user principal name of the owner of the mailbox that was acted upon
+      ecs: user.target.name
+      status: mapped
+      notes: >
+        the mailbox being acted upon, which is the correct sense of
+        user.target.* - the actor is LogonUserDisplayName. For owner-logon
+        entries the two are the same principal, which is expected rather than
+        a mapping error
+    - vendor: LogonUserDisplayName
+      type: string
+      description: display name of the user who performed the operation
+      ecs: user.name
+      status: partial
+      notes: >
+        a display name, not a sAMAccountName or UPN, so it will not join to
+        Windows or Entra identity events; LogonUserSid is the reliable
+        identity and should drive any correlation
+    - vendor: LogonUserSid
+      type: string
+      description: security identifier of the user who performed the operation
+      ecs: null
+      status: unmapped
+      custom: microsoft.exchange.mailbox_audit.logon_user_sid
+      notes: >-
+        the only stable actor identity on the record; the join key to Windows
+        Security-channel events
+    - vendor: ClientIPAddress
+      type: ip
+      description: IP address of the client computer that accessed the mailbox
+      ecs: source.ip
+      status: mapped
+    - vendor: ClientMachineName
+      type: string
+      description: name of the client computer that accessed the mailbox
+      ecs: source.address
+      status: partial
+      notes: >
+        a NetBIOS or DNS hostname rather than an address; kept on
+        source.address because it is unresolved and host.name is reserved for
+        the collecting Exchange server, which the audit entry itself does not
+        record
+    - vendor: ClientProcessName
+      type: string
+      description: name of the client application process that accessed the mailbox
+      ecs: process.name
+      status: mapped
+    - vendor: ClientInfoString
+      type: string
+      description: >-
+        detail identifying which client or Exchange component performed the
+        operation (e.g. Client=OWA;Action=ViaProxy, Client=MSExchangeRPC)
+      ecs: null
+      status: partial
+      custom: microsoft.exchange.mailbox_audit.client_info_string
+      notes: >
+        semi-structured key/value text whose grammar varies by client; the
+        practical discriminator between interactive human access and automated
+        or migration tooling, and worth splitting into a client component and
+        an action component rather than indexing whole
+    - vendor: ItemSubject
+      type: string
+      description: subject of the mailbox item the operation was performed on
+      ecs: email.subject
+      status: partial
+      notes: >
+        the subject of a stored item rather than a message in transit, so an
+        email.* mapping is a modelling stretch that only holds for mail items
+        - it is empty or meaningless for FolderBind and for calendar and
+        contact items. Unbounded user-controlled text
+    - vendor: FolderPathName
+      type: string
+      description: path of the mailbox folder the operation was performed in
+      ecs: null
+      status: unmapped
+      custom: microsoft.exchange.mailbox_audit.folder_path
+      notes: >
+        a MAPI folder path such as \Inbox\Archive, not a filesystem path;
+        deliberately not mapped to file.path, which would make mailbox
+        browsing indistinguishable from filesystem activity in any
+        cross-source query
+    - vendor: DestFolderPathName
+      type: string
+      description: destination folder path for Move and MoveToDeletedItems operations
+      ecs: null
+      status: unmapped
+      custom: microsoft.exchange.mailbox_audit.dest_folder_path
+      notes: >-
+        only populated for move operations; the source/destination pair is
+        what distinguishes filing from staging for exfiltration
+    - vendor: CrossMailboxOperation
+      type: boolean
+      description: whether the logged operation copied or moved items between mailboxes
+      ecs: null
+      status: unmapped
+      custom: microsoft.exchange.mailbox_audit.cross_mailbox
+      notes: >-
+        true on any item movement across a mailbox boundary - a low-volume,
+        high-signal exfiltration indicator with no ECS equivalent
+    - vendor: MailboxGuid
+      type: string
+      description: GUID of the mailbox the operation was performed on
+      ecs: null
+      status: unmapped
+      custom: microsoft.exchange.mailbox_audit.mailbox_guid
+      notes: >-
+        stable mailbox identity that survives UPN and display-name changes;
+        the correct join key for longitudinal mailbox analysis
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Shape the collector output into flat ECS JSON in the pipeline and
+          solve the two problems the feed creates rather than deferring them:
+          deduplicate on the audit entry Identity across overlapping
+          Search-MailboxAuditLog windows, since a pull-based source with no
+          checkpoint will otherwise re-emit entries on every run, and stamp
+          host.name from the collecting Exchange server because the audit
+          entry itself carries no server field and both the iam and
+          authentication alerting profiles require it. Enrich MailboxOwnerUPN
+          against the mailbox inventory low-side where the lookup already
+          lives, cap ItemSubject, and validate against a Schema Library schema
+          with a dead-letter route before the destination.
+        elastic: >
+          Land pre-shaped documents in a custom
+          logs-microsoft_exchange_server.mailbox_audit data stream with an
+          explicit index template; nothing is inherited because no integration
+          exists. Map the Operation vocabulary to event.action directly but
+          handle OperationResult's PartiallySucceeded explicitly - ECS has no
+          such event.outcome value, and silently folding it into success will
+          hide partially completed bulk deletes. Map
+          microsoft.exchange.mailbox_audit.logon_type, .client_info_string and
+          .cross_mailbox as keyword, and build detections on the combination
+          the raw fields leave inert: a LogonType of Delegate or Admin paired
+          with HardDelete or SendAs, any CrossMailboxOperation, and a
+          ClientInfoString whose client component is not the one that mailbox
+          normally uses.
+        relay: >
+          Full ECS JSON crosses the guard rather than a thin envelope, because
+          no high-side integration exists to parse an opaque payload and the
+          record is already small and field-aware once shaped. ItemSubject is
+          the only unbounded, user-controlled value on the line and the only
+          real content-filter friction - cap it, strip control characters and
+          normalize unicode, and consider dropping it entirely if mailbox
+          subject retention is contentious, since the operation and the actor
+          carry the detection value without it. At-most-once crossing with no
+          acknowledgement: reconcile counts per (dataset, hour), which is more
+          fragile here than elsewhere because the pull collector's own
+          deduplication also affects the low-side count.
+      direct:
+        parse_location: low
+        cribl: >
+          Shape the collector output into flat ECS JSON in the pipeline and
+          solve the two problems the feed creates rather than deferring them:
+          deduplicate on the audit entry Identity across overlapping
+          Search-MailboxAuditLog windows, since a pull-based source with no
+          checkpoint will otherwise re-emit entries on every run, and stamp
+          host.name from the collecting Exchange server because the audit
+          entry itself carries no server field and both the iam and
+          authentication alerting profiles require it. Enrich MailboxOwnerUPN
+          against the mailbox inventory at the edge worker group where the
+          lookup already lives, cap ItemSubject, and validate against a Schema
+          Library schema with a dead-letter route before the destination.
+        elastic: >
+          Land pre-shaped documents in a custom
+          logs-microsoft_exchange_server.mailbox_audit data stream with an
+          explicit index template; nothing is inherited because no integration
+          exists. Map the Operation vocabulary to event.action directly but
+          handle OperationResult's PartiallySucceeded explicitly - ECS has no
+          such event.outcome value, and silently folding it into success will
+          hide partially completed bulk deletes. Map
+          microsoft.exchange.mailbox_audit.logon_type, .client_info_string and
+          .cross_mailbox as keyword, and build detections on the combination
+          the raw fields leave inert: a LogonType of Delegate or Admin paired
+          with HardDelete or SendAs, any CrossMailboxOperation, and a
+          ClientInfoString whose client component is not the one that mailbox
+          normally uses.

@@ -1,0 +1,1676 @@
+id: infoblox-ddi
+name: Infoblox NIOS DDI
+vendor: Infoblox
+versions: NIOS 8.6.x, 9.0.x (Grid Master + DNS/DHCP grid members)
+draft: true
+references:
+- https://docs.infoblox.com/space/NAG8/22252249/Using%20a%20Syslog%20Server
+- >-
+  https://infoblox-docs.atlassian.net/wiki/spaces/nios90/pages/280275770/Monitoring+through+Syslog
+- >-
+  https://infoblox-docs.atlassian.net/wiki/spaces/nios90/pages/1381139017/Setting+DNS+Logging+Categories
+- >-
+  https://infoblox-docs.atlassian.net/wiki/spaces/nios90/pages/280269642/Verifying+RPZ+Configuration
+- https://docs.infoblox.com/space/NAG8/22253114/Testing+RPZ+Feed+Rules
+- >-
+  https://docs.infoblox.com/space/nios85/35816694/Capturing+DNS+Queries+and+Responses
+- https://www.elastic.co/docs/reference/integrations/infoblox_nios
+- >-
+  https://github.com/elastic/integrations/tree/main/packages/infoblox_nios/data_stream/log
+- https://bind9.readthedocs.io/en/stable/reference.html
+datasets:
+- id: dns-query
+  name: DNS query/response log (named)
+  description: >
+    Per-transaction DNS records written by the `named` instance on each NIOS
+    DNS grid member and forwarded off-box by the member's syslog
+    configuration. NIOS emits two distinct grammars on this channel and the
+    difference from stock BIND matters: the classic BIND `queries` category
+    line (`client @0xHANDLE ip#port (qname): view V: query: NAME IN A +
+    (dest)`), and the NIOS-specific combined query/response line (`client
+    ip#port: UDP: query: NAME IN A response: NOERROR +AED <answer RRs>;`)
+    produced by "DNS query and response logging". The second form carries the
+    transport as a literal token, the rcode, and the full answer RR set on the
+    SAME line — no BIND build does this — and it is the form a SOC wants,
+    because one record contains both the question and what the resolver
+    actually handed back. Highest-volume dataset in the grid by an order of
+    magnitude.
+  event_categories:
+  - dns
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        NIOS grid members forward syslog (UDP/TCP 514, or TLS where the grid
+        is configured for it) straight to the Cribl syslog source, replacing
+        the ArcSight syslog connector. All three text feeds — named, dhcpd and
+        httpd — arrive on ONE stream and are separated only by the syslog tag,
+        so this source cannot be onboarded per dataset at the collector. The
+        low-side crossing needs a destination allow-list before onboarding,
+        and query volume forces a sampling or aggregation decision at this
+        hop.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-infoblox_nios.log
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        NIOS grid members forward syslog (UDP/TCP 514, or TLS where the grid
+        is configured for it) straight to the Cribl syslog source, replacing
+        the ArcSight syslog connector. All three text feeds — named, dhcpd and
+        httpd — arrive on ONE stream and are separated only by the syslog tag,
+        so this source cannot be onboarded per dataset at the collector. Query
+        volume forces a sampling or aggregation decision at this hop.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-infoblox_nios.log
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: elastic-integration
+      artifact: Elastic infoblox_nios integration (data stream infoblox_nios.log)
+      notes: >
+        The integration ships ONE data stream, `infoblox_nios.log`, whose
+        default pipeline splits on the syslog tag (`named` -> pipeline_dns,
+        `dhcpd`/`dhcpdv6` -> pipeline_dhcp, `httpd` -> pipeline_audit), so
+        DNS, DHCP and audit all land in the same index and must be separated
+        at query time on `infoblox_nios.log.type`. pipeline_dns carries
+        thirteen ordered grok patterns covering both query grammars plus
+        notify, zone transfer, DNSSEC validation, dynamic update, query-errors
+        and rewrite lines. The header-flag blob is kept raw in
+        `infoblox_nios.log.dns.header_flags` and expanded into ECS
+        `dns.header_flags` for the letters that have an ECS token, on both
+        query grammars. Real coverage gaps: `dns.resolved_ip` is never
+        populated; and the client/server pair goes to `client.ip`/`server.ip`
+        rather than `source.ip`/`destination.ip`, which most DNS detection
+        content pivots on.
+    fields:
+    - vendor: client address
+      type: ip
+      description: IP address of the resolver client that asked the question.
+      ecs: source.ip
+      status: mapped
+      notes: >
+        the stock integration writes this to client.ip only; copy it to
+        source.ip, which is where DNS detection content looks
+    - vendor: client port
+      type: port
+      description: Source UDP/TCP port of the querying client.
+      ecs: source.port
+      status: mapped
+    - vendor: '@0x<handle>'
+      type: string
+      description: BIND client object printed as a hex pointer, e.g. @0x7f1dd4114af0.
+      ecs: null
+      status: unmapped
+      custom: infoblox.nios.dns.client_handle
+      notes: >
+        present on the classic `queries` grammar and absent on the NIOS
+        combined query/response line; useful only for tying a query line to
+        its query-errors or rewrite follow-up
+    - vendor: view <name>
+      type: string
+      description: DNS view the query matched, printed as `view _default:` or `view 1:`.
+      ecs: null
+      status: unmapped
+      custom: infoblox.nios.dns.view
+      notes: >
+        NIOS prints either the view name or its internal ordinal depending on
+        grid configuration; essential for disambiguating split-horizon answers
+        and it has no ECS equivalent
+    - vendor: transport token (UDP:/TCP:)
+      type: enum
+      description: >-
+        Literal transport token emitted before `query:` on the NIOS combined
+        query/response line.
+      ecs: network.transport
+      status: mapped
+      transform: >
+        lowercase to udp/tcp. This token is NIOS-specific and does not exist
+        in stock BIND querylog — on the classic `queries` grammar there is no
+        transport token at all and the pipeline must default to udp unless the
+        flag blob carries `T`, so a parser that assumes one grammar silently
+        mislabels every line of the other
+    - vendor: 'query: <QNAME>'
+      type: string
+      description: Fully qualified domain name being queried.
+      ecs: dns.question.name
+      status: mapped
+      transform: >
+        strip any trailing dot and lowercase before indexing, then derive
+        dns.question.registered_domain / subdomain / top_level_domain with a
+        registered-domain processor — the integration does not
+    - vendor: query class
+      type: enum
+      description: DNS question class (IN, and CH for version.bind probes).
+      ecs: dns.question.class
+      status: mapped
+    - vendor: query type
+      type: enum
+      description: Record type requested (A, AAAA, PTR, TXT, MX, AXFR, ...).
+      ecs: dns.question.type
+      status: mapped
+    - vendor: 'response: <rcode>'
+      type: enum
+      description: DNS response code returned to the client (NOERROR, NXDOMAIN, REFUSED, SERVFAIL).
+      ecs: dns.response_code
+      status: mapped
+      notes: >
+        only present on the NIOS combined query/response grammar. This is the
+        single biggest reason to enable that form: on the classic `queries`
+        line the outcome is not logged at all and NXDOMAIN hunting is
+        impossible without correlating a second record
+    - vendor: header flag blob
+      type: string
+      description: Compact BIND flag string such as `+`, `-`, `+ED`, `+AED`, `+AEDV`.
+      ecs: dns.header_flags
+      status: partial
+      transform: >
+        the stock integration keeps the blob verbatim in
+        infoblox_nios.log.dns.header_flags AND expands it into ECS
+        dns.header_flags on both grammars — A -> AA, t -> TC, C -> CD, D ->
+        DO, and `+` -> RA where a response code was parsed, RD otherwise,
+        because NIOS reuses the same character for recursion-desired on the
+        query line and recursion-available on the response line. The residual
+        gap is the rest of the NIOS letter set: V (the responding server
+        validated the DNSSEC records), E(n) (EDNS OPT present, with version)
+        and L (DTC synthetic record) have no ECS header-flag token, so only
+        the raw blob carries them
+    - vendor: answer RR ttl
+      type: integer
+      description: TTL of each answer record in the semicolon-separated answer set.
+      ecs: dns.answers.ttl
+      status: mapped
+    - vendor: answer RR type
+      type: enum
+      description: Record type of each answer record (A, AAAA, CNAME, PTR, TXT).
+      ecs: dns.answers.type
+      status: mapped
+    - vendor: answer RR rdata
+      type: string
+      description: Answer record data — address, CNAME target or quoted TXT payload.
+      ecs: dns.answers.data
+      status: mapped
+      transform: >
+        the answer set is one line of `name ttl class type rdata;` triples and
+        must be split on `;` with quote awareness, since TXT payloads legally
+        contain both spaces and semicolons. Feed dns.resolved_ip from the
+        A/AAAA members — the integration never populates it. This tail is
+        unbounded: a single CNAME-to-many-A response runs to multiple
+        kilobytes on one syslog line
+    - vendor: destination address (<ip>)
+      type: ip
+      description: >-
+        Grid member listening address that received the query, printed in
+        trailing parentheses.
+      ecs: destination.ip
+      status: mapped
+      notes: >
+        present on the classic `queries` grammar only; the integration puts it
+        in server.ip, so copy it to destination.ip
+    - vendor: logging category prefix
+      type: enum
+      description: >-
+        Category label prefixed to the message body, e.g. `queries:`,
+        `infoblox-responses:`, `query-errors:`, `responses:`, `rpz:`.
+      ecs: event.dataset
+      status: partial
+      notes: >
+        controlled per-category in Grid DNS Properties > Logging. All
+        categories share one channel, so this prefix is the only in-band
+        discriminator; without splitting on it, zone-transfer,
+        DNSSEC-validation and RPZ lines pollute the query stream
+    - vendor: named timestamp
+      type: timestamp
+      description: BIND-format event time inside the message body, e.g. `07-Apr-2022 08:08:10.043`.
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        NIOS emits this in the member's configured local zone with no offset
+        while the syslog header carries a separate time; the integration
+        prefers the body time when present. Decide which one is authoritative
+        and keep the other as a clock-drift check, because a member whose NTP
+        has drifted produces silently misordered DNS timelines
+    - vendor: syslog hostname
+      type: string
+      description: Grid member name from the syslog header (e.g. infoblox.localdomain).
+      ecs: observer.hostname
+      status: mapped
+      notes: >-
+        also copy to observer.name so the DNS, DHCP and audit datasets join on
+        the same member
+    - vendor: member IP
+      type: ip
+      description: >-
+        Grid member address that NIOS inserts as a second header token ahead
+        of the program name.
+      ecs: observer.ip
+      status: partial
+      notes: >
+        NIOS-specific header shape — the member IP may appear with, or instead
+        of, the hostname, and some deployments emit both. A parser that
+        assumes RFC 3164 positions will read this address as the hostname
+    - vendor: syslog tag
+      type: string
+      description: Emitting daemon name; always `named` for this dataset.
+      ecs: process.name
+      status: mapped
+      notes: >-
+        the only discriminator separating DNS from dhcpd and httpd lines on
+        the shared stream
+    - vendor: raw message
+      type: string
+      description: Unparsed syslog message body retained for reprocessing.
+      ecs: message
+      status: mapped
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Split the shared NIOS syslog stream on the `named` tag and branch
+          again on the logging-category prefix so `queries`,
+          `infoblox-responses`, `query-errors` and the RPZ CEF lines each get
+          their own route rather than polluting one dataset. Emit the thin
+          envelope {_dataId, @timestamp, host, _raw} and take the sampling or
+          aggregation decision here, where it is cheapest — but bound the
+          answer-RR tail first, because a single CNAME-plus-A response can run
+          to several kilobytes on one line. Validate the envelope with
+          C.Schema(...).validate before the destination with a dead-letter
+          route for failures.
+        elastic: >
+          Route to the stock infoblox_nios integration and put the fixes in an
+          `@custom` pipeline rather than forking it: copy `client.ip`/
+          `client.port` to `source.ip`/`source.port` and `server.ip` to
+          `destination.ip` so DNS detection content resolves, and populate
+          `dns.resolved_ip` from the answer RRs whose type is A or AAAA.
+          `dns.header_flags` needs no work here — the integration expands the
+          raw flag blob itself. Add the registered_domain / subdomain /
+          top_level_domain derivation from `dns.question.name` and map
+          `infoblox.nios.dns.view` and `.client_handle` as keywords in the
+          custom index template.
+        relay: >
+          Cross the thin envelope, not full ECS — the integration's ingest
+          pipeline is the parser and reimplementing thirteen grok patterns
+          low-side buys nothing — but that means `_raw` is what crosses, and
+          this is the highest-volume feed on the route, so it is the first
+          place to drop `_raw` once the grammars are proven. Cap the answer-RR
+          tail and bound QNAME length and non-ASCII/punycode forms low-side so
+          attacker-chosen names and multi-kilobyte response lines do not trip
+          content filtering; use Persistent Queue backpressure on the guard
+          destination and reconcile low-side vs high-side counts per (dataset,
+          hour) because there is no acknowledgement.
+      direct:
+        parse_location: hybrid
+        cribl: >
+          Split the shared NIOS syslog stream on the `named` tag and branch
+          again on the logging-category prefix so `queries`,
+          `infoblox-responses`, `query-errors` and the RPZ CEF lines each get
+          their own route rather than polluting one dataset. Emit the thin
+          envelope {_dataId, @timestamp, host, _raw} and take the sampling or
+          aggregation decision here, where it is cheapest — but bound the
+          answer-RR tail first, because a single CNAME-plus-A response can run
+          to several kilobytes on one line. Validate the envelope with
+          C.Schema(...).validate before the destination with a dead-letter
+          route for failures.
+        elastic: >
+          Route to the stock infoblox_nios integration and put the fixes in an
+          `@custom` pipeline rather than forking it: copy `client.ip`/
+          `client.port` to `source.ip`/`source.port` and `server.ip` to
+          `destination.ip` so DNS detection content resolves, and populate
+          `dns.resolved_ip` from the answer RRs whose type is A or AAAA.
+          `dns.header_flags` needs no work here — the integration expands the
+          raw flag blob itself. Add the registered_domain / subdomain /
+          top_level_domain derivation from `dns.question.name` and map
+          `infoblox.nios.dns.view` and `.client_handle` as keywords in the
+          custom index template.
+  - format: syslog-cef
+    enable: >
+      In Grid DNS Properties (or Member DNS Properties for a single member),
+      click Toggle Advanced Mode, open the Logging tab and select the
+      `queries` and/or `responses` log categories - responses is what turns
+      the record into a combined query-and-answer line. Then under Grid
+      Manager > Members > Grid Properties > Monitoring, enable Log to External
+      Syslog Servers and point it at the collector. CEF emission of the
+      query/response records is governed at the appliance by the `set
+      cef_logging` CLI command; with it on, NIOS writes the query/ response
+      events with Infoblox-defined CEF extension elements (InfobloxDNSView,
+      InfobloxDNSQClass, InfobloxDNSQType, InfobloxDNSRCode) rather than the
+      raw BIND querylog grammar. Enabling responses logging materially loads a
+      busy grid, so bring it up member by member and watch system utilization;
+      this is the highest volume feed in the estate.
+    references:
+    - https://docs.infoblox.com/space/nios90/1580827644
+    - https://docs.infoblox.com/space/nios90/843645041
+    - https://docs.infoblox.com/space/BloxOneCloud/35463384
+    - https://infoblox-docs.atlassian.net/wiki/spaces/nios90/pages/280275770
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom NIOS DNS query/response CEF pipeline
+      notes: >
+        The stock Elastic infoblox_nios integration parses the BIND querylog
+        GRAMMAR in pipeline_dns; it does not parse these Infoblox CEF query/
+        response records, whose extension keys are entirely different, so the
+        integration's groks never match this form and a dedicated CEF parse is
+        required. Org doctrine also takes CEF off the wire, so the parse
+        belongs low-side: unpack the CEF header and extension list into ECS-
+        shaped JSON and never let CEF cross the guard. Two documented quirks
+        to handle explicitly - Query Flags and Response Flags are BOTH carried
+        under the single element name InfobloxDNSQFlags (they collide, so keep
+        request and response header-flag sets distinct in the pipeline before
+        they overwrite each other), and the answer RR set arrives inside the
+        CEF `msg` value where a `=` or quoted span in rdata is exactly what
+        trips a naive CEF extension splitter.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Branch this out of the shared NIOS syslog stream on the
+          `CEF:0|Infoblox|NIOS|` prefix, parse the CEF header and extension
+          list into ECS-shaped JSON low-side, then parse the answer RR set out
+          of the `msg` value as a second step with quote awareness, since TXT
+          rdata legally contains spaces and `=`. Rename the Infoblox elements
+          to ECS (src/spt->source, dst/dest_port->destination,
+          InfobloxDNSQType ->dns.question.type,
+          InfobloxDNSRCode->dns.response_code), expand the InfobloxDNSQFlags
+          blob into dns.header_flags keeping query- and response-side flags
+          separate, and feed dns.resolved_ip from the A/AAAA members of msg.
+          Take the sampling or aggregation decision here where it is cheapest
+          and bound the answer-RR tail first - a single CNAME-plus-A response
+          is multiple kilobytes on one line. Validate the emitted envelope
+          with C.Schema(...).validate before the destination with a
+          dead-letter route for failures.
+        elastic: >
+          Take pre-shaped ECS JSON and keep high-side work to a small custom
+          logs-infoblox_nios ingest pipeline: derive dns.question
+          registered_domain / subdomain / top_level_domain from the (already
+          renamed) question name, map the infoblox.nios.dns.view custom as a
+          keyword in the custom index template, and copy observer.hostname to
+          observer.name so this feed joins the DHCP and audit datasets on the
+          member. Do NOT route this form through the stock integration's
+          pipeline_dns - its groks are written for the BIND grammar and will
+          drop every CEF line.
+        relay: >
+          Highest-volume feed in the grid, so cross the thin ECS envelope, not
+          CEF, and make this the first place to drop `_raw` once the mapping
+          is proven. CEF is converted low-side and never crosses the guard.
+          Cap the answer-RR tail and bound QNAME length and non-ASCII/punycode
+          forms before the guard, because the question name and the msg RR set
+          both carry attacker-chosen content and a CEF extension value with an
+          embedded `=` or quoted span is the shape that makes a simple NDJSON
+          content filter behave unpredictably. Use Persistent Queue
+          backpressure on the guard destination and reconcile low-side vs
+          high-side counts per (dataset, hour) since the crossing is
+          unacknowledged.
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side grid with no guard, still parse the CEF at the edge
+          into ECS JSON rather than shipping CEF to Elastic: branch on the
+          `CEF:0|Infoblox|NIOS|` prefix, unpack the CEF header and extension
+          list, then parse the answer RR set out of the `msg` value with quote
+          awareness (TXT rdata legally contains spaces and `=`), and expand
+          the InfobloxDNSQFlags blob into dns.header_flags keeping query- and
+          response-side flags separate. With nothing crossing a guard, the
+          schema-validate and answer-RR tail caps are optional. The one
+          decision that matters is not double-counting against any
+          co-collected BIND-grammar query feed for the same members: pick one
+          authoritative query transport per grid, or key de-duplication on
+          transaction_id (dns.id) plus source/question if both run briefly
+          during cutover.
+        elastic: >
+          Take pre-shaped ECS JSON into a small custom logs-infoblox_nios
+          ingest pipeline: derive dns.question registered_domain / subdomain /
+          top_level_domain from the renamed question name, copy
+          observer.hostname to observer.name so this feed joins the DHCP and
+          audit datasets on the member, and map the infoblox.nios.dns.view
+          custom as a keyword in the index template. Retain the full answer RR
+          set for resolution forensics rather than capping it, and treat
+          whichever of CEF or BIND-grammar you standardize on as the single
+          authoritative query feed so answer-type and rcode aggregations are
+          not split across two parsers. Do NOT route this form through the
+          stock integration's pipeline_dns — its groks are written for the
+          BIND grammar and drop every CEF line.
+    fields:
+    - vendor: Timestamp
+      type: timestamp
+      description: >-
+        Event time carried in the CEF record (Infoblox marks this element as
+        format-specific).
+      ecs: '@timestamp'
+      status: partial
+      notes: >
+        the syslog header also carries a time; NIOS emits the record time in
+        the member's configured zone, so decide which is authoritative and
+        keep the other as a clock-drift check as on the syslog-raw feed
+    - vendor: src
+      type: ip
+      description: IP address of the resolver client that asked the question.
+      ecs: source.ip
+      status: mapped
+    - vendor: spt
+      type: port
+      description: Source port of the querying client.
+      ecs: source.port
+      status: mapped
+    - vendor: dst
+      type: ip
+      description: Grid member (name server) listening address that received the query.
+      ecs: destination.ip
+      status: mapped
+      notes: >-
+        the NIOS listener, not an external destination; keep it out of
+        server.ip so DNS detection content resolves on destination.ip
+    - vendor: dest_port
+      type: port
+      description: Response port element (server-side port of the transaction).
+      ecs: destination.port
+      status: mapped
+    - vendor: InfobloxDNSView
+      type: string
+      description: DNS view the query matched.
+      ecs: null
+      status: unmapped
+      custom: infoblox.nios.dns.view
+      notes: >-
+        shared custom namespace with the syslog-raw feed so the two join on
+        view; essential for disambiguating split-horizon answers and has no
+        ECS equivalent
+    - vendor: destinationDnsDomain
+      type: string
+      description: Fully qualified domain name being queried (CEF Query Name element).
+      ecs: dns.question.name
+      status: mapped
+      transform: >
+        strip any trailing dot and lowercase, then derive
+        dns.question.registered_domain / subdomain / top_level_domain with a
+        registered-domain processor - NIOS does not emit those
+    - vendor: InfobloxDNSQClass
+      type: enum
+      description: DNS question class (IN, CH).
+      ecs: dns.question.class
+      status: mapped
+    - vendor: InfobloxDNSQType
+      type: enum
+      description: Record type requested (A, AAAA, PTR, TXT, MX, ...).
+      ecs: dns.question.type
+      status: mapped
+    - vendor: InfobloxDNSQFlags
+      type: string
+      description: >-
+        Header flag set - carries BOTH the Query Flags and Response Flags
+        values under this one element name.
+      ecs: dns.header_flags
+      status: partial
+      transform: >
+        Infoblox maps both Query Flags and Response Flags to the single
+        InfobloxDNSQFlags element, so the two collide on the wire; split them
+        in the pipeline and expand each into its ECS header-flag token array
+        (RD/AA/DO/CD/EDNS) rather than storing the blob verbatim
+    - vendor: proto
+      type: enum
+      description: Transport of the transaction (UDP/TCP).
+      ecs: network.transport
+      status: mapped
+      transform: lowercase to udp/tcp for ECS style
+    - vendor: InfobloxDNSRCode
+      type: enum
+      description: DNS response code returned to the client (NOERROR, NXDOMAIN, REFUSED, SERVFAIL).
+      ecs: dns.response_code
+      status: mapped
+      notes: >-
+        present only when responses logging is enabled; this is the outcome
+        the classic queries line never carries
+    - vendor: msg
+      type: string
+      description: >-
+        Resource Records - the answer RR set (name ttl class type rdata
+        triples) carried in the CEF msg extension.
+      ecs: dns.answers.data
+      status: mapped
+      transform: >
+        split on the RR separator with quote awareness (TXT rdata legally
+        contains spaces and `=`), populate dns.answers.ttl / dns.answers.type
+        from each triple and feed dns.resolved_ip from the A/AAAA members; the
+        set is unbounded and a single CNAME-to-many-A answer runs to kilobytes
+    - vendor: transaction_id
+      type: string
+      description: DNS transaction (message) ID of the query/response.
+      ecs: dns.id
+      status: mapped
+      notes: >-
+        the join key stitching a query to its response and the natural
+        de-duplication key against a co-collected BIND-grammar feed
+    - vendor: opcode
+      type: enum
+      description: DNS opcode of the message (QUERY, NOTIFY, UPDATE).
+      ecs: dns.op_code
+      status: mapped
+    - vendor: CEF device vendor/product
+      type: string
+      description: Static Infoblox|NIOS pair in the CEF header.
+      ecs: observer.product
+      status: mapped
+      notes: >-
+        also set observer.vendor=Infoblox; constants, and the cheapest
+        reliable discriminator for this branch
+    - vendor: CEF device version
+      type: string
+      description: NIOS build string in the CEF header, e.g. 8.6.2-49634-e88e9df276a8.
+      ecs: observer.version
+      status: partial
+      transform: split the semantic version off the build hash before indexing
+    - vendor: syslog hostname
+      type: string
+      description: Grid member name from the syslog header.
+      ecs: observer.hostname
+      status: mapped
+      notes: >-
+        also copy to observer.name so DNS, DHCP and audit datasets join on the
+        same member
+  - format: syslog-leef
+    enable: >
+      Enabled by the same controls as the CEF form - Grid/Member DNS
+      Properties > Logging tab > `queries` and/or `responses`, then Grid
+      Properties > Monitoring > Log to External Syslog Servers - with the
+      appliance emitting the LEEF serialization of the query/response record
+      (LEEF header plus tab/caret-delimited key=value attributes) instead of
+      CEF. NIOS documents the query/response log with field elements in both
+      CEF and LEEF; pick one serialization per collector so the low-side
+      parser is unambiguous. Same performance caveat: responses logging is
+      heavy on a busy grid, so enable it incrementally by member.
+    references:
+    - https://docs.infoblox.com/space/nios90/1580827644
+    - https://docs.infoblox.com/space/BloxOneCloud/35463384
+    - https://infoblox-docs.atlassian.net/wiki/spaces/nios90/pages/280275770
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom NIOS DNS query/response LEEF pipeline
+      notes: >
+        As with the CEF form the stock integration's pipeline_dns groks are
+        written for the BIND grammar and do not read LEEF, so a dedicated LEEF
+        parse is required. LEEF's delimiter model (a LEEF header then
+        key=value attributes on a per-record delimiter) is more forgiving than
+        CEF's single msg blob, but the same two hazards apply - the answer RR
+        set is still a whole grammar inside the msg attribute, and Query Flags
+        and Response Flags still share the single InfobloxDNSQFlags attribute
+        and must be de-collided before either overwrites the other.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Branch on the `LEEF:` header, parse the LEEF attributes into ECS
+          JSON low-side and parse the answer RR set out of the msg attribute
+          as a second step. The rename map differs from CEF in two keys -
+          srcPort (not spt) -> source.port and url (not destinationDnsDomain)
+          -> dns.question.name - so keep a per-serialization field map rather
+          than one shared table. Expand InfobloxDNSQFlags into
+          dns.header_flags with query/response sides kept separate, feed
+          dns.resolved_ip from the A/AAAA msg members, take the sampling
+          decision here and bound the answer-RR tail before the destination.
+          Schema-validate the envelope with a dead-letter route for failures.
+        elastic: >
+          Take pre-shaped ECS JSON into a small custom logs-infoblox_nios
+          pipeline doing the registered-domain derivation and the
+          observer.hostname->observer.name copy, and map the
+          infoblox.nios.dns.view custom as a keyword. As with CEF, do not send
+          this through the stock integration's BIND-grammar groks.
+        relay: >
+          Same posture as the CEF form: highest-volume feed, so cross the thin
+          ECS envelope and drop `_raw` early once proven; LEEF is converted
+          low-side and never crosses. Bound QNAME length and the msg RR tail
+          before the guard because both carry attacker-chosen names, and
+          reconcile low- vs high-side counts per (dataset, hour) over the
+          unacknowledged crossing.
+      direct:
+        parse_location: low
+        cribl: >
+          High-side with no guard: branch on the `LEEF:` header, parse the
+          LEEF attributes into ECS JSON and parse the answer RR set out of the
+          msg attribute as a second step, expanding InfobloxDNSQFlags into
+          dns.header_flags with query- and response-side flags kept separate.
+          The LEEF rename map differs from CEF in two keys — srcPort (not spt)
+          -> source.port and url (not destinationDnsDomain) ->
+          dns.question.name. With nothing crossing a guard, the answer-RR tail
+          caps and schema-validate are optional. De-duplicate on
+          transaction_id (dns.id) if a BIND-grammar feed is co-collected for
+          the same members during cutover, then retire one transport.
+        elastic: >
+          Take pre-shaped ECS JSON into a small custom logs-infoblox_nios
+          pipeline doing the registered-domain derivation and the
+          observer.hostname -> observer.name copy, and map the
+          infoblox.nios.dns.view custom as a keyword. Retain the full answer
+          RR set for forensics with no boundary to cap it, and standardize on
+          one authoritative query serialization so aggregations are not split
+          across parsers. Do not send LEEF through the stock integration's
+          pipeline_dns groks — they read the BIND grammar only.
+    fields:
+    - vendor: Timestamp
+      type: timestamp
+      description: Event time carried in the LEEF record (format-specific element).
+      ecs: '@timestamp'
+      status: partial
+      notes: reconcile against the syslog header time as on the CEF and syslog-raw forms
+    - vendor: src
+      type: ip
+      description: IP address of the resolver client that asked the question.
+      ecs: source.ip
+      status: mapped
+    - vendor: srcPort
+      type: port
+      description: Source port of the querying client (LEEF uses srcPort where CEF uses spt).
+      ecs: source.port
+      status: mapped
+    - vendor: dst
+      type: ip
+      description: Grid member (name server) listening address that received the query.
+      ecs: destination.ip
+      status: mapped
+      notes: the NIOS listener, not an external destination
+    - vendor: dest_port
+      type: port
+      description: Response port attribute (server-side port of the transaction).
+      ecs: destination.port
+      status: mapped
+    - vendor: InfobloxDNSView
+      type: string
+      description: DNS view the query matched.
+      ecs: null
+      status: unmapped
+      custom: infoblox.nios.dns.view
+      notes: >-
+        shared custom namespace with the syslog-raw and CEF forms so all three
+        join on view
+    - vendor: url
+      type: string
+      description: >-
+        Fully qualified domain name being queried (LEEF Query Name attribute;
+        CEF calls this destinationDnsDomain).
+      ecs: dns.question.name
+      status: mapped
+      transform: >-
+        strip trailing dot, lowercase, and derive registered_domain /
+        subdomain / top_level_domain
+    - vendor: InfobloxDNSQClass
+      type: enum
+      description: DNS question class (IN, CH).
+      ecs: dns.question.class
+      status: mapped
+    - vendor: InfobloxDNSQType
+      type: enum
+      description: Record type requested (A, AAAA, PTR, TXT, MX, ...).
+      ecs: dns.question.type
+      status: mapped
+    - vendor: InfobloxDNSQFlags
+      type: string
+      description: >-
+        Header flag set - carries both Query Flags and Response Flags under
+        this one attribute name.
+      ecs: dns.header_flags
+      status: partial
+      transform: >
+        de-collide the query- and response-side flag sets that share this
+        attribute, then expand each into its ECS header-flag token array
+    - vendor: proto
+      type: enum
+      description: Transport of the transaction (UDP/TCP).
+      ecs: network.transport
+      status: mapped
+      transform: lowercase to udp/tcp
+    - vendor: InfobloxDNSRCode
+      type: enum
+      description: DNS response code returned to the client.
+      ecs: dns.response_code
+      status: mapped
+      notes: present only when responses logging is enabled
+    - vendor: msg
+      type: string
+      description: Resource Records - the answer RR set carried in the LEEF msg attribute.
+      ecs: dns.answers.data
+      status: mapped
+      transform: >
+        split with quote awareness, populate dns.answers.ttl /
+        dns.answers.type and feed dns.resolved_ip from the A/AAAA members;
+        unbounded tail
+    - vendor: transaction_id
+      type: string
+      description: DNS transaction (message) ID of the query/response.
+      ecs: dns.id
+      status: mapped
+      notes: >-
+        query-to-response join key and the de-duplication key against a
+        co-collected BIND-grammar feed
+    - vendor: opcode
+      type: enum
+      description: DNS opcode of the message (QUERY, NOTIFY, UPDATE).
+      ecs: dns.op_code
+      status: mapped
+    - vendor: LEEF device vendor/product
+      type: string
+      description: Static Infoblox|NIOS pair in the LEEF header.
+      ecs: observer.product
+      status: mapped
+      notes: also set observer.vendor=Infoblox
+    - vendor: LEEF device version
+      type: string
+      description: NIOS build string in the LEEF header.
+      ecs: observer.version
+      status: partial
+      transform: split the semantic version off the build hash
+    - vendor: syslog hostname
+      type: string
+      description: Grid member name from the syslog header.
+      ecs: observer.hostname
+      status: mapped
+      notes: also copy to observer.name to join DNS, DHCP and audit datasets on the member
+- id: dns-firewall-rpz
+  name: DNS Firewall / RPZ hit (CEF)
+  description: >
+    Response Policy Zone hits — the DNS Firewall record. When a query matches
+    an RPZ rule from a local block list or an Infoblox threat intelligence
+    feed, NIOS logs the hit in CEF over syslog rather than in the plain BIND
+    grammar the rest of the `named` channel uses. This is the highest-value
+    security dataset the grid produces: it is the point at which a client's
+    request for a known-bad name was blocked, redirected or explicitly allowed
+    through, and it names the rule and the feed category that fired. Enabled
+    by the `rpz` logging category in Grid DNS Properties.
+  event_categories:
+  - dns
+  - network
+  - malware
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Arrives on the SAME `named` syslog stream as the query log — it is not
+        a separate source and cannot be subscribed to independently at the
+        collector, so it must be branched out by content (a
+        `CEF:0|Infoblox|NIOS|` prefix) inside Cribl. It shares the query log's
+        transport, but its far lower volume and far higher value justify a
+        separate, higher-priority route across the boundary.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-infoblox_nios.log
+      notes: >
+        shares the integration's single data stream with the other NIOS feeds;
+        if RPZ needs its own retention or alerting tier, split it to a
+        dedicated dataset at the Cribl hop rather than at Elastic
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Arrives on the SAME `named` syslog stream as the query log — it is not
+        a separate source and cannot be subscribed to independently at the
+        collector, so it must be branched out by content (a
+        `CEF:0|Infoblox|NIOS|` prefix) inside Cribl. It shares the query log's
+        transport, but its far lower volume and far higher value justify a
+        separate, higher-priority route.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-infoblox_nios.log
+      notes: >
+        shares the integration's single data stream with the other NIOS feeds;
+        if RPZ needs its own retention or alerting tier, split it to a
+        dedicated dataset at the Cribl hop rather than at Elastic
+  formats:
+  - format: syslog-cef
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom NIOS RPZ CEF pipeline
+      notes: >
+        The stock infoblox_nios integration does have an RPZ branch inside
+        pipeline_dns, but two things argue against relying on it. First, org
+        doctrine takes CEF off the wire: where a vendor emits CEF over syslog
+        today the low-side Cribl pipeline parses it into JSON and CEF never
+        crosses the guard or reaches Elastic, which means the integration's
+        CEF grok never matches anything. Second, its mapping is wrong where it
+        matters — the device event class `RPZ-QNAME` is written to
+        `dns.answers.type`, which is a question-side rule identifier landing
+        in an answer-side field, and the `msg` dissect requires a trailing
+        `CAT=` that older NIOS builds and non-feed (locally authored) RPZ
+        rules do not emit, so those lines silently lose every rpz.* subfield.
+    fields:
+    - vendor: CEF device event class (RPZ-<TYPE>)
+      type: enum
+      description: RPZ trigger type that matched — QNAME, IP, NSIP, NSDNAME or CLIENT-IP.
+      ecs: null
+      status: unmapped
+      custom: infoblox.nios.rpz.rule_type
+      notes: >
+        says WHICH property of the transaction tripped the policy — a bad name
+        (QNAME), a bad answer address (IP), or a bad nameserver (NSIP/NSDNAME)
+        — and the three are different detections. The stock integration
+        misroutes this to dns.answers.type; keep it custom
+    - vendor: CEF name (policy action)
+      type: enum
+      description: >-
+        Mitigation applied — NXDOMAIN, NODATA, PASSTHRU, Local-Data,
+        Substituted or Disabled.
+      ecs: event.action
+      status: mapped
+      transform: >
+        lowercase for ECS style and derive event.outcome: NXDOMAIN / NODATA /
+        Local-Data / Substituted are blocks or redirections (the detection
+        fired), PASSTHRU is an explicit allow-list hit. Treating PASSTHRU as a
+        block is the classic false-positive source in RPZ alerting
+    - vendor: CEF severity
+      type: integer
+      description: Numeric threat severity in the CEF header — 8, 7, 6 or 4.
+      ecs: event.severity
+      status: partial
+      transform: >
+        NIOS documents these as Critical(8), Major(7), Warning(6),
+        Informational(4) — a four-value scale, not the 0-10 CEF range, so a
+        naive passthrough compresses everything into the top half
+    - vendor: CEF device version
+      type: string
+      description: NIOS build string in the CEF header, e.g. 8.6.2-49634-e88e9df276a8.
+      ecs: observer.version
+      status: partial
+      transform: split the semantic version off the build hash before indexing
+    - vendor: CEF device vendor/product
+      type: string
+      description: Static `Infoblox|NIOS` pair in the CEF header.
+      ecs: observer.product
+      status: mapped
+      notes: >-
+        also set observer.vendor=Infoblox; these are constants and are the
+        cheapest reliable discriminator for this branch
+    - vendor: src
+      type: ip
+      description: IP address of the client whose query matched the policy.
+      ecs: source.ip
+      status: mapped
+      notes: the asset to investigate — this is the host that asked for the bad name
+    - vendor: spt
+      type: port
+      description: Source port of the querying client.
+      ecs: source.port
+      status: mapped
+    - vendor: dst
+      type: ip
+      description: Grid member address that served and rewrote the response.
+      ecs: destination.ip
+      status: mapped
+      notes: >-
+        the integration maps this to server.ip; it is the NIOS listener, not
+        an external destination
+    - vendor: app
+      type: string
+      description: Application constant, always DNS on RPZ records.
+      ecs: network.protocol
+      status: mapped
+    - vendor: view
+      type: string
+      description: DNS view in which the policy matched, e.g. _default.
+      ecs: null
+      status: unmapped
+      custom: infoblox.nios.dns.view
+      notes: shared custom namespace with the query dataset so the two join on view
+    - vendor: qtype
+      type: enum
+      description: Record type of the query that matched the policy.
+      ecs: dns.question.type
+      status: mapped
+    - vendor: 'msg: rewritten QNAME'
+      type: string
+      description: >-
+        Domain name that triggered the policy, taken from the `rewrite
+        <QUERY>` slot inside the msg extension.
+      ecs: dns.question.name
+      status: mapped
+      transform: >
+        lives inside the quoted CEF `msg` value rather than in its own
+        extension key, so the pipeline has to parse a log grammar nested in a
+        CEF field; strip the trailing dot and lowercase, then derive the
+        registered domain
+    - vendor: 'msg: via <RPZ_RECORD>'
+      type: string
+      description: The RPZ record that fired, e.g. nxd1.com.rpz1.com — the rule identity.
+      ecs: rule.name
+      status: mapped
+      notes: >
+        rule.name is unoccupied in this dataset and no separate signature id
+        exists, so the trigger record is the rule identity. It is NOT a
+        threat.indicator value — it is the detection rule, not the provider's
+        indicator record
+    - vendor: RPZ zone (parent of the trigger record)
+      type: string
+      description: Response policy zone the trigger record belongs to, e.g. rpz1.com.
+      ecs: rule.ruleset
+      status: partial
+      transform: >
+        not emitted as its own token — it must be derived by stripping the
+        queried name off the trigger record. Worth the effort: the zone is
+        what tells you whether an Infoblox threat feed or a locally authored
+        block list produced the hit
+    - vendor: CAT
+      type: string
+      description: >-
+        Threat classification of the feed rule, appended after the msg
+        extension (e.g. CAT=RPZ, CAT=Malware, CAT=Phishing).
+      ecs: rule.category
+      status: mapped
+      notes: >
+        absent on locally authored RPZ rules and on older NIOS builds; the
+        integration's msg dissect requires it and drops every rpz subfield
+        when it is missing
+    - vendor: 'msg: query class rewrite ([A], [ANY])'
+      type: string
+      description: Bracketed record class/type the policy applied the rewrite to.
+      ecs: null
+      status: unmapped
+      custom: infoblox.nios.rpz.query_class_rewrite
+    - vendor: 'msg: trailing error text'
+      type: string
+      description: >-
+        Optional error text appended after the RPZ record when the rewrite
+        could not be applied.
+      ecs: event.reason
+      status: partial
+      notes: >-
+        only present on failed rewrites; its absence is the normal case, not a
+        parse failure
+    - vendor: syslog hostname
+      type: string
+      description: Grid member that applied the policy, from the syslog header.
+      ecs: observer.hostname
+      status: mapped
+      notes: also copy to observer.name to join with the query and DHCP datasets
+    - vendor: syslog tag
+      type: string
+      description: Emitting daemon; `named` (older builds emit `rpz:` as the program name instead).
+      ecs: process.name
+      status: partial
+      notes: the tag alone does not identify this dataset — the CEF prefix does
+    - vendor: raw message
+      type: string
+      description: Unparsed CEF line retained for reprocessing.
+      ecs: message
+      status: mapped
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Branch this out of the `named` stream on the `CEF:0|Infoblox|NIOS|`
+          prefix and parse the CEF header plus extensions into full ECS-shaped
+          JSON low-side, then parse the nested `msg` text as a second step —
+          it is a whole log grammar inside a CEF extension value and needs a
+          CAT-optional pattern so locally authored RPZ rules do not lose their
+          rule name. Run the severity lookup (8/7/6/4 -> critical/major/
+          warning/informational) and the event.outcome derivation from the
+          policy action here, and keep the RPZ zone split out from the trigger
+          record so rule.name and rule.ruleset are separately queryable.
+        elastic: >
+          Take pre-shaped documents and keep high-side work to a small custom
+          ingest pipeline doing the registered-domain derivation on
+          dns.question.name and the observer.hostname to observer.name copy.
+          Map infoblox.nios.rpz.rule_type and .policy_zone_origin as keywords
+          in the custom index template, and explicitly assert that
+          dns.answers.type is NOT populated from the CEF device event class —
+          that is the defect inherited from the stock integration and it
+          poisons answer-type aggregations across the whole NIOS index.
+        relay: >
+          Low volume and the highest security value in the grid, so give it a
+          priority route and full ECS NDJSON rather than folding it into the
+          query log's thin envelope — a blocked-malware-domain record should
+          not sit behind a sampled multi-gigabyte query feed. CEF is converted
+          low-side and never crosses. Bound the `msg` extension and the
+          rewritten QNAME before the guard: both carry attacker-chosen domain
+          names, and a CEF extension value containing an embedded `=` or a
+          quoted span is exactly the shape that makes a simple custom NDJSON
+          content filter behave unpredictably.
+      direct:
+        parse_location: low
+        cribl: >
+          Branch this out of the `named` stream on the `CEF:0|Infoblox|NIOS|`
+          prefix and parse the CEF header plus extensions into full ECS-shaped
+          JSON at the edge, then parse the nested `msg` text as a second step
+          — it is a whole log grammar inside a CEF extension value and needs a
+          CAT-optional pattern so locally authored RPZ rules do not lose their
+          rule name. Run the severity lookup (8/7/6/4 -> critical/major/
+          warning/informational) and the event.outcome derivation from the
+          policy action here, and keep the RPZ zone split out from the trigger
+          record so rule.name and rule.ruleset are separately queryable.
+        elastic: >
+          Take pre-shaped documents and keep high-side work to a small custom
+          ingest pipeline doing the registered-domain derivation on
+          dns.question.name and the observer.hostname to observer.name copy.
+          Map infoblox.nios.rpz.rule_type and .policy_zone_origin as keywords
+          in the custom index template, and explicitly assert that
+          dns.answers.type is NOT populated from the CEF device event class —
+          that is the defect inherited from the stock integration and it
+          poisons answer-type aggregations across the whole NIOS index.
+- id: dhcp
+  name: DHCP lease event (dhcpd)
+  description: >
+    Lease transactions from the ISC-derived `dhcpd` service on NIOS DHCP grid
+    members. The DORA sequence (DHCPDISCOVER / DHCPOFFER / DHCPREQUEST /
+    DHCPACK) plus NAK, DECLINE, RELEASE, INFORM, EXPIRE and LEASEQUERY, with
+    the DHCPv6 message set from `dhcpdv6`. Infoblox adds tokens stock ISC
+    dhcpd does not print — `TransID`, `relay`, `lease-duration` and
+    `offered-duration` as separate values — which makes DORA correlation and
+    relay attribution materially easier here than on a stock dhcpd. This is
+    the authoritative IP-to-MAC-to-hostname binding record and it underpins
+    asset attribution for every other source in the estate.
+  event_categories:
+  - network
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same syslog stream and same Cribl source as the named query log; the
+        two are separated only by the `dhcpd` / `dhcpdv6` vs `named` syslog
+        tag, so this dataset takes the same crossing as the DNS feed — they
+        share a transport and cannot be separated upstream of Cribl.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-infoblox_nios.log
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Same syslog stream and same Cribl source as the named query log; the
+        two are separated only by the `dhcpd` / `dhcpdv6` vs `named` syslog
+        tag, so this dataset follows the same route as the DNS feed — they
+        share a transport and cannot be separated upstream of Cribl.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-infoblox_nios.log
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: elastic-integration
+      artifact: Elastic infoblox_nios integration (pipeline_dhcp)
+      notes: >
+        pipeline_dhcp is by far the largest of the three sub-pipelines,
+        branching on the verb substring and then running an ordered grok list
+        per verb — roughly a dozen alternatives for DHCPACK and DHCPREQUEST
+        alone, because each optional token (client hostname, relay,
+        offered-duration, uid, parenthesised reason) changes the line shape.
+        Coverage of the v4 verbs is genuinely good, and `client.mac` arrives
+        normalized to the ECS uppercase-dash form. Known weaknesses: the
+        server-identifier address on DHCPREQUEST is written to
+        `infoblox_nios.log.dhcp.router.ip`, which is a misnomer that invites
+        wrong queries; and lease durations stay in seconds instead of ECS
+        nanosecond event.duration.
+    fields:
+    - vendor: DHCP verb
+      type: enum
+      description: >-
+        Leading message type — DHCPDISCOVER, DHCPOFFER, DHCPREQUEST, DHCPACK,
+        DHCPNAK, DHCPDECLINE, DHCPRELEASE, DHCPINFORM, DHCPEXPIRE,
+        DHCPLEASEQUERY.
+      ecs: event.action
+      status: mapped
+      transform: >
+        lowercase for ECS style and set event.outcome=failure for DHCPNAK and
+        DHCPDECLINE, success for DHCPACK. The integration lowercases the verb
+        but never derives the outcome
+    - vendor: lease address
+      type: ip
+      description: Address offered, requested, acknowledged, released, declined or expired.
+      ecs: client.ip
+      status: mapped
+      notes: >
+        parsed from the `on <ip>` / `for <ip>` / `of <ip>` / `from <ip>` slot
+        depending on the verb. Deliberately client.ip and not source.ip — on a
+        DISCOVER the client has no address yet
+    - vendor: chaddr
+      type: mac
+      description: Client hardware (MAC) address from the DHCP packet.
+      ecs: client.mac
+      status: mapped
+      transform: >
+        dhcpd prints lowercase colon-separated (00:50:56:83:6c:a0) and ECS
+        requires uppercase dash-separated (00-50-56-83-6C-A0); the integration
+        applies that conversion. A parser that bypasses the integration owes
+        the same normalization, because it is what makes the DHCP binding
+        table joinable against every other source
+    - vendor: client hostname
+      type: string
+      description: Client-supplied hostname printed in parentheses after the MAC.
+      ecs: host.hostname
+      status: partial
+      notes: >
+        this is the DHCP option 12 / option 81 value and is
+        attacker-controllable; dhcpd substitutes the literal "Hostname
+        Unsuitable for Printing" when it contains non-printable bytes, which
+        must not be indexed as a real hostname
+    - vendor: via <interface>
+      type: string
+      description: Grid member interface the request arrived on, e.g. eth1, eth3.
+      ecs: observer.ingress.interface.name
+      status: partial
+      notes: >
+        the `via` token holds EITHER an interface name or the relay agent
+        address depending on whether the request was relayed, so the pipeline
+        must test for an IP and route it elsewhere — the integration's groks
+        do this with an alternation, but a custom parser that assumes one form
+        drops half the population
+    - vendor: via <giaddr>
+      type: ip
+      description: Relay agent address form of the `via` token.
+      ecs: network.forwarded_ip
+      status: partial
+      notes: the only field identifying which subnet or VLAN a relayed request came from
+    - vendor: relay <interface|ip>
+      type: string
+      description: >-
+        Relay interface or address printed as a separate `relay` token on
+        OFFER and ACK lines.
+      ecs: null
+      status: unmapped
+      custom: infoblox.nios.dhcp.relay_interface
+      notes: >
+        NIOS-specific — stock ISC dhcpd does not print a `relay` token at all.
+        It can disagree with the `via` token on the same line, and when it
+        does, `relay` is the one describing the return path
+    - vendor: TransID <hex>
+      type: string
+      description: DHCP transaction id (xid) printed as a hex string, e.g. a76ecf84.
+      ecs: null
+      status: unmapped
+      custom: infoblox.nios.dhcp.trans_id
+      notes: >
+        NIOS-specific and the highest-value custom field in this dataset — it
+        is the join key that stitches DISCOVER/OFFER/REQUEST/ACK into one DORA
+        sequence. ECS has no transaction-id field for DHCP
+    - vendor: uid <hex>
+      type: string
+      description: DHCP option 61 client identifier, e.g. 01:00:50:56:83:6c:a0.
+      ecs: null
+      status: unmapped
+      custom: infoblox.nios.dhcp.uid
+      notes: >-
+        distinct from chaddr and often the only stable identifier for PXE and
+        virtual clients
+    - vendor: server identifier (<ip>)
+      type: ip
+      description: DHCP server the client selected, printed in parentheses on DHCPREQUEST lines.
+      ecs: destination.ip
+      status: partial
+      notes: >
+        absent on INIT-REBOOT requests. The integration stores it as
+        infoblox_nios.log.dhcp.router.ip, which is a misnomer — it is the
+        server identifier, not a default gateway, and queries written against
+        the vendor name will be wrong
+    - vendor: lease-duration <seconds>
+      type: integer
+      description: Length of the granted lease in seconds.
+      ecs: event.duration
+      status: partial
+      transform: >
+        ECS event.duration is nanoseconds, so multiply by 1e9. Values range
+        from a 119-second probationary lease to 7257600 seconds, so an
+        unconverted field silently mixes two scales
+    - vendor: offered-duration <seconds>
+      type: integer
+      description: Lease length the server offered, which can exceed the duration actually granted.
+      ecs: null
+      status: unmapped
+      custom: infoblox.nios.dhcp.offered_duration
+      notes: >
+        NIOS-specific second duration; the gap between offered and granted is
+        the signal that a lease was cut short by policy or pool pressure
+    - vendor: parenthesised reason
+      type: string
+      description: >-
+        Trailing qualifier or failure text — (RENEW), (found), (not found),
+        (abandoned), "unknown lease", "no free leases", "ignored (not
+        authoritative)", "database update failed".
+      ecs: event.reason
+      status: partial
+      notes: >
+        conflates two different things — a normal state qualifier like (RENEW)
+        and a genuine failure like "database update failed" — so event.outcome
+        must be driven by an explicit list, never by the mere presence of this
+        token
+    - vendor: network <cidr>
+      type: string
+      description: >-
+        Subnet named on pool-exhaustion lines, e.g. `network 10.50.0.0/20: no
+        free leases`.
+      ecs: null
+      status: unmapped
+      custom: infoblox.nios.dhcp.network
+      notes: >-
+        the pool-exhaustion detection field — a burst of these is either a
+        capacity failure or a DHCP starvation attack
+    - vendor: DUID
+      type: string
+      description: DHCPv6 unique client identifier, used in place of chaddr.
+      ecs: null
+      status: unmapped
+      custom: infoblox.nios.dhcp.duid
+      notes: >-
+        the v6 message set from `dhcpdv6` needs its own parser branch keyed on
+        this rather than on a MAC
+    - vendor: IAID
+      type: string
+      description: DHCPv6 identity association identifier scoping the v6 lease.
+      ecs: null
+      status: unmapped
+      custom: infoblox.nios.dhcp.iaid
+    - vendor: link-address
+      type: string
+      description: 'DHCPv6 relay link address identifying the client''s link.'
+      ecs: null
+      status: unmapped
+      custom: infoblox.nios.dhcp.link_address
+      notes: the v6 equivalent of giaddr and the only v6 subnet-attribution field
+    - vendor: syslog hostname
+      type: string
+      description: Grid member that served the lease, from the syslog header.
+      ecs: observer.hostname
+      status: mapped
+      notes: also copy to observer.name to match the DNS datasets
+    - vendor: syslog tag
+      type: string
+      description: Emitting daemon — `dhcpd` for v4, `dhcpdv6` for v6.
+      ecs: process.name
+      status: mapped
+      notes: >-
+        the discriminator against `named` and `httpd` lines on the shared
+        stream, and the v4/v6 selector
+    - vendor: raw message
+      type: string
+      description: Unparsed syslog message body retained for reprocessing.
+      ecs: message
+      status: mapped
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Split the shared stream on the `dhcpd` / `dhcpdv6` tag and emit the
+          thin envelope, but do two things low-side that the integration will
+          not: test the `via` token for an IP so relayed requests are
+          separated from interface names before they are indexed, and suppress
+          dhcpd's "Hostname Unsuitable for Printing" placeholder so it is
+          never stored as a real host.hostname. MAC normalization is not one
+          of them — the integration writes `client.mac` in the ECS
+          uppercase-dash form, so this route inherits it. Keep DHCPv6 on its
+          own branch keyed on DUID rather than chaddr.
+        elastic: >
+          Route to the stock integration and add an `@custom` pipeline that
+          converts lease-duration seconds to nanosecond event.duration,
+          derives event.outcome (failure for DHCPNAK and DHCPDECLINE, success
+          for DHCPACK), and copies the misnamed
+          infoblox_nios.log.dhcp.router.ip to destination.ip where the DHCP
+          server identifier actually belongs. Map the custom keys —
+          infoblox.nios.dhcp.trans_id, .uid, .relay_interface, .duid, .iaid,
+          .link_address — as keywords in the index template, or the DORA
+          correlation and v6 attribution pivots are unqueryable.
+        relay: >
+          Shares its transport with the query log and so takes the same
+          low-side crossing, but it is orders of magnitude lower in volume and
+          far higher in forensic value, so keep `_raw` across the boundary
+          well after it has been dropped from the DNS feed. Client-supplied
+          hostnames and option-61 uid strings are attacker-controllable free
+          text — bound and sanitize them low-side before content filtering
+          sees them, and cap the parenthesised reason text, which is the only
+          unbounded field in the grammar.
+      direct:
+        parse_location: hybrid
+        cribl: >
+          Split the shared stream on the `dhcpd` / `dhcpdv6` tag and emit the
+          thin envelope, but do two things at the edge that the integration
+          will not: test the `via` token for an IP so relayed requests are
+          separated from interface names before they are indexed, and suppress
+          dhcpd's "Hostname Unsuitable for Printing" placeholder so it is
+          never stored as a real host.hostname. MAC normalization is not one
+          of them — the integration writes `client.mac` in the ECS
+          uppercase-dash form, so this route inherits it. Keep DHCPv6 on its
+          own branch keyed on DUID rather than chaddr.
+        elastic: >
+          Route to the stock integration and add an `@custom` pipeline that
+          converts lease-duration seconds to nanosecond event.duration,
+          derives event.outcome (failure for DHCPNAK and DHCPDECLINE, success
+          for DHCPACK), and copies the misnamed
+          infoblox_nios.log.dhcp.router.ip to destination.ip where the DHCP
+          server identifier actually belongs. Map the custom keys —
+          infoblox.nios.dhcp.trans_id, .uid, .relay_interface, .duid, .iaid,
+          .link_address — as keywords in the index template, or the DORA
+          correlation and v6 attribution pivots are unqueryable.
+- id: grid-audit
+  name: Grid audit log (httpd)
+  description: >
+    Administrative and authentication activity from the NIOS Grid Master,
+    emitted by the `httpd` service. Two grammars share the tag: object change
+    records (`<ts>Z [admin]: Modified MemberDhcp infoblox.localdomain: Changed
+    enable_service:False->True`) covering every add, update and delete made
+    through the GUI, the WAPI or the CLI, and session records
+    (`Login_Allowed`, `Login_Denied`, `Logout`, `First_Login`,
+    `Password_Reset_Error`) carrying key=value detail. Low volume, high value:
+    this is the only place a change to a DNS record, a DHCP range or the
+    grid's own syslog destinations is attributable to a named administrator.
+  event_categories:
+  - configuration
+  - iam
+  - authentication
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Emitted by the Grid Master on the same syslog configuration as the
+        member feeds and separated only by the `httpd` tag. The Grid Master is
+        frequently in a management enclave separate from the DNS/DHCP data
+        plane, so which side a given Grid Master falls on can differ from its
+        own member feeds even though they share a collector configuration.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-infoblox_nios.log
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Emitted by the Grid Master on the same syslog configuration as the
+        member feeds and separated only by the `httpd` tag. The management
+        plane often sits in a different enclave from the DNS/DHCP data plane,
+        so a Grid Master's side can differ from its own member feeds even
+        though they share a collector configuration — confirm this one is
+        high-side before treating it as direct.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-infoblox_nios.log
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: elastic-integration
+      artifact: Elastic infoblox_nios integration (pipeline_audit)
+      notes: >
+        pipeline_audit branches on the presence of Created/Modified/Deleted or
+        Called, then falls through to a session-event grok plus a kv processor
+        over the trailing `key=value` detail. It handles the common cases well
+        and already derives event.outcome for login_allowed / login_denied and
+        for the standalone "AD authentication for user X failed" line. The gap
+        is the change payload: `Changed <field>:<old>-><new>` and `Set
+        <k=v,...>` are captured as one opaque text blob in
+        `infoblox_nios.log.audit.message`, so the before/after values that
+        DNS-record-tampering detection depends on are present but not
+        queryable as fields.
+    fields:
+    - vendor: '[<user>]'
+      type: string
+      description: >-
+        NIOS administrator account that performed the action, printed in
+        square brackets.
+      ecs: user.name
+      status: mapped
+      notes: >-
+        also populate related.user; account names arrive octal-escaped when
+        they contain spaces
+    - vendor: action verb
+      type: enum
+      description: >-
+        Leading verb — Created, Modified, Deleted, Called, Login_Allowed,
+        Login_Denied, Logout, First_Login, Password_Reset_Error.
+      ecs: event.action
+      status: mapped
+      transform: >
+        lowercase for ECS style and derive event.outcome — success for
+        Login_Allowed / First_Login, failure for Login_Denied /
+        Password_Reset_Error. The stock pipeline covers only login_allowed and
+        login_denied
+    - vendor: object type
+      type: enum
+      description: >-
+        Class of entity affected — Network, HostRecord, HostAddress,
+        CaaRecord, MemberDhcp, Grid, Ruleset, NetworkView.
+      ecs: null
+      status: unmapped
+      custom: infoblox.nios.audit.object_type
+      notes: >
+        ECS 9.4 has beta entity.target.type / entity.target.sub_type; adopt
+        when GA. The GA host.target.* reuse is not a fit — a NIOS HostRecord
+        is a DNS object, not a host being acted upon
+    - vendor: object name
+      type: string
+      description: Identifier of the affected entity — a network CIDR, an FQDN, a member name.
+      ecs: null
+      status: unmapped
+      custom: infoblox.nios.audit.object_name
+      notes: >
+        usually the only human-meaningful identifier in the record. ECS 9.4
+        has beta entity.target.name; adopt when GA
+    - vendor: Changed <field>:<old>-><new>
+      type: string
+      description: Before/after values for each attribute a Modified action changed.
+      ecs: null
+      status: unmapped
+      custom: infoblox.nios.audit.change
+      notes: >
+        the field DNS-record-tampering and rogue-forwarder detection actually
+        depends on. The integration keeps the whole payload as one text blob,
+        so "who repointed a zone" is present in the data but not queryable
+        without further parsing. NIOS replaces password values with ******
+        inside this payload before emitting it
+    - vendor: Set <k=v,...>
+      type: string
+      description: >-
+        Full attribute list recorded on a Created action, and the Args list on
+        a Called action.
+      ecs: null
+      status: unmapped
+      custom: infoblox.nios.audit.attributes
+      notes: >
+        unbounded — a Created Network or a Modified Grid record can carry the
+        entire object configuration, including the grid's own syslog
+        destination list, on one line
+    - vendor: ip
+      type: ip
+      description: Source address of the administrative session, from the key=value detail.
+      ecs: source.ip
+      status: partial
+      transform: >
+        octal-escaped by NIOS, so IPv6 arrives as 2a02\072cf40\072\072 and
+        must be unescaped before it will parse as an IP. Present on session
+        events, usually absent on object-change records
+    - vendor: to
+      type: enum
+      description: Interface the session targeted — AdminConnector, Serial Console.
+      ecs: service.name
+      status: partial
+      notes: >
+        distinguishes a GUI/WAPI login from console access, which is the
+        higher-privilege path and warrants separate alerting
+    - vendor: auth
+      type: enum
+      description: Authentication backend that validated the admin — LOCAL, AD, RADIUS, TACACS.
+      ecs: null
+      status: unmapped
+      custom: infoblox.nios.audit.auth_method
+      notes: >
+        ECS has no authentication-method field; a shift from AD to LOCAL for a
+        given account is a strong break-glass or backdoor signal
+    - vendor: group
+      type: string
+      description: NIOS admin group the account belongs to, e.g. admin-group.
+      ecs: user.group.name
+      status: mapped
+      notes: >-
+        the effective privilege level of the actor and the field
+        privilege-escalation alerting keys on
+    - vendor: apparently_via
+      type: enum
+      description: Access path NIOS believes the session used — GUI, API, Direct, CLI.
+      ecs: null
+      status: unmapped
+      custom: infoblox.nios.audit.via
+      notes: >
+        the vendor's own hedge in the name is meaningful — it is inferred, not
+        authoritative, so it should inform triage rather than gate a detection
+    - vendor: trigger_event
+      type: string
+      description: Reason a session ended, e.g. Session Expiration.
+      ecs: event.reason
+      status: partial
+      transform: octal-escaped (Session\040Expiration); unescape before indexing
+    - vendor: error
+      type: string
+      description: Failure text on a denied login, e.g. "invalid login or password".
+      ecs: error.message
+      status: mapped
+    - vendor: info
+      type: string
+      description: Supplementary session detail, e.g. the realm on a denied login.
+      ecs: null
+      status: unmapped
+      custom: infoblox.nios.audit.info
+    - vendor: AD authentication for user <u> failed
+      type: string
+      description: >-
+        Standalone domain-controller authentication failure line, prefixed
+        with the DC hostname.
+      ecs: server.address
+      status: partial
+      notes: >
+        a third grammar on the same tag with no bracketed user and no
+        key=value detail; the DC name is the only address in it. The
+        integration handles it with a dedicated grok and sets
+        event.outcome=failure
+    - vendor: audit timestamp
+      type: timestamp
+      description: Event time inside the message body in UTC, e.g. 2022-03-18 11:46:38.877Z.
+      ecs: '@timestamp'
+      status: partial
+      notes: >
+        unlike the named and dhcpd feeds this one is explicitly UTC, while the
+        syslog header time is member-local — so the two can differ by the
+        grid's offset and picking the wrong one shifts the entire audit
+        timeline
+    - vendor: syslog hostname
+      type: string
+      description: Grid Master name from the syslog header.
+      ecs: observer.hostname
+      status: mapped
+      notes: distinguishes the active Grid Master from a candidate in an HA pair
+    - vendor: syslog tag
+      type: string
+      description: Emitting daemon; always `httpd` for this dataset.
+      ecs: process.name
+      status: mapped
+      notes: >
+        the discriminator against named and dhcpd on the shared stream — note
+        that unrelated `syslog:` and `-- MARK --` lines also arrive on this
+        stream and must not be routed here
+    - vendor: raw message
+      type: string
+      description: Unparsed syslog message body retained for reprocessing.
+      ecs: message
+      status: mapped
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Split on the `httpd` tag and emit the thin envelope, but decode NIOS
+          octal escaping low-side before anything else touches the record —
+          the appliance escapes spaces as \040, colons as \072 and commas as
+          \054 inside key=value details, which means IPv6 admin source
+          addresses arrive as 2a02\072cf40\072\072 and will not parse as IPs
+          anywhere downstream. Drop or mask the change payloads that carry
+          credential material, and note that NIOS already replaces password
+          values with ****** so the masking rule should assert that, not
+          assume it.
+        elastic: >
+          Route to the stock integration and add an `@custom` pipeline that
+          decomposes the opaque change blob into structured before/after
+          values, derives event.outcome for the Password_Reset_Error and
+          First_Login actions the stock pipeline does not cover, and populates
+          related.user. Map the infoblox.nios.audit.* customs (object_type,
+          object_name, change, attributes, auth_method, via) as keywords in
+          the index template, and revisit entity.target.name / .type once that
+          set leaves beta — the GA host.target.* reuse is not a fit, because a
+          NIOS HostRecord object is a DNS record, not a host being
+          administered.
+        relay: >
+          Low volume and the highest-integrity-value feed in the grid, and the
+          management plane often sits in a different enclave from the data
+          plane, so establish which side each Grid Master falls on per grid
+          rather than inheriting the member feeds' side. Keep `_raw` across
+          the boundary indefinitely — an audit record is forensic evidence and
+          the change payload is not fully structured. Cap the `Set` attribute
+          list before the guard: a single Modified Grid record can carry the
+          whole grid configuration on one line, which is the largest single
+          value on this route.
+      direct:
+        parse_location: hybrid
+        cribl: >
+          Split on the `httpd` tag and emit the thin envelope, but decode NIOS
+          octal escaping at the edge before anything else touches the record —
+          the appliance escapes spaces as \040, colons as \072 and commas as
+          \054 inside key=value details, which means IPv6 admin source
+          addresses arrive as 2a02\072cf40\072\072 and will not parse as IPs
+          anywhere downstream. Drop or mask the change payloads that carry
+          credential material, and note that NIOS already replaces password
+          values with ****** so the masking rule should assert that, not
+          assume it.
+        elastic: >
+          Route to the stock integration and add an `@custom` pipeline that
+          decomposes the opaque change blob into structured before/after
+          values, derives event.outcome for the Password_Reset_Error and
+          First_Login actions the stock pipeline does not cover, and populates
+          related.user. Map the infoblox.nios.audit.* customs (object_type,
+          object_name, change, attributes, auth_method, via) as keywords in
+          the index template, and revisit entity.target.name / .type once that
+          set leaves beta — the GA host.target.* reuse is not a fit, because a
+          NIOS HostRecord object is a DNS record, not a host being
+          administered.

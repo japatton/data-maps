@@ -1,0 +1,2063 @@
+id: forescout-counteract
+name: Forescout eyeSight/CounterACT
+vendor: Forescout
+versions: eyeSight 8.5.x, eyeSight 9.1.x (Syslog Plugin 3.8.x, CEF Plugin 2.x)
+draft: true
+references:
+- >-
+  https://docs.forescout.com/modules-plugins/core-extensions/syslog-plugin/syslog-plugin/syslog-triggers.htm
+- >-
+  https://docs.forescout.com/modules-plugins/core-extensions/syslog-plugin/syslog-plugin/send-events-to-tab.htm
+- https://docs.forescout.com/PDFs/syslog_plugin_v3_8_2.pdf
+- >-
+  https://www.forescout.com/wp-content/uploads/2018/04/counteract-cef-plugin-2-7.pdf
+- >-
+  https://docs.forescout.com/modules-plugins/core-extensions/cef-plugin/cef-plugin/about-the-cef-plugin.htm
+- https://www.elastic.co/docs/reference/integrations/forescout
+- https://github.com/elastic/integrations/tree/main/packages/forescout
+- >-
+  https://github.com/Cargill/OpenSIEM-Logstash-Parsing/blob/main/config/processors/syslog_security_forescout.counteract.nac.conf
+- >-
+  https://docs.cloud.google.com/chronicle/docs/ingestion/default-parsers/forescout-nac
+datasets:
+- id: nac-event
+  name: NAC and threat-protection event log
+  description: >
+    The Syslog Plugin's NAC Events and Threat Protection triggers. NAC policy
+    logs are emitted continuously as an endpoint is discovered and
+    re-evaluated, and NAC policy match/unmatch events fire on policy
+    evaluation change; Threat Protection adds bite, block, scan, lockdown and
+    email-worm events (Appliance-only, never from an Enterprise Manager). The
+    plugin's default text format is not a fixed grammar: NAC policy logs carry
+    a documented "NAC Policy Log: Source: ..., Rule: ..., Match: ...,
+    Category: ..." body, threat events carry a loose
+    "Type:/Source:/Target:/Vendor:/Severity:" key-value tail, and the Send
+    Message to Syslog policy action emits whatever free text the operator
+    composed from CounterACT property tags ({ip}, {mac}, {nbthost}, {user},
+    {segment_path}, {prim_classification}, {vendor_classification},
+    {sw_ipport_desc}, {wifi_ssid}, ...). Treat the tag template as site
+    configuration that the parser must be versioned against.
+  event_categories:
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Receives RFC 3164 syslog over TCP/UDP (optionally TLS) from each
+        Appliance's Syslog Plugin "Send Events To" server definition.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-forescout.event
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Receives RFC 3164 syslog over TCP/UDP (optionally TLS) from each
+        Appliance's Syslog Plugin "Send Events To" server definition.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-forescout.event
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Forescout NAC pipeline
+      notes: >
+        An Elastic Forescout integration does exist (package "forescout", data
+        streams forescout.event and forescout.host), but its event ingest
+        pipeline is honestly not a Forescout parser: it sets ecs.version and
+        event.kind, runs one dissect for the appliance's sudo-style "<service>
+        : TTY=... ; PWD=... ; USER=... ; COMMAND=..." OS messages, and leaves
+        everything else in `message`. No NAC policy log, policy match/unmatch,
+        or threat-protection body is extracted, and there is no Cribl pack for
+        Forescout, so the "NAC Policy Log:" and threat key-value grammars have
+        to be owned as a hand-built Cribl pipeline. Publicly available
+        third-party parsers (Cargill's OpenSIEM Logstash rules, the Google
+        SecOps FORESCOUT_NAC parser) are useful as grammar evidence but each
+        carries its own field choices and should not be copied verbatim.
+    fields:
+    - vendor: Source
+      type: string
+      description: identity of the endpoint the NAC policy log entry is about
+      ecs: source.ip
+      status: partial
+      transform: >
+        the field carries either a dotted-quad address or the literal "MAC
+        Address-<mac>" when Forescout has no IP for the endpoint; branch on
+        the shape and populate source.mac instead of source.ip for the MAC
+        form, or the parser writes a malformed address
+      notes: >
+        this is the observed endpoint, not a flow source; there is no
+        destination in a NAC policy log, so the network alerting profile's
+        destination.ip/port and network.transport stay empty here
+    - vendor: Rule
+      type: string
+      description: name of the NAC policy whose evaluation produced the log entry
+      ecs: rule.name
+      status: mapped
+    - vendor: Match
+      type: string
+      description: >-
+        the policy sub-rule or condition the endpoint matched (or unmatched)
+        on this evaluation
+      ecs: null
+      status: unmapped
+      custom: forescout.nac.match
+      notes: >
+        ECS has no sub-rule concept beneath rule.name. rule.ruleset models a
+        parent grouping rather than a child sub-rule so it would invert the
+        hierarchy, and rule.description would present a matched condition as
+        prose - kept custom instead. Third-party parsers do put this in
+        rule.description; do not follow them.
+    - vendor: Category
+      type: string
+      description: policy category the matched rule belongs to
+      ecs: rule.category
+      status: mapped
+    - vendor: Duration
+      type: string
+      description: >-
+        how long the endpoint has been in the matched state, as a
+        human-readable interval
+      ecs: event.duration
+      status: partial
+      transform: >
+        vendor emits a readable interval string, not a number; ECS
+        event.duration is a long in nanoseconds, so this needs parsing and
+        unit conversion before it is usable in a range query
+    - vendor: MAC Address changed from/to (detail clause)
+      type: string
+      description: >-
+        detail clause appended to a NAC policy log when the endpoint's MAC
+        changed on the same address
+      ecs: null
+      status: unmapped
+      custom: forescout.nac.mac_change
+      notes: >
+        carries the old and new MAC in one free-text clause; split into two
+        custom subfields rather than overloading source.mac, which should hold
+        the current value only. High-signal for a NAC/CDM SOC (MAC spoofing,
+        address reuse) and worth a dedicated detection.
+    - vendor: Type
+      type: string
+      description: threat-protection event type (bite, block, scan, lockdown, email worm)
+      ecs: event.action
+      status: partial
+      notes: >
+        these five Threat Protection triggers only fire when the Syslog Plugin
+        runs on an Appliance, never on an Enterprise Manager, so a missing
+        type is a deployment fact and not evidence of no threats
+    - vendor: Target
+      type: string
+      description: destination the blocked or bitten traffic was aimed at, as host plus service
+      ecs: destination.ip
+      status: partial
+      notes: >
+        documented as "host + service", so the value is not always a bare
+        address; split the service component out before writing destination.ip
+        or the mapping will silently reject values
+    - vendor: Vendor
+      type: string
+      description: NIC vendor of the endpoint that raised the threat event
+      ecs: device.manufacturer
+      status: partial
+      notes: >
+        derived from the MAC OUI, so it names the network adapter manufacturer
+        rather than the system vendor; third-party parsers put this in
+        host.type, which is wrong
+    - vendor: Severity
+      type: enum
+      description: threat event severity carried in the message body (ERRR, WARN, INFO)
+      ecs: event.severity
+      status: partial
+      transform: >
+        four-character vendor codes ERRR/WARN/INFO need a lookup to the
+        numeric ECS event.severity scale before alerting thresholds work; this
+        is a different vocabulary from the syslog PRI severity below and the
+        two must not be conflated
+    - vendor: CounterACT device identifier
+      type: string
+      description: >-
+        name or address of the Forescout device that sent the message,
+        prefixed to the RFC 3164 header
+      ecs: observer.name
+      status: partial
+      notes: >
+        only present when "Include timestamp and CounterACT device identifier
+        in all messages" is enabled, and the documented fallback substitutes
+        the appliance IP when the device name cannot be resolved - so one
+        field carries two value shapes and IP-form values belong in
+        observer.ip
+    - vendor: Message Identity
+      type: string
+      description: >-
+        free-text identifier configured per Syslog server (and per Send
+        Message to Syslog action), emitted as the syslog tag
+      ecs: log.syslog.appname
+      status: mapped
+      notes: >-
+        operator-chosen, so it is the only reliable way to tell one Forescout
+        feed from another on a shared collector
+    - vendor: Facility
+      type: enum
+      description: syslog facility transmitted in the message priority field
+      ecs: log.syslog.facility.name
+      status: mapped
+      notes: defaults to local5 when the administrator leaves it unset
+    - vendor: Syslog Severity
+      type: enum
+      description: >-
+        syslog severity transmitted in the message priority field, set per
+        server rather than per event
+      ecs: log.syslog.severity.name
+      status: partial
+      notes: >
+        this is a static per-destination configuration value, not the severity
+        of the event; never drive event.severity from it
+    - vendor: timestamp
+      type: timestamp
+      description: RFC 3164 header timestamp inserted by the plugin
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        BSD syslog timestamps carry neither year nor timezone; supply both
+        from the receiving worker group's clock and site timezone, and expect
+        year rollover errors around 1 January if this is left to a default
+    - vendor: Message to Syslog
+      type: string
+      description: >-
+        the message body a Send Message to Syslog policy action emits,
+        composed by the operator from CounterACT property tags
+      ecs: message
+      status: partial
+      notes: >
+        entirely site-defined - the tag template ({ip}, {mac}, {nbthost},
+        {user}, {segment_path}, {prim_classification},
+        {vendor_classification}, {sw_ipport_desc}, {wifi_ssid}, ...) is
+        console configuration, so the parser must be versioned against it and
+        a template edit is a breaking change to the data map
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Own the message grammars in the low-side pipeline rather than in an
+          ingest pipeline: branch on the "NAC Policy Log:" literal, on the
+          threat-protection "Type:/Source:/Target:" key-value tail, and on the
+          site's Send Message to Syslog property-tag template, and emit one
+          ECS-shaped JSON document per line. Resolve the two documented
+          ambiguities here - the Source field arrives either as a dotted-quad
+          or as the literal "MAC Address-<mac>", so route it to source.ip or
+          source.mac by shape instead of writing a malformed IP, and convert
+          the human-readable Duration string to nanoseconds. Version the
+          pipeline against the property-tag template, validate against a Cribl
+          Schema Library schema with a dead-letter route so a template edit
+          surfaces as a validation failure rather than silent field loss, and
+          run Persistent Queue backpressure on the destination.
+        elastic: >
+          Do not lean on the stock Forescout integration for this dataset -
+          its event pipeline only dissects the appliance's sudo-style OS
+          messages - so land the pre-shaped documents in logs-forescout.event
+          behind a logs-forescout.event@custom pipeline that only finishes
+          what the low side cannot. That means the ERRR/WARN/INFO severity
+          string to numeric event.severity lookup, and deriving event.outcome
+          from the threat action vocabulary (block and lockdown are
+          enforcement failures for the endpoint; bite and scan are detections
+          with no outcome). Add explicitly typed custom-namespace
+          index-template mappings for forescout.nac.match, .category,
+          .mac_change and .event_type as keyword so policy dashboards
+          aggregate without dynamic mapping, and expect source.port,
+          destination.port and network.transport to stay empty - alerting
+          rules for this dataset must not require them.
+        relay: >
+          Full ECS-shaped NDJSON crosses (envelope mode B), because a thin
+          envelope would push N site-specific text grammars at the guard's
+          content filter instead of one stable schema. The friction to settle
+          with the guard owner is the free-text tail: policy and sub-rule
+          names, the Category value and the operator-composed property-tag
+          body are all unbounded, so cap their lengths, strip control and
+          non-UTF-8 characters, and hold the JSON to two levels of nesting
+          with short ASCII keys low-side. Crossing is at-most-once with no
+          return channel; reconcile low-side and high-side counts per
+          (dataset, hour) and carry _raw across until the hand-built grammar
+          parser is proven, since NAC policy logs are the discovery record of
+          record for CDM HWAM.
+      direct:
+        parse_location: low
+        cribl: >
+          Own the message grammars in the Cribl pipeline rather than in an
+          ingest pipeline: branch on the "NAC Policy Log:" literal, on the
+          threat-protection "Type:/Source:/Target:" key-value tail, and on the
+          site's Send Message to Syslog property-tag template, and emit one
+          ECS-shaped JSON document per line. Resolve the two documented
+          ambiguities here - the Source field arrives either as a dotted-quad
+          or as the literal "MAC Address-<mac>", so route it to source.ip or
+          source.mac by shape instead of writing a malformed IP, and convert
+          the human-readable Duration string to nanoseconds. Version the
+          pipeline against the property-tag template, validate against a Cribl
+          Schema Library schema with a dead-letter route so a template edit
+          surfaces as a validation failure rather than silent field loss, and
+          run Persistent Queue backpressure on the destination.
+        elastic: >
+          Do not lean on the stock Forescout integration for this dataset -
+          its event pipeline only dissects the appliance's sudo-style OS
+          messages - so land the pre-shaped documents in logs-forescout.event
+          behind a logs-forescout.event@custom pipeline that only finishes
+          what the Cribl pass cannot. That means the ERRR/WARN/INFO severity
+          string to numeric event.severity lookup, and deriving event.outcome
+          from the threat action vocabulary (block and lockdown are
+          enforcement failures for the endpoint; bite and scan are detections
+          with no outcome). Add explicitly typed custom-namespace
+          index-template mappings for forescout.nac.match, .category,
+          .mac_change and .event_type as keyword so policy dashboards
+          aggregate without dynamic mapping, and expect source.port,
+          destination.port and network.transport to stay empty - alerting
+          rules for this dataset must not require them.
+  - format: syslog-leef
+    enable: >
+      Install eyeExtend for IBM QRadar on the CounterACT/eyeSight side
+      (Console: Options > Plugins > Install, then select the QRadar plugin and
+      Configure with the collector address). The module forwards CounterACT
+      host and threat events to the target as Log Event Extended Format (LEEF)
+      over syslog - the same NAC-Events and Threat-Protection activity the
+      text feed carries, but rendered as a structured
+      "LEEF:1.0|ForeScout|CounterACT|<version>|<EventID>|" record with
+      tab-delimited key=value attributes. Point the module at a Cribl syslog
+      source instead of a QRadar collector; nothing about the format is
+      QRadar-specific once it is on the wire. The documented event set is DoS,
+      Authentication, Exploit, Suspicious and System, so this transport leans
+      toward the Threat-Protection half of the dataset rather than the
+      continuous NAC policy log - confirm at deployment which triggers the
+      site actually forwards, since a missing category is a configuration
+      fact, not an absence of events.
+    references:
+    - https://www.ibm.com/docs/en/dsm?topic=counteract-configuring-forescout-plug-in
+    - >-
+      https://www.ibm.com/docs/SS42VS_DSM/com.ibm.dsm.doc/c_DSM_guide_Forescout_intro.html
+    - >-
+      https://www.juniper.net/documentation/us/en/software/jsa7.4.2/jsa-dsm/topics/concept/jsa-configuring-dsm-sample-event-message-forescout-counteract.html
+    - >-
+      https://docs.forescout.com/bundle/qradar-2-2-h/page/qradar-2-2-h.How-to-Work-with-eyeExtend-for-IBM-QRadar.html
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Forescout LEEF pipeline
+      notes: >
+        Neither the Elastic Forescout package nor any Cribl pack parses
+        Forescout LEEF - the stock integration is syslog-text only and its one
+        dissect targets the appliance sudo records - so a hand-built pipeline
+        must split the LEEF header on pipe and the attribute payload on tab
+        into key=value pairs. The attribute set is smaller and more regular
+        than the free-text grammar, which is the appeal: devTime/devTimeFormat
+        carry an explicit time format, srcMAC arrives in a fixed shape, and
+        the header EventID names the specific event while cat carries its
+        generic classification, so there is no "NAC Policy Log:" literal or
+        "Type:/Source:/Target:" tail to branch on. LEEF stops at the low side;
+        only ECS JSON goes forward.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Decode LEEF low-side: split the five header segments, then parse the
+          tab-delimited attributes into fields and shape ECS JSON per event.
+          Resolve the same NAC ambiguity the text feed has - src is the
+          observed endpoint, not a flow source, so keep it on source.ip with
+          no fabricated destination - and normalize srcMAC from the colon form
+          to the uppercase dash-separated ECS MAC. Map the LEEF sev (1-10) to
+          numeric event.severity through a lookup rather than copying it,
+          since it is a different scale from both the text feed's
+          ERRR/WARN/INFO codes and the syslog PRI. Validate against a Schema
+          Library schema with a dead-letter route so an unrecognized cat or
+          EventID surfaces, and run Persistent Queue backpressure on the
+          destination.
+        elastic: >
+          Land the pre-shaped documents in logs-forescout.event behind a
+          logs-forescout.event@custom pipeline and do no second parse. Give
+          this transport a distinct event.dataset from the text feed so a site
+          that runs both does not collide two grammars in one stream. The
+          high-side finishing work is deriving event.outcome and
+          event.category from the EventID/cat vocabulary (Exploit and DoS are
+          detections; Authentication carries an outcome) and adding keyword
+          index-template mappings for forescout.leef.cat so threat dashboards
+          aggregate without dynamic mapping. Expect destination.ip,
+          source.port and network.transport to stay empty as on the text feed
+          - alerting rules must not require them.
+        relay: >
+          Full ECS-shaped NDJSON crosses (envelope mode B): the LEEF payload
+          is already delimited and bounded far more tightly than the text
+          feed's site-composed tails, so converting low-side and shipping one
+          stable schema is the smaller content-filter surface. The residual
+          free text is usrName and identHostName plus any policy/rule names
+          carried in cat - cap their lengths, strip control and non-UTF-8
+          characters, and hold the JSON to two shallow levels with short ASCII
+          keys. Crossing is at-most-once with no return channel; reconcile
+          low-side and high-side counts per (dataset, hour) and carry _raw
+          until the LEEF decoder is proven, since these are the
+          threat-detection records of record for the enclave.
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side CounterACT whose target and Elastic stack sit on the
+          same side, run the identical LEEF decode and ECS shaping in one low
+          pass with no crossing discipline - the header split, tab-parse,
+          srcMAC normalization and sev-to-severity lookup are the same work,
+          just without the envelope and length caps. Persistent Queue
+          backpressure still applies.
+        elastic: >
+          Do the logs-forescout.event@custom finishing:
+          event.outcome/event.category derivation from EventID and cat, and
+          the forescout.leef.cat keyword mapping. Nothing on the direct side
+          needs a second decode because the low pass already emitted ECS JSON.
+    fields:
+    - vendor: EventID
+      type: string
+      description: >-
+        LEEF header event identifier naming the CounterACT event class (DoS,
+        Authentication, Exploit, Suspicious, System)
+      ecs: event.code
+      status: mapped
+      notes: >
+        this is the fifth pipe-delimited LEEF header segment, not an
+        attribute; it is the stable event class and the natural key for the
+        event.category/outcome lookup done high-side
+    - vendor: cat
+      type: string
+      description: >-
+        LEEF category attribute carrying the generic event classification, one
+        level above the more specific header EventID
+      ecs: null
+      status: unmapped
+      custom: forescout.leef.cat
+      notes: >
+        cat is the generic classification sitting a level above the more
+        specific header EventID, so it has no clean ECS home; retain it for
+        the high-side category derivation rather than overwriting event.code
+    - vendor: sev
+      type: integer
+      description: LEEF severity attribute on the 1-10 LEEF scale
+      ecs: event.severity
+      status: partial
+      transform: >
+        the LEEF 1-10 scale is neither the text feed's ERRR/WARN/INFO codes
+        nor the syslog PRI severity; map it to numeric ECS event.severity
+        through an explicit lookup and never conflate the three vocabularies
+    - vendor: src
+      type: ip
+      description: source IP attribute carrying the observed endpoint address
+      ecs: source.ip
+      status: partial
+      notes: >
+        the endpoint the event is about, not a flow source; as on the text
+        feed there is no destination in these records, so destination.ip and
+        network.transport stay empty and alerting must not require them
+    - vendor: srcMAC
+      type: mac
+      description: source MAC attribute for the endpoint
+      ecs: source.mac
+      status: partial
+      transform: >
+        arrives colon-separated; ECS requires uppercase dash-separated MAC
+        notation, so rewrite it before indexing or a join against the host
+        feed will miss
+    - vendor: usrName
+      type: string
+      description: user name associated with the endpoint or event
+      ecs: user.name
+      status: mapped
+    - vendor: domain
+      type: string
+      description: NT/AD domain attribute reported for the endpoint
+      ecs: host.domain
+      status: partial
+      notes: >
+        the LEEF sample carries this as the endpoint domain; confirm at
+        deployment it is not the user's logon domain before promoting it,
+        since the two diverge on shared or BYOD endpoints
+    - vendor: identHostName
+      type: string
+      description: identity host name attribute for the endpoint
+      ecs: host.name
+      status: mapped
+    - vendor: devTime
+      type: timestamp
+      description: raw event date and time generated by the appliance
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        parse against the paired devTimeFormat rather than guessing; QRadar
+        uses the devTime/devTimeFormat pair precisely because the appliance
+        time string is not self-describing
+    - vendor: devTimeFormat
+      type: string
+      description: format specifier declaring how devTime is encoded
+      ecs: null
+      status: unmapped
+      custom: forescout.leef.dev_time_format
+      notes: >-
+        a parsing helper for devTime, not event content; drop it once
+        @timestamp is set rather than indexing it
+  - format: syslog-cef
+    enable: >
+      Install the CEF Plugin (a separate Core Extensions module from the
+      Syslog Plugin) and drive it from a Send Customized CEF Message policy
+      action. Unlike the bundled Send Compliant / Not Compliant CEF actions,
+      the customized action lets an operator set the header Signature ID, Name
+      and Severity and bind each CounterACT extension slot to any host
+      property tag as "cs#Label=<field label>,cs#={property tag}", so the same
+      NAC and threat context the text feed carries ({ip}, {mac},
+      {prim_classification}, {vendor_classification}, threat type, policy) can
+      be re-emitted as a structured CEF record. Each CounterACT device is
+      assigned to one SIEM server definition in the CEF Plugin, so the Cribl
+      source is that SIEM server address. Because the slot bindings are
+      per-policy, the message shape is site- and policy-defined and must be
+      versioned like the text feed's tag template.
+    references:
+    - >-
+      https://docs.forescout.com/bundle/cef-3-0-3-h/page/gitdoc-global/_reusables_global/topics/send_customized_cef_message.html
+    - >-
+      https://docs.forescout.com/bundle/cef-2-8-2-h/page/cef-2-8-2-h.Send-CEF-Messages-%E2%80%93-Policy-Actions.html
+    - >-
+      https://docs.forescout.com/bundle/cef-2-8-2-h/page/cef-2-8-2-h.Device-Event-Mapping-to-CEF-Data-Fields.html
+    - >-
+      https://www.forescout.com/wp-content/uploads/2018/04/counteract-cef-plugin-2-7.pdf
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Forescout CEF pipeline
+      notes: >
+        No Elastic integration and no Cribl pack parse Forescout CEF. Decode
+        CEF low-side keyed off the csNLabel pairs rather than the slot
+        numbers, because the customized action rebinds slots per policy and a
+        positional parser will silently mis-file the first time a policy is
+        edited. CEF stops at the low side; only ECS JSON goes forward. This is
+        the same decoder as the compliance CEF feed, so a site that adopts
+        both should share one label-indirection pipeline and split on the
+        Signature ID / event class.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Parse CEF low-side and key the extension fields off the csNLabel
+          values, not the slot numbers. Normalize on the way through: the
+          endpoint address arrives in the CEF destination slot (dst) but is
+          the subject of the event, so keep it on host.ip rather than
+          fabricating a flow destination; rewrite dmac from colon to uppercase
+          dash-separated form; convert epoch-millisecond rt to a date. Because
+          the operator can set Signature ID and Name freely, derive
+          event.severity from the Signature ID by lookup rather than trusting
+          the header Severity. Validate against a Schema Library schema with a
+          dead-letter route that alerts on unknown csNLabel values, and run
+          Persistent Queue backpressure.
+        elastic: >
+          Take pre-decoded JSON into logs-forescout.event with a distinct
+          event.dataset and do no second parse. High-side work is the
+          custom-namespace keyword mappings for the retained csNLabel set and
+          the Signature-ID-keyed severity lookup. Assert in the index template
+          that the endpoint identity (host.ip/host.mac) is populated, since a
+          rebound csN slot cannot quietly empty a slot the site relies on for
+          the NAC context.
+        relay: >
+          Only field-aware ECS JSON crosses - no CEF reaches the boundary or
+          Elastic - so this is a clean CEF-exit for the NAC context too.
+          Content-filter friction is the free-text policy and classification
+          names in the csN slots plus the operator-set Name and Signature ID
+          header values, all unbounded and operator-editable: cap lengths and
+          allow-list the csNLabel key set low-side. At-most-once crossing with
+          no return channel; reconcile counts per (dataset, hour) and drop
+          _raw only after the label-indirection decoder is proven.
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side CounterACT, run the same label-keyed CEF decode,
+          dst-to-host.ip mapping, dmac normalization and rt conversion in one
+          low pass with no crossing discipline. Persistent Queue backpressure
+          still applies, and the same-decoder-shared-with-compliance-CEF note
+          holds.
+        elastic: >
+          Finish in logs-forescout.event@custom: the csNLabel keyword mappings
+          and the Signature-ID severity lookup. No second decode is needed
+          because the low pass emits ECS JSON.
+    fields:
+    - vendor: Device Vendor
+      type: string
+      description: CEF header vendor field, constant "ForeScout Technologies"
+      ecs: observer.vendor
+      status: mapped
+    - vendor: Device Product
+      type: string
+      description: CEF header product field, constant "CounterAct"
+      ecs: observer.product
+      status: mapped
+    - vendor: Device Version
+      type: string
+      description: CounterACT version of the reporting device
+      ecs: observer.version
+      status: mapped
+    - vendor: Signature ID
+      type: string
+      description: host event identifier, operator-set for the customized action
+      ecs: event.code
+      status: partial
+      notes: >-
+        the Send Customized CEF Message action lets operators set this freely
+        per policy, so treat it as the event class only after confirming the
+        site's binding
+    - vendor: Name
+      type: string
+      description: host event name, operator-composed for the customized action
+      ecs: event.action
+      status: partial
+      notes: >-
+        a lookup keyed on Signature ID is more stable than trusting this
+        string, which the customized action can set to anything
+    - vendor: Severity
+      type: integer
+      description: CEF header severity expressing the importance of the host event
+      ecs: event.severity
+      status: partial
+      transform: >-
+        derive the numeric severity from Signature ID and treat this header
+        value as advisory, since the customized action sets it per policy
+    - vendor: cs1..cs6
+      type: string
+      description: >-
+        CounterACT extension slots bound to NAC/threat property tags (ip, mac,
+        classification, threat type, policy) by the customized action
+      ecs: null
+      status: unmapped
+      custom: forescout.nac.cef_slots
+      notes: >
+        slot bindings are per-policy, so the value in cs1 on one policy is
+        unrelated to cs1 on another; key on the paired csNLabel and retain the
+        observed labels so a mis-binding is auditable after the fact
+    - vendor: cs1Label..cs6Label
+      type: string
+      description: label names declaring what each extension slot holds in this message
+      ecs: null
+      status: unmapped
+      custom: forescout.nac.cef_labels
+      notes: >
+        CEF label indirection is load-bearing, not cosmetic - a parser that
+        keys on slot number instead of label mis-files fields as soon as a
+        policy is edited, so the labels are the actual field names for this
+        format
+    - vendor: dst
+      type: ip
+      description: the endpoint IP address, in dot-separated format
+      ecs: host.ip
+      status: mapped
+      notes: >-
+        CEF puts the endpoint in the destination slot, but it is the subject
+        of the event; mapping it to destination.ip would fabricate a flow this
+        message does not describe
+    - vendor: dmac
+      type: mac
+      description: the endpoint MAC address, in colon-separated format
+      ecs: host.mac
+      status: partial
+      transform: rewrite the colon form to uppercase dash-separated ECS MAC notation
+    - vendor: dhost
+      type: string
+      description: the host name of the endpoint
+      ecs: host.name
+      status: mapped
+    - vendor: dvc
+      type: ip
+      description: CounterACT device IP address
+      ecs: observer.ip
+      status: mapped
+    - vendor: dvchost
+      type: string
+      description: CounterACT device host name
+      ecs: observer.name
+      status: mapped
+    - vendor: rt
+      type: timestamp
+      description: event detection time, in milliseconds since 1 January 1970
+      ecs: '@timestamp'
+      status: mapped
+      transform: epoch milliseconds; convert to a date rather than indexing the integer
+- id: policy-cef
+  name: Policy compliance CEF message
+  description: >
+    Compliance and host-property messages emitted by the separate CEF Plugin
+    (not the Syslog Plugin) from the Send Compliant CEF message, Send Not
+    Compliant CEF message and Send Customized CEF Message policy actions.
+    Every message combines the CEF header, four CounterACT extension slots
+    (cs1-cs4) carrying the policy name, sub-rule, host compliance verdict and
+    event trigger, and a fixed set of CEF dictionary fields identifying the
+    endpoint and the reporting CounterACT device. This is the org's CEF-exit
+    candidate: the vendor side keeps emitting CEF, and the low-side pipeline
+    converts it.
+  event_categories:
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Each CounterACT device is assigned to exactly one SIEM server
+        definition in the CEF Plugin, so the Cribl source is the SIEM server
+        address.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-forescout.event
+      notes: >
+        the Elastic Forescout package has no CEF data stream, so the decoded
+        documents share the integration's event data stream; give them a
+        distinct event.dataset value, or split to a dedicated index template
+        if the custom-namespace mappings collide
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Each CounterACT device is assigned to exactly one SIEM server
+        definition in the CEF Plugin, so the Cribl source is the SIEM server
+        address.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-forescout.event
+      notes: >
+        the Elastic Forescout package has no CEF data stream, so the decoded
+        documents share the integration's event data stream; give them a
+        distinct event.dataset value, or split to a dedicated index template
+        if the custom-namespace mappings collide
+  formats:
+  - format: syslog-cef
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Forescout CEF pipeline
+      notes: >
+        No Elastic integration and no Cribl pack parse Forescout CEF. The
+        low-side pipeline decodes CEF including the csNLabel indirection and
+        emits JSON; CEF stops at the low side and never reaches Elastic. Note
+        the Send Customized CEF Message action lets operators rebind any csN
+        slot to any CounterACT property tag and set an arbitrary Signature ID
+        and Event Type in the header, so slot numbers are not stable across
+        policies.
+    fields:
+    - vendor: Device Vendor
+      type: string
+      description: CEF header vendor field, constant "ForeScout Technologies"
+      ecs: observer.vendor
+      status: mapped
+    - vendor: Device Product
+      type: string
+      description: CEF header product field, constant "CounterAct"
+      ecs: observer.product
+      status: mapped
+    - vendor: Device Version
+      type: string
+      description: CounterACT version of the device that generated the message
+      ecs: observer.version
+      status: mapped
+    - vendor: Signature ID
+      type: string
+      description: host event identifier, COMPLIANCE or NONCOMPLIANCE for the bundled actions
+      ecs: event.code
+      status: mapped
+      notes: >
+        not rule.id - in this dataset rule.name already holds the compliance
+        policy from cs1, and pairing a message-class token with a policy name
+        under one rule.* object would mislead any dashboard reading them as a
+        name/id pair. The Send Customized CEF Message action lets operators
+        set this freely, so treat the two documented values as a floor, not
+        the vocabulary.
+    - vendor: Name
+      type: string
+      description: >-
+        host event name, "Host is compliant" or "Host is not compliant" for
+        the bundled actions
+      ecs: event.action
+      status: partial
+      notes: >-
+        operator-settable for customized messages; a lookup keyed on Signature
+        ID is more stable than trusting this string
+    - vendor: Priority
+      type: integer
+      description: CEF header severity expressing the importance of the host event
+      ecs: event.severity
+      status: partial
+      transform: >
+        the vendor's own mapping table states 3 for compliance and 5 for
+        non-compliance while its sample messages show 1 for both; derive the
+        numeric severity from Signature ID and treat this header value as
+        advisory
+    - vendor: cs1
+      type: string
+      description: Compliancy Policy Name - the CounterACT policy that classified the host
+      ecs: rule.name
+      status: mapped
+      transform: >
+        read the paired cs1Label value ("Compliancy Policy Name") to confirm
+        the slot binding before mapping; the customized-message action can
+        rebind cs1 to any host property tag
+    - vendor: cs2
+      type: string
+      description: >-
+        Compliancy Policy Sub-rule Name - the sub-rule that classified the
+        host as compliant or not
+      ecs: null
+      status: unmapped
+      custom: forescout.policy.subrule
+      notes: >
+        ECS models no sub-rule beneath rule.name; rule.ruleset describes a
+        parent policy or grouping, so using it for a child sub-rule would
+        invert the hierarchy. Kept custom, consistent with the Match field on
+        the NAC event dataset.
+    - vendor: cs3
+      type: enum
+      description: Host Compliancy Status - yes for a compliant host, no for a non-compliant host
+      ecs: event.outcome
+      status: partial
+      transform: yes maps to success and no to failure
+      notes: >
+        this is a posture verdict about the endpoint, not the result of an
+        enforcement action, so alerting must not read outcome=failure here as
+        "Forescout failed to act" - it means "the endpoint failed the policy".
+        Keep the raw yes/no alongside if that distinction matters to a
+        detection.
+    - vendor: cs4
+      type: enum
+      description: Compliancy Event Trigger - New host, Compliancy status changed, or Periodical
+      ecs: null
+      status: unmapped
+      custom: forescout.policy.event_trigger
+      notes: >
+        the deduplication and discovery key for this dataset: Periodical
+        messages restate unchanged status on the reporting interval and will
+        dominate volume, New host is the CDM HWAM discovery signal, and
+        Compliancy status changed is the state transition worth alerting on
+    - vendor: cs1Label..cs4Label
+      type: string
+      description: label names declaring what each CounterACT extension slot holds in this message
+      ecs: null
+      status: unmapped
+      custom: forescout.policy.cef_labels
+      notes: >
+        CEF label indirection is load-bearing here rather than cosmetic - the
+        Send Customized CEF Message action binds "cs#Label=<field
+        label>,cs#={property tag}" per policy, so a parser that keys on slot
+        number instead of label will mis-file fields as soon as a policy is
+        edited. Retain the observed labels so the mis-binding is auditable
+        after the fact.
+    - vendor: dst
+      type: ip
+      description: the host IP address, in dot-separated format
+      ecs: host.ip
+      status: mapped
+      notes: >
+        CEF puts the endpoint in the destination slot, but it is the subject
+        of the event rather than a flow destination; mapping it to
+        destination.ip would fabricate a network conversation that this
+        message does not describe
+    - vendor: dmac
+      type: mac
+      description: the host MAC address, in colon-separated format
+      ecs: host.mac
+      status: mapped
+      transform: >
+        ECS requires upper-case dash-separated MAC notation, so the
+        colon-separated vendor form must be rewritten - the same normalization
+        the Elastic integration applies to the host feed
+    - vendor: dhost
+      type: string
+      description: the host name of the endpoint
+      ecs: host.name
+      status: mapped
+    - vendor: dntdom
+      type: string
+      description: domain of which the endpoint is a member
+      ecs: host.domain
+      status: mapped
+    - vendor: duser
+      type: string
+      description: user logged onto the host when the event occurred
+      ecs: user.name
+      status: partial
+      transform: >
+        the documented sample carries a scope suffix ("administrator
+        (local)"); strip it into a separate custom field or local and domain
+        accounts of the same name will not correlate
+    - vendor: dvc
+      type: ip
+      description: CounterACT device IP address, in dot-separated format
+      ecs: observer.ip
+      status: mapped
+    - vendor: dvchost
+      type: string
+      description: CounterACT device host name
+      ecs: observer.name
+      status: mapped
+    - vendor: rt
+      type: timestamp
+      description: event detection time, in milliseconds elapsed since 1 January 1970
+      ecs: '@timestamp'
+      status: mapped
+      transform: epoch milliseconds; convert to a date rather than indexing the integer
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Parse CEF low-side and key the extension fields off the csNLabel
+          pairs rather than the slot numbers, because the Send Customized CEF
+          Message action rebinds slots per policy and a slot-positional parser
+          will silently mis-file fields the first time an operator edits a
+          policy. Normalize on the way through: epoch-millisecond rt to a
+          date, colon-separated dmac to the uppercase dash-separated ECS MAC
+          form, the "user (scope)" suffix off duser, and the yes/no cs3
+          compliance verdict into event.outcome. Validate against a Schema
+          Library schema with a dead-letter route that alerts on unknown
+          csNLabel values, and run Persistent Queue backpressure on the
+          destination.
+        elastic: >
+          Take pre-decoded JSON into logs-forescout.event with a distinct
+          event.dataset and do no second parse. High-side work is the severity
+          reconciliation the vendor docs leave inconsistent - the mapping
+          table specifies CEF priority 3 for compliance and 5 for
+          non-compliance while the sample messages show 1 - so pin the numeric
+          event.severity by Signature ID rather than trusting the header, and
+          add custom-namespace keyword mappings for forescout.policy.subrule,
+          .event_trigger and .cef_labels. Assert in the index template that
+          event.outcome is populated for both COMPLIANCE and NONCOMPLIANCE so
+          a rebound csN slot cannot quietly empty the compliance verdict.
+        relay: >
+          This is the clearest CEF-exit case on the technology: the vendor
+          feed stays CEF over syslog, the low-side pipeline converts it, and
+          only field-aware ECS JSON crosses the guard - no CEF reaches the
+          boundary or Elastic. Content-filter friction is the free-text policy
+          and sub-rule names in cs1/cs2 and the operator-set Name and
+          Signature ID header values, all unbounded and all operator-editable,
+          so cap lengths and allow-list the key set low-side to keep a custom
+          NDJSON filter simple. Compliance verdicts are low-volume and
+          individually significant, so drop _raw only after the
+          label-indirection decoder is proven, and reconcile counts per
+          (dataset, hour) given the at-most-once crossing.
+      direct:
+        parse_location: low
+        cribl: >
+          Parse CEF in one low pass and key the extension fields off the
+          csNLabel pairs rather than the slot numbers, because the Send
+          Customized CEF Message action rebinds slots per policy and a
+          slot-positional parser will silently mis-file fields the first time
+          an operator edits a policy. Normalize on the way through:
+          epoch-millisecond rt to a date, colon-separated dmac to the
+          uppercase dash-separated ECS MAC form, the "user (scope)" suffix off
+          duser, and the yes/no cs3 compliance verdict into event.outcome.
+          Validate against a Schema Library schema with a dead-letter route
+          that alerts on unknown csNLabel values, and run Persistent Queue
+          backpressure on the destination.
+        elastic: >
+          Take pre-decoded JSON into logs-forescout.event with a distinct
+          event.dataset and do no second parse. High-side work is the severity
+          reconciliation the vendor docs leave inconsistent - the mapping
+          table specifies CEF priority 3 for compliance and 5 for
+          non-compliance while the sample messages show 1 - so pin the numeric
+          event.severity by Signature ID rather than trusting the header, and
+          add custom-namespace keyword mappings for forescout.policy.subrule,
+          .event_trigger and .cef_labels. Assert in the index template that
+          event.outcome is populated for both COMPLIANCE and NONCOMPLIANCE so
+          a rebound csN slot cannot quietly empty the compliance verdict.
+  - format: syslog-raw
+    enable: >
+      The Syslog Plugin's Send Message to Syslog policy action can recompose
+      the same compliance verdict the CEF Plugin emits, as free-text syslog
+      rather than CEF. On the compliant/non-compliant branches of a policy,
+      attach a Send Message to Syslog action whose body is built from
+      CounterACT property tags - typically the endpoint identity plus the
+      compliance property and policy name, e.g. "{ip} {mac} policy {policy}
+      compliance {comp_state}" - and set the per-server Message Identity,
+      Facility and Syslog Severity in the Syslog Plugin's Send Events To
+      configuration. This reuses the Syslog Plugin transport already deployed
+      for the NAC/threat text feed, so it lands on the same wire and must be
+      split by the Message Identity tag; it is the raw alternate for sites
+      that want to retire the separate CEF Plugin without losing the
+      compliance signal.
+    references:
+    - >-
+      https://docs.forescout.com/modules-plugins/core-extensions/syslog-plugin/syslog-plugin/send-events-to-tab.htm
+    - >-
+      https://docs.forescout.com/modules-plugins/core-extensions/syslog-plugin/syslog-plugin/syslog-triggers.htm
+    - https://docs.forescout.com/PDFs/syslog_plugin_v3_8_2.pdf
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Forescout compliance-text pipeline
+      notes: >
+        There is no vendor grammar here - the body is whatever the operator
+        composed from property tags - so the pipeline must be versioned
+        against the site's message template exactly like the NAC text feed's
+        Send Message to Syslog form. The reliable structure is the syslog
+        envelope (Message Identity tag, Facility, Syslog Severity, device
+        identifier, RFC 3164 timestamp); the compliance verdict, policy name
+        and endpoint identity have to be extracted from the free-text body by
+        a template-specific parser. Prefer the CEF Plugin form for compliance
+        unless the operator is deliberately consolidating on the Syslog
+        Plugin, because CEF gives structured slots for the same content.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Own the message template in the low-side pipeline: branch on the
+          Message Identity tag to separate this compliance text from the NAC
+          text feed sharing the transport, then extract the endpoint identity,
+          policy name and compliance verdict from the composed body and emit
+          ECS JSON. Route the endpoint address to host.ip (it is the subject,
+          not a flow endpoint), derive event.outcome from the compliance
+          token, and version the pipeline against the template with a
+          dead-letter route so an operator edit surfaces as a validation
+          failure rather than silent field loss. Persistent Queue backpressure
+          on the destination.
+        elastic: >
+          Land the pre-shaped documents in logs-forescout.event behind
+          logs-forescout.event@custom and finish only what the low side
+          cannot: the compliance-token-to-event.outcome normalization if it
+          was left raw, and keyword mappings for any custom compliance fields.
+          Give this a distinct event.dataset from both the NAC text feed and
+          the CEF compliance feed so the three do not collide, and expect the
+          network alerting fields (destination.ip, ports, transport) to stay
+          empty.
+        relay: >
+          Full ECS-shaped NDJSON crosses so the guard sees one stable schema
+          rather than a site-composed text grammar. The content-filter
+          friction is the entire free-text body - policy names and the
+          operator-composed template are unbounded - so cap lengths, strip
+          control and non-UTF-8 characters, and hold the JSON shallow with
+          short ASCII keys low-side. At-most-once crossing; reconcile counts
+          per (dataset, hour) and carry _raw until the template parser is
+          proven, since compliance verdicts are low-volume and individually
+          significant.
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side CounterACT, run the same tag-split, endpoint-to-
+          host.ip mapping and compliance-token extraction in one low pass with
+          no crossing discipline, still versioning the pipeline against the
+          site template and splitting on the Message Identity tag. Persistent
+          Queue backpressure applies.
+        elastic: >
+          Do the logs-forescout.event@custom finishing: the event.outcome
+          normalization and custom keyword mappings. No second parse is needed
+          because the low pass emitted ECS JSON.
+    fields:
+    - vendor: Message to Syslog
+      type: string
+      description: >-
+        the compliance message body a Send Message to Syslog action emits,
+        composed by the operator from CounterACT property tags
+      ecs: message
+      status: partial
+      notes: >
+        entirely site-defined - the tag template ({ip}, {mac}, {policy},
+        {comp_state}, ...) is console configuration - so the parser must be
+        versioned against it and a template edit is a breaking change to the
+        data map; the endpoint identity, policy name and compliance verdict
+        are all inside this string
+    - vendor: Message Identity
+      type: string
+      description: >-
+        free-text identifier configured per Syslog server and per action,
+        emitted as the syslog tag
+      ecs: log.syslog.appname
+      status: mapped
+      notes: >-
+        the only reliable way to split this compliance text from the NAC text
+        feed sharing the Syslog Plugin transport
+    - vendor: Facility
+      type: enum
+      description: syslog facility transmitted in the message priority field
+      ecs: log.syslog.facility.name
+      status: mapped
+      notes: defaults to local5 when the administrator leaves it unset
+    - vendor: Syslog Severity
+      type: enum
+      description: >-
+        syslog severity transmitted in the priority field, set per server
+        rather than per event
+      ecs: log.syslog.severity.name
+      status: partial
+      notes: >-
+        a static per-destination configuration value, not the severity of the
+        compliance event; never drive event.severity from it
+    - vendor: CounterACT device identifier
+      type: string
+      description: >-
+        name or address of the Forescout device that sent the message,
+        prefixed to the RFC 3164 header
+      ecs: observer.name
+      status: partial
+      notes: >
+        only present when "Include timestamp and CounterACT device identifier
+        in all messages" is enabled; the documented fallback substitutes the
+        appliance IP when the device name cannot be resolved, so IP-form
+        values belong on observer.ip
+    - vendor: timestamp
+      type: timestamp
+      description: RFC 3164 header timestamp inserted by the plugin
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        BSD syslog timestamps carry neither year nor timezone; supply both
+        from the receiving worker group's clock and site timezone and expect
+        year-rollover errors around 1 January if left to a default
+- id: host-property
+  name: Host property and asset inventory record
+  description: >
+    Endpoint inventory and classification records pushed by the Forescout
+    eyeExtend Connect app - one JSON object per endpoint state report,
+    carrying addressing, segment placement, compliance state, open ports and
+    OS fingerprint. This is the CDM HWAM/SWAM asset layer: the authoritative
+    "what is on the network" feed a federal agency draws device inventory
+    from, distinct from the event streams above.
+  event_categories:
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        The Elastic integration ships no collector for this data stream - the
+        eyeExtend Connect app posts records directly - so Cribl must present
+        an HTTP source the app targets, or the app must be pointed at Elastic
+        and Cribl bypassed; deployment must still confirm that choice.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-forescout.host
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        The Elastic integration ships no collector for this data stream - the
+        eyeExtend Connect app posts records directly - so Cribl must present
+        an HTTP source the app targets, or the app must be pointed at Elastic
+        and Cribl bypassed; deployment must still confirm that choice.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-forescout.host
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: Forescout integration (host data stream)
+      notes: >
+        The host data stream is the part of the Elastic Forescout package that
+        genuinely parses: it JSON-decodes the record into forescout.host.*,
+        normalizes the MAC, converts the three address fields to ip type, and
+        copies ip/mac/user to host.ip/host.mac/ user.name. Elastic documents
+        compatibility with Forescout 8.5.2 and eyeExtend Connect app 0.2.0.
+        Its ingest pipeline strips every field whose value is null, empty,
+        "n/a" or "unknown" before indexing, which is a real behaviour to plan
+        around rather than a detail.
+    fields:
+    - vendor: timestamp
+      type: timestamp
+      description: time the endpoint state was reported, in ISO 8601
+      ecs: '@timestamp'
+      status: mapped
+      transform: >-
+        parsed as ISO8601 and copied to @timestamp; the pipeline drops the
+        record's own timestamp afterwards
+    - vendor: ip
+      type: ip
+      description: primary IP address of the endpoint
+      ecs: host.ip
+      status: mapped
+    - vendor: mac
+      type: mac
+      description: MAC address of the endpoint
+      ecs: host.mac
+      status: mapped
+      transform: >
+        arrives as bare 12-hex with no separators; the pipeline inserts dashes
+        and upper-cases it to reach the ECS MAC form, so any low-side join on
+        this value must apply the same normalization
+    - vendor: access_ip
+      type: ip
+      description: address the Forescout appliance uses to reach the endpoint
+      ecs: null
+      status: unmapped
+      custom: forescout.host.access_ip
+      notes: >
+        differs from ip where the endpoint is NAT'd or nested; the integration
+        only appends it to related.ip, so it is not queryable as a distinct
+        concept without this custom field
+    - vendor: user
+      type: string
+      description: user associated with the endpoint
+      ecs: user.name
+      status: mapped
+    - vendor: compliance_state
+      type: string
+      description: compliance verdict Forescout holds for the endpoint
+      ecs: null
+      status: unmapped
+      custom: forescout.host.compliance_state
+      notes: >
+        the CDM HWAM/SWAM posture verdict and the most alerting-relevant field
+        in the feed, with no ECS home. Beware the integration's cleanup: the
+        value "N/A" is deleted outright, so an unassessed endpoint is
+        indistinguishable from one carrying no verdict unless a sentinel is
+        set first.
+    - vendor: guest_corporate_state
+      type: string
+      description: whether the endpoint is classified as a corporate or guest device
+      ecs: null
+      status: unmapped
+      custom: forescout.host.guest_corporate_state
+      notes: >-
+        the corporate/guest/BYOD distinction a federal SOC scopes most NAC
+        detections by; no ECS equivalent
+    - vendor: segment_name
+      type: string
+      description: name of the Forescout network segment the endpoint sits in
+      ecs: null
+      status: unmapped
+      custom: forescout.host.segment_name
+      notes: >
+        Forescout's own segment taxonomy, not a VLAN - mapping it to
+        network.vlan.name would assert a layer-2 identity the feed does not
+        carry
+    - vendor: segment_path
+      type: string
+      description: full hierarchical path of the segment the endpoint sits in
+      ecs: null
+      status: unmapped
+      custom: forescout.host.segment_path
+      notes: >-
+        the natural join key for site and enclave enrichment; carries the
+        whole parent chain, so cap its length
+    - vendor: openports
+      type: string
+      description: ports found open on the endpoint
+      ecs: null
+      status: unmapped
+      custom: forescout.host.openports
+      notes: >
+        arrives as one delimited string rather than an array and ECS has no
+        open-port inventory field; parse to a numeric array in an @custom
+        pipeline if port-level queries matter, and expect kilobyte-scale
+        values on servers
+    - vendor: os_cpe
+      type: string
+      description: CPE identifier of the operating system fingerprinted on the endpoint
+      ecs: null
+      status: unmapped
+      custom: forescout.host.os_cpe
+      notes: >
+        kept custom deliberately: host.os.full is free text and would discard
+        the structured CPE vendor/product/version tuple that makes this field
+        useful for SWAM and vulnerability correlation
+    - vendor: device_interfaces
+      type: string
+      description: interfaces enumerated on the endpoint
+      ecs: null
+      status: unmapped
+      custom: forescout.host.device_interfaces
+    - vendor: hwi_network_adapters
+      type: string
+      description: network adapters reported by hardware inventory on the endpoint
+      ecs: null
+      status: unmapped
+      custom: forescout.host.hwi_network_adapters
+      notes: >-
+        multi-valued delimited string; the per-adapter MACs here are the
+        evidence for multi-homed and virtual endpoints
+    - vendor: dhcp_server
+      type: string
+      description: DHCP server observed serving the endpoint
+      ecs: null
+      status: unmapped
+      custom: forescout.host.dhcp_server
+    - vendor: is_dhcp_server
+      type: string
+      description: whether the endpoint was observed acting as a DHCP server
+      ecs: null
+      status: unmapped
+      custom: forescout.host.is_dhcp_server
+      notes: >
+        not a boolean despite the name - documented values include "No DHCP
+        traffic seen" and "Irresolvable" alongside yes/no, so a boolean
+        coercion would turn "unknown" into "false". Rogue-DHCP detections must
+        test the string, not truthiness.
+    - vendor: is_dhcp_relay
+      type: string
+      description: whether the endpoint was observed relaying DHCP
+      ecs: null
+      status: unmapped
+      custom: forescout.host.is_dhcp_relay
+      notes: same tri-state string vocabulary as is_dhcp_server
+    - vendor: is_behind_nat
+      type: string
+      description: whether the endpoint appears to sit behind a NAT device
+      ecs: null
+      status: unmapped
+      custom: forescout.host.is_behind_nat
+      notes: >
+        tri-state string; a "yes" means the reported ip identifies a boundary
+        rather than the endpoint, which materially weakens every IP-keyed join
+        against this record
+    - vendor: smb_relay
+      type: string
+      description: whether SMB relay behaviour was observed on the endpoint
+      ecs: null
+      status: unmapped
+      custom: forescout.host.smb_relay
+    - vendor: nested_device_id
+      type: string
+      description: identifier of a device nested behind another endpoint
+      ecs: null
+      status: unmapped
+      custom: forescout.host.nested_device_id
+      notes: >-
+        the IoT/OT case - devices discovered behind a hub, switch or gateway
+        rather than directly on an access port
+    - vendor: nested_device_parent_ip
+      type: ip
+      description: address of the parent device a nested endpoint sits behind
+      ecs: null
+      status: unmapped
+      custom: forescout.host.nested_device_parent_ip
+      notes: >
+        ECS has no parent-device relationship for hosts; this plus
+        nested_device_id is the only way to reconstruct the OT/IoT topology,
+        and the record carries no hostname field at all, so host.name is empty
+        for this whole dataset
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Keep the worker group a pass-through for this feed - the records are
+          already JSON and the integration's pipeline is the parser - and
+          limit low-side work to Persistent Queue backpressure plus the
+          enrichment that is cheaper near the source than in an ingest
+          pipeline: segment-to-site and segment-to-owner lookups, and the
+          endpoint identity that the feed itself never carries. Because there
+          is no hostname field in this record at all, attaching an inventory
+          lookup keyed on MAC or IP here is what makes the feed joinable to
+          the NAC event and CEF datasets later.
+        elastic: >
+          The stock host ingest pipeline does the decode, MAC normalization
+          and ip conversion; add a logs-forescout.host@custom pipeline for
+          what it deliberately does not do. Its cleanup script deletes every
+          field valued null, empty, "n/a" or "unknown" before indexing, so an
+          unassessed endpoint and a compliant one both arrive with no
+          compliance_state - set an explicit "not_assessed" sentinel before
+          that script runs or every compliance dashboard will overcount. Map
+          the remaining custom-namespace fields as keyword in the index
+          template (segment_name, segment_path, openports, os_cpe,
+          compliance_state, guest_corporate_state, the tri-state DHCP/NAT/SMB
+          flags) and parse openports into a numeric array if port-level
+          queries are wanted, since it arrives as one delimited string.
+        relay: >
+          Only the thin envelope needs to cross on the low-side route - the
+          payload is already one JSON object per endpoint and the integration
+          owns extraction - but the JSON is vendor-shaped, not constrained, so
+          flatten it low-side to the same outer envelope keys the other
+          datasets use before the crossing. The content-filter friction is
+          openports, device_interfaces and hwi_network_adapters: unbounded
+          delimited lists that can reach kilobyte scale on a server or a
+          hypervisor. Cap and truncate them explicitly rather than letting the
+          guard decide, and reconcile per-hour endpoint counts across the
+          boundary - a silently dropped inventory record is an asset that
+          disappears from HWAM reporting with no error anywhere.
+      direct:
+        parse_location: high
+        cribl: >
+          Keep the worker group a pass-through for this feed - the records are
+          already JSON and the integration's pipeline is the parser - and
+          limit worker-group work to Persistent Queue backpressure plus the
+          enrichment that is cheaper near the source than in an ingest
+          pipeline: segment-to-site and segment-to-owner lookups, and the
+          endpoint identity that the feed itself never carries. Because there
+          is no hostname field in this record at all, attaching an inventory
+          lookup keyed on MAC or IP here is what makes the feed joinable to
+          the NAC event and CEF datasets later.
+        elastic: >
+          The stock host ingest pipeline does the decode, MAC normalization
+          and ip conversion; add a logs-forescout.host@custom pipeline for
+          what it deliberately does not do. Its cleanup script deletes every
+          field valued null, empty, "n/a" or "unknown" before indexing, so an
+          unassessed endpoint and a compliant one both arrive with no
+          compliance_state - set an explicit "not_assessed" sentinel before
+          that script runs or every compliance dashboard will overcount. Map
+          the remaining custom-namespace fields as keyword in the index
+          template (segment_name, segment_path, openports, os_cpe,
+          compliance_state, guest_corporate_state, the tri-state DHCP/NAT/SMB
+          flags) and parse openports into a numeric array if port-level
+          queries are wanted, since it arrives as one delimited string.
+  - format: api-pull
+    enable: >
+      Install and enable the eyeExtend Connect Module: Web API submodule
+      (Console: Options > Web API) and create a Web API user; the module opens
+      a RESTful HTTPS service on the Enterprise Manager or standalone
+      appliance. A collector authenticates with POST /api/login (username and
+      password form-encoded), receives a token, and carries it in the
+      Authorization header on subsequent requests with Accept:
+      application/hal+json. It then GETs /api/hostfields to enumerate the
+      available host property fields, GET /api/hosts (optionally
+      ?matchRuleId={id} to scope to a policy) for the active endpoint index,
+      and GET /api/hosts/ip/{ip}?fields=... or /api/hosts/mac/{mac}?fields=...
+      for per-endpoint detail. This is a pull of the SAME host-property store
+      the eyeExtend Connect push feed emits, but the collector owns the cursor
+      and the field selection rather than receiving whatever the push app
+      sends.
+    references:
+    - >-
+      https://docs.forescout.com/bundle/web-api-1-5-4-h/page/c-restful-web-service-interaction.html
+    - >-
+      https://docs.forescout.com/bundle/web-api-1-5-4-h/page/t-configure-web-api-plugin.html
+    - >-
+      https://docs.forescout.com/bundle/web-api-1-5-3-h/page/web-api-1-5-3-h.About-eyeExtend-Connect-Module_3a-Web-API.html
+    - https://xsoar.pan.dev/docs/reference/integrations/forescout
+    - >-
+      https://github.com/claytonraymond2004/forescout_connect_ccri/blob/master/Get%20Forescout%20Web%20API%20Data.ps1
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        custom Cribl REST Collector + host-field-to-forescout.host pipeline
+        (the Elastic package has no Web API collector)
+      notes: >
+        The Elastic Forescout package ships no collector for the host data
+        stream - it expects the eyeExtend Connect app to push - so a Web API
+        pull needs a hand-built Cribl REST Collector that logs in, pages
+        /api/hosts, and requests the field set per endpoint, plus a pipeline
+        that renames the hal+json response into forescout.host.* and ECS. The
+        appeal over the push feed is control: the collector requests only the
+        fields it wants (avoiding the push app's kilobyte-scale delimited
+        lists unless asked), owns a durable cursor for gap-free polling, and
+        never sees the push pipeline's aggressive null/"n/a"/"unknown" field
+        stripping - so an unassessed endpoint keeps its explicit value here
+        instead of arriving with the field deleted.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          The REST Collector must live low-side because it needs HTTPS reach
+          to the low-side appliance, so run the login, /api/hosts paging and
+          the hal+json-to-forescout.host rename at the low-side worker group
+          and cross a shaped record rather than a raw response. Normalize mac
+          (the API returns it much like the push feed) to uppercase
+          dash-separated ECS form, copy ip/mac/user to host.ip/host.mac/
+          user.name, and add the segment-to-site/owner enrichment here exactly
+          as on the push feed so the inventory joins to the event datasets.
+          Persist the poll cursor durably and request an explicit field set so
+          an unassessed endpoint carries a real value rather than a stripped
+          field.
+        elastic: >
+          Point a logs-forescout.host@custom ingest pipeline at the hal+json
+          field names since no stock pipeline fires on a Web API pull: map
+          ip/mac/hostname to host.ip/host.mac/host.name, lift the
+          classification and posture fields (prim_classification,
+          vendor_classification, os_classification, onsite, online, access_ip,
+          agent_version, fingerprint) into the forescout.host namespace as
+          keyword, and set an explicit not_assessed sentinel on any compliance
+          field before indexing so unassessed and compliant endpoints stay
+          distinguishable. Parse any delimited port list into a numeric array
+          if port-level queries are wanted.
+        relay: >
+          This crossing is a pull re-emitted as NDJSON, not a syslog stream,
+          so the low-side shape is one already-structured JSON object per
+          endpoint - friendlier to an allowlisted-key content filter than the
+          push feed's vendor-shaped JSON. Request a bounded field set low-side
+          so unbounded lists (interfaces, adapters, open ports) never reach
+          the boundary at kilobyte scale; cap and truncate what does cross.
+          There is no return channel and no per-record ack, so reconcile
+          per-hour endpoint counts across the boundary - and because the
+          collector owns a monotonic cursor, gap detection here is exact where
+          the push feed cannot offer it. Keep the Web API token rotation on a
+          calendar since a lapsed credential silently stops the pull.
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side appliance whose Web API and Elastic stack sit on the
+          same side, run the REST Collector, mac normalization and the
+          hal+json-to-forescout.host shaping in one low pass with no crossing
+          discipline. Persist the cursor and request an explicit field set so
+          an unassessed endpoint carries a real value rather than a stripped
+          field; the null-stripping advantage over the push feed holds here
+          too.
+        elastic: >
+          Do the logs-forescout.host@custom finishing: the
+          classification/posture keyword mappings and the not_assessed
+          sentinel. No second parse is needed because the low pass emitted ECS
+          JSON.
+    fields:
+    - vendor: ip
+      type: ip
+      description: primary IP address of the endpoint
+      ecs: host.ip
+      status: mapped
+    - vendor: mac
+      type: mac
+      description: MAC address of the endpoint
+      ecs: host.mac
+      status: partial
+      transform: >-
+        normalize to uppercase dash-separated ECS MAC form before indexing or
+        joining to the event datasets
+    - vendor: hostname
+      type: string
+      description: resolved host name of the endpoint
+      ecs: host.name
+      status: mapped
+      notes: >
+        the Web API exposes several hostname sources (nbthost, dhcp_hostname,
+        mac_hostname, sw_hostname, linux_hostname); pick a precedence low-side
+        rather than letting whichever the field set returns win, since the
+        push feed carries no hostname at all
+    - vendor: nbthost
+      type: string
+      description: NetBIOS host name property
+      ecs: host.name
+      status: partial
+      notes: >-
+        one of the hostname sources; if both hostname and nbthost are
+        requested, resolve precedence rather than double-writing host.name
+    - vendor: user
+      type: string
+      description: user associated with the endpoint
+      ecs: user.name
+      status: mapped
+    - vendor: prim_classification
+      type: string
+      description: Forescout primary device-type classification of the endpoint
+      ecs: null
+      status: unmapped
+      custom: forescout.host.prim_classification
+      notes: >
+        Forescout's own device-type taxonomy (for example "Windows Machine",
+        "Network Device"); host.type is a constrained ECS vocab that would
+        discard the specific classification, so keep it custom
+    - vendor: vendor_classification
+      type: string
+      description: 'Forescout classification of the endpoint''s device vendor'
+      ecs: device.manufacturer
+      status: partial
+      notes: >
+        a Forescout-derived classification string rather than a raw OUI
+        lookup, so it approximates the manufacturer; keep the raw value if a
+        detection needs the exact classification token
+    - vendor: os_classification
+      type: string
+      description: Forescout classification of the endpoint operating system
+      ecs: host.os.full
+      status: partial
+      notes: >
+        a classification label, not a parsed OS name/version tuple; it
+        populates host.os.full as free text but host.os.name/version stay
+        empty unless the label is split
+    - vendor: onsite
+      type: string
+      description: whether the endpoint is currently on the monitored network
+      ecs: null
+      status: unmapped
+      custom: forescout.host.onsite
+    - vendor: online
+      type: string
+      description: whether the endpoint is currently online
+      ecs: null
+      status: unmapped
+      custom: forescout.host.online
+    - vendor: access_ip
+      type: ip
+      description: address the Forescout appliance uses to reach the endpoint
+      ecs: null
+      status: unmapped
+      custom: forescout.host.access_ip
+      notes: >-
+        differs from ip where the endpoint is NAT'd or nested; kept custom for
+        consistency with the push feed
+    - vendor: agent_version
+      type: string
+      description: version of the Forescout SecureConnector/agent on the endpoint
+      ecs: null
+      status: unmapped
+      custom: forescout.host.agent_version
+    - vendor: fingerprint
+      type: string
+      description: OS/device fingerprint the appliance derived for the endpoint
+      ecs: null
+      status: unmapped
+      custom: forescout.host.fingerprint
+    - vendor: open_port
+      type: string
+      description: ports found open on the endpoint
+      ecs: null
+      status: unmapped
+      custom: forescout.host.openports
+      notes: >
+        request this only when port-level queries matter - it can reach
+        kilobyte scale on servers - and parse the delimited value to a numeric
+        array in an @custom pipeline; kept on the same custom key as the push
+        feed's openports for join continuity
+  - format: syslog-cef
+    enable: >
+      The CEF Plugin's Send Customized CEF Message action can also carry host
+      properties: bind each CounterACT extension slot to a host property tag
+      as "cs#Label=<field label>,cs#={property tag}" ({ip}, {mac},
+      {prim_classification}, {vendor_classification}, {os_classification},
+      {segment_path}, ...) and the plugin emits the inventory record as a CEF
+      message over the same SIEM server definition the compliance CEF feed
+      uses. This is a push alternate to the Web API pull for sites that want
+      host-property context on the CEF transport rather than standing up a
+      REST collector; the slot bindings are per-policy, so the message shape
+      is site-defined and versioned like every other Send Customized CEF
+      Message form.
+    references:
+    - >-
+      https://docs.forescout.com/bundle/cef-3-0-3-h/page/gitdoc-global/_reusables_global/topics/send_customized_cef_message.html
+    - >-
+      https://docs.forescout.com/bundle/cef-2-8-2-h/page/cef-2-8-2-h.Device-Event-Mapping-to-CEF-Data-Fields.html
+    - >-
+      https://www.forescout.com/wp-content/uploads/2018/04/counteract-cef-plugin-2-7.pdf
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Forescout CEF pipeline
+      notes: >
+        Same label-indirection decoder as the compliance and NAC CEF forms -
+        key on csNLabel, never on slot number - so a site running host
+        properties over CEF should reuse one Forescout CEF pipeline and split
+        on the csNLabel set to route inventory records into the host data
+        stream rather than the event stream. CEF stops at the low side; only
+        ECS JSON goes forward. The property inventory over CEF is thinner than
+        the Web API or push feed because it is bounded by the number of csN
+        slots, so it suits a curated subset (identity plus classification)
+        rather than the full inventory.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Decode CEF low-side keyed off csNLabel, map the endpoint identity
+          (dst-to-host.ip, dmac-to-host.mac normalized, dhost-to-host.name),
+          and lift the classification tags carried in the csN slots into the
+          forescout.host namespace. Route these records to the host data
+          stream by the csNLabel set, not the CEF header, and validate against
+          a Schema Library schema with a dead-letter route on unknown labels.
+          Persistent Queue backpressure on the destination.
+        elastic: >
+          Take pre-decoded JSON into logs-forescout.host with a distinct
+          event.dataset and no second parse; add keyword mappings for the
+          retained csNLabel classification fields. Because the CEF slot count
+          bounds the inventory, expect fewer host fields than the Web API pull
+          - do not build host dashboards that require inventory fields this
+          transport was not configured to carry.
+        relay: >
+          Only field-aware ECS JSON crosses - no CEF at the boundary. The
+          content-filter friction is the free-text classification and segment
+          names in the csN slots plus operator-set header values: cap lengths
+          and allow-list the csNLabel key set low-side. At-most-once crossing;
+          reconcile per-hour endpoint counts and drop _raw only after the
+          label decoder is proven, since a dropped inventory record is an
+          asset that disappears from HWAM reporting with no error.
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side appliance, run the same label-keyed CEF decode,
+          endpoint-identity mapping and classification lift in one low pass
+          with no crossing discipline, routing to the host data stream by
+          csNLabel. Persistent Queue backpressure applies.
+        elastic: >
+          Do the logs-forescout.host finishing: the csNLabel classification
+          keyword mappings. No second decode is needed because the low pass
+          emits ECS JSON.
+    fields:
+    - vendor: Device Vendor
+      type: string
+      description: CEF header vendor field, constant "ForeScout Technologies"
+      ecs: observer.vendor
+      status: mapped
+    - vendor: Device Product
+      type: string
+      description: CEF header product field, constant "CounterAct"
+      ecs: observer.product
+      status: mapped
+    - vendor: Device Version
+      type: string
+      description: CounterACT version of the reporting device
+      ecs: observer.version
+      status: mapped
+    - vendor: dst
+      type: ip
+      description: the endpoint IP address, in dot-separated format
+      ecs: host.ip
+      status: mapped
+      notes: >-
+        the endpoint is the subject of an inventory record; mapping it to
+        destination.ip would fabricate a flow
+    - vendor: dmac
+      type: mac
+      description: the endpoint MAC address, in colon-separated format
+      ecs: host.mac
+      status: partial
+      transform: rewrite the colon form to uppercase dash-separated ECS MAC notation
+    - vendor: dhost
+      type: string
+      description: the host name of the endpoint
+      ecs: host.name
+      status: mapped
+    - vendor: dvc
+      type: ip
+      description: CounterACT device IP address
+      ecs: observer.ip
+      status: mapped
+    - vendor: dvchost
+      type: string
+      description: CounterACT device host name
+      ecs: observer.name
+      status: mapped
+    - vendor: rt
+      type: timestamp
+      description: report time, in milliseconds since 1 January 1970
+      ecs: '@timestamp'
+      status: mapped
+      transform: epoch milliseconds; convert to a date rather than indexing the integer
+    - vendor: cs1..cs6 (host property tags)
+      type: string
+      description: >-
+        CounterACT extension slots bound to host property tags
+        (prim_classification, vendor_classification, os_classification,
+        segment_path, ...)
+      ecs: null
+      status: unmapped
+      custom: forescout.host.cef_slots
+      notes: >
+        per-policy bindings, so cs1 on one policy is unrelated to cs1 on
+        another; key on the paired csNLabel and route these into the
+        forescout.host namespace rather than the event namespace
+    - vendor: cs1Label..cs6Label
+      type: string
+      description: label names declaring what each extension slot holds in this message
+      ecs: null
+      status: unmapped
+      custom: forescout.host.cef_labels
+      notes: >-
+        the actual field names for this format; a slot-positional parser
+        mis-files fields as soon as a policy is edited
+- id: platform-audit
+  name: Platform audit trail and system log
+  description: >
+    The Syslog Plugin's User Operations, System Logs and Events, and Operating
+    System Messages triggers, covering the Forescout console audit trail
+    (policy edits, device start/stop, password changes), system log events
+    including successful and failed console logins, Packet Engine and system
+    status messages, uptime events, and the appliance operating system's own
+    sudo, sshd and cron records. This is the dataset that answers "who changed
+    the NAC posture" and "is the Appliance healthy" - both mandatory for a
+    federal accreditation boundary.
+  event_categories:
+  - authentication
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same Syslog Plugin destination as the NAC event dataset - the triggers
+        are checkboxes on one configuration, not separate servers - so this
+        dataset and nac-event share a transport, always take the same side,
+        and must be split by content.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-forescout.event
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Same Syslog Plugin destination as the NAC event dataset - the triggers
+        are checkboxes on one configuration, not separate servers - so this
+        dataset and nac-event share a transport, always take the same side,
+        and must be split by content.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-forescout.event
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: elastic-integration
+      artifact: Forescout integration (event data stream)
+      notes: >
+        This is the only dataset the stock integration actually parses beyond
+        the RFC 3164 envelope: one dissect for the appliance's sudo records,
+        "<invoking account> : TTY=... ; PWD=... ; USER=... ; COMMAND=...",
+        mapped to process.working_directory and process.command_line, with the
+        sudo USER= target written to both process.user.name and user.name and
+        the invoking account left at forescout.event.service. The console
+        audit trail and system status messages are left whole in `message` and
+        need additional extraction.
+    fields:
+    - vendor: service
+      type: string
+      description: >-
+        login name of the account that invoked sudo on the appliance, for
+        example the _fsservice service account
+      ecs: user.name
+      status: partial
+      custom: forescout.event.service
+      transform: >
+        sudoers(5) documents the token before the colon as the login name of
+        the user who ran sudo, so this is the actor on the record; the
+        integration's dissect parks it at forescout.event.service and never
+        copies it to user.name, so an @custom pipeline has to copy it there
+        and append it to related.user
+      notes: >-
+        separates Forescout's own service-account activity from operator
+        activity, and it is the only token on these records that carries
+        identity - the sudo USER= target below is the privilege assumed, not
+        the actor
+    - vendor: TTY
+      type: string
+      description: terminal the command was issued from, "unknown" for service-invoked commands
+      ecs: null
+      status: unmapped
+      custom: forescout.event.tty
+    - vendor: PWD
+      type: string
+      description: working directory the command was issued from
+      ecs: process.working_directory
+      status: mapped
+    - vendor: USER
+      type: string
+      description: account the command ran as after the sudo transition
+      ecs: user.effective.name
+      status: partial
+      transform: >
+        sudoers(5) defines USER= as the user the command was run as, and ECS
+        models that as user.effective.name - the privileges assumed - with
+        user.name holding the invoking account; the integration copies this
+        value to user.name as well as process.user.name, so an @custom
+        pipeline has to move the user.name copy to user.effective.name and
+        append both accounts to related.user
+      notes: >-
+        process.user.name is the correct second home, since the command really
+        does run as this account; almost every appliance record carries root
+        here, so a detection that reads it as the actor sees "root" on every
+        event, and the authentication and configuration profiles on this
+        dataset are satisfied by user.name from the invoking account instead
+    - vendor: COMMAND
+      type: string
+      description: full command line executed on the appliance
+      ecs: process.command_line
+      status: mapped
+    - vendor: APP-NAME
+      type: string
+      description: 'syslog app-name of the record''s originator, for example sudo, sshd, crond'
+      ecs: log.syslog.appname
+      status: mapped
+    - vendor: HOSTNAME
+      type: string
+      description: syslog header hostname of the Forescout Appliance or Enterprise Manager
+      ecs: log.syslog.hostname
+      status: mapped
+      notes: >
+        the emitting appliance, so it should also drive observer.name; leaving
+        it only on log.syslog.hostname means observer-scoped dashboards
+        silently exclude this dataset
+    - vendor: PRI
+      type: integer
+      description: syslog priority value combining facility and severity
+      ecs: log.syslog.priority
+      status: mapped
+    - vendor: FACILITY
+      type: enum
+      description: syslog facility decoded from the priority value
+      ecs: log.syslog.facility.name
+      status: mapped
+    - vendor: SEVERITY
+      type: enum
+      description: syslog severity decoded from the priority value
+      ecs: log.syslog.severity.name
+      status: partial
+      notes: >
+        set per Syslog server in the plugin configuration rather than per
+        event, so it does not distinguish a failed login from a routine status
+        message and must not be promoted to event.severity
+    - vendor: PROCID
+      type: string
+      description: process id or name from the syslog header
+      ecs: log.syslog.procid
+      status: mapped
+    - vendor: Application status
+      type: string
+      description: state of the Forescout application reported in a system status message
+      ecs: service.state
+      status: mapped
+    - vendor: Connected clients
+      type: string
+      description: number of clients connected to the device, from a system status message
+      ecs: null
+      status: unmapped
+      custom: forescout.system.connected_clients
+    - vendor: EM connection status
+      type: string
+      description: 'state of the Appliance''s connection to its Enterprise Manager'
+      ecs: null
+      status: unmapped
+      custom: forescout.system.em_connection_status
+      notes: >
+        the highest-value availability signal in the feed - a disconnected
+        Appliance still emits syslog while its policy evaluation is stale, so
+        absence of NAC events is not detectable without this field
+    - vendor: Assigned hosts
+      type: string
+      description: number of endpoints assigned to the device, from a system status message
+      ecs: null
+      status: unmapped
+      custom: forescout.system.assigned_hosts
+      notes: >-
+        the denominator for CDM HWAM coverage reporting - a sudden drop is a
+        collection failure, not an inventory change
+    - vendor: Engine status
+      type: string
+      description: state of the Packet Engine that monitors and injects SPAN traffic
+      ecs: null
+      status: unmapped
+      custom: forescout.system.engine_status
+      notes: >-
+        documented as gating many Forescout features when down, so it belongs
+        on a collection-health monitor rather than a security dashboard
+    - vendor: Installed Plugins
+      type: string
+      description: list of plugins installed on the device, from a system status message
+      ecs: null
+      status: unmapped
+      custom: forescout.system.installed_plugins
+      notes: >-
+        unbounded delimited list repeated on every status message; a strong
+        candidate to drop low-side rather than index at interval frequency
+    - vendor: message
+      type: string
+      description: >-
+        the console audit trail or system log event text, for example a policy
+        update, a device start or stop, or a successful or failed user login
+      ecs: message
+      status: partial
+      notes: >
+        user operations and login events carry no field grammar at all - the
+        whole record is prose - so event.action, event.outcome and the source
+        address of a console login all have to be regexed out of this string
+        before either alerting profile on this dataset is satisfiable
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Pass this dataset through the worker group unparsed with Persistent
+          Queue backpressure and let the integration's dissect run high-side.
+          The one job worth doing low-side is the split from the NAC event
+          dataset, since both arrive on the same Syslog Plugin destination:
+          route on the Message Identity tag and the syslog app-name (sudo,
+          sshd, crond) so the two get distinct event.dataset values before
+          anything downstream sees them. Carry _raw here - console audit
+          records are individually significant and low-volume, and system
+          status messages are the only evidence of an Appliance going quiet.
+        elastic: >
+          The integration's event pipeline dissects the sudo-style OS records
+          and nothing else, so add a logs-forescout.event@custom pipeline for
+          the two grammars it leaves in `message`: split the semicolon-
+          delimited system status message into its Application status,
+          Connected clients, EM connection status, Assigned hosts, Engine
+          status and Installed Plugins components, and derive event.action and
+          event.outcome from the console audit trail text - login success and
+          failure are documented as flowing through the same System log events
+          trigger, so authentication alerting depends entirely on that
+          derivation. Correct the sudo identity the dissect leaves behind: the
+          USER= target belongs on user.effective.name rather than user.name,
+          user.name takes the invoking account the dissect parks at
+          forescout.event.service, and both accounts append to related.user.
+          Map forescout.event.service and .tty plus the forescout.system.*
+          status fields as keyword in the index template, and add source.ip
+          extraction from the sshd records so the authentication profile is
+          satisfiable.
+        relay: >
+          High-side instances ship raw end-to-end; on the low-side crossing
+          this becomes a thin-envelope hybrid rather than a low-side parse -
+          {_dataId, @timestamp, host, _raw} with extraction left to the
+          integration - so the guard sees the same outer schema as every other
+          dataset rather than three more text grammars. The content-filter
+          exposure is then entirely inside _raw: appliance command lines from
+          the sudo records and the free-text console audit trail, both
+          unbounded and both able to carry operator input. Cap _raw length,
+          strip control and non-UTF-8 characters, and mask credential-bearing
+          command patterns before the guard destination. At-most-once crossing
+          with no acknowledgement: reconcile counts per (dataset, hour), which
+          matters more here than elsewhere because a missing audit record is
+          itself an audit finding.
+      direct:
+        parse_location: high
+        cribl: >
+          Pass this dataset through the worker group unparsed with Persistent
+          Queue backpressure and let the integration's dissect run high-side.
+          The one job worth doing at the worker group is the split from the
+          NAC event dataset, since both arrive on the same Syslog Plugin
+          destination: route on the Message Identity tag and the syslog
+          app-name (sudo, sshd, crond) so the two get distinct event.dataset
+          values before anything downstream sees them. Carry _raw here -
+          console audit records are individually significant and low-volume,
+          and system status messages are the only evidence of an Appliance
+          going quiet.
+        elastic: >
+          The integration's event pipeline dissects the sudo-style OS records
+          and nothing else, so add a logs-forescout.event@custom pipeline for
+          the two grammars it leaves in `message`: split the semicolon-
+          delimited system status message into its Application status,
+          Connected clients, EM connection status, Assigned hosts, Engine
+          status and Installed Plugins components, and derive event.action and
+          event.outcome from the console audit trail text - login success and
+          failure are documented as flowing through the same System log events
+          trigger, so authentication alerting depends entirely on that
+          derivation. Correct the sudo identity the dissect leaves behind: the
+          USER= target belongs on user.effective.name rather than user.name,
+          user.name takes the invoking account the dissect parks at
+          forescout.event.service, and both accounts append to related.user.
+          Map forescout.event.service and .tty plus the forescout.system.*
+          status fields as keyword in the index template, and add source.ip
+          extraction from the sshd records so the authentication profile is
+          satisfiable.

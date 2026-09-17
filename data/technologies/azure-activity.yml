@@ -1,0 +1,1878 @@
+id: azure-activity
+name: Azure Activity Logs (Government subscription)
+vendor: Microsoft
+versions: >-
+  Azure Monitor resource log schema (2018-11 JSON Lines onward); Azure
+  Government subscriptions, US Gov L4/L5 regions
+draft: true
+references:
+- >-
+  https://learn.microsoft.com/en-us/azure/azure-monitor/essentials/activity-log-schema
+- >-
+  https://learn.microsoft.com/en-us/azure/azure-monitor/essentials/resource-logs-schema
+- >-
+  https://learn.microsoft.com/en-us/azure/azure-monitor/essentials/diagnostic-settings
+- https://learn.microsoft.com/en-us/azure/azure-monitor/essentials/activity-log
+- >-
+  https://learn.microsoft.com/en-us/azure/governance/policy/how-to/get-compliance-data
+- >-
+  https://learn.microsoft.com/en-us/azure/service-health/service-health-notifications-properties
+- >-
+  https://learn.microsoft.com/en-us/azure/azure-government/documentation-government-developer-guide
+- https://www.elastic.co/docs/reference/integrations/azure
+- https://www.elastic.co/docs/reference/integrations/azure/activitylogs
+- >-
+  https://github.com/elastic/integrations/tree/main/packages/azure/data_stream/activitylogs
+datasets:
+- id: administrative
+  name: Administrative operations
+  description: |
+    The subscription control-plane audit trail: every create, update, delete and action performed through Azure Resource Manager, plus every change to Azure RBAC role assignments in the subscription. This is the primary dataset on the technology - it answers "who changed what in the cloud", and it is the only Azure-native record of privilege grants (role assignment writes), resource deletions, network security group edits and key vault access-policy changes.
+    Two things about the shape matter more than any single field. First, the export schema is NOT the schema in the portal or the REST API: when a diagnostic setting streams the Activity log to an event hub the records follow the Azure Monitor resource log schema (time, resourceId, operationName, category, resultType, resultSignature, durationMs, callerIpAddress, correlationId, identity, level, location, properties), arriving as a JSON envelope with a `records` array that must be split into individual events. The rich REST-API-only fields (eventDataId, eventName, status/subStatus objects, resourceType, subscriptionId) are either dropped or demoted into `properties`. Second, a single Resource Manager operation produces a start record and a completion record, so any count of "administrative actions" that does not filter on properties.eventName double-counts.
+    In an Azure Government subscription the diagnostic setting targets an Event Hubs namespace on the usgovcloudapi.net suffix and any collector must use the US Government ARM endpoint (https://management.usgovcloudapi.net/) and authority host (login.microsoftonline.us); the commercial defaults fail to authenticate.
+  event_categories:
+  - configuration
+  - iam
+  route:
+    guarded:
+    - hop: other
+      name: Azure Government Event Hubs namespace
+      notes: >
+        A subscription-level diagnostic setting exports the selected Activity
+        log categories to an event hub in the tenant's own Azure Government
+        subscription (<namespace>.servicebus.usgovcloudapi.net). This is a
+        push from a control plane we do not own: there is no on-prem collector
+        in front of it, retention on the hub (1-7 days) is the only replay
+        window, and the hub name defaults to insights-activity-logs for a
+        diagnostic setting (Elastic's integration still defaults to the legacy
+        insights-operational-logs, so the two must be reconciled at
+        deployment).
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Cribl's Azure Event Hubs source consumes the hub with its own consumer
+        group and checkpoint store, then unwraps the `records` array into one
+        event per activity record. The collector runs in the low-side enclave
+        and pushes across; the unwrapping happens before the crossing so the
+        guard sees one activity record per line.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-azure.activitylogs
+    direct:
+    - hop: other
+      name: Azure Government Event Hubs namespace
+      notes: >
+        A subscription-level diagnostic setting exports the selected Activity
+        log categories to an event hub in the tenant's own Azure Government
+        subscription (<namespace>.servicebus.usgovcloudapi.net). This is a
+        push from a control plane we do not own: there is no on-prem collector
+        in front of it, retention on the hub (1-7 days) is the only replay
+        window, and the hub name defaults to insights-activity-logs for a
+        diagnostic setting (Elastic's integration still defaults to the legacy
+        insights-operational-logs, so the two must be reconciled at
+        deployment).
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Cribl's Azure Event Hubs source consumes the hub with its own consumer
+        group and checkpoint store, then unwraps the `records` array into one
+        event per activity record before anything downstream counts them.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-azure.activitylogs
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: Azure Logs integration (azure.activitylogs data stream)
+      notes: >
+        The stock integration splits the records array, sets event.action from
+        operationName, derives event.outcome from resultType, sets
+        cloud.provider azure and splits resourceId into azure.subscription_id,
+        azure.resource_group, azure.resource.provider and azure.resource.name.
+        Everything else stays under azure.activitylogs.* - notably
+        `properties`, which is declared as a `flattened` field, so its
+        contents are searchable but not individually mapped or aggregatable.
+        Two package details to verify before relying on them:
+        azure.activitylogs.level is declared `long` in the package fields
+        while the record carries the string level ("Informational", "Warning",
+        "Error", "Critical"), and non-public clouds require
+        resource_manager_endpoint set to
+        https://management.usgovcloudapi.net/.
+    fields:
+    - vendor: time
+      type: timestamp
+      description: >-
+        UTC time the event was generated by the Azure service processing the
+        request (ISO 8601)
+      ecs: '@timestamp'
+      status: mapped
+      notes: >
+        the export-schema rename of the REST API's eventTimestamp; the
+        companion submissionTimestamp (when the record became queryable) is
+        not carried in the export, so ingest lag is only measurable against
+        the event hub enqueue time
+    - vendor: category
+      type: enum
+      description: >-
+        Activity log category that produced the record (Administrative,
+        Security, ServiceHealth, ResourceHealth, Alert, Autoscale,
+        Recommendation, Policy)
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.category
+      notes: >
+        the only field that separates the co-mingled categories arriving on
+        one event hub, so it drives routing and nearly every CSOC filter.
+        Deliberately not mapped to ECS event.category, which is a closed
+        vocabulary these values do not belong to. Microsoft's own mapping
+        table also notes properties.eventCategory carries the category and
+        that the record falls back to "Administrative" when that key is absent
+    - vendor: operationName
+      type: string
+      description: >-
+        Resource Manager operation performed, in provider/type/verb form (e.g.
+        Microsoft.Network/networkSecurityGroups/write,
+        Microsoft.Authorization/roleAssignments/write)
+      ecs: event.action
+      status: mapped
+      notes: >
+        the primary detection surface on this dataset - roleAssignments/write,
+        keyvault/accessPolicies/write and */delete are the high-signal values.
+        The provider segment (Microsoft.Network, Microsoft.Authorization) is
+        also the natural source for event.provider, which neither the export
+        nor the stock pipeline sets
+    - vendor: resultType
+      type: enum
+      description: outcome of the operation (Start, Accept, Success, Failure)
+      ecs: event.outcome
+      status: partial
+      transform: >
+        Success maps to success and Failure to failure, but Start and Accept
+        are lifecycle states, not outcomes, and must become unknown - the
+        stock pipeline's naive two-way derivation counts a Start record as a
+        completed action and inflates every "successful change" dashboard. The
+        companion resultDescription (the REST API's `description`) is usually
+        empty on Administrative records, so it is not a usable failure reason
+        here
+    - vendor: resultSignature
+      type: string
+      description: >-
+        sub-status of the operation, typically the HTTP result phrase of the
+        underlying REST call (e.g. Succeeded.Created, Failed.Conflict, OK,
+        BadRequest)
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.result_signature
+      notes: >
+        the export-schema rename of subStatus.value. Not mapped to
+        http.response.status_code: the value is a compound reason phrase, not
+        a numeric code, and only the trailing segment corresponds to an HTTP
+        status. Resolve it through a lookup if a numeric status is wanted
+        rather than parsing the string at query time
+    - vendor: level
+      type: enum
+      description: severity level of the event (Critical, Error, Warning, Informational)
+      ecs: event.severity
+      status: partial
+      transform: >
+        needs an explicit lookup to the numeric ECS event.severity scale. Two
+        traps: the value appears as both "Information" and "Informational"
+        depending on the emitting resource provider, and Elastic's azure
+        package declares azure.activitylogs.level as `long` while the record
+        carries this string - confirm the package version's behaviour before
+        writing both fields, or the data stream throws mapping conflicts
+    - vendor: durationMs
+      type: long
+      description: duration of the operation in milliseconds
+      ecs: event.duration
+      status: partial
+      transform: >
+        ECS event.duration is nanoseconds, so multiply by 1,000,000.
+        Microsoft's own export mapping table documents this as "always 0", but
+        real Administrative records carry real values - treat 0 as "not
+        reported" rather than "instantaneous"
+    - vendor: callerIpAddress
+      type: ip
+      description: IP address of the client that issued the Resource Manager request
+      ecs: source.ip
+      status: mapped
+      notes: >
+        the export-schema rename of httpRequest.clientIpAddress. Empty on
+        every operation initiated by Azure itself or by a managed identity
+        running inside the platform, which is a large share of Administrative
+        records - absence is not evidence of a suppressed source. Some
+        providers emit a truncated or masked address; validate before
+        geo-enriching
+    - vendor: correlationId
+      type: string
+      description: GUID shared by every record belonging to the same overall action
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.correlation_id
+      notes: >
+        the join key that stitches the Start and Success records of one
+        operation together, and the link to the matching Entra ID sign-in.
+        Kept custom rather than mapped to trace.id, which models distributed
+        tracing spans; note that a deployment fans out to many child
+        operations under one correlationId, so it identifies an action, not an
+        event
+    - vendor: identity.claims.http://schemas.xmlsoap.org/ws/2005/05/identity/claims/upn
+      type: string
+      description: UPN of the user who performed the operation, taken from the ARM access token
+      ecs: user.name
+      status: mapped
+      notes: >
+        absent for anything performed by a service principal or managed
+        identity, where only appid and the objectidentifier claim are present;
+        a "who did this" dashboard keyed on user.name alone silently loses all
+        automation-driven change. Elastic exposes this as
+        azure.activitylogs.identity.claims_initiated_by_user.name
+    - vendor: identity.claims.http://schemas.microsoft.com/identity/claims/objectidentifier
+      type: string
+      description: Entra ID object ID (GUID) of the principal that performed the operation
+      ecs: user.id
+      status: mapped
+      notes: >
+        the only actor identifier present on every authenticated record, user
+        or service principal, so it is the reliable actor key where the UPN
+        claim is not
+    - vendor: identity.claims.appid
+      type: string
+      description: >-
+        application (client) ID of the Entra application whose token
+        authorized the operation
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.identity.claims.appid
+      notes: >
+        distinguishes a human using the portal or CLI (well-known first-party
+        app ids) from a registered automation principal; the field that makes
+        "which pipeline changed this" answerable. No ECS home - it is neither
+        a user id nor a service name
+    - vendor: identity.claims.http://schemas.microsoft.com/claims/authnmethodsreferences
+      type: string
+      description: >-
+        comma-separated authentication methods (amr) satisfied by the token,
+        e.g. "pwd", "rsa,mfa"
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.identity.claims.authn_methods
+      transform: >
+        arrives as a comma-joined string, not an array; split it before use.
+        This is the only per-operation evidence of whether the change was made
+        under MFA, which makes "privileged write with pwd only" a directly
+        alertable condition - but the claim reflects the token, so a
+        long-lived token can carry an amr from hours earlier
+    - vendor: identity.authorization.action
+      type: string
+      description: Azure RBAC action string that was evaluated to authorize the request
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.identity.authorization.action
+      notes: >
+        usually mirrors operationName, but diverges exactly where it matters -
+        policy-compliance reads and delegated operations authorize under a
+        different action than the one they perform, so keep both rather than
+        deduplicating into event.action
+    - vendor: identity.authorization.scope
+      type: string
+      description: >-
+        resource scope the RBAC evaluation was performed against
+        (subscription, resource group or resource path)
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.identity.authorization.scope
+      notes: >
+        the blast-radius field - a write authorized at subscription scope is a
+        materially different event from the same write at resource scope.
+        Long, slash-delimited and high-cardinality, so map as keyword with
+        ignore_above rather than letting it be analyzed
+    - vendor: identity.authorization.evidence.role
+      type: string
+      description: >-
+        name of the RBAC role that granted the caller permission (e.g. Owner,
+        Contributor, Azure Eventhubs Service Role)
+      ecs: user.roles
+      status: partial
+      notes: >
+        ECS user.roles is an array of the roles a user holds; this is the
+        single role that authorized this one request, so it is a subset, not
+        the caller's role inventory. Mapped anyway because it is the field
+        privilege-abuse hunting keys on, with the caveat recorded here so
+        nobody treats it as a complete role list
+    - vendor: identity.authorization.evidence.principalType
+      type: enum
+      description: >-
+        type of principal the role assignment resolved to (User,
+        ServicePrincipal, Group, ManagedIdentity)
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.identity.authorization.evidence.principal_type
+      notes: >
+        the cheapest human-vs-automation discriminator on the dataset, and the
+        field that makes an alert on "User-type principal performing a bulk
+        delete" separable from routine pipeline activity. The sibling
+        evidence.principalId, roleAssignmentId and roleDefinitionId belong in
+        the same custom namespace
+    - vendor: resourceId
+      type: string
+      description: full ARM resource ID of the resource the operation acted on
+      ecs: null
+      status: unmapped
+      custom: azure.resource.id
+      transform: >
+        the export drops subscriptionId, resourceGroupName, resourceType and
+        resourceProviderName as separate fields - all four are only derivable
+        by splitting this path. Extract the subscription GUID into ECS
+        cloud.account.id (and set cloud.provider azure) so Azure records join
+        the AWS GovCloud records in one query; the stock integration already
+        splits the remainder into azure.resource.* but does not populate
+        cloud.account.id from it
+    - vendor: properties.statusCode
+      type: string
+      description: >-
+        HTTP result phrase of the underlying Resource Manager call (Created,
+        OK, Accepted, NoContent, Conflict, BadRequest, Forbidden)
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.properties.status_code
+      notes: >
+        Forbidden and Conflict here are the authorization-denied and
+        concurrent-change signals a CSOC wants, but the field lives inside
+        `properties`, which the Elastic package declares as `flattened` -
+        searchable, not aggregatable - so it needs an explicit promotion to a
+        mapped keyword before it can back a dashboard
+    - vendor: properties.eventName
+      type: enum
+      description: request phase of the record (BeginRequest or EndRequest)
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.properties.event_name
+      notes: >
+        the deduplication key for this dataset - Resource Manager writes one
+        record when an operation starts and another when it completes, and
+        without filtering on EndRequest every count of administrative actions
+        is roughly doubled. Also inside the flattened `properties` object, so
+        it must be promoted before it can be filtered on efficiently
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Keep the worker group close to a pass-through and let the
+          integration pipeline parse, but own three things low-side that the
+          pipeline cannot: unwrap the event hub `records` array into discrete
+          events before anything downstream counts them, route by the record's
+          `category` value so Administrative, Policy and ServiceHealth land in
+          separate pipelines with independent volume rules, and drop or mask
+          properties.requestbody/responseBody, which can carry template
+          parameters, connection strings and secrets in cleartext. Run the
+          Event Hubs source with a dedicated consumer group and durable
+          checkpoint store and use Persistent Queue backpressure on the
+          Elastic destination - the hub's 1-7 day retention is the only replay
+          window.
+        elastic: >
+          Point the Azure Logs integration at the Government endpoints
+          (resource_manager_endpoint management.usgovcloudapi.net,
+          authority_host login.microsoftonline.us) and add a
+          logs-azure.activitylogs@custom pipeline for the gaps this map
+          records: convert the string level to ECS event.severity through an
+          explicit lookup (and confirm the package's `long` typing of
+          azure.activitylogs.level does not produce a mapping conflict),
+          convert durationMs to nanoseconds for event.duration, map
+          resultType's four values so Start and Accept become `unknown` rather
+          than being folded into success, and lift the useful identity claims
+          - upn to user.name, objectidentifier to user.id, appid and the
+          authnmethodsreferences (amr) list - out of the claims bag into
+          explicit keyword fields. Because `properties` is flattened, promote
+          the per-record keys the CSOC actually queries (statusCode,
+          eventName, serviceRequestId) into explicitly mapped custom-namespace
+          keyword fields, and set the subscription id from resourceId into
+          cloud.account.id so Azure records join the rest of the cloud estate.
+        relay: >
+          Low-side instances cross the guard, and this feed is a reasonable
+          crossing candidate once bounded: the envelope is shallow, but
+          identity.claims is an open-ended bag whose keys are full URIs
+          (http://schemas.xmlsoap.org/...) and identity.authorization.evidence
+          nests a third level, both of which violate the
+          shallow-and-short-keys constraint a simple custom NDJSON filter
+          needs. Flatten the claims to an allow-listed set of short scalar
+          keys low-side and either drop or hard-cap
+          properties.requestbody/responseBody before the crossing - those are
+          unbounded, can be kilobytes of ARM template JSON, and are the single
+          worst content-filter and data-spill risk on this technology. Nothing
+          CEF-shaped is involved; the feed is already JSON, so the CEF exit
+          does not apply here. Keep _raw across the guard on this dataset - it
+          is low-volume, individually significant change evidence - and
+          reconcile low-side and high-side counts per (dataset, hour) since
+          the crossing is at-most-once.
+      direct:
+        parse_location: high
+        cribl: >
+          Keep the worker group close to a pass-through and let the
+          integration pipeline parse, but own three things the pipeline
+          cannot: unwrap the event hub `records` array into discrete events
+          before anything downstream counts them, route by the record's
+          `category` value so Administrative, Policy and ServiceHealth land in
+          separate pipelines with independent volume rules, and drop or mask
+          properties.requestbody/responseBody, which can carry template
+          parameters, connection strings and secrets in cleartext. Run the
+          Event Hubs source with a dedicated consumer group and durable
+          checkpoint store and use Persistent Queue backpressure on the
+          Elastic destination - the hub's 1-7 day retention is the only replay
+          window.
+        elastic: >
+          Point the Azure Logs integration at the Government endpoints
+          (resource_manager_endpoint management.usgovcloudapi.net,
+          authority_host login.microsoftonline.us) and add a
+          logs-azure.activitylogs@custom pipeline for the gaps this map
+          records: convert the string level to ECS event.severity through an
+          explicit lookup (and confirm the package's `long` typing of
+          azure.activitylogs.level does not produce a mapping conflict),
+          convert durationMs to nanoseconds for event.duration, map
+          resultType's four values so Start and Accept become `unknown` rather
+          than being folded into success, and lift the useful identity claims
+          - upn to user.name, objectidentifier to user.id, appid and the
+          authnmethodsreferences (amr) list - out of the claims bag into
+          explicit keyword fields. Because `properties` is flattened, promote
+          the per-record keys the CSOC actually queries (statusCode,
+          eventName, serviceRequestId) into explicitly mapped custom-namespace
+          keyword fields, and set the subscription id from resourceId into
+          cloud.account.id so Azure records join the rest of the cloud estate.
+  - format: api-pull
+    enable: >
+      Add a Log Analytics workspace as a destination on the same
+      subscription-level Activity log diagnostic setting that already streams
+      to Event Hubs (Monitor > Activity log > Export Activity Logs, or a
+      subscription-scope Microsoft.Insights/diagnosticSettings with a
+      workspaceId) and check the Administrative category - a single setting
+      may target one workspace and one event hub at once, so this is an added
+      destination, not a replacement. The Activity log lands in the
+      workspace's AzureActivity table within about 90 minutes of the first
+      record; the table is auto-created. Retrieve it by querying the Azure
+      Monitor Log Analytics Query API over HTTPS with a Microsoft Entra
+      service principal granted Log Analytics Reader on the workspace: POST
+      https://api.loganalytics.us/v1/workspaces/{workspaceId}/query (the Azure
+      Government query endpoint - api.loganalytics.io is the commercial host
+      and will not resolve the Gov workspace) with a KQL body such as
+      `AzureActivity | where CategoryValue == "Administrative" | where
+      TimeGenerated > ago(5m)`. Authenticate the token against the Gov
+      authority login.microsoftonline.us. Because this is a poll, the
+      collector owns the query window and de-duplicates on EventDataId; there
+      is no checkpointed stream as with the event hub.
+    references:
+    - >-
+      https://learn.microsoft.com/en-us/azure/azure-monitor/reference/tables/azureactivity
+    - >-
+      https://learn.microsoft.com/en-us/azure/azure-monitor/essentials/diagnostic-settings
+    - https://learn.microsoft.com/en-us/azure/azure-monitor/logs/api/overview
+    - https://learn.microsoft.com/en-us/azure/azure-monitor/logs/api/request-format
+    - https://learn.microsoft.com/en-us/azure/azure-monitor/essentials/activity-log
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        Cribl REST Collector against the Log Analytics Query API, feeding a
+        column-rename pipeline into logs-azure.activitylogs
+      notes: >
+        There is no stock Elastic integration that runs KQL against a
+        workspace - the Azure Logs integration is Event Hubs-only - so the
+        realistic path is a Cribl REST Collector that pages the Query API
+        response (a columns/rows table, not one object per row) into events,
+        then a pipeline that renames the AzureActivity columns back to the
+        resource-log field names the stock azure.activitylogs ingest pipeline
+        expects (OperationNameValue -> operationName, ActivityStatusValue ->
+        resultType, CategoryValue -> category, CallerIpAddress ->
+        callerIpAddress, Properties_d -> properties) before handing off. Two
+        reshape traps drive that pipeline: ActivityStatusValue carries
+        display-friendly verbs ("Started", "Succeeded", "Failed"), not the
+        envelope's Start/Success/Failure, so the outcome lookup needs its own
+        value table; and Authorization_d / Claims_d / Properties_d arrive as
+        dynamic JSON already parsed by the workspace, so unlike the event hub
+        feed they do not need a JSON-decode step - but their URI-keyed
+        sub-structure is identical to the envelope's identity.* bag.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Treat the Log Analytics pull as a topology alternative to the Event
+          Hubs source, not a second copy to merge - a subscription that
+          streams to the hub AND pulls from the workspace will double every
+          administrative action, so pick one authoritative transport per
+          instance and reconcile the other as a metric. If the workspace pull
+          is chosen, run the REST Collector on the low-side worker group with
+          egress to api.loganalytics.us, key the scheduled query window on
+          TimeGenerated with a deliberate overlap, and de-duplicate on
+          EventDataId across windows - the poll is at-least-once by window and
+          will re-emit boundary records. Back the Elastic destination with
+          Persistent Queue, and note the workspace's own retention (not a 1-7
+          day hub) is the replay bound here. Route on CategoryValue as the hub
+          feed routes on category, and drop or mask Properties_d.requestbody /
+          responseBody low-side before anything downstream, exactly as on the
+          json feed.
+        elastic: >
+          Once the columns are renamed to the resource-log schema the same
+          logs-azure.activitylogs@custom fixes apply, plus the ones this
+          reshape makes cheaper. SubscriptionId and ResourceGroup are already
+          first-class columns, so cloud.account.id and azure.resource_group no
+          longer require splitting resourceId - set cloud.account.id from
+          SubscriptionId directly and cloud.provider azure. EventDataId is a
+          genuine per-record identifier the Event Hub envelope lacks; map it
+          to event.id so the workspace feed is natively de-dupable.
+          EventSubmissionTimestamp gives the ingest lag the hub feed could
+          only estimate; map it to event.ingested. Keep the string-level to
+          numeric event.severity lookup (Level here adds a "Verbose" value the
+          envelope does not emit), the ActivityStatusValue-to-event.outcome
+          value table with Started held at unknown, and the Claims_d UPN and
+          objectidentifier extraction to user.name / user.id. The one column
+          trap: TenantId in this table is the Log Analytics workspace ID, not
+          the Entra tenant - do not feed it to any tenant/organization field.
+        relay: >
+          The crossing shape and its worst offenders are unchanged from the
+          json feed: Claims_d is an open-ended bag whose keys are full URIs
+          (http://schemas.xmlsoap.org/...), Authorization_d nests role /
+          action / scope evidence, and Properties_d can carry kilobytes of ARM
+          request/response body - all three are dynamic JSON that violate the
+          shallow-short-keys constraint a simple custom NDJSON filter needs.
+          Flatten Claims_d to an allow-listed set of short scalar keys and
+          hard-cap or drop Properties_d.requestbody/responseBody low-side
+          before the guard, precisely as on the json feed. The reshape helps
+          at the margin - Caller, SubscriptionId and ResourceGroup are already
+          flat scalar columns rather than values to be dug out of a path or a
+          claims bag - so the allow-listed record that crosses is a little
+          smaller. Keep _raw across the guard (low-volume, high-significance
+          change evidence) and reconcile low-side/high-side counts per
+          (dataset, hour) on EventDataId, which the workspace feed provides as
+          a stable key.
+      direct:
+        parse_location: high
+        cribl: >
+          For a high-side instance with no guard the choice between the
+          workspace pull and the Event Hubs stream is operational: the pull
+          needs a service principal, a scheduled query, and window/dedup
+          management but gives workspace-length retention and a stable
+          EventDataId; the stream is already deployed and self-checkpointing.
+          If the pull is used, run the REST Collector with light shaping and
+          route on CategoryValue; there is no low-side reduction obligation,
+          so the worker group is a thin poller in front of the Elastic
+          destination.
+        elastic: >
+          Rename the AzureActivity columns to the resource-log schema, run the
+          stock azure.activitylogs pipeline plus the @custom fixes, and take
+          the reshape's gifts - event.id from EventDataId, event.ingested from
+          EventSubmissionTimestamp, cloud.account.id straight from
+          SubscriptionId - rather than re-deriving them from resourceId.
+    fields:
+    - vendor: TimeGenerated
+      type: datetime
+      description: timestamp when the event was generated by the Azure service
+      ecs: '@timestamp'
+      status: mapped
+      notes: >-
+        the AzureActivity column equivalent of the envelope's `time` / the
+        REST API eventTimestamp
+    - vendor: EventSubmissionTimestamp
+      type: datetime
+      description: timestamp when the event became available for querying in the workspace
+      ecs: event.ingested
+      status: mapped
+      notes: >
+        the reshape recovers the REST API's submissionTimestamp that the Event
+        Hub envelope drops entirely - the difference between this and
+        TimeGenerated is the true ingestion lag, which the hub feed could only
+        estimate against enqueue time
+    - vendor: EventDataId
+      type: string
+      description: unique identifier of the individual activity-log record
+      ecs: event.id
+      status: mapped
+      notes: >
+        a genuine per-record key the Event Hub envelope does not carry; makes
+        the workspace feed natively de-dupable across overlapping poll windows
+        and is the reconciliation key across the guard. Distinct from
+        CorrelationId, which groups the records of one action
+    - vendor: OperationNameValue
+      type: string
+      description: >-
+        identifier of the operation performed, in provider/type/verb form
+        (e.g. Microsoft.Authorization/roleAssignments/write)
+      ecs: event.action
+      status: mapped
+      notes: >
+        the display-value column; the sibling OperationName holds the same
+        operation and OperationId is the operation's GUID. Same high-signal
+        detection surface as the envelope's operationName -
+        roleAssignments/write, keyvault/accessPolicies/write, */delete
+    - vendor: ActivityStatusValue
+      type: string
+      description: >-
+        status of the operation in display-friendly form (Started, In
+        Progress, Succeeded, Failed, Active, Resolved)
+      ecs: event.outcome
+      status: partial
+      transform: >
+        the reshape renames AND re-spells the envelope's resultType: map
+        Succeeded to success and Failed to failure, but Started and In
+        Progress are lifecycle states and must become unknown - a naive
+        two-way derivation counts a Started record as a completed action. Note
+        the value set is display verbs, not the envelope's
+        Start/Success/Failure, so the lookup table differs from the json
+        feed's
+    - vendor: ActivitySubstatusValue
+      type: string
+      description: >-
+        substatus of the operation in display-friendly form, typically the
+        HTTP result phrase (e.g. OK (HTTP Status Code 200), Created, Conflict)
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.result_signature
+      notes: >
+        the reshape of the envelope's resultSignature / the REST subStatus
+        value; not mapped to http.response.status_code because it is a
+        compound reason phrase, not a numeric code. Resolve through a lookup
+        if a numeric status is wanted
+    - vendor: Level
+      type: string
+      description: severity level of the event (Critical, Error, Warning, Informational, Verbose)
+      ecs: event.severity
+      status: partial
+      transform: >
+        same string-to-numeric ECS event.severity lookup as the json feed,
+        with one reshape difference - the workspace column adds a "Verbose"
+        value the Event Hub envelope does not emit, so extend the lookup table
+        to cover it
+    - vendor: Caller
+      type: string
+      description: >-
+        identity that performed the operation - the caller's object GUID for
+        service and managed-identity callers, the UPN for interactive user
+        operations
+      ecs: user.id
+      status: partial
+      notes: >
+        the reshape promotes the caller to a flat column instead of burying it
+        in the identity.claims bag, but collapses the envelope's separate upn
+        and objectidentifier claims into one field - so it is user.id when it
+        is a GUID and needs conditional routing to user.name when it is a UPN.
+        Use Claims_d for the authoritative split
+    - vendor: CallerIpAddress
+      type: string
+      description: IP address of the client that issued the Resource Manager request
+      ecs: source.ip
+      status: mapped
+      notes: >
+        the column form of the envelope's callerIpAddress; empty on operations
+        initiated by Azure itself or by a platform managed identity, a large
+        share of Administrative records, so absence is not a suppressed source
+    - vendor: CategoryValue
+      type: string
+      description: >-
+        category of the activity-log record (Administrative, Policy, Security,
+        ServiceHealth, ResourceHealth, Alert, Autoscale, Recommendation)
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.category
+      notes: >
+        the single field that separates the co-mingled categories in one table
+        and drives every routing decision and CSOC filter, as on the json
+        feed. The sibling Category column holds the same value. Deliberately
+        not mapped to the closed ECS event.category vocabulary
+    - vendor: ResourceProviderValue
+      type: string
+      description: >-
+        id of the resource provider for the impacted resource (e.g.
+        Microsoft.Storage, Microsoft.Authorization)
+      ecs: event.provider
+      status: mapped
+      notes: >
+        the reshape exposes the provider segment as its own column, so
+        event.provider - which neither the Event Hub envelope nor the stock
+        pipeline sets - can be populated directly rather than parsed out of
+        operationName or resourceId
+    - vendor: Authorization_d
+      type: dynamic
+      description: >-
+        RBAC evaluation blob for the event, usually carrying the action, role
+        and scope that authorized the request
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.identity.authorization
+      transform: >
+        the reshape of the envelope's identity.authorization object, delivered
+        as parsed dynamic JSON (the deprecated string sibling Authorization is
+        the same data as text). Lift scope and action into
+        azure.activitylogs.identity.authorization.scope / .action, and the
+        evidence.role into user.roles as a partial (it is the single role that
+        authorized this one request, not the caller's full role inventory),
+        matching the json feed's handling
+    - vendor: Claims_d
+      type: dynamic
+      description: >-
+        parsed claims of the Entra token used to authenticate the caller,
+        including upn, objectidentifier, appid and the authn-methods (amr)
+        reference
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.identity.claims
+      transform: >
+        the reshape of the envelope's identity.claims bag as parsed dynamic
+        JSON (the string sibling Claims is the raw JWT payload). Extract the
+        schemas.xmlsoap.org .../upn claim to user.name and the
+        schemas.microsoft.com/identity/claims/objectidentifier claim to
+        user.id - the objectidentifier is present on every authenticated
+        record where the UPN is not. appid and the comma-joined amr string
+        stay custom under this namespace as on the json feed
+    - vendor: SubscriptionId
+      type: string
+      description: subscription ID of the impacted resource, as a first-class column
+      ecs: cloud.account.id
+      status: mapped
+      notes: >
+        the reshape promotes the subscription GUID to its own column, so
+        cloud.account.id is a direct assignment here rather than a resourceId
+        path-split - the single biggest ergonomic gain of this format over the
+        Event Hub envelope
+    - vendor: ResourceGroup
+      type: string
+      description: resource group name of the impacted resource, as a first-class column
+      ecs: null
+      status: unmapped
+      custom: azure.resource_group
+      notes: >
+        also promoted to a column rather than derived from resourceId; ECS has
+        no resource-group field, so it stays in the azure custom namespace the
+        stock integration already uses
+    - vendor: ResourceId
+      type: string
+      description: full ARM resource ID of the resource the operation acted on
+      ecs: null
+      status: unmapped
+      custom: azure.resource.id
+      notes: >
+        the sibling _ResourceId column carries the same value normalized to
+        lowercase. Because SubscriptionId, ResourceGroup and
+        ResourceProviderValue are already separate columns in this format,
+        this path only needs splitting for the trailing resource type and
+        name, not for the subscription/group/provider the envelope forced you
+        to parse out
+    - vendor: CorrelationId
+      type: string
+      description: GUID shared by every record belonging to the same overall action
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.correlation_id
+      notes: >
+        the join key stitching the Started and Succeeded records of one
+        operation, and the link to the matching Entra sign-in; kept custom
+        rather than mapped to trace.id, since a deployment fans out many child
+        operations under one correlationId
+    - vendor: HTTPRequest
+      type: dynamic
+      description: >-
+        blob describing the HTTP request, usually including clientRequestId,
+        clientIpAddress and method
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.http_request
+      transform: >
+        extract method to http.request.method; clientIpAddress duplicates
+        CallerIpAddress and clientRequestId is a client-supplied idempotency
+        token. Present as a dynamic column in this format where the envelope
+        carries the same data under httpRequest
+    - vendor: Hierarchy
+      type: string
+      description: >-
+        management-group hierarchy of the subscription or management group the
+        record belongs to
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.hierarchy
+      notes: >
+        a column the Event Hub envelope does not surface at all - it places
+        the subscription in the management-group tree, which a government
+        tenant needs to attribute an action to an organizational boundary
+        rather than a bare subscription GUID
+    - vendor: Properties_d
+      type: dynamic
+      description: >-
+        parsed set of key/value pairs with the details of the event, including
+        statusCode, eventName (BeginRequest/EndRequest) and serviceRequestId
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.properties
+      transform: >
+        the reshape of the envelope's `properties`, delivered as parsed
+        dynamic JSON (the string sibling Properties is the same as text).
+        Promote the keys the CSOC queries - statusCode (Forbidden/Conflict are
+        the authorization-denied and concurrent-change signals) and eventName,
+        the BeginRequest/EndRequest deduplication phase without which every
+        administrative-action count roughly doubles - into explicitly mapped
+        custom keywords, exactly as on the json feed
+    - vendor: TenantId
+      type: string
+      description: the Log Analytics workspace ID (a GUID)
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.workspace_id
+      notes: >
+        a reshape trap - despite the name, this column is the workspace GUID
+        the record was stored in, NOT the Entra tenant of the subscription. Do
+        not feed it to any tenant or organization.id field; the Entra tenant
+        is only derivable from the Claims_d issuer/tenant claim
+- id: policy
+  name: Azure Policy evaluations
+  description: |
+    Records of every effect action taken by Azure Policy - Audit, Deny, AuditIfNotExists, DeployIfNotExists, Modify, Append - modeled as operations on the resource being evaluated. For a government subscription this is the compliance-drift feed: it is where a Deny shows an attempted non-compliant deployment (a blocked public IP, an unencrypted storage account) and where an Audit effect records a resource that drifted out of the baseline.
+    The category's defining hazard is volume and interpretation, not schema. properties.isComplianceCheck is "True" for scheduled re-evaluation sweeps and "False" only when a resource is actually created or updated - the sweeps dominate the category by orders of magnitude and mean nothing operationally. The `caller` on a sweep is the Policy Insights resource provider's GUID, not a person, so any identity-based analytic written against Administrative records produces nonsense here.
+  event_categories:
+  - configuration
+  route:
+    guarded:
+    - hop: other
+      name: Azure Government Event Hubs namespace
+      notes: >
+        Policy category on the same subscription diagnostic setting and the
+        same event hub as the Administrative category; there is no separate
+        transport to configure, only a category checkbox. Volume is driven by
+        the compliance re-evaluation cadence rather than by human activity, so
+        it can dwarf Administrative on a large subscription.
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Consumed from the same Event Hubs source and split on the record's
+        `category` value. On the crossing the JSON-encoded properties.policies
+        array is the first thing the guard owner will want bounded.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-azure.activitylogs
+    direct:
+    - hop: other
+      name: Azure Government Event Hubs namespace
+      notes: >
+        Policy category on the same subscription diagnostic setting and the
+        same event hub as the Administrative category; there is no separate
+        transport to configure, only a category checkbox. Volume is driven by
+        the compliance re-evaluation cadence rather than by human activity, so
+        it can dwarf Administrative on a large subscription.
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Consumed from the same Event Hubs source and split on the record's
+        `category` value before anything downstream counts it.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-azure.activitylogs
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: Azure Logs integration (azure.activitylogs data stream)
+      notes: >
+        Shares the activitylogs data stream and ingest pipeline with the
+        Administrative category - there is no policy-specific pipeline, and
+        the two are separable only by azure.activitylogs.category. The entire
+        policy payload lands inside the flattened `properties` object, and
+        properties.policies is a JSON-encoded string inside that object, so
+        nothing about the policy definition, assignment or effect is queryable
+        as a field without additional parsing.
+    fields:
+    - vendor: time
+      type: timestamp
+      description: UTC time the policy evaluation was recorded (ISO 8601)
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: category
+      type: enum
+      description: Activity log category, "Policy" for this feed
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.category
+      notes: >-
+        the only separator between this dataset and the Administrative records
+        sharing the same data stream
+    - vendor: operationName
+      type: string
+      description: >-
+        policy effect that fired, as an operation name
+        (Microsoft.Authorization/policies/audit/action, /deny/action,
+        /auditIfNotExists/action, /deployIfNotExists/action)
+      ecs: event.action
+      status: mapped
+      notes: >-
+        directly correlates to the Policy effect, so it is the field an
+        "enforcement fired" alert keys on rather than resultType
+    - vendor: resultType
+      type: enum
+      description: result of the policy evaluation (Success for most effects, Failed for a Deny)
+      ecs: event.outcome
+      status: partial
+      transform: >
+        semantically inverted relative to every other dataset on this
+        technology: a Deny returns Failed, but that is a control working
+        correctly, not a platform failure. Map it to failure only if the
+        consuming analytic understands the inversion; otherwise derive outcome
+        from operationName and leave this field custom, or every successful
+        policy block reads as an error
+    - vendor: level
+      type: enum
+      description: >-
+        severity of the policy event (Warning for Audit, Error for Deny,
+        Informational for other effects)
+      ecs: event.severity
+      status: partial
+      transform: >
+        same string-to-numeric lookup as the Administrative dataset, but note
+        the level is a property of the effect type, not of the risk - a Deny
+        that blocked a trivial misconfiguration still emits Error
+    - vendor: identity.authorization.action
+      type: string
+      description: >-
+        RBAC action evaluated,
+        "Microsoft.Resources/checkPolicyCompliance/read" for existing
+        resources or the triggering write action for new ones
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.identity.authorization.action
+      notes: >-
+        the cheapest way to separate a scheduled compliance sweep from an
+        evaluation triggered by a real deployment, alongside
+        properties.isComplianceCheck
+    - vendor: caller
+      type: string
+      description: >-
+        identity that triggered the evaluation - the deploying principal for
+        new resources, or the Azure Policy Insights resource provider GUID for
+        existing ones
+      ecs: user.name
+      status: partial
+      notes: >
+        only a person on isComplianceCheck "False" records; on sweeps it is a
+        fixed service GUID, and mapping it to user.name unconditionally
+        pollutes every user-activity dashboard with a synthetic principal that
+        appears to touch thousands of resources
+    - vendor: properties.isComplianceCheck
+      type: string
+      description: >-
+        "True" when the record is a scheduled or on-demand re-evaluation,
+        "False" when a resource was actually deployed or updated
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.properties.is_compliance_check
+      transform: >
+        emitted as the strings "True"/"False", not JSON booleans - convert
+        before filtering. This is the single most important volume and
+        relevance filter on the dataset
+    - vendor: properties.policies
+      type: string
+      description: >-
+        JSON-encoded array of the policy definitions and assignments that
+        produced this evaluation, each with policyDefinitionId,
+        policyDefinitionName, policyDefinitionEffect, policyAssignmentId,
+        policyAssignmentName, policyAssignmentScope and
+        policyAssignmentParameters
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.properties.policies
+      transform: >
+        arrives as an escaped JSON string inside the flattened `properties`
+        object and is never expanded by the stock pipeline; decode it before
+        anything about the policy is queryable. Deliberately not mapped to
+        rule.name/rule.id even though policyDefinitionName and
+        policyDefinitionId do describe the same object: this is an unbounded
+        array and one evaluation can cite several policies, so collapsing it
+        to a single ECS rule object would lose the per-policy effect - the
+        same reasoning applied to Conditional Access policies on the entra-id
+        map
+    - vendor: properties.policies[].policyDefinitionEffect
+      type: enum
+      description: >-
+        effect the policy definition applied (Audit, Deny, AuditIfNotExists,
+        DeployIfNotExists, Modify, Append, Disabled)
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.properties.policies.policy_definition_effect
+      notes: >
+        the field that separates a blocked deployment (Deny) from a recorded
+        observation (Audit) and from a policy that silently changed the
+        resource (Modify, DeployIfNotExists) - the last two are
+        platform-initiated changes with no human actor and are easy to miss in
+        a change-review process
+    - vendor: properties.resourceLocation
+      type: string
+      description: Azure region of the resource being evaluated
+      ecs: cloud.region
+      status: mapped
+      notes: >
+        unlike the top-level `location` field, which records where the event
+        was processed, this is genuinely the resource's region and is the
+        correct source for cloud.region on this dataset
+    - vendor: properties.ancestors
+      type: string
+      description: >-
+        comma-separated list of parent management groups, ordered from direct
+        parent to farthest ancestor
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.properties.ancestors
+      transform: >
+        split on commas before use; this is the only field that places the
+        subscription in the management-group hierarchy, which is what a
+        government tenant needs to attribute a policy result to an
+        organizational boundary rather than a subscription GUID
+    - vendor: resourceId
+      type: string
+      description: full ARM resource ID of the resource that was evaluated
+      ecs: null
+      status: unmapped
+      custom: azure.resource.id
+      transform: >-
+        extract the subscription GUID into cloud.account.id as on the
+        Administrative dataset; for compliance sweeps the resourceType segment
+        resolves to Microsoft.Resources/checkPolicyCompliance rather than the
+        real resource type
+    - vendor: correlationId
+      type: string
+      description: >-
+        GUID linking the policy evaluation to the deployment or write
+        operation that triggered it
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.correlation_id
+      notes: >
+        the join back to the Administrative record for the same action, which
+        is how a Deny is traced to the user who attempted the non-compliant
+        deployment; empty or self-referential on scheduled sweeps
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Route this category away from Administrative on the `category` value
+          and shape it low-side, because this is where the volume is: drop or
+          heavily sample records where properties.isComplianceCheck is "True"
+          and the effect is Audit, keeping every Deny and every
+          isComplianceCheck "False" record regardless of effect. Decode the
+          JSON-encoded properties.policies string into real fields here rather
+          than shipping an escaped blob, and use Persistent Queue backpressure
+          on the Elastic destination like the other categories.
+        elastic: >
+          Extend the logs-azure.activitylogs@custom pipeline with a
+          policy-specific branch keyed on azure.activitylogs.category: parse
+          properties.policies out of the flattened object into mapped keyword
+          fields (policy_definition_id, policy_definition_name,
+          policy_definition_effect, policy_assignment_id,
+          policy_assignment_name) so a Deny can be attributed to a named
+          policy without a runtime regex, and gate the shared
+          resultType-to-event.outcome conversion so a Deny's "Failed"
+          resultType is understood as a successfully enforced control rather
+          than a platform error. Suppress the caller-to-user.name mapping when
+          isComplianceCheck is "True", where the caller is the Policy Insights
+          service GUID rather than a person, and map
+          properties.resourceLocation to cloud.region.
+        relay: >
+          The one problem field for a crossing is properties.policies: a
+          JSON-encoded array embedded as a string inside a flattened object,
+          carrying full ARM paths and an open policyAssignmentParameters map -
+          unbounded, deeply nested once decoded, and exactly the shape a
+          simple custom NDJSON content filter handles worst. Decode and
+          flatten it into bounded scalar keys low-side, or cap and allow-list
+          it, before the guard. Otherwise this dataset is the best candidate
+          on the technology for aggressive low-side reduction ahead of the
+          crossing, since the compliance-sweep records are high-volume and
+          low-forensic-value - drop _raw here first.
+      direct:
+        parse_location: high
+        cribl: >
+          Route this category away from Administrative on the `category` value
+          and shape it upstream, because this is where the volume is: drop or
+          heavily sample records where properties.isComplianceCheck is "True"
+          and the effect is Audit, keeping every Deny and every
+          isComplianceCheck "False" record regardless of effect. Decode the
+          JSON-encoded properties.policies string into real fields here rather
+          than shipping an escaped blob, and use Persistent Queue backpressure
+          on the Elastic destination like the other categories.
+        elastic: >
+          Extend the logs-azure.activitylogs@custom pipeline with a
+          policy-specific branch keyed on azure.activitylogs.category: parse
+          properties.policies out of the flattened object into mapped keyword
+          fields (policy_definition_id, policy_definition_name,
+          policy_definition_effect, policy_assignment_id,
+          policy_assignment_name) so a Deny can be attributed to a named
+          policy without a runtime regex, and gate the shared
+          resultType-to-event.outcome conversion so a Deny's "Failed"
+          resultType is understood as a successfully enforced control rather
+          than a platform error. Suppress the caller-to-user.name mapping when
+          isComplianceCheck is "True", where the caller is the Policy Insights
+          service GUID rather than a person, and map
+          properties.resourceLocation to cloud.region.
+  - format: api-pull
+    enable: >
+      The Policy category flows to the same AzureActivity table as
+      Administrative on the same subscription diagnostic setting - there is no
+      separate destination to configure, only the Policy category checkbox
+      alongside the workspace destination. Retrieve it from the Log Analytics
+      Query API filtered on the category: POST
+      https://api.loganalytics.us/v1/workspaces/{workspaceId}/query with a KQL
+      body `AzureActivity | where CategoryValue == "Policy" | where
+      TimeGenerated > ago(5m)`, using the same Gov query host, service
+      principal (Log Analytics Reader) and Gov authority as the Administrative
+      pull. Volume is driven by the compliance-re-evaluation cadence rather
+      than by human activity, so scope the query window and the low-side
+      reduction accordingly.
+    references:
+    - >-
+      https://learn.microsoft.com/en-us/azure/azure-monitor/reference/tables/azureactivity
+    - >-
+      https://learn.microsoft.com/en-us/azure/azure-monitor/essentials/diagnostic-settings
+    - https://learn.microsoft.com/en-us/azure/azure-monitor/logs/api/overview
+    - https://learn.microsoft.com/en-us/azure/azure-monitor/essentials/activity-log
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        Cribl REST Collector against the Log Analytics Query API, feeding a
+        column-rename pipeline into logs-azure.activitylogs
+      notes: >
+        Same REST-Collector-plus-column-rename path as the Administrative
+        pull; there is no policy-specific stock pipeline and the two
+        categories are separable only by CategoryValue. The reshape's
+        advantage for this category is concrete: the entire policy payload
+        that the Event Hub envelope buries in a flattened `properties` object
+        arrives here as parsed Properties_d dynamic JSON, so isComplianceCheck
+        and the policies array are addressable as dynamic sub-fields without
+        the separate JSON-decode step the hub feed needs - but they still need
+        promotion to mapped keywords before they can back a dashboard, and the
+        resultType inversion (a Deny reports Failed) still applies.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          This is where the volume is, so shape it at the pull: build the
+          scheduled KQL to drop or heavily sample records where
+          Properties_d.isComplianceCheck == "True" and the effect is Audit,
+          keeping every Deny and every isComplianceCheck "False" record -
+          doing this reduction inside the query means the compliance-sweep
+          noise never leaves Azure or counts against egress. De-duplicate on
+          EventDataId across overlapping windows as on the Administrative
+          pull, route on CategoryValue, and keep Persistent Queue on the
+          Elastic destination. Because Properties_d is already parsed dynamic
+          JSON here, the escaped-blob problem the hub feed has with
+          properties.policies does not arise - the array is addressable
+          directly.
+        elastic: >
+          Extend logs-azure.activitylogs@custom with the same policy branch
+          keyed on CategoryValue: lift Properties_d.policies into mapped
+          keyword fields (policy_definition_id, policy_definition_name,
+          policy_definition_effect, policy_assignment_id,
+          policy_assignment_name) so a Deny attributes to a named policy, and
+          gate the ActivityStatusValue-to-event.outcome conversion so a Deny's
+          Failed status reads as a successfully enforced control, not a
+          platform error. Suppress the Caller-to-user mapping when
+          Properties_d.isComplianceCheck is "True", where Caller is the Policy
+          Insights service GUID rather than a person, and map
+          Properties_d.resourceLocation to cloud.region. The reshape also
+          gives you Hierarchy as a column, so the management-group attribution
+          the government tenant needs no longer depends on splitting
+          properties.ancestors.
+        relay: >
+          The one problem field for a crossing is Properties_d.policies: a
+          policy array carrying full ARM paths and an open
+          policyAssignmentParameters map - unbounded and deeply nested, the
+          shape a simple custom NDJSON filter handles worst - even though this
+          format delivers it pre-parsed rather than as an escaped string.
+          Flatten it to bounded scalar keys low-side, or cap and allow-list
+          it, before the guard. This dataset is otherwise the best candidate
+          on the technology for aggressive low-side reduction ahead of the
+          crossing, since the compliance-sweep records are high-volume and
+          low-forensic-value - drop _raw here first and reconcile on
+          EventDataId per (dataset, hour).
+      direct:
+        parse_location: high
+        cribl: >
+          High side with no guard: the pull's value for this category is that
+          the isComplianceCheck volume filter can live in the KQL itself, so
+          the sweep noise is dropped before it is ever collected rather than
+          in a downstream pipeline. Run the REST Collector with that filter,
+          route on CategoryValue, and pass through with light shaping.
+        elastic: >
+          Decode Properties_d.policies into named keyword fields, gate the
+          ActivityStatusValue-to-event.outcome inversion so a Deny's Failed
+          status reads as a successfully enforced control, suppress the Caller
+          mapping on sweeps, and map Properties_d.resourceLocation to
+          cloud.region. Take Hierarchy from the column rather than parsing
+          properties.ancestors.
+    fields:
+    - vendor: TimeGenerated
+      type: datetime
+      description: timestamp when the policy evaluation was recorded
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: CategoryValue
+      type: string
+      description: category of the record, "Policy" for this feed
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.category
+      notes: >-
+        the only separator between this dataset and the Administrative records
+        sharing the same table
+    - vendor: OperationNameValue
+      type: string
+      description: >-
+        policy effect that fired, as an operation name
+        (Microsoft.Authorization/policies/audit/action, /deny/action,
+        /auditIfNotExists/action, /deployIfNotExists/action)
+      ecs: event.action
+      status: mapped
+      notes: >-
+        correlates directly to the Policy effect, so it is the field an
+        "enforcement fired" alert keys on rather than ActivityStatusValue
+    - vendor: ActivityStatusValue
+      type: string
+      description: result of the policy evaluation (Succeeded for most effects, Failed for a Deny)
+      ecs: event.outcome
+      status: partial
+      transform: >
+        semantically inverted for this category as on the json feed - a Deny
+        reports Failed, but that is a control working correctly. Map to
+        failure only if the consuming analytic understands the inversion;
+        otherwise derive outcome from OperationNameValue and leave this
+        custom, or every successful policy block reads as an error. Note the
+        display spelling (Succeeded/Failed) differs from the envelope's
+        Success/Failed
+    - vendor: Level
+      type: string
+      description: >-
+        severity of the policy event (Warning for Audit, Error for Deny,
+        Informational for other effects)
+      ecs: event.severity
+      status: partial
+      transform: >-
+        same string-to-numeric lookup as the Administrative pull; the level
+        reflects the effect type, not the risk - a Deny that blocked a trivial
+        misconfiguration still emits Error
+    - vendor: Caller
+      type: string
+      description: >-
+        identity that triggered the evaluation - the deploying principal for
+        new resources, or the Azure Policy Insights resource-provider GUID for
+        compliance sweeps
+      ecs: user.id
+      status: partial
+      notes: >
+        a person only on Properties_d.isComplianceCheck "False" records; on
+        sweeps it is the fixed Policy Insights service GUID, so mapping it
+        unconditionally pollutes every user-activity view with a synthetic
+        principal touching thousands of resources. In this format the column
+        is the caller GUID, where the Event Hub envelope's `caller` is usually
+        the UPN string - a genuine reshape difference to account for
+    - vendor: Authorization_d
+      type: dynamic
+      description: >-
+        RBAC evaluation blob, carrying the action evaluated -
+        Microsoft.Resources/checkPolicyCompliance/read for existing resources,
+        or the triggering write action for new ones
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.identity.authorization
+      notes: >-
+        the action sub-field is the cheapest way to separate a scheduled
+        compliance sweep from an evaluation triggered by a real deployment,
+        alongside Properties_d.isComplianceCheck
+    - vendor: Hierarchy
+      type: string
+      description: >-
+        management-group hierarchy of the evaluated subscription, ordered from
+        direct parent outward
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.hierarchy
+      notes: >
+        this format's first-class column replaces the envelope's
+        properties.ancestors comma-string - it is the field that attributes a
+        policy result to an organizational boundary rather than a subscription
+        GUID, and it needs no comma-splitting here
+    - vendor: Properties_d.isComplianceCheck
+      type: dynamic
+      description: >-
+        "True" when the record is a scheduled or on-demand re-evaluation,
+        "False" when a resource was actually deployed or updated
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.properties.is_compliance_check
+      transform: >
+        the single most important volume and relevance filter on the dataset -
+        emitted as the strings "True"/"False", convert before filtering.
+        Addressable as a parsed dynamic sub-field in this format, where the
+        Event Hub feed carries it inside an escaped properties blob
+    - vendor: Properties_d.policies
+      type: dynamic
+      description: >-
+        array of the policy definitions and assignments that produced the
+        evaluation, each with policyDefinitionId, policyDefinitionName,
+        policyDefinitionEffect, policyAssignmentId, policyAssignmentName,
+        policyAssignmentScope and policyAssignmentParameters
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.properties.policies
+      transform: >
+        parsed dynamic JSON in this format rather than the escaped string the
+        json feed carries, so no decode step is needed - but still never
+        expanded to mapped fields by any stock pipeline. Deliberately not
+        collapsed to a single ECS rule object: it is an unbounded array and
+        one evaluation can cite several policies, so a single rule.name would
+        lose the per-policy effect
+    - vendor: Properties_d.policies[].policyDefinitionEffect
+      type: dynamic
+      description: >-
+        effect the policy definition applied (Audit, Deny, AuditIfNotExists,
+        DeployIfNotExists, Modify, Append, Disabled)
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.properties.policies.policy_definition_effect
+      notes: >-
+        separates a blocked deployment (Deny) from a recorded observation
+        (Audit) and from a policy that silently changed the resource (Modify,
+        DeployIfNotExists) - the last two are platform-initiated changes with
+        no human actor
+    - vendor: Properties_d.resourceLocation
+      type: dynamic
+      description: Azure region of the resource being evaluated
+      ecs: cloud.region
+      status: mapped
+      notes: >-
+        the resource's own region, unlike the top-level processing location;
+        the correct source for cloud.region on this dataset
+    - vendor: ResourceId
+      type: string
+      description: full ARM resource ID of the resource that was evaluated
+      ecs: null
+      status: unmapped
+      custom: azure.resource.id
+      transform: >-
+        extract the subscription GUID into cloud.account.id (or take
+        SubscriptionId directly); for compliance sweeps the resourceType
+        segment resolves to Microsoft.Resources/checkPolicyCompliance rather
+        than the real resource type
+    - vendor: SubscriptionId
+      type: string
+      description: subscription ID of the evaluated resource, as a first-class column
+      ecs: cloud.account.id
+      status: mapped
+      notes: >-
+        promoted to a column in this format, so cloud.account.id is a direct
+        assignment rather than a resourceId split
+    - vendor: CorrelationId
+      type: string
+      description: >-
+        GUID linking the policy evaluation to the deployment or write
+        operation that triggered it
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.correlation_id
+      notes: >-
+        the join back to the Administrative record for the same action - how a
+        Deny is traced to the user who attempted the non-compliant deployment;
+        empty or self-referential on scheduled sweeps
+- id: service-health
+  name: Service Health incidents
+  description: |
+    Thin starter - Azure platform service health incidents, planned maintenance, health advisories and security advisories affecting resources in the subscription. Not a security dataset in itself, but it is the availability context that keeps a CSOC from investigating an Azure outage as an intrusion, and it is the only in-band notice of Microsoft-declared security advisories affecting the subscription's services.
+    The record shape is unusual for this technology: nearly all the content lives in properties as human-facing prose (title, communication and defaultLanguageContent are HTML-bearing free text of arbitrary length), and one incident emits several records over its lifetime as the stage moves from Active through Resolved to RCA. Deduplication is by properties.trackingId, not by any per-event identifier, and the status value is a lifecycle stage rather than a success or failure.
+  event_categories:
+  - configuration
+  route:
+    guarded:
+    - hop: other
+      name: Azure Government Event Hubs namespace
+      notes: >
+        ServiceHealth category on the same subscription diagnostic setting and
+        event hub. Volume is negligible - tens of records a month on a typical
+        subscription - but the records are individually large because of the
+        embedded communication text.
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same Event Hubs source, split on the record's `category` value. On the
+        crossing the multi-kilobyte HTML communication body is the constraint
+        rather than the volume.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-azure.activitylogs
+    direct:
+    - hop: other
+      name: Azure Government Event Hubs namespace
+      notes: >
+        ServiceHealth category on the same subscription diagnostic setting and
+        event hub. Volume is negligible - tens of records a month on a typical
+        subscription - but the records are individually large because of the
+        embedded communication text.
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Same Event Hubs source, split on the record's `category` value before
+        anything downstream counts it.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-azure.activitylogs
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: Azure Logs integration (azure.activitylogs data stream)
+      notes: >
+        Same shared activitylogs pipeline as the other categories, with no
+        ServiceHealth-specific handling: the whole incident payload lands
+        inside the flattened `properties` object, and
+        properties.impactedServices is a JSON-encoded string within it. The
+        pipeline's resultType-to-outcome derivation is actively wrong for this
+        category, where the value is a lifecycle stage.
+    fields:
+    - vendor: time
+      type: timestamp
+      description: UTC time the service health record was generated (ISO 8601)
+      ecs: '@timestamp'
+      status: mapped
+      notes: >-
+        the time of this update, not the start of the incident - use
+        properties.impactStartTime for when impact actually began
+    - vendor: category
+      type: enum
+      description: Activity log category, "ServiceHealth" for this feed
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.category
+    - vendor: operationName
+      type: string
+      description: >-
+        operation name for the health notification,
+        "Microsoft.ServiceHealth/incident/action"
+      ecs: event.action
+      status: partial
+      notes: >-
+        effectively constant across the dataset and therefore useless as a
+        discriminator; properties.incidentType and properties.stage carry the
+        real event semantics
+    - vendor: resultType
+      type: enum
+      description: lifecycle stage of the incident (Active, In Progress, Resolved, Updated)
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.result_type
+      notes: >
+        deliberately not mapped to event.outcome even though the shared
+        pipeline will try: these are incident stages, and "Resolved" becoming
+        success or "Active" becoming failure makes any cross-dataset outcome
+        rollup meaningless
+    - vendor: resultDescription
+      type: string
+      description: >-
+        one-line summary of the notification, e.g. "Active: Network
+        Infrastructure - UK South"
+      ecs: message
+      status: mapped
+      notes: >-
+        the export-schema rename of the REST API's `description`; the only
+        human-readable summary available without decoding the properties
+        object
+    - vendor: level
+      type: enum
+      description: severity of the health notification (Informational, Warning, Error, Critical)
+      ecs: event.severity
+      status: partial
+      transform: same string-to-numeric lookup as the other categories on this technology
+    - vendor: properties.trackingId
+      type: string
+      description: >-
+        Microsoft's tracking identifier for the incident, stable across every
+        update to it
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.properties.tracking_id
+      notes: >
+        the deduplication and correlation key for the dataset - one incident
+        emits a record per update, and this is the only field that groups
+        them. Not event.id, which would imply per-record uniqueness this value
+        does not have
+    - vendor: properties.incidentType
+      type: enum
+      description: >-
+        kind of health notification (Incident, Maintenance, Informational,
+        ActionRequired, Security)
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.properties.incident_type
+      notes: >
+        the field that decides whether the CSOC cares - Security notifications
+        are Microsoft-declared advisories affecting the subscription's
+        services and should route differently from routine Maintenance
+    - vendor: properties.service
+      type: string
+      description: Azure service affected by the incident (e.g. Service Fabric, Azure SQL Database)
+      ecs: cloud.service.name
+      status: partial
+      notes: >
+        the affected platform service rather than a service the org runs, so
+        it is a target rather than the emitter of the event; mapped for
+        cross-cloud consistency with the note that it must not be conflated
+        with an application service name
+    - vendor: properties.region
+      type: string
+      description: Azure region affected by the incident
+      ecs: cloud.region
+      status: mapped
+      notes: >-
+        uses display names ("UK South", "USGov Virginia") rather than the API
+        region slugs used elsewhere, so a lookup is needed to join against
+        resource regions
+    - vendor: properties.impactStartTime
+      type: timestamp
+      description: UTC time impact on the service began (ISO 8601)
+      ecs: event.start
+      status: mapped
+      notes: >-
+        routinely hours earlier than the record's own time; this is the value
+        to correlate against an unexplained failure window, not @timestamp
+    - vendor: properties.stage
+      type: enum
+      description: current stage of the incident communication (Active, Resolved, RCA)
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.properties.stage
+    - vendor: properties.communication
+      type: string
+      description: >-
+        full Microsoft communication text for this update, including impact
+        description and next-update commitment
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.properties.communication
+      notes: >
+        unbounded HTML-bearing free text, frequently several kilobytes, and
+        duplicated verbatim into defaultLanguageContent on English tenants -
+        the size driver on this dataset and the length-cap candidate before
+        any guard crossing
+    - vendor: properties.impactedServices
+      type: string
+      description: JSON-encoded array of the affected services and their impacted regions
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.properties.impacted_services
+      transform: >
+        arrives as an escaped JSON string inside the flattened `properties`
+        object; decode it to get the full service/region matrix, which is
+        broader than the single properties.service and properties.region
+        values on the record
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Route on the `category` value like the other categories and
+          otherwise pass through - the volume does not justify a pipeline. The
+          one useful low-side action is capping or stripping the duplicate
+          prose: defaultLanguageTitle and defaultLanguageContent repeat title
+          and communication verbatim on English-language tenants, so dropping
+          the defaultLanguage* pair halves the record size at no information
+          cost. Keep Persistent Queue backpressure on the Elastic destination.
+        elastic: >
+          Add a ServiceHealth branch to the logs-azure.activitylogs@custom
+          pipeline that suppresses the shared resultType-to-event.outcome
+          derivation for this category - Active and Resolved are stages, not
+          outcomes, and letting them become failure/success corrupts every
+          cross-dataset outcome metric - and instead maps the stage to
+          event.action alongside properties.incidentType. Set event.start from
+          properties.impactStartTime, promote trackingId to a mapped keyword
+          so the several records of one incident can be collapsed, decode
+          properties.impactedServices out of its JSON string, and map the
+          communication body as text with a keyword sub-field capped by
+          ignore_above so the HTML prose stays searchable without bloating the
+          index.
+        relay: >
+          Volume is trivial but per-record size is not:
+          properties.communication and properties.defaultLanguageContent are
+          multi-kilobyte HTML free text with non-ASCII characters, which is
+          precisely the payload a simple custom NDJSON content filter
+          struggles with. Strip the defaultLanguage* duplicates and hard-cap
+          the communication body low-side before the crossing, or carry only
+          the structured incident fields (trackingId, service, region,
+          incidentType, stage, impactStartTime) across and leave the prose
+          behind. Drop _raw on this dataset first - the forensic value of a
+          Microsoft status page announcement is low.
+      direct:
+        parse_location: high
+        cribl: >
+          Route on the `category` value like the other categories and
+          otherwise pass through - the volume does not justify a pipeline. The
+          one useful shaping action is capping or stripping the duplicate
+          prose: defaultLanguageTitle and defaultLanguageContent repeat title
+          and communication verbatim on English-language tenants, so dropping
+          the defaultLanguage* pair halves the record size at no information
+          cost. Keep Persistent Queue backpressure on the Elastic destination.
+        elastic: >
+          Add a ServiceHealth branch to the logs-azure.activitylogs@custom
+          pipeline that suppresses the shared resultType-to-event.outcome
+          derivation for this category - Active and Resolved are stages, not
+          outcomes, and letting them become failure/success corrupts every
+          cross-dataset outcome metric - and instead maps the stage to
+          event.action alongside properties.incidentType. Set event.start from
+          properties.impactStartTime, promote trackingId to a mapped keyword
+          so the several records of one incident can be collapsed, decode
+          properties.impactedServices out of its JSON string, and map the
+          communication body as text with a keyword sub-field capped by
+          ignore_above so the HTML prose stays searchable without bloating the
+          index.
+  - format: api-pull
+    enable: >
+      The ServiceHealth category flows to the same AzureActivity table on the
+      same subscription diagnostic setting; enable it by checking the Service
+      Health category on the workspace-targeted setting. Retrieve it from the
+      Log Analytics Query API filtered on the category: POST
+      https://api.loganalytics.us/v1/workspaces/{workspaceId}/query with
+      `AzureActivity | where CategoryValue == "ServiceHealth" | where
+      TimeGenerated > ago(1h)`, using the same Gov query host, service
+      principal and authority as the other two categories. Volume is
+      negligible - tens of records a month - but each record is large because
+      of the embedded communication prose, so the reduction case is per-record
+      size rather than record count.
+    references:
+    - >-
+      https://learn.microsoft.com/en-us/azure/azure-monitor/reference/tables/azureactivity
+    - >-
+      https://learn.microsoft.com/en-us/azure/azure-monitor/essentials/diagnostic-settings
+    - https://learn.microsoft.com/en-us/azure/azure-monitor/logs/api/overview
+    - >-
+      https://learn.microsoft.com/en-us/azure/service-health/service-health-notifications-properties
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        Cribl REST Collector against the Log Analytics Query API, feeding a
+        column-rename pipeline into logs-azure.activitylogs
+      notes: >
+        Same REST-Collector-plus-column-rename path, shared table, no
+        ServiceHealth-specific stock handling. The reshape does not fix this
+        category's defining problem - the whole incident payload (trackingId,
+        incidentType, service, region, impactStartTime, stage, communication,
+        impactedServices) still lands inside Properties_d, addressable here as
+        parsed dynamic sub-fields but not as first-class columns - and the
+        ActivityStatusValue column carries the lifecycle stage (Active,
+        Resolved), so the shared status-to-outcome derivation is actively
+        wrong for this category exactly as on the json feed.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Route on CategoryValue and otherwise pass through - the volume does
+          not justify a pipeline. The one useful low-side action is capping or
+          stripping the duplicate prose: Properties_d.defaultLanguageTitle and
+          defaultLanguageContent repeat title and communication verbatim on
+          English-language tenants, so dropping the defaultLanguage* pair
+          halves the record size at no information cost. De-duplicate on
+          EventDataId, and note one incident emits several records over its
+          lifetime that Properties_d.trackingId, not EventDataId, groups. Keep
+          Persistent Queue on the Elastic destination.
+        elastic: >
+          Add a ServiceHealth branch to logs-azure.activitylogs@custom that
+          suppresses the shared ActivityStatusValue-to-event.outcome
+          derivation for this category - Active and Resolved are stages, not
+          outcomes, and letting them become failure/success corrupts every
+          cross-dataset outcome metric - and instead maps the stage to
+          event.action alongside Properties_d.incidentType. Set event.start
+          from Properties_d.impactStartTime, promote Properties_d.trackingId
+          to a mapped keyword so the several records of one incident collapse,
+          and map the communication body as text with a keyword sub-field
+          capped by ignore_above so the HTML prose stays searchable without
+          bloating the index. Properties_d is parsed dynamic JSON in this
+          format, so impactedServices needs no separate decode step.
+        relay: >
+          Volume is trivial but per-record size is not:
+          Properties_d.communication and defaultLanguageContent are
+          multi-kilobyte HTML free text with non-ASCII characters, precisely
+          the payload a simple custom NDJSON content filter struggles with.
+          Strip the defaultLanguage* duplicates and hard-cap the communication
+          body low-side before the crossing, or carry only the structured
+          incident fields (trackingId, service, region, incidentType, stage,
+          impactStartTime) across and leave the prose behind. Drop _raw on
+          this dataset first - the forensic value of a Microsoft status-page
+          announcement is low - and reconcile on trackingId, the
+          incident-level key, rather than the per-record EventDataId.
+      direct:
+        parse_location: high
+        cribl: >
+          High side with no guard: route on CategoryValue and pass through;
+          the only worthwhile shaping is dropping the defaultLanguage*
+          duplicate prose to halve record size. No volume controls are needed
+          on a feed of tens of records a month.
+        elastic: >
+          Add a ServiceHealth branch to logs-azure.activitylogs@custom that
+          suppresses the ActivityStatusValue-to-event.outcome derivation, maps
+          the stage to event.action, sets event.start from
+          Properties_d.impactStartTime, promotes trackingId to a mapped
+          keyword, and caps the communication body with ignore_above.
+    fields:
+    - vendor: TimeGenerated
+      type: datetime
+      description: timestamp when the service-health record was generated
+      ecs: '@timestamp'
+      status: mapped
+      notes: >-
+        the time of this update, not the start of impact - use
+        Properties_d.impactStartTime for when impact actually began
+    - vendor: EventDataId
+      type: string
+      description: unique identifier of the individual health-notification record
+      ecs: event.id
+      status: mapped
+      notes: >-
+        unique per record, so it does NOT group an incident's several
+        lifecycle records - that is Properties_d.trackingId's job
+    - vendor: CategoryValue
+      type: string
+      description: category of the record, "ServiceHealth" for this feed
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.category
+    - vendor: OperationNameValue
+      type: string
+      description: >-
+        operation name for the health notification,
+        "Microsoft.ServiceHealth/incident/action"
+      ecs: event.action
+      status: partial
+      notes: >-
+        effectively constant across the dataset and useless as a
+        discriminator; Properties_d.incidentType and Properties_d.stage carry
+        the real event semantics
+    - vendor: ActivityStatusValue
+      type: string
+      description: lifecycle stage of the incident (Active, In Progress, Resolved, Updated)
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.result_type
+      notes: >
+        the workspace-table reference lists Active and Resolved among this
+        column's values, confirming it is a stage, not an outcome -
+        deliberately not mapped to event.outcome even though the shared
+        pipeline will try, because "Resolved" becoming success or "Active"
+        becoming failure makes any cross-dataset outcome rollup meaningless
+    - vendor: Level
+      type: string
+      description: severity of the health notification (Informational, Warning, Error, Critical)
+      ecs: event.severity
+      status: partial
+      transform: same string-to-numeric lookup as the other categories on this technology
+    - vendor: Properties_d.trackingId
+      type: dynamic
+      description: >-
+        Microsoft's tracking identifier for the incident, stable across every
+        update to it
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.properties.tracking_id
+      notes: >
+        the deduplication and correlation key for the dataset - one incident
+        emits a record per update and this is the only field that groups them.
+        Not event.id, which the per-record EventDataId already fills and which
+        implies a uniqueness this value does not have
+    - vendor: Properties_d.incidentType
+      type: dynamic
+      description: >-
+        kind of health notification (Incident, Maintenance, Informational,
+        ActionRequired, Security)
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.properties.incident_type
+      notes: >-
+        the field that decides whether the CSOC cares - Security notifications
+        are Microsoft-declared advisories affecting the subscription's
+        services and should route differently from routine Maintenance
+    - vendor: Properties_d.service
+      type: dynamic
+      description: Azure service affected by the incident (e.g. Service Fabric, Azure SQL Database)
+      ecs: cloud.service.name
+      status: partial
+      notes: >-
+        the affected platform service rather than a service the org runs - a
+        target, not the emitter; mapped for cross-cloud consistency with the
+        caveat that it must not be conflated with an application service name
+    - vendor: Properties_d.region
+      type: dynamic
+      description: Azure region affected by the incident
+      ecs: cloud.region
+      status: mapped
+      notes: >-
+        uses display names ("UK South", "USGov Virginia") rather than API
+        region slugs, so a lookup is needed to join against resource regions
+    - vendor: Properties_d.impactStartTime
+      type: dynamic
+      description: UTC time impact on the service began
+      ecs: event.start
+      status: mapped
+      notes: >-
+        routinely hours earlier than the record's own TimeGenerated; the value
+        to correlate against an unexplained failure window
+    - vendor: Properties_d.stage
+      type: dynamic
+      description: current stage of the incident communication (Active, Resolved, RCA)
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.properties.stage
+    - vendor: Properties_d.communication
+      type: dynamic
+      description: >-
+        full Microsoft communication text for this update, including impact
+        description and next-update commitment
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.properties.communication
+      notes: >
+        unbounded HTML-bearing free text, frequently several kilobytes, and
+        duplicated verbatim into defaultLanguageContent on English tenants -
+        the size driver on this dataset and the length-cap candidate before
+        any guard crossing
+    - vendor: Properties_d.impactedServices
+      type: dynamic
+      description: array of the affected services and their impacted regions
+      ecs: null
+      status: unmapped
+      custom: azure.activitylogs.properties.impacted_services
+      transform: >
+        parsed dynamic JSON in this format rather than the escaped string the
+        json feed carries, so no decode step is needed; broader than the
+        single Properties_d.service and Properties_d.region values on the
+        record

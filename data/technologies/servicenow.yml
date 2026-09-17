@@ -1,0 +1,2177 @@
+id: servicenow
+name: ServiceNow ITSM
+vendor: ServiceNow
+versions: >-
+  Washington DC, Xanadu, Yokohama, Zurich (incl. ServiceNow Federal / FedRAMP
+  High instances)
+draft: true
+references:
+- https://www.elastic.co/docs/reference/integrations/servicenow
+- >-
+  https://raw.githubusercontent.com/elastic/integrations/main/packages/servicenow/data_stream/event/fields/fields.yml
+- >-
+  https://documentation.insightsoftware.com/simba-servicenow-jdbc-data-connector-reference-guide/content/reference/svc/schema/sys_audit.htm
+- >-
+  https://www.servicenow.com/docs/bundle/xanadu-platform-administration/page/administer/platform-events/concept/c_EventRegistry.html
+- >-
+  https://www.servicenow.com/docs/bundle/xanadu-platform-administration/page/administer/platform-performance/concept/c_TransactionLogResponseTimes.html
+- >-
+  https://docs.cloud.google.com/chronicle/docs/ingestion/parser-list/servicenow-audit-changelog
+- >-
+  https://www.servicenow.com/community/developer-forum/how-to-get-the-ip-address-from-transaction-log-entry-and-add-it/m-p/1854386
+datasets:
+- id: audit
+  name: Platform audit (sys_audit)
+  description: >
+    Field-level audit trail for every audited table on the instance: one row
+    per changed column, carrying the old and new value, the table and sys_id
+    of the record, and the account credited with the change. This is the
+    platform's own change-of-record evidence and the feed that answers "who
+    edited this incident/CI/role assignment". Deletes appear here with
+    fieldname DELETED and the removed record lands in sys_audit_delete; a
+    recovered record writes a RECOVERED row. Collected by REST Table API pull
+    from the ServiceNow Federal (FedRAMP High) instance rather than by syslog
+    forwarding - ServiceNow does not push platform audit off-instance.
+  event_categories:
+  - configuration
+  - iam
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        A Cribl REST Collector polls /api/now/table/sys_audit on a schedule,
+        watermarking on sys_created_on and paging with
+        sysparm_limit/sysparm_offset; the collector must sit where it can
+        reach the instance, since an API pull has no one-way variant. The
+        collector stays low-side and only the pulled results cross.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-servicenow.event
+      notes: >
+        The Elastic ServiceNow integration consolidates every configured table
+        into one event data stream, so sys_audit rows share an index with the
+        change and event-log datasets below and must be disambiguated on the
+        table name.
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        A Cribl REST Collector polls /api/now/table/sys_audit on a schedule,
+        watermarking on sys_created_on and paging with
+        sysparm_limit/sysparm_offset; the collector must sit where it can
+        reach the instance, since an API pull has no one-way variant. It
+        delivers straight to Elastic with no guard hop.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-servicenow.event
+      notes: >
+        The Elastic ServiceNow integration consolidates every configured table
+        into one event data stream, so sys_audit rows share an index with the
+        change and event-log datasets below and must be disambiguated on the
+        table name.
+  formats:
+  - format: api-pull
+    parsing:
+      mechanism: elastic-integration
+      artifact: ServiceNow integration
+      notes: >
+        The integration ingests arbitrary tables (default and custom) over
+        REST, S3 polling, or S3+SQS, and emits servicenow.event.<column>.value
+        / .display_value pairs. Its stock ECS coverage is thin (event.*,
+        user.name, related.user), so every mapping below is
+        logs-servicenow.event@custom pipeline work rather than out-of-the-box
+        behaviour.
+    fields:
+    - vendor: sys_created_on
+      type: timestamp
+      description: date and time the audit row was written, i.e. when the change was made
+      ecs: '@timestamp'
+      status: mapped
+      transform: >
+        Glide date/time string "YYYY-MM-DD HH:MM:SS" rendered in the instance
+        time zone (and in the caller's time zone when sysparm_display_value is
+        used); parse explicitly to UTC rather than relying on the ingest
+        default
+    - vendor: sys_created_by
+      type: string
+      description: user name of the account credited with making the change
+      ecs: user.name
+      status: mapped
+    - vendor: user
+      type: string
+      description: reference to the sys_user record the change is attributed to
+      ecs: user.id
+      status: mapped
+      notes: >
+        reference field - the Table API returns the sys_user sys_id in .value
+        and the display name in .display_value; the sys_id is the stable
+        identity, so it lands on user.id while sys_created_by supplies
+        user.name
+    - vendor: tablename
+      type: string
+      description: name of the table whose record was changed
+      ecs: null
+      status: unmapped
+      custom: servicenow.audit.table_name
+      notes: >
+        the discriminator for this feed - sys_user_has_role, change_request,
+        incident and cmdb_ci rows all arrive in the same data stream and are
+        only separable on this value
+    - vendor: documentkey
+      type: string
+      description: sys_id of the changed record on that table
+      ecs: null
+      status: unmapped
+      custom: servicenow.audit.document_key
+      notes: >-
+        join key back to the audited record (e.g. change_request.sys_id in the
+        change dataset below)
+    - vendor: fieldname
+      type: string
+      description: name of the column that changed
+      ecs: null
+      status: unmapped
+      custom: servicenow.audit.field_name
+      notes: >
+        also carries the sentinels DELETED (record removed, body in
+        sys_audit_delete) and RECOVERED (record restored), which are not real
+        column names and must be branched on before any field-change logic
+    - vendor: oldvalue
+      type: string
+      description: value of the column before the change, up to 8000 characters
+      ecs: null
+      status: unmapped
+      custom: servicenow.audit.old_value
+      notes: >-
+        unbounded free text; may contain credentials or PII when the audited
+        column does, so redact and length-cap before forwarding
+    - vendor: newvalue
+      type: string
+      description: value of the column after the change, up to 8000 characters
+      ecs: null
+      status: unmapped
+      custom: servicenow.audit.new_value
+      notes: same size and sensitivity profile as oldvalue
+    - vendor: reason
+      type: string
+      description: optional reason text recorded alongside the change, up to 2000 characters
+      ecs: event.reason
+      status: mapped
+    - vendor: record_checkpoint
+      type: integer
+      description: monotonically increasing checkpoint number for the audited record
+      ecs: null
+      status: unmapped
+      custom: servicenow.audit.record_checkpoint
+      notes: >
+        groups the N per-field rows written by a single update - without it an
+        analyst sees isolated column changes rather than one edit, so it must
+        stay queryable as a numeric field
+    - vendor: internal_checkpoint
+      type: string
+      description: platform-internal checkpoint identifier for the audited record
+      ecs: null
+      status: unmapped
+      custom: servicenow.audit.internal_checkpoint
+    - vendor: sys_id
+      type: string
+      description: sys_id of the audit row itself, used for de-duplicating overlapping API pulls
+      ecs: event.id
+      status: mapped
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Keep the REST Collector a thin pass-through: watermark on
+          sys_created_on with overlap and de-duplicate on the audit row
+          sys_id, because a missed page of a checkpoint-grouped update can
+          never be reconstructed downstream. Redact low-side before anything
+          leaves the enclave - oldvalue/newvalue are 8000-character free text
+          and will carry credentials, tokens and PII whenever an audited
+          column holds them - and cap both values at an agreed length with an
+          explicit truncation flag. Run the Elastic destination on Persistent
+          Queue backpressure, never Block.
+        elastic: >
+          Own a logs-servicenow.event@custom pipeline that flattens the
+          value/display_value pairs to single fields, parses the Glide
+          "YYYY-MM-DD HH:MM:SS" timestamps against the instance time zone
+          rather than assuming UTC, and sets event.action/event.outcome from
+          the fieldname sentinels (DELETED, RECOVERED) versus an ordinary
+          field change. Map servicenow.audit.table_name, .document_key,
+          .field_name and .record_checkpoint as keyword (checkpoint as long)
+          in the index template so a single update can be reassembled from its
+          per-field rows at query time, and keep .old_value/.new_value out of
+          the default field set given their size.
+        relay: >
+          On the low-side instances, full ECS-shaped NDJSON crosses (mode B)
+          rather than a thin envelope, because the redaction decisions are
+          field-aware and must happen before the boundary, not after it. The
+          content filter's friction here is oldvalue/newvalue: unbounded free
+          text up to 8000 characters that may hold arbitrary unicode, embedded
+          XML/JSON and pasted secrets - cap, normalize encoding and allow-list
+          keys low-side so a custom NDJSON filter can stay simple. Nothing
+          CEF-shaped is involved; the feed is JSON from the Table API.
+          Crossing is at-most-once, so reconcile low-side and high-side row
+          counts per (dataset, hour).
+      direct:
+        parse_location: high
+        cribl: >
+          Keep the REST Collector a thin pass-through: watermark on
+          sys_created_on with overlap and de-duplicate on the audit row
+          sys_id, because a missed page of a checkpoint-grouped update can
+          never be reconstructed downstream. Redact at the collector before
+          ingest - oldvalue/newvalue are 8000-character free text and will
+          carry credentials, tokens and PII whenever an audited column holds
+          them - and cap both values at an agreed length with an explicit
+          truncation flag. Run the Elastic destination on Persistent Queue
+          backpressure, never Block.
+        elastic: >
+          Own a logs-servicenow.event@custom pipeline that flattens the
+          value/display_value pairs to single fields, parses the Glide
+          "YYYY-MM-DD HH:MM:SS" timestamps against the instance time zone
+          rather than assuming UTC, and sets event.action/event.outcome from
+          the fieldname sentinels (DELETED, RECOVERED) versus an ordinary
+          field change. Map servicenow.audit.table_name, .document_key,
+          .field_name and .record_checkpoint as keyword (checkpoint as long)
+          in the index template so a single update can be reassembled from its
+          per-field rows at query time, and keep .old_value/.new_value out of
+          the default field set given their size.
+  - format: kafka-json
+    enable: >
+      Activate the Log Export Service plugin (com.snc.log_export); on
+      activation LES auto-configures syslog and sys_audit as default log
+      sources (later releases add sys_audit_delete and sys_audit_relation). In
+      Log Export Service > Log Sources confirm the sys_audit source is enabled
+      and choose its fields, then run the LES Guided Setup to provision the
+      Hermes messaging cluster and the Kafka topic. Consume the topic either
+      with a dedicated MID Server that pulls from Hermes or with a Kafka
+      connector/consumer subscribed to the topic; records arrive as JSON
+      payloads on the topic in near real time rather than on a poll interval.
+    references:
+    - >-
+      https://docs.servicenow.com/en-US/bundle/vancouver-platform-security/page/administer/log-export-service/concept/les-landing-page.html
+    - >-
+      https://www.servicenow.com/docs/bundle/vancouver-platform-security/page/administer/log-export-service/task/les-guided-setup-kafka.html
+    - >-
+      https://www.servicenow.com/standard/resource-center/data-sheet/ds-log-export-service.html
+    - >-
+      https://www.servicenow.com/community/servicenow-ai-platform-articles/administration-log-export-service-knowledge-amp-troubleshooting/ta-p/3126967
+    - >-
+      https://www.servicenow.com/community/developer-forum/json-payload-being-to-sent-to-hermes-kafka-from-servicenow-is/m-p/2752488
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: Cribl Kafka Source -> logs-servicenow.event@custom
+      notes: >
+        The Elastic ServiceNow integration has no Kafka input, so a Cribl
+        Kafka Source (or Elastic Agent kafka input) consumes the Hermes topic,
+        JSON-parses each record, and reshapes it into the same
+        servicenow.event.* document the REST path produces so the existing
+        logs-servicenow.event@custom pipeline still does the ECS work. LES
+        wraps each sys_audit row in a JSON envelope whose own metadata field
+        names are not published; treat the envelope as pass-through and key
+        off the inner row.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          A Kafka Source cannot be a one-way sender, so the consumer sits
+          low-side beside the Hermes broker and only the shaped results cross.
+          Do the field-aware redaction here: oldvalue/newvalue are
+          8000-character free text that will carry credentials and PII, so cap
+          and allow-list them before the guard destination, and de-duplicate
+          on the audit row sys_id because Kafka at-least-once delivery can
+          redeliver a row after a consumer restart.
+        elastic: >
+          Reuse logs-servicenow.event@custom unchanged: flatten the row to
+          single fields, parse the Glide timestamp to UTC against the instance
+          time zone, and branch event.action/event.outcome on the fieldname
+          sentinels (DELETED, RECOVERED). Keep
+          servicenow.audit.old_value/.new_value out of the default field set
+          given their size.
+        relay: >
+          Full ECS-shaped NDJSON crosses (mode B), not a thin envelope,
+          because the redaction is field-aware and must complete low-side.
+          Kafka's own offsets give a low-side count to reconcile against
+          high-side per (dataset, hour); a re-delivered offset must not be
+          re-counted, so reconcile on distinct sys_id rather than message
+          count.
+      direct:
+        parse_location: high
+        cribl: >
+          High-side instances consume Hermes directly with no guard hop, so
+          keep the Kafka Source a thin pass-through and de-duplicate on
+          sys_id; run the Elastic destination on Persistent Queue backpressure
+          so a topic-lag catch-up cannot become an ingest spike.
+        elastic: >
+          Identical logs-servicenow.event@custom shaping as the REST path; the
+          only delta is that documents arrive continuously, so index the
+          audit-reassembly keys (servicenow.audit.record_checkpoint as long,
+          .table_name/.document_key/.field_name as keyword) so a single update
+          stays queryable across its per-field rows.
+    fields:
+    - vendor: sys_created_on
+      type: timestamp
+      description: date and time the audit row was written
+      ecs: '@timestamp'
+      status: mapped
+      transform: Glide "YYYY-MM-DD HH:MM:SS" in the instance time zone; parse explicitly to UTC
+    - vendor: sys_created_by
+      type: string
+      description: user name credited with the change
+      ecs: user.name
+      status: mapped
+    - vendor: user
+      type: string
+      description: reference to the sys_user the change is attributed to
+      ecs: user.id
+      status: partial
+      notes: >
+        LES emits the raw reference value (the sys_user sys_id) with no
+        display_value pair, so the stable identity lands on user.id while
+        sys_created_by supplies user.name
+    - vendor: tablename
+      type: string
+      description: table whose record changed - the feed discriminator
+      ecs: null
+      custom: servicenow.audit.table_name
+      status: unmapped
+    - vendor: documentkey
+      type: string
+      description: sys_id of the changed record
+      ecs: null
+      custom: servicenow.audit.document_key
+      status: unmapped
+    - vendor: fieldname
+      type: string
+      description: name of the column that changed
+      ecs: null
+      custom: servicenow.audit.field_name
+      status: unmapped
+      notes: >-
+        also carries the DELETED and RECOVERED sentinels, which must be
+        branched on before any field-change logic
+    - vendor: oldvalue
+      type: string
+      description: value before the change, up to 8000 characters
+      ecs: null
+      custom: servicenow.audit.old_value
+      status: unmapped
+      notes: >-
+        unbounded free text that may hold credentials or PII; redact and
+        length-cap low-side before the record leaves the enclave
+    - vendor: newvalue
+      type: string
+      description: value after the change, up to 8000 characters
+      ecs: null
+      custom: servicenow.audit.new_value
+      status: unmapped
+      notes: same size and sensitivity profile as oldvalue
+    - vendor: sys_id
+      type: string
+      description: sys_id of the audit row, used to de-duplicate re-delivered Kafka records
+      ecs: event.id
+      status: mapped
+  - format: json
+    enable: >
+      Build a System Export Sets pipeline: an Export Definition on sys_audit
+      (choose table, a sys_created_on condition, and the columns to emit), an
+      Export Target naming the MID Server and the destination file path, and
+      an Export Set whose file type is set to JSON (CSV, XML and XLS are also
+      selectable) with an appended timestamp. Attach it to a Scheduled Data
+      Export record to drop a JSON file into the MID Server folder on a
+      recurring schedule; the MID Server writes the file on the internal side
+      because the instance itself cannot reach an on-prem share.
+    references:
+    - https://support.servicenow.com/kb?id=kb_article_view&sysparm_article=KB1691217
+    - >-
+      https://www.servicenow.com/community/developer-blog/servicenow-things-to-know-111-system-export-sets/ba-p/2926648
+    - >-
+      https://www.servicenow.com/community/developer-articles/scheduled-export-file-records-to-attachment-to-a-mid-server/ta-p/2329970
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: Cribl File Source -> logs-servicenow.event@custom
+      notes: >
+        A Cribl File Source (or Filebeat) monitors the MID Server folder,
+        parses the JSON array, and emits the same servicenow.event.* shape for
+        logs-servicenow.event@custom. Unlike the Table API pull the export
+        renders one value per column and resolves reference fields to their
+        display value by default, so dot-walk the sys_id columns (e.g.
+        user.sys_id) into the Export Definition where a stable identity is
+        needed.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          The file lands low-side on the MID Server, so redact and length-cap
+          oldvalue/newvalue in the File Source pipeline before anything
+          crosses, and de-duplicate across successive files on the audit row
+          sys_id since a watermark-overlapped export re-emits rows. Watch for
+          partial-file reads by keying the source on file-close.
+        elastic: >
+          Same logs-servicenow.event@custom shaping; the exported user column
+          is the sys_user display name, so write it to user.full_name and
+          leave user.name to sys_created_by rather than letting a login and a
+          display name collide on one field. Add a step that recovers user.id
+          from a dot-walked user.sys_id column where the Export Definition
+          includes it, and document the missing stable identity where it does
+          not.
+        relay: >
+          The reduced, redacted NDJSON subset crosses rather than the raw
+          file. Batch files make count reconciliation cleaner than the
+          streaming path: reconcile distinct sys_id per (dataset, hour)
+          against the row count the export logged low-side.
+      direct:
+        parse_location: high
+        cribl: >
+          High-side instances read the MID Server file with no guard hop; keep
+          the File Source thin and de-duplicate on sys_id, running the Elastic
+          destination on Persistent Queue backpressure.
+        elastic: >
+          logs-servicenow.event@custom does the flattening, Glide-timestamp
+          parsing and sentinel branching exactly as on the REST path; the user
+          column is the one delta, arriving as the sys_user display name and
+          going to user.full_name while sys_created_by supplies user.name.
+    fields:
+    - vendor: sys_created_on
+      type: timestamp
+      description: date and time the audit row was written
+      ecs: '@timestamp'
+      status: mapped
+      transform: Glide date/time string in the instance time zone; parse explicitly to UTC
+    - vendor: sys_created_by
+      type: string
+      description: user name credited with the change
+      ecs: user.name
+      status: mapped
+    - vendor: user
+      type: string
+      description: reference to the sys_user the change is attributed to
+      ecs: user.full_name
+      status: partial
+      notes: >
+        JSON export renders the reference display value rather than the
+        sys_id, and the sys_user display field is the person's full name, not
+        the login - so it lands on user.full_name and user.name stays
+        sys_created_by's on this record. The stable identity is unavailable
+        unless the Export Definition dot-walks user.sys_id, which maps to
+        user.id as on the api-pull and kafka-json formats
+    - vendor: tablename
+      type: string
+      description: table whose record changed - the feed discriminator
+      ecs: null
+      custom: servicenow.audit.table_name
+      status: unmapped
+    - vendor: documentkey
+      type: string
+      description: sys_id of the changed record
+      ecs: null
+      custom: servicenow.audit.document_key
+      status: unmapped
+    - vendor: fieldname
+      type: string
+      description: column that changed; also carries DELETED/RECOVERED sentinels
+      ecs: null
+      custom: servicenow.audit.field_name
+      status: unmapped
+    - vendor: oldvalue
+      type: string
+      description: value before the change, up to 8000 characters
+      ecs: null
+      custom: servicenow.audit.old_value
+      status: unmapped
+      notes: redact and length-cap low-side
+    - vendor: newvalue
+      type: string
+      description: value after the change, up to 8000 characters
+      ecs: null
+      custom: servicenow.audit.new_value
+      status: unmapped
+    - vendor: sys_id
+      type: string
+      description: sys_id of the audit row, used to de-duplicate overlapping exports
+      ecs: event.id
+      status: mapped
+  - format: webhook
+    enable: >
+      Create an Outbound REST Message (sn_ws.RESTMessageV2) targeting the
+      collector's HTTPS endpoint with mutual-TLS or bearer auth, then an
+      after-insert Business Rule on sys_audit that builds a JSON body from the
+      changed row and calls the REST message. This pushes each audit row as it
+      is written rather than waiting for a poll, at the cost of an outbound
+      call per audited change - scope the Business Rule with a table/field
+      condition so it fires only on the audited tables that matter.
+    references:
+    - >-
+      https://docs.servicenow.com/bundle/kingston-application-development/page/integrate/outbound-rest/concept/c_OutboundRESTWebService.html
+    - https://www.nowspectrum.com/blog/restmessagev2-guide
+    - >-
+      https://www.servicenow.com/community/developer-forum/how-to-setup-outbound-webhook-for-any-event-occurs-in-the/m-p/2141298
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: Cribl HTTP Source -> logs-servicenow.event@custom
+      notes: >
+        A Cribl HTTP Source (or an Elastic HTTP endpoint) receives the POST
+        body. The payload is whatever the Business Rule scripts, so the field
+        names below are the recommended keys, not a fixed vendor schema; keep
+        them aligned with the REST path's columns so the same
+        logs-servicenow.event@custom pipeline applies.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Because the payload is author-defined, do the redaction in the
+          Business Rule itself - strip or hash oldvalue/newvalue before the
+          REST call so secrets never leave the instance - and let the low-side
+          HTTP Source only cap and normalize. There is no offset or watermark,
+          so include the audit row sys_id in the body and de-duplicate on it;
+          a failed POST is lost unless the Business Rule queues retries.
+        elastic: >
+          logs-servicenow.event@custom shapes the JSON body as usual; because
+          delivery is per-row and real time, ensure event.action is derived
+          from fieldname before the sentinels arrive interleaved with ordinary
+          changes.
+        relay: >
+          The Business Rule emits ECS-aligned JSON that crosses as mode B.
+          At-most-once with no return channel and no broker to replay from, so
+          reconcile distinct sys_id per (dataset, hour) and alert on any
+          shortfall, since a dropped audit push cannot be re-pulled.
+      direct:
+        parse_location: high
+        cribl: >
+          High-side instances POST straight to the core HTTP Source; keep the
+          redaction in the Business Rule regardless, and de-duplicate on
+          sys_id at the source.
+        elastic: >
+          Same custom pipeline; monitor for Business Rule execution errors
+          instance-side, as a silently failing rule is the only signal that
+          the feed has stopped.
+    fields:
+    - vendor: sys_created_on
+      type: timestamp
+      description: date and time the audit row was written
+      ecs: '@timestamp'
+      status: mapped
+      transform: Glide date/time in instance time zone; parse to UTC
+    - vendor: sys_created_by
+      type: string
+      description: user name credited with the change
+      ecs: user.name
+      status: mapped
+    - vendor: tablename
+      type: string
+      description: table whose record changed - the feed discriminator
+      ecs: null
+      custom: servicenow.audit.table_name
+      status: unmapped
+    - vendor: documentkey
+      type: string
+      description: sys_id of the changed record
+      ecs: null
+      custom: servicenow.audit.document_key
+      status: unmapped
+    - vendor: fieldname
+      type: string
+      description: column that changed; also carries DELETED/RECOVERED sentinels
+      ecs: null
+      custom: servicenow.audit.field_name
+      status: unmapped
+    - vendor: oldvalue
+      type: string
+      description: value before the change, up to 8000 characters
+      ecs: null
+      custom: servicenow.audit.old_value
+      status: unmapped
+      notes: >-
+        redact or hash inside the Business Rule before the POST, since the
+        payload is constructed instance-side
+    - vendor: newvalue
+      type: string
+      description: value after the change, up to 8000 characters
+      ecs: null
+      custom: servicenow.audit.new_value
+      status: unmapped
+    - vendor: sys_id
+      type: string
+      description: sys_id of the audit row, included in the payload to de-duplicate retries
+      ecs: event.id
+      status: mapped
+- id: login-events
+  name: Event log - login and session events (sysevent)
+  description: >
+    The platform event queue, filtered to the security-relevant event names:
+    login, logout and login.failed (plus the role/impersonation events
+    registered on sys_user). Each row carries the event name and two generic
+    parameters whose meaning depends on that name - for the login family parm1
+    is the user name and parm2 is the source IP address. This is the only
+    place ServiceNow records interactive authentication outcomes, so it is the
+    authentication feed for the platform.
+  event_categories:
+  - authentication
+  - iam
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Cribl REST Collector against /api/now/table/sysevent with a
+        sysparm_query restricted to the login/logout/login.failed name
+        allow-list - sysevent is the busiest table on the instance and an
+        unfiltered pull is not viable. The collector itself cannot cross, so
+        only the pulled rows do.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-servicenow.event
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Cribl REST Collector against /api/now/table/sysevent with a
+        sysparm_query restricted to the login/logout/login.failed name
+        allow-list - sysevent is the busiest table on the instance and an
+        unfiltered pull is not viable. It delivers straight to Elastic with no
+        guard hop.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-servicenow.event
+  formats:
+  - format: api-pull
+    parsing:
+      mechanism: elastic-integration
+      artifact: ServiceNow integration
+      notes: >
+        Configured as an additional table on the same integration; the
+        integration transports parm1/parm2 verbatim as
+        servicenow.event.parm1.value / parm2.value and has no notion of what
+        they mean, so the positional semantics are custom pipeline work.
+    fields:
+    - vendor: name
+      type: string
+      description: registered event name, e.g. login, logout, login.failed
+      ecs: event.action
+      status: mapped
+      transform: >
+        the name is also the only source of outcome on this dataset:
+        login.failed maps to event.outcome failure, login and logout to
+        success; there is no vendor result column
+    - vendor: parm1
+      type: string
+      description: first event parameter - the user name for login, logout and login.failed
+      ecs: user.name
+      status: partial
+      notes: >
+        generic parameter (default maximum length 4000) whose meaning is
+        defined per registered event; only the login family reliably puts a
+        user name here, so the mapping must be gated on the event name
+    - vendor: parm2
+      type: string
+      description: >-
+        second event parameter - the source IP address for login, logout and
+        login.failed
+      ecs: source.ip
+      status: partial
+      notes: >
+        same generic-parameter caveat as parm1; validate the value parses as
+        an IP before assigning it, since other event names put unrelated free
+        text in this column
+    - vendor: instance
+      type: string
+      description: sys_id of the record the event was raised against
+      ecs: null
+      status: unmapped
+      custom: servicenow.sysevent.instance_sys_id
+      notes: >-
+        for the login family this is the sys_user record, giving a stable
+        subject identity when parm1 is ambiguous
+    - vendor: table
+      type: string
+      description: 'table the event''s record belongs to, sys_user for the login family'
+      ecs: null
+      status: unmapped
+      custom: servicenow.sysevent.table_name
+    - vendor: sys_created_on
+      type: timestamp
+      description: date and time the event was queued
+      ecs: '@timestamp'
+      status: mapped
+      transform: Glide date/time string in the instance time zone; parse explicitly to UTC
+    - vendor: sys_created_by
+      type: string
+      description: account credited with inserting the event row
+      ecs: null
+      status: unmapped
+      custom: servicenow.sysevent.created_by
+      notes: >
+        often system or the authenticating session rather than the subject of
+        the event - do not overload user.name with it; parm1 is the subject
+        for the login family
+    - vendor: state
+      type: enum
+      description: processing state of the queued event (ready, processed, error, transferred)
+      ecs: null
+      status: unmapped
+      custom: servicenow.sysevent.state
+      notes: >-
+        a rising count of error/ready is queue-health signal, not security
+        signal, but it explains gaps in this feed
+    - vendor: processed
+      type: timestamp
+      description: date and time the event processor handled the row
+      ecs: null
+      status: unmapped
+      custom: servicenow.sysevent.processed
+      notes: >-
+        lag between sys_created_on and this value is the instance-side delay
+        before an event becomes visible
+    - vendor: process_on
+      type: timestamp
+      description: earliest time the event is eligible for processing
+      ecs: null
+      status: unmapped
+      custom: servicenow.sysevent.process_on
+    - vendor: queue
+      type: string
+      description: event queue the row was placed on
+      ecs: null
+      status: unmapped
+      custom: servicenow.sysevent.queue
+    - vendor: claimed_by
+      type: string
+      description: instance node that claimed the event for processing
+      ecs: null
+      status: unmapped
+      custom: servicenow.sysevent.claimed_by
+      notes: >
+        identifies a ServiceNow application node, not the machine the user
+        authenticated from - keep it off host.* and observer.* so node
+        identity is never mistaken for client identity
+    - vendor: sys_id
+      type: string
+      description: sys_id of the event row, used to de-duplicate overlapping API pulls
+      ecs: event.id
+      status: mapped
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Do the volume control at the collector, not downstream: pin the
+          sysparm_query to the registered security event names and watermark
+          on sys_created_on, so a queue backlog on the instance cannot turn
+          into an ingest spike. Keep the rows otherwise untouched -
+          authentication evidence is forensically load-bearing and this is the
+          last dataset on this technology where trimming is worth the risk -
+          and use Persistent Queue backpressure on the Elastic destination.
+        elastic: >
+          Put the whole parm1/parm2 interpretation table in one
+          logs-servicenow.event@custom pipeline gated on the event name: copy
+          parm1 to user.name and parm2 to source.ip only for the login family,
+          validate parm2 as an IP before assigning it (other event names put
+          arbitrary text in the same column), and derive event.outcome from
+          the name - login.failed is failure, login and logout are success -
+          since no vendor column carries an outcome. Map
+          servicenow.sysevent.state, .queue, .claimed_by, .table_name and
+          .instance_sys_id as keyword so the queue-health and per-record
+          pivots work without dynamic mapping.
+        relay: >
+          Full ECS JSON crosses on the low-side instances, since the
+          event-name-conditional decisions are worth making once rather than
+          on both sides of an unacknowledged boundary. parm1 and parm2 default
+          to a 4000-character maximum and are free text for every event name
+          outside the login family, so cap and allow-list them low-side to
+          keep a custom NDJSON content filter tractable. At-most-once
+          crossing: reconcile counts per (dataset, hour), which matters here
+          because a dropped login.failed batch silently weakens brute-force
+          detection.
+      direct:
+        parse_location: high
+        cribl: >
+          Do the volume control at the collector, not downstream: pin the
+          sysparm_query to the registered security event names and watermark
+          on sys_created_on, so a queue backlog on the instance cannot turn
+          into an ingest spike. Keep the rows otherwise untouched -
+          authentication evidence is forensically load-bearing and this is the
+          last dataset on this technology where trimming is worth the risk -
+          and use Persistent Queue backpressure on the Elastic destination.
+        elastic: >
+          Put the whole parm1/parm2 interpretation table in one
+          logs-servicenow.event@custom pipeline gated on the event name: copy
+          parm1 to user.name and parm2 to source.ip only for the login family,
+          validate parm2 as an IP before assigning it (other event names put
+          arbitrary text in the same column), and derive event.outcome from
+          the name - login.failed is failure, login and logout are success -
+          since no vendor column carries an outcome. Map
+          servicenow.sysevent.state, .queue, .claimed_by, .table_name and
+          .instance_sys_id as keyword so the queue-health and per-record
+          pivots work without dynamic mapping.
+  - format: kafka-json
+    enable: >
+      With the Log Export Service plugin active, add the event log (sysevent)
+      as a Log Source in Log Export Service > Log Sources and restrict it to
+      the security event names (login, logout, login.failed) so the busiest
+      table on the instance does not flood the topic. Provision the Hermes
+      cluster/topic through the LES Guided Setup and consume it with a MID
+      Server or Kafka connector; each qualifying sysevent row is streamed as a
+      JSON record in near real time.
+    references:
+    - >-
+      https://docs.servicenow.com/en-US/bundle/vancouver-platform-security/page/administer/log-export-service/concept/les-landing-page.html
+    - >-
+      https://www.servicenow.com/docs/bundle/vancouver-platform-security/page/administer/log-export-service/task/les-guided-setup-kafka.html
+    - >-
+      https://www.servicenow.com/standard/resource-center/data-sheet/ds-log-export-service.html
+    - >-
+      https://www.servicenow.com/community/developer-forum/three-types-of-event-logs-transaction-logs-and-system-logs-by/m-p/2759655
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: Cribl Kafka Source -> logs-servicenow.event@custom
+      notes: >
+        The Kafka Source consumes the topic and reshapes each JSON row into
+        servicenow.event.* so the parm1/parm2 positional interpretation still
+        happens in logs-servicenow.event@custom. LES does not restrict the
+        source by name on its own, so the name allow-list must be set on the
+        Log Source or the topic will carry every platform event.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Pin the event-name allow-list on the Log Source and consume
+          low-side; authentication evidence is forensically load-bearing so
+          keep rows otherwise untouched, capping parm1/parm2 (4000-character
+          free text for non-login events) only for safety. De-duplicate on the
+          event row sys_id against Kafka re-delivery.
+        elastic: >
+          Reuse logs-servicenow.event@custom: copy parm1 to user.name and
+          parm2 to source.ip only for the login family, validate parm2 as an
+          IP first, and derive event.outcome from the name (login.failed is
+          failure, login/logout success) since no column carries an outcome.
+        relay: >
+          Full ECS JSON crosses as mode B. Reconcile distinct sys_id per
+          (dataset, hour), which matters here because a dropped login.failed
+          batch silently weakens brute-force detection; use Kafka offsets
+          low-side but reconcile on sys_id, not raw message count.
+      direct:
+        parse_location: high
+        cribl: >
+          High-side consumes Hermes directly with no guard hop; keep the
+          allow-list on the Log Source, de-duplicate on sys_id, and run the
+          Elastic destination on Persistent Queue backpressure.
+        elastic: >
+          Identical parm1/parm2 interpretation table in
+          logs-servicenow.event@custom, gated on the event name.
+    fields:
+    - vendor: name
+      type: string
+      description: registered event name (login, logout, login.failed)
+      ecs: event.action
+      status: mapped
+      transform: >-
+        also the only source of outcome - login.failed to event.outcome
+        failure, login/logout to success
+    - vendor: parm1
+      type: string
+      description: first event parameter - the user name for the login family
+      ecs: user.name
+      status: partial
+      notes: >-
+        generic 4000-character parameter whose meaning is per-event; only the
+        login family reliably carries a user name, so gate the mapping on the
+        event name
+    - vendor: parm2
+      type: string
+      description: second event parameter - the source IP for the login family
+      ecs: source.ip
+      status: partial
+      notes: >-
+        same generic-parameter caveat; validate it parses as an IP before
+        assigning, since other events put free text here
+    - vendor: instance
+      type: string
+      description: >-
+        sys_id of the record the event was raised against (sys_user for the
+        login family)
+      ecs: null
+      custom: servicenow.sysevent.instance_sys_id
+      status: unmapped
+    - vendor: sys_created_on
+      type: timestamp
+      description: date and time the event was queued
+      ecs: '@timestamp'
+      status: mapped
+      transform: Glide date/time in instance time zone; parse to UTC
+    - vendor: sys_id
+      type: string
+      description: sys_id of the event row, used to de-duplicate re-delivered records
+      ecs: event.id
+      status: mapped
+  - format: json
+    enable: >
+      Configure a System Export Sets pipeline on sysevent: an Export
+      Definition with a condition restricting the name column to the login
+      family and the columns to emit, an Export Target naming the MID Server
+      and file path, and an Export Set with file type JSON (CSV, XML and XLS
+      also available). Schedule it with a Scheduled Data Export so a JSON file
+      of the qualifying event rows lands in the MID Server folder on each run.
+    references:
+    - https://support.servicenow.com/kb?id=kb_article_view&sysparm_article=KB1691217
+    - >-
+      https://www.servicenow.com/community/developer-blog/servicenow-things-to-know-111-system-export-sets/ba-p/2926648
+    - >-
+      https://www.servicenow.com/community/developer-articles/scheduled-export-file-records-to-attachment-to-a-mid-server/ta-p/2329970
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: Cribl File Source -> logs-servicenow.event@custom
+      notes: >
+        A Cribl File Source parses the JSON file and reshapes to
+        servicenow.event.*; the parm1/parm2 semantics are still resolved
+        high-side. Set the name condition in the Export Definition, because
+        without it the file inherits the full sysevent volume.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          The file lands low-side; keep the login rows intact, cap parm1/
+          parm2 only for safety, and de-duplicate across overlapping export
+          files on sys_id. Key the File Source on file-close to avoid partial
+          reads.
+        elastic: >
+          Same login-family interpretation in logs-servicenow.event@custom -
+          parm1 to user.name, validated parm2 to source.ip, outcome from the
+          event name.
+        relay: >
+          The reduced ECS JSON subset crosses as mode B; reconcile distinct
+          sys_id per (dataset, hour) so a dropped batch of login.failed rows
+          is caught.
+      direct:
+        parse_location: high
+        cribl: >
+          High-side reads the file with no guard hop; thin File Source,
+          de-duplicate on sys_id, Persistent Queue backpressure.
+        elastic: >
+          logs-servicenow.event@custom applies the parm1/parm2 table exactly
+          as on the REST path.
+    fields:
+    - vendor: name
+      type: string
+      description: registered event name (login, logout, login.failed)
+      ecs: event.action
+      status: mapped
+      transform: outcome derived from name - login.failed failure, login/logout success
+    - vendor: parm1
+      type: string
+      description: user name for the login family
+      ecs: user.name
+      status: partial
+      notes: generic per-event parameter; gate on the event name
+    - vendor: parm2
+      type: string
+      description: source IP for the login family
+      ecs: source.ip
+      status: partial
+      notes: validate as an IP before assigning
+    - vendor: instance
+      type: string
+      description: sys_id of the record the event was raised against
+      ecs: null
+      custom: servicenow.sysevent.instance_sys_id
+      status: unmapped
+    - vendor: sys_created_on
+      type: timestamp
+      description: date and time the event was queued
+      ecs: '@timestamp'
+      status: mapped
+      transform: Glide date/time; parse to UTC
+    - vendor: sys_id
+      type: string
+      description: sys_id of the event row, used to de-duplicate overlapping exports
+      ecs: event.id
+      status: mapped
+  - format: webhook
+    enable: >
+      Create an Outbound REST Message pointing at the collector endpoint and
+      an after-insert Business Rule on sysevent, conditioned on the name
+      column being login, logout or login.failed, that builds a JSON body and
+      calls sn_ws.RESTMessageV2. This forwards interactive authentication
+      outcomes the moment they are queued, which is the lowest-latency way to
+      feed brute-force and impossible-travel detections; the name condition
+      keeps it off the rest of the event queue.
+    references:
+    - >-
+      https://docs.servicenow.com/bundle/kingston-application-development/page/integrate/outbound-rest/concept/c_OutboundRESTWebService.html
+    - https://www.nowspectrum.com/blog/restmessagev2-guide
+    - >-
+      https://www.servicenow.com/community/developer-forum/how-to-setup-outbound-webhook-for-any-event-occurs-in-the/m-p/2141298
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: Cribl HTTP Source -> logs-servicenow.event@custom
+      notes: >
+        A Cribl HTTP Source receives the POST body. The payload is
+        author-defined, so the keys below are the recommended shape; keep them
+        aligned with the REST path's columns so the same custom pipeline
+        resolves parm1/parm2 and the outcome.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          The Business Rule can pre-resolve the login-family semantics (write
+          user and source IP as named keys) so the low-side HTTP Source only
+          caps and normalizes. Include the event sys_id in the body and
+          de-duplicate on it; a failed POST is lost unless the rule queues
+          retries.
+        elastic: >
+          logs-servicenow.event@custom sets event.outcome from the name and
+          places user.name/source.ip; because delivery is per-row, ensure the
+          IP validation runs before assignment.
+        relay: >
+          ECS-aligned JSON crosses as mode B, at-most-once with no broker to
+          replay. Reconcile distinct sys_id per (dataset, hour) and alert on
+          shortfall - a dropped login.failed push cannot be re-pulled.
+      direct:
+        parse_location: high
+        cribl: >
+          High-side POSTs straight to the core HTTP Source; de-duplicate on
+          sys_id and keep the name condition on the Business Rule.
+        elastic: >
+          Same custom pipeline; watch instance-side for Business Rule
+          execution errors, the only signal the feed has stopped.
+    fields:
+    - vendor: name
+      type: string
+      description: registered event name (login, logout, login.failed)
+      ecs: event.action
+      status: mapped
+      transform: outcome from name - login.failed failure, login/logout success
+    - vendor: parm1
+      type: string
+      description: user name for the login family
+      ecs: user.name
+      status: partial
+      notes: gate on the event name; the Business Rule can emit it as a named key
+    - vendor: parm2
+      type: string
+      description: source IP for the login family
+      ecs: source.ip
+      status: partial
+      notes: validate as an IP before assigning
+    - vendor: instance
+      type: string
+      description: sys_id of the record the event was raised against
+      ecs: null
+      custom: servicenow.sysevent.instance_sys_id
+      status: unmapped
+    - vendor: sys_created_on
+      type: timestamp
+      description: date and time the event was queued
+      ecs: '@timestamp'
+      status: mapped
+      transform: Glide date/time; parse to UTC
+    - vendor: sys_id
+      type: string
+      description: sys_id of the event row, included in the payload to de-duplicate retries
+      ecs: event.id
+      status: mapped
+- id: transaction
+  name: Transaction log (syslog_transaction)
+  description: >
+    Per-transaction record of user and API activity against the instance - one
+    row per request the platform served (only transactions above the
+    configured response-time threshold are retained by default). Carries the
+    requested URL, the client IP, the session id and the response size, which
+    together make it the platform's user-activity and bulk-export trail:
+    enumeration of a table, an unusually large export, or activity from an
+    unexpected address all show here rather than in sys_audit.
+  event_categories:
+  - web
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Cribl REST Collector against /api/now/table/syslog_transaction
+        watermarked on sys_created_on. This is the highest-volume dataset on
+        the technology, so the collector filter is a sizing decision, not a
+        detail.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-servicenow.event
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Cribl REST Collector against /api/now/table/syslog_transaction
+        watermarked on sys_created_on. This is the highest-volume dataset on
+        the technology, so the collector filter is a sizing decision, not a
+        detail. It delivers straight to Elastic with no guard hop.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-servicenow.event
+  formats:
+  - format: api-pull
+    parsing:
+      mechanism: elastic-integration
+      artifact: ServiceNow integration
+      notes: >
+        Same integration, configured as an additional table; the URL, timing
+        and size columns arrive as untyped servicenow.event.<column>.value
+        strings and need explicit typing.
+    fields:
+    - vendor: sys_created_on
+      type: timestamp
+      description: date and time the transaction was recorded
+      ecs: '@timestamp'
+      status: mapped
+      transform: Glide date/time string in the instance time zone; parse explicitly to UTC
+    - vendor: sys_created_by
+      type: string
+      description: user name of the account that issued the transaction
+      ecs: user.name
+      status: mapped
+    - vendor: remote_ip
+      type: ip
+      description: >-
+        IP address of the client that issued the transaction (shown as "IP
+        Address" on the transaction log form)
+      ecs: source.ip
+      status: mapped
+      notes: >
+        the instance sits behind a load balancer, so this is the forwarded-for
+        client address; confirm the header trust chain on the Federal instance
+        before treating it as authoritative for geo/enrichment
+    - vendor: url
+      type: string
+      description: relative URL of the transaction, e.g. /incident_list.do?sysparm_query=...
+      ecs: url.original
+      status: partial
+      notes: >
+        path and query only - no scheme or host - so url.domain must be
+        supplied from the instance identity and the value split into url.path
+        and url.query rather than left whole
+    - vendor: response_time
+      type: integer
+      description: server-side processing time for the transaction, in milliseconds
+      ecs: event.duration
+      status: partial
+      transform: >
+        vendor value is milliseconds; ECS event.duration is nanoseconds, so
+        multiply by 1,000,000 on ingest
+      notes: >-
+        only transactions above the instance's logging threshold (100 ms by
+        default) are retained, so this dataset is not a complete request log
+    - vendor: output_length
+      type: integer
+      description: size in bytes of the response payload returned to the client
+      ecs: http.response.body.bytes
+      status: mapped
+      notes: >-
+        the volume signal for bulk-export and enumeration detection; must be
+        typed as a long, not left as the API's string
+    - vendor: type
+      type: enum
+      description: transaction type/origin, e.g. UI, REST, SOAP, processor
+      ecs: null
+      status: unmapped
+      custom: servicenow.transaction.type
+      notes: >-
+        separates interactive UI activity from integration-account API
+        traffic, which is the first filter any hunt on this dataset applies
+    - vendor: session_id
+      type: string
+      description: identifier of the user session, stable from login to logout
+      ecs: null
+      status: unmapped
+      custom: servicenow.transaction.session_id
+      notes: >
+        ECS 9.4 has no general session identifier field, so this stays custom;
+        it is the join back to the login/logout rows in the sysevent dataset
+        and the only way to group a user's requests
+    - vendor: system_id
+      type: string
+      description: identifier of the instance node that served the transaction
+      ecs: null
+      status: unmapped
+      custom: servicenow.transaction.system_id
+      notes: >-
+        ServiceNow application node identity, not a customer host -
+        deliberately kept off host.* and observer.*
+    - vendor: sql_time
+      type: integer
+      description: milliseconds of the transaction spent in database calls
+      ecs: null
+      status: unmapped
+      custom: servicenow.transaction.sql_time_ms
+    - vendor: sql_count
+      type: integer
+      description: number of SQL statements executed by the transaction
+      ecs: null
+      status: unmapped
+      custom: servicenow.transaction.sql_count
+      notes: >-
+        an outsized statement count against a single table is the cheapest
+        enumeration signal in this dataset
+    - vendor: business_rule_time
+      type: integer
+      description: milliseconds of the transaction spent executing business rules
+      ecs: null
+      status: unmapped
+      custom: servicenow.transaction.business_rule_time_ms
+    - vendor: business_rule_count
+      type: integer
+      description: number of business rules executed by the transaction
+      ecs: null
+      status: unmapped
+      custom: servicenow.transaction.business_rule_count
+    - vendor: network_time
+      type: integer
+      description: milliseconds spent transferring the transaction between server and browser
+      ecs: null
+      status: unmapped
+      custom: servicenow.transaction.network_time_ms
+    - vendor: sys_id
+      type: string
+      description: sys_id of the transaction row, used to de-duplicate overlapping API pulls
+      ecs: event.id
+      status: mapped
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          This is where low-side work actually pays: drop the static-asset and
+          polling URLs (/images, /scripts, amb/ heartbeat, ui_page refreshes)
+          and any transaction type that is not user- or API-initiated before
+          anything is shipped, then normalize the URL - percent-decode, cap
+          its length, and split the sysparm_query string off the path so query
+          predicates are not indexed as one opaque blob. Keep _raw only until
+          the typing is proven; of the four datasets here this one is the
+          first to drop it.
+        elastic: >
+          Take the shaped documents into logs-servicenow.event and use a
+          logs-servicenow.event@custom pipeline to finish the typing the
+          integration leaves as strings: response_time and the component
+          timers to numerics, response_time converted
+          milliseconds-to-nanoseconds for event.duration, output_length to a
+          long on http.response.body.bytes, and url.domain filled in from the
+          instance hostname since the vendor URL is relative. Map
+          servicenow.transaction.session_id and .system_id as keyword -
+          session id is the only pivot that reconstructs a user's activity
+          across requests and ECS 9.4 has no general session field to hold it.
+        relay: >
+          The thin envelope is not enough here because the drop rules are the
+          point of the low-side pass, so what crosses is the reduced,
+          ECS-shaped subset rather than every transaction. URLs are the
+          content filter's friction: kilobyte-scale encoded sysparm_query
+          strings with arbitrary user-supplied text, which must be decoded,
+          capped and held to short ASCII keys with nesting depth two before
+          the guard destination. At-most-once with no return channel -
+          reconcile low-side and high-side counts per (dataset, hour), and
+          expect the reconciliation to be noisiest on this dataset because of
+          its volume.
+      direct:
+        parse_location: hybrid
+        cribl: >
+          The URL reduction still pays for itself on ingest cost here: drop
+          the static-asset and polling URLs (/images, /scripts, amb/
+          heartbeat, ui_page refreshes) and any transaction type that is not
+          user- or API-initiated before anything is shipped, then normalize
+          the URL - percent-decode, cap its length, and split the
+          sysparm_query string off the path so query predicates are not
+          indexed as one opaque blob. Keep _raw only until the typing is
+          proven; of the four datasets here this one is the first to drop it.
+        elastic: >
+          Take the shaped documents into logs-servicenow.event and use a
+          logs-servicenow.event@custom pipeline to finish the typing the
+          integration leaves as strings: response_time and the component
+          timers to numerics, response_time converted
+          milliseconds-to-nanoseconds for event.duration, output_length to a
+          long on http.response.body.bytes, and url.domain filled in from the
+          instance hostname since the vendor URL is relative. Map
+          servicenow.transaction.session_id and .system_id as keyword -
+          session id is the only pivot that reconstructs a user's activity
+          across requests and ECS 9.4 has no general session field to hold it.
+  - format: kafka-json
+    enable: >
+      With the Log Export Service plugin active, add the transaction log
+      (syslog_transaction) as a Log Source in Log Export Service > Log
+      Sources; this is the highest-volume table on the instance, so use the
+      Log Source filter to exclude static-asset and polling URLs before the
+      topic. Provision the Hermes cluster/topic via the LES Guided Setup and
+      consume with a MID Server or Kafka connector; transactions stream as
+      JSON records in near real time.
+    references:
+    - >-
+      https://docs.servicenow.com/en-US/bundle/vancouver-platform-security/page/administer/log-export-service/concept/les-landing-page.html
+    - >-
+      https://www.servicenow.com/docs/bundle/vancouver-platform-security/page/administer/log-export-service/task/les-guided-setup-kafka.html
+    - >-
+      https://www.servicenow.com/standard/resource-center/data-sheet/ds-log-export-service.html
+    - >-
+      https://www.servicenow.com/community/developer-forum/three-types-of-event-logs-transaction-logs-and-system-logs-by/m-p/2759655
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: Cribl Kafka Source -> logs-servicenow.event@custom
+      notes: >
+        The Kafka Source consumes the topic and reshapes each JSON row into
+        servicenow.event.*; the URL, timing and size columns arrive as strings
+        and still need typing high-side. Volume control has to happen on the
+        Log Source filter, since a topic sized for the raw transaction rate is
+        the dominant cost on this technology.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Consume low-side and do the reduction here: drop static-asset and
+          polling URLs the Log Source filter missed, percent-decode and cap
+          the URL, split the query string off the path, and de-duplicate on
+          sys_id against Kafka re-delivery before anything crosses.
+        elastic: >
+          Reuse logs-servicenow.event@custom to finish the typing: response
+          time and component timers to numerics, response_time converted
+          milliseconds-to-nanoseconds for event.duration, output_length to a
+          long on http.response.body.bytes, and url.domain filled from the
+          instance hostname since the vendor URL is relative.
+        relay: >
+          The reduced, ECS-shaped subset crosses as mode B, not every
+          transaction. URLs are the content-filter friction - kilobyte-scale
+          encoded sysparm_query strings - so decode, cap and hold them to
+          short ASCII keys low-side. Reconcile distinct sys_id per (dataset,
+          hour); expect this feed to be the noisiest because of its volume.
+      direct:
+        parse_location: hybrid
+        cribl: >
+          High-side consumes Hermes directly with no guard hop, but the same
+          URL normalization and drop rules still pay for themselves on ingest
+          cost; de-duplicate on sys_id and run Persistent Queue backpressure.
+        elastic: >
+          logs-servicenow.event@custom does the numeric typing and url.*
+          splitting exactly as on the REST path; keep
+          servicenow.transaction.session_id as keyword for the cross-request
+          pivot.
+    fields:
+    - vendor: sys_created_on
+      type: timestamp
+      description: date and time the transaction was recorded
+      ecs: '@timestamp'
+      status: mapped
+      transform: Glide date/time in instance time zone; parse to UTC
+    - vendor: sys_created_by
+      type: string
+      description: user name that issued the transaction
+      ecs: user.name
+      status: mapped
+    - vendor: remote_ip
+      type: ip
+      description: IP address of the client that issued the transaction
+      ecs: source.ip
+      status: mapped
+      notes: >-
+        forwarded-for client address behind the load balancer; confirm the
+        header trust chain before treating it as authoritative
+    - vendor: url
+      type: string
+      description: relative URL of the transaction (path and query, no scheme or host)
+      ecs: url.original
+      status: partial
+      notes: >-
+        supply url.domain from the instance identity and split into url.path
+        and url.query rather than leaving it whole
+    - vendor: response_time
+      type: integer
+      description: server-side processing time in milliseconds
+      ecs: event.duration
+      status: partial
+      transform: vendor milliseconds; multiply by 1,000,000 for ECS nanoseconds
+    - vendor: output_length
+      type: integer
+      description: response payload size in bytes - the bulk-export/enumeration signal
+      ecs: http.response.body.bytes
+      status: mapped
+      notes: 'type as a long, not the API''s string'
+    - vendor: type
+      type: enum
+      description: transaction origin (UI, REST, SOAP, processor)
+      ecs: null
+      custom: servicenow.transaction.type
+      status: unmapped
+    - vendor: session_id
+      type: string
+      description: user session identifier, stable login to logout
+      ecs: null
+      custom: servicenow.transaction.session_id
+      status: unmapped
+      notes: ECS 9.4 has no general session field; the join back to the login/logout rows
+    - vendor: sys_id
+      type: string
+      description: sys_id of the transaction row, used to de-duplicate re-delivered records
+      ecs: event.id
+      status: mapped
+  - format: json
+    enable: >
+      Build a System Export Sets pipeline on syslog_transaction: an Export
+      Definition with a condition excluding static-asset and polling
+      transactions and selecting the columns to emit, an Export Target naming
+      the MID Server and file path, and an Export Set with file type JSON
+      (CSV, XML and XLS also available). Schedule it with a Scheduled Data
+      Export; because this is the highest-volume table, the condition on the
+      Export Definition is a sizing decision, not a detail.
+    references:
+    - https://support.servicenow.com/kb?id=kb_article_view&sysparm_article=KB1691217
+    - >-
+      https://www.servicenow.com/community/developer-blog/servicenow-things-to-know-111-system-export-sets/ba-p/2926648
+    - >-
+      https://www.servicenow.com/community/developer-articles/scheduled-export-file-records-to-attachment-to-a-mid-server/ta-p/2329970
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: Cribl File Source -> logs-servicenow.event@custom
+      notes: >
+        A Cribl File Source parses the JSON file and reshapes to
+        servicenow.event.*; typing of the URL, timing and size columns is
+        finished high-side. Put the volume filter in the Export Definition
+        condition, not downstream.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          The file lands low-side; drop the URLs the export condition missed,
+          percent-decode and cap the URL, split the query off the path, and
+          de-duplicate across overlapping files on sys_id. Key the File Source
+          on file-close to avoid partial reads of a large file.
+        elastic: >
+          Same numeric typing and url.* splitting in
+          logs-servicenow.event@custom; response_time to nanoseconds on
+          event.duration, output_length to a long on http.response.body.bytes.
+        relay: >
+          The reduced ECS subset crosses as mode B; reconcile distinct sys_id
+          per (dataset, hour), the noisiest reconciliation on this technology
+          given the volume.
+      direct:
+        parse_location: hybrid
+        cribl: >
+          High-side reads the file with no guard hop; the URL normalization
+          and drop rules still cut ingest cost. De-duplicate on sys_id,
+          Persistent Queue backpressure.
+        elastic: >
+          logs-servicenow.event@custom finishes the typing exactly as on the
+          REST path.
+    fields:
+    - vendor: sys_created_on
+      type: timestamp
+      description: date and time the transaction was recorded
+      ecs: '@timestamp'
+      status: mapped
+      transform: Glide date/time; parse to UTC
+    - vendor: sys_created_by
+      type: string
+      description: user name that issued the transaction
+      ecs: user.name
+      status: mapped
+    - vendor: remote_ip
+      type: ip
+      description: client IP that issued the transaction
+      ecs: source.ip
+      status: mapped
+      notes: forwarded-for address; confirm the header trust chain
+    - vendor: url
+      type: string
+      description: relative URL (path and query, no scheme or host)
+      ecs: url.original
+      status: partial
+      notes: supply url.domain from the instance and split path/query
+    - vendor: response_time
+      type: integer
+      description: server-side processing time in milliseconds
+      ecs: event.duration
+      status: partial
+      transform: milliseconds to nanoseconds - multiply by 1,000,000
+    - vendor: output_length
+      type: integer
+      description: response payload size in bytes
+      ecs: http.response.body.bytes
+      status: mapped
+      notes: type as a long
+    - vendor: type
+      type: enum
+      description: transaction origin (UI, REST, SOAP, processor)
+      ecs: null
+      custom: servicenow.transaction.type
+      status: unmapped
+    - vendor: session_id
+      type: string
+      description: user session identifier
+      ecs: null
+      custom: servicenow.transaction.session_id
+      status: unmapped
+    - vendor: sys_id
+      type: string
+      description: sys_id of the transaction row, used to de-duplicate overlapping exports
+      ecs: event.id
+      status: mapped
+- id: change-request
+  name: Change request records (change_request)
+  description: >
+    Change management records pulled for correlation context rather than as a
+    security log in their own right: the approved-change join that lets an
+    analyst ask whether a firewall edit, a service restart or a privileged
+    account grant seen elsewhere in the SIEM fell inside an authorized change
+    window. State, risk and approval are numeric or choice-list values whose
+    codes are configurable per instance, so this feed is only as good as the
+    lookup tables shipped with it.
+  event_categories:
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Cribl REST Collector against /api/now/table/change_request watermarked
+        on sys_updated_on so state transitions re-emit the record; low volume
+        compared with the other three datasets.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-servicenow.event
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Cribl REST Collector against /api/now/table/change_request watermarked
+        on sys_updated_on so state transitions re-emit the record; low volume
+        compared with the other three datasets. It delivers straight to
+        Elastic with no guard hop.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-servicenow.event
+  formats:
+  - format: api-pull
+    parsing:
+      mechanism: elastic-integration
+      artifact: ServiceNow integration
+      notes: >
+        change_request is one of the integration's default tables, so the
+        transport and the servicenow.event.* field shape are stock; the choice
+        list decoding and ECS placement below are not.
+    fields:
+    - vendor: number
+      type: string
+      description: human-readable change number, e.g. CHG0030001
+      ecs: null
+      status: unmapped
+      custom: servicenow.change.number
+      notes: >-
+        the identifier analysts and change owners actually cite; needs a
+        keyword mapping because every correlation query filters on it
+    - vendor: sys_id
+      type: string
+      description: sys_id of the change record, the join target for sys_audit documentkey
+      ecs: event.id
+      status: mapped
+    - vendor: sys_updated_on
+      type: timestamp
+      description: date and time the change record was last modified
+      ecs: '@timestamp'
+      status: mapped
+      transform: >
+        the collector watermarks on this column, so @timestamp tracks the most
+        recent state transition rather than record creation; Glide date/time
+        string in the instance time zone, parse explicitly to UTC
+    - vendor: sys_created_on
+      type: timestamp
+      description: date and time the change record was created
+      ecs: null
+      status: unmapped
+      custom: servicenow.change.created_on
+      notes: kept separately because @timestamp is driven by sys_updated_on on this dataset
+    - vendor: state
+      type: integer
+      description: >-
+        numeric state of the change (-5 new, -4 assess, -3 authorize, -2
+        scheduled, -1 implement, 0 review, 3 closed, 4 canceled out of the
+        box)
+      ecs: null
+      status: unmapped
+      custom: servicenow.change.state
+      transform: >
+        numeric choice-list codes need a lookup to labels, and the code-to-
+        label mapping is configurable per instance - build the table from the
+        instance's own sys_choice records rather than the out-of-box values
+    - vendor: type
+      type: enum
+      description: change type - normal, standard, or emergency
+      ecs: null
+      status: unmapped
+      custom: servicenow.change.type
+      notes: >-
+        emergency changes are the ones a SOC most often has to distinguish,
+        since they bypass the normal approval path
+    - vendor: risk
+      type: integer
+      description: assessed risk of the change (2 high, 3 moderate, 4 low out of the box)
+      ecs: null
+      status: unmapped
+      custom: servicenow.change.risk
+      transform: same per-instance choice-list lookup problem as state
+    - vendor: approval
+      type: enum
+      description: approval state of the change - not requested, requested, approved, rejected
+      ecs: null
+      status: unmapped
+      custom: servicenow.change.approval
+      notes: >-
+        this, not state, is the field that answers "was this an approved
+        change" - a scheduled change with approval rejected is exactly the
+        case worth alerting on
+    - vendor: assigned_to
+      type: string
+      description: reference to the sys_user the change is assigned to
+      ecs: user.name
+      status: partial
+      notes: >
+        reference field - .value is a sys_id and .display_value the user's
+        full name, neither of which is the user_name that other datasets put
+        on user.name; resolve against sys_user before the join or the
+        correlation silently misses
+    - vendor: requested_by
+      type: string
+      description: reference to the sys_user who requested the change
+      ecs: null
+      status: unmapped
+      custom: servicenow.change.requested_by
+      notes: >-
+        kept custom rather than overloading user.name, which assigned_to
+        already occupies on this dataset
+    - vendor: cmdb_ci
+      type: string
+      description: reference to the primary configuration item the change affects
+      ecs: null
+      status: unmapped
+      custom: servicenow.change.cmdb_ci
+      notes: >
+        deliberately not mapped to host.name - a CI may be a business service,
+        application or cluster rather than a host, so the join to host.name
+        has to go through a CMDB resolution step instead of being assumed at
+        ingest
+    - vendor: start_date
+      type: timestamp
+      description: planned start of the change window
+      ecs: null
+      status: unmapped
+      custom: servicenow.change.planned_start
+      notes: >-
+        planned, not actual - kept off event.start so the two are never
+        conflated in a correlation window
+    - vendor: end_date
+      type: timestamp
+      description: planned end of the change window
+      ecs: null
+      status: unmapped
+      custom: servicenow.change.planned_end
+    - vendor: work_start
+      type: timestamp
+      description: actual time implementation work began
+      ecs: event.start
+      status: partial
+      notes: >-
+        only populated once the change enters the implement state, so
+        correlation must fall back to the planned window for changes still in
+        flight
+    - vendor: work_end
+      type: timestamp
+      description: actual time implementation work finished
+      ecs: event.end
+      status: partial
+      notes: same population caveat as work_start
+    - vendor: short_description
+      type: string
+      description: one-line summary of the change
+      ecs: message
+      status: mapped
+    - vendor: close_code
+      type: enum
+      description: closure result of the change - successful, successful_with_issues, unsuccessful
+      ecs: event.outcome
+      status: partial
+      transform: >
+        successful maps to success and unsuccessful to failure, but
+        successful_with_issues has no ECS equivalent and must become unknown
+        with the raw value retained in a custom field, or partially failed
+        changes will be counted as clean
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Keep the collector simple and let it re-pull on sys_updated_on with
+          overlap, de-duplicating on sys_id so the latest state of a change
+          wins - a change record is a slowly-changing document, not an event,
+          and losing its final transition is what breaks the approved-change
+          join. Request display values alongside raw values on this pull so
+          reference fields (assigned_to, cmdb_ci, requested_by) arrive
+          resolvable without a second API call. Persistent Queue backpressure
+          on the Elastic destination.
+        elastic: >
+          In a logs-servicenow.event@custom pipeline, resolve the numeric
+          state and risk choice lists through an enrich policy built from the
+          instance's own sys_choice values rather than hardcoding the
+          out-of-box codes, and derive event.outcome from close_code
+          (successful to success, unsuccessful to failure,
+          successful_with_issues to unknown with the raw value retained).
+          Prefer work_start/work_end for event.start/event.end and keep the
+          planned window as servicenow.change.planned_start/.planned_end so
+          correlation can fall back to it while the change is still open. Map
+          servicenow.change.number, .approval, .type and .cmdb_ci as keyword -
+          the number and CI are the two fields every correlation query joins
+          on.
+        relay: >
+          Low volume and individually significant, so this is the dataset
+          where a silent guard drop hurts most: the approved-change join fails
+          open and legitimate activity looks unauthorized. Full ECS JSON
+          crosses; short_description is the only unbounded free text and
+          should be length-capped and stripped of control characters low-side,
+          while work-notes style columns are deliberately not carried.
+          Reconcile low-side and high-side counts per (dataset, hour) and
+          alert on any shortfall rather than sampling.
+      direct:
+        parse_location: high
+        cribl: >
+          Keep the collector simple and let it re-pull on sys_updated_on with
+          overlap, de-duplicating on sys_id so the latest state of a change
+          wins - a change record is a slowly-changing document, not an event,
+          and losing its final transition is what breaks the approved-change
+          join. Request display values alongside raw values on this pull so
+          reference fields (assigned_to, cmdb_ci, requested_by) arrive
+          resolvable without a second API call. Persistent Queue backpressure
+          on the Elastic destination.
+        elastic: >
+          In a logs-servicenow.event@custom pipeline, resolve the numeric
+          state and risk choice lists through an enrich policy built from the
+          instance's own sys_choice values rather than hardcoding the
+          out-of-box codes, and derive event.outcome from close_code
+          (successful to success, unsuccessful to failure,
+          successful_with_issues to unknown with the raw value retained).
+          Prefer work_start/work_end for event.start/event.end and keep the
+          planned window as servicenow.change.planned_start/.planned_end so
+          correlation can fall back to it while the change is still open. Map
+          servicenow.change.number, .approval, .type and .cmdb_ci as keyword -
+          the number and CI are the two fields every correlation query joins
+          on.
+  - format: json
+    enable: >
+      Configure a System Export Sets pipeline on change_request: an Export
+      Definition selecting the correlation columns (and dot-walking the sys_id
+      of reference fields such as assigned_to and cmdb_ci so stable identities
+      survive), an Export Target naming the MID Server and file path, and an
+      Export Set with file type JSON (CSV, XML and XLS also available).
+      Schedule it with a Scheduled Data Export watermarked so re-exported
+      records reflect the latest state transition; low volume compared with
+      the log tables.
+    references:
+    - https://support.servicenow.com/kb?id=kb_article_view&sysparm_article=KB1691217
+    - >-
+      https://www.servicenow.com/community/developer-blog/servicenow-things-to-know-111-system-export-sets/ba-p/2926648
+    - >-
+      https://www.servicenow.com/community/developer-articles/scheduled-export-file-records-to-attachment-to-a-mid-server/ta-p/2329970
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: Cribl File Source -> logs-servicenow.event@custom
+      notes: >
+        A Cribl File Source parses the JSON file and reshapes to
+        servicenow.event.*; the choice-list decoding and reference resolution
+        below are custom pipeline work. The export renders the display value
+        of reference and choice fields by default, so decide per column
+        whether the code or the label is wanted.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Let the export re-emit records on state change and de-duplicate on
+          sys_id so the latest state wins - losing a final transition breaks
+          the approved-change join. short_description is the only unbounded
+          free text; length-cap it and strip control characters low-side, and
+          leave work-notes columns out of the Export Definition.
+        elastic: >
+          In logs-servicenow.event@custom resolve numeric state/risk choice
+          lists through an enrich policy built from the instance's own
+          sys_choice values, derive event.outcome from close_code, and prefer
+          work_start/work_end for event.start/event.end while keeping the
+          planned window as servicenow.change.planned_start/.planned_end.
+        relay: >
+          Low volume and individually significant, so a silent guard drop
+          hurts most here - the approved-change join fails open. Full ECS JSON
+          crosses as mode B; reconcile distinct sys_id per (dataset, hour) and
+          alert on any shortfall rather than sampling.
+      direct:
+        parse_location: high
+        cribl: >
+          High-side reads the file with no guard hop; de-duplicate on sys_id
+          so the latest state wins, and request display values alongside raw
+          values in the Export Definition so references resolve without a
+          second call.
+        elastic: >
+          logs-servicenow.event@custom does the choice-list enrichment and
+          close_code-to-outcome mapping exactly as on the REST path.
+    fields:
+    - vendor: number
+      type: string
+      description: human-readable change number (CHG0030001)
+      ecs: null
+      custom: servicenow.change.number
+      status: unmapped
+      notes: keyword; every correlation query filters on it
+    - vendor: sys_id
+      type: string
+      description: sys_id of the change record - the join target for sys_audit documentkey
+      ecs: event.id
+      status: mapped
+    - vendor: sys_updated_on
+      type: timestamp
+      description: date and time the change record was last modified
+      ecs: '@timestamp'
+      status: mapped
+      transform: >-
+        watermark column, so @timestamp tracks the most recent state
+        transition; Glide date/time, parse to UTC
+    - vendor: state
+      type: integer
+      description: numeric state of the change (-5 new through 3 closed, 4 canceled out of the box)
+      ecs: null
+      custom: servicenow.change.state
+      status: unmapped
+      transform: >-
+        choice-list codes need a per-instance lookup to labels built from the
+        instance's own sys_choice records
+    - vendor: type
+      type: enum
+      description: change type (normal, standard, emergency)
+      ecs: null
+      custom: servicenow.change.type
+      status: unmapped
+      notes: emergency changes bypass the normal approval path
+    - vendor: approval
+      type: enum
+      description: approval state (not requested, requested, approved, rejected)
+      ecs: null
+      custom: servicenow.change.approval
+      status: unmapped
+      notes: this, not state, answers whether the change was approved
+    - vendor: assigned_to
+      type: string
+      description: reference to the sys_user the change is assigned to
+      ecs: user.name
+      status: partial
+      notes: >
+        JSON export renders the reference display value (full name), not the
+        user_name other datasets put on user.name; dot-walk assigned_to.sys_id
+        in the Export Definition to resolve against sys_user before the join
+    - vendor: cmdb_ci
+      type: string
+      description: reference to the primary configuration item the change affects
+      ecs: null
+      custom: servicenow.change.cmdb_ci
+      status: unmapped
+      notes: >-
+        not mapped to host.name - a CI may be a service or cluster; resolve
+        through the CMDB
+    - vendor: short_description
+      type: string
+      description: one-line summary of the change
+      ecs: message
+      status: mapped
+    - vendor: work_start
+      type: timestamp
+      description: actual time implementation work began
+      ecs: event.start
+      status: partial
+      notes: >-
+        only populated once the change enters the implement state; fall back
+        to the planned window while in flight
+    - vendor: work_end
+      type: timestamp
+      description: actual time implementation work finished
+      ecs: event.end
+      status: partial
+      notes: same population caveat as work_start
+    - vendor: close_code
+      type: enum
+      description: closure result (successful, successful_with_issues, unsuccessful)
+      ecs: event.outcome
+      status: partial
+      transform: >-
+        successful to success, unsuccessful to failure; successful_with_issues
+        has no ECS equivalent and becomes unknown with the raw value retained
+  - format: csv-file
+    enable: >
+      Same System Export Sets pipeline on change_request but with the Export
+      Set file type set to CSV. Because CSV is a flat delimited format with no
+      value/display_value pairing, reference fields (assigned_to,
+      requested_by, cmdb_ci) render as their display value and choice fields
+      (state, risk, approval) render according to the export's label setting,
+      so configure the Export Definition columns deliberately - dot-walk the
+      sys_id of any reference whose stable identity is needed, and decide per
+      choice column whether the code or the label is exported.
+    references:
+    - https://support.servicenow.com/kb?id=kb_article_view&sysparm_article=KB1691217
+    - >-
+      https://www.servicenow.com/community/developer-blog/servicenow-things-to-know-111-system-export-sets/ba-p/2926648
+    - >-
+      https://www.servicenow.com/community/platform-analytics-forum/scheduled-export-of-a-file-in-csv-format-into-a-shared-folder/m-p/1266620
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: Cribl File Source (CSV) -> logs-servicenow.event@custom
+      notes: >
+        A Cribl File Source with a CSV/delimited parser reads the file; the
+        header row names the selected columns. The flattening is the parsing
+        hazard - a reference column arrives as a display name and a choice
+        column may arrive as a label rather than a code, so the @custom
+        pipeline must know which convention each column was exported under.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          De-duplicate on sys_id so the latest state wins, length-cap
+          short_description and strip control characters and embedded
+          delimiters low-side (a comma or newline in free text is the classic
+          CSV corruption), and leave work-notes columns out of the Export
+          Definition.
+        elastic: >
+          logs-servicenow.event@custom must branch on the export convention:
+          if choice fields were exported as labels, skip the sys_choice
+          enrichment for them; if reference fields were exported as display
+          names, map assigned_to to user.name directly and accept that user.id
+          is unavailable unless a dot-walked sys_id column was added.
+        relay: >
+          Full ECS JSON crosses as mode B after the CSV is parsed and
+          normalized low-side; reconcile distinct sys_id per (dataset, hour)
+          and alert on shortfall, since the approved-change join fails open on
+          a silent drop.
+      direct:
+        parse_location: high
+        cribl: >
+          High-side reads the CSV with no guard hop; still normalize embedded
+          delimiters and de-duplicate on sys_id at the File Source.
+        elastic: >
+          logs-servicenow.event@custom must branch on the export convention:
+          if choice fields were exported as labels, skip the sys_choice
+          enrichment for them; if reference fields were exported as display
+          names, map assigned_to to user.name directly and accept that user.id
+          is unavailable unless a dot-walked sys_id column was added.
+    fields:
+    - vendor: number
+      type: string
+      description: human-readable change number (CHG0030001)
+      ecs: null
+      custom: servicenow.change.number
+      status: unmapped
+    - vendor: sys_id
+      type: string
+      description: sys_id of the change record - the join target for sys_audit documentkey
+      ecs: event.id
+      status: mapped
+    - vendor: sys_updated_on
+      type: timestamp
+      description: date and time the change record was last modified
+      ecs: '@timestamp'
+      status: mapped
+      transform: watermark column; Glide date/time, parse to UTC
+    - vendor: state
+      type: string
+      description: >-
+        state of the change, exported as the numeric code or the label
+        depending on the export setting
+      ecs: null
+      custom: servicenow.change.state
+      status: unmapped
+      transform: >-
+        if exported as a code, apply the per-instance sys_choice lookup; if
+        exported as a label, skip the lookup for this column
+    - vendor: approval
+      type: enum
+      description: approval state (not requested, requested, approved, rejected)
+      ecs: null
+      custom: servicenow.change.approval
+      status: unmapped
+    - vendor: assigned_to
+      type: string
+      description: user the change is assigned to, rendered as the display name in CSV
+      ecs: user.name
+      status: partial
+      notes: >-
+        CSV has no value/display pairing, so this is the full name; add a
+        dot-walked assigned_to.sys_id column if user.id is needed
+    - vendor: cmdb_ci
+      type: string
+      description: primary configuration item, rendered as the display name in CSV
+      ecs: null
+      custom: servicenow.change.cmdb_ci
+      status: unmapped
+      notes: resolve through the CMDB rather than assuming host.name
+    - vendor: short_description
+      type: string
+      description: one-line summary of the change
+      ecs: message
+      status: mapped
+      notes: strip embedded commas/newlines that corrupt the CSV row
+    - vendor: close_code
+      type: enum
+      description: closure result (successful, successful_with_issues, unsuccessful)
+      ecs: event.outcome
+      status: partial
+      transform: >-
+        successful to success, unsuccessful to failure, successful_with_issues
+        to unknown with the raw value retained
+  - format: webhook
+    enable: >
+      Create an Outbound REST Message targeting the collector endpoint and an
+      after-update Business Rule on change_request, conditioned on state or
+      approval changing, that builds a JSON body from the record and calls
+      sn_ws.RESTMessageV2. This is the canonical ServiceNow webhook use case -
+      it pushes each state transition of a change in near real time so the
+      approved-change join is current rather than lagging a poll interval, and
+      the Business Rule can pre-resolve reference fields before sending.
+    references:
+    - >-
+      https://docs.servicenow.com/bundle/kingston-application-development/page/integrate/outbound-rest/concept/c_OutboundRESTWebService.html
+    - https://www.nowspectrum.com/blog/restmessagev2-guide
+    - >-
+      https://www.servicenow.com/community/developer-forum/how-to-setup-outbound-webhook-for-any-event-occurs-in-the/m-p/2141298
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: Cribl HTTP Source -> logs-servicenow.event@custom
+      notes: >
+        A Cribl HTTP Source receives the POST body. The payload is
+        author-defined, so the Business Rule can emit resolved reference names
+        and either choice codes or labels; keep the keys aligned with the REST
+        path's columns so logs-servicenow.event@custom applies.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Have the Business Rule resolve assigned_to and cmdb_ci to readable
+          values and include both sys_id and number so the low-side HTTP
+          Source only caps short_description and de-duplicates on sys_id. Fire
+          on state/approval change so a chatty field edit does not generate a
+          push per keystroke.
+        elastic: >
+          logs-servicenow.event@custom derives event.outcome from close_code
+          and prefers work_start/work_end for event.start/event.end; if the
+          rule sent choice labels, skip the sys_choice enrichment for those
+          columns.
+        relay: >
+          ECS-aligned JSON crosses as mode B, at-most-once with no broker to
+          replay. Reconcile distinct sys_id per (dataset, hour) and alert on
+          shortfall - a dropped change transition is exactly what makes
+          legitimate activity look unauthorized.
+      direct:
+        parse_location: high
+        cribl: >
+          High-side POSTs straight to the core HTTP Source; de-duplicate on
+          sys_id and keep the state/approval condition on the Business Rule.
+        elastic: >
+          Same custom pipeline; monitor instance-side for Business Rule
+          execution errors, the only signal the feed has stopped.
+    fields:
+    - vendor: number
+      type: string
+      description: human-readable change number (CHG0030001)
+      ecs: null
+      custom: servicenow.change.number
+      status: unmapped
+    - vendor: sys_id
+      type: string
+      description: sys_id of the change record, included to de-duplicate retries
+      ecs: event.id
+      status: mapped
+    - vendor: sys_updated_on
+      type: timestamp
+      description: date and time of the state transition that fired the rule
+      ecs: '@timestamp'
+      status: mapped
+      transform: Glide date/time; parse to UTC
+    - vendor: state
+      type: integer
+      description: numeric state of the change
+      ecs: null
+      custom: servicenow.change.state
+      status: unmapped
+      transform: per-instance sys_choice lookup unless the rule sent the label
+    - vendor: approval
+      type: enum
+      description: approval state (not requested, requested, approved, rejected)
+      ecs: null
+      custom: servicenow.change.approval
+      status: unmapped
+      notes: the field that answers whether the change was approved
+    - vendor: assigned_to
+      type: string
+      description: user the change is assigned to
+      ecs: user.name
+      status: partial
+      notes: >-
+        the Business Rule should emit the resolved user_name (or sys_id)
+        rather than the raw reference so the join does not silently miss
+    - vendor: cmdb_ci
+      type: string
+      description: primary configuration item the change affects
+      ecs: null
+      custom: servicenow.change.cmdb_ci
+      status: unmapped
+      notes: resolve through the CMDB rather than assuming host.name
+    - vendor: short_description
+      type: string
+      description: one-line summary of the change
+      ecs: message
+      status: mapped
+    - vendor: close_code
+      type: enum
+      description: closure result (successful, successful_with_issues, unsuccessful)
+      ecs: event.outcome
+      status: partial
+      transform: >-
+        successful to success, unsuccessful to failure, successful_with_issues
+        to unknown with the raw value retained

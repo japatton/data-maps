@@ -1,0 +1,1862 @@
+id: cribl-internal
+name: Cribl Stream Internal Logs
+vendor: Cribl
+versions: >-
+  Cribl Stream 4.x (field and metric names below verified against the 4.19
+  docs); Cribl Edge shares the same internal log and metric model
+draft: true
+references:
+- https://docs.cribl.io/stream/internal-logs/
+- https://docs.cribl.io/stream/internal-metrics/
+- https://docs.cribl.io/stream/sources-cribl-internal/
+- https://docs.cribl.io/stream/monitoring/
+- https://docs.cribl.io/stream/event-model/
+- https://docs.cribl.io/stream/sample-login-logs/
+- https://docs.cribl.io/stream/persistent-queues/
+- https://www.elastic.co/docs/reference/integrations/cribl
+datasets:
+- id: internal-logs
+  name: Cribl internal logs (Worker Process)
+  description: |
+    The pipeline observing itself. Cribl Stream's own application log, exposed for forwarding by the CriblLogs option on the Cribl Internal Source, which in a distributed deployment forwards Worker Process logs only (it omits API Process logs, and therefore telemetry/license-validation traffic). Every record is a flat JSON object built on the same five-key envelope - time, cid, channel, level, message - with record-specific context keys appended.
+    The highest-value record on this feed is the "_raw stats" event that each Worker Process emits once a minute, carrying inEvents / outEvents / inBytes / outBytes, droppedEvents, the persistent-queue counters, and blockedEP. Those counters are the low-side half of the low-versus-high reconciliation that detects silent guard drops: because the guard is a one-way protocol break with no return channel, nothing acknowledges a crossing, and a comparison of low-side sent counts against high-side received counts per (dataset, hour) is the only thing that will ever reveal a drop. The same feed is where destination backpressure and persistent-queue engagement become visible during the ArcSight cutover, when both the legacy and the new path are live and feed parity is the acceptance criterion.
+  event_categories:
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge Cribl worker group, on-prem enclave (low side)
+      notes: >
+        The low-side worker group's own CriblLogs output crosses the guard to
+        be visible in Elastic - that crossed low-side copy is what makes
+        reconciliation possible at all. The low-side half is genuinely routed
+        across the boundary rather than merely retained locally; that is what
+        keeps silent guard drops detectable and every other technology's
+        parity claim grounded.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >
+        allow-list on the logs-cribl_internal.logs destination data stream
+        only; allowlisted envelope keys with bounded string lengths, since the
+        free-text message and error context are the only unbounded content on
+        the route
+      notes: |
+        The drop detector must be the most reliable thing on the boundary. Give this route its own guard destination and its own persistent queue rather than sharing one with bulk vendor traffic, so that the telemetry proving a shed did not happen is never itself the thing that gets shed.
+        Crossing transport is confirmed. TODAY the low-side Cribl ships through a Cribl Syslog Destination, using the __syslogout internal field whose value is a CEF-structured string; the high-side Cribl receives each message as _raw containing a JSON object string, runs a Parser function (Extract JSON) over _raw, adds Cribl fields and ships to Routes. That syslog/CEF leg is being retired. PLANNED and confirmed as the plan of record: low-side Cribl HTTP Destination -> guard -> high-side Cribl HTTP Source carrying NDJSON. "Its own guard destination" therefore means a dedicated Syslog Destination today and a dedicated HTTP Destination after the cutover - and note that the high-side Extract JSON parse currently sits between the crossing and the Routes, so a parse failure on this route silently costs the reconciliation its low-side half.
+    - hop: cribl
+      location: core worker group, Elastic side (high side)
+      notes: >
+        Merges the crossed low-side telemetry with the high-side tier's own
+        CriblLogs feed into one data stream; the worker-group identity is the
+        only thing that tells the two halves apart, so it must be stamped
+        before the merge rather than inferred afterward.
+    - hop: elastic
+      data_stream: logs-cribl_internal.logs
+    direct:
+    - hop: cribl
+      location: edge Cribl worker group
+      notes: >
+        The high-side worker group emits its own CriblLogs feed straight to
+        Elastic with no guard hop; worker-group identity is stamped on every
+        record so this high-side tier's records stay distinguishable in the
+        shared data stream.
+    - hop: cribl
+      location: core worker group, Elastic side (high side)
+      notes: >
+        Merges the crossed low-side telemetry with the high-side tier's own
+        CriblLogs feed into one data stream; the worker-group identity is the
+        only thing that tells the two halves apart, so it must be stamped
+        before the merge rather than inferred afterward.
+    - hop: elastic
+      data_stream: logs-cribl_internal.logs
+  formats:
+  - format: json
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Cribl internal telemetry pipeline
+      notes: >
+        There is no parser to inherit. The Elastic Cribl integration is a
+        routing integration - it maps the _dataId set on each event to a Fleet
+        dataset and namespace - not an ingest pipeline that understands
+        Cribl's own log schema, and no Cribl pack ships content for the
+        internal sources. The records are already well-formed JSON with stable
+        key names, so the work is field selection, typing and ECS naming
+        rather than text extraction. Note the feedback loop this creates:
+        routing internal logs through Routes and Pipelines makes them ordinary
+        events that generate more internal telemetry, so the pipeline handling
+        this source must be cheap and must never be able to log an error per
+        event.
+    fields:
+    - vendor: time
+      type: timestamp
+      description: ISO 8601 UTC time the Worker Process wrote the log record
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: cid
+      type: string
+      description: >-
+        identifier of the Cribl process that emitted the record - w0, w1, ...
+        for Worker Processes, api for the API process
+      ecs: service.node.name
+      status: partial
+      notes: >
+        discriminates two processes of the same service on one host, which is
+        exactly what service.node.name models; it stays partial because the
+        value is process-scoped and node-local, so it is only unique when
+        paired with host.name
+    - vendor: channel
+      type: string
+      description: >-
+        name of the internal logger that emitted the record - server,
+        input:<source-id>, <source-id>_lb, LDAPMapper, and so on
+      ecs: log.logger
+      status: mapped
+      notes: >
+        the primary triage filter on this dataset, and the naming is not
+        uniform: Worker Process logs for a Source use channel ==
+        "input:<source-id>" while the TCP load-balancer logs for the same
+        Source use channel == "<source-id>_lb", so any per-source dashboard
+        needs both forms or it will silently miss the load-balancing half
+    - vendor: level
+      type: enum
+      description: log severity - info, warn, error, debug, silly
+      ecs: log.level
+      status: mapped
+      transform: >
+        copied verbatim to log.level; if a numeric event.severity is also
+        wanted for alert thresholds it needs a lookup, and note that Cribl's
+        silly level has no syslog equivalent and that debug/silly on a busy
+        Node will hit the 5 MB rotation threshold fast enough to lose history
+    - vendor: message
+      type: string
+      description: >-
+        short fixed token identifying the record type, e.g. "_raw stats",
+        "Successful login", a backpressure or persistent-queue notice
+      ecs: message
+      status: partial
+      transform: >
+        this is a discriminator, not prose - the context keys present on a
+        record are determined by it - so it must also drive event.action, and
+        the record-type vocabulary should be pinned to a lookup rather than
+        matched with substring tests that break on a version upgrade
+    - vendor: inEvents
+      type: long
+      description: >-
+        events received from all Sources during the one-minute window, after
+        Event Breakers are applied
+      ecs: null
+      status: unmapped
+      custom: cribl.stats.in_events
+    - vendor: outEvents
+      type: long
+      description: events sent out to all Destinations during the one-minute window
+      ecs: null
+      status: unmapped
+      custom: cribl.stats.out_events
+      notes: >
+        outEvents can legitimately exceed inEvents (clones, Aggregation
+        Function output) and can legitimately fall below it (Drop, Suppress,
+        Sampling), so a naive in-versus-out comparison on one tier is
+        meaningless; the reconciliation that matters is low-side outEvents
+        against high-side inEvents across the guard
+    - vendor: inBytes
+      type: bytes
+      description: bytes received from all Sources during the window, counted off _raw only
+      ecs: null
+      status: unmapped
+      custom: cribl.stats.in_bytes
+    - vendor: outBytes
+      type: bytes
+      description: bytes sent to all Destinations during the window, counted off _raw only
+      ecs: null
+      status: unmapped
+      custom: cribl.stats.out_bytes
+    - vendor: droppedEvents
+      type: long
+      description: >-
+        events not sent to any Destination during the window - from Pipeline
+        Functions, from Source or Destination backpressure, or from other
+        errors
+      ecs: null
+      status: unmapped
+      custom: cribl.stats.dropped_events
+      notes: >
+        the single most operationally important number on this technology, and
+        equivalent to the total.dropped_events internal metric. It does not
+        distinguish an intended Drop Function from a backpressure shed, so a
+        non-zero value always needs the concurrent blockedEP and
+        persistent-queue counters to interpret
+    - vendor: blockedEP
+      type: integer
+      description: event processors currently blocked because a Destination is blocking
+      ecs: null
+      status: unmapped
+      custom: cribl.stats.blocked_ep
+      notes: >
+        the leading indicator of a guard or Elastic destination going
+        unresponsive - it rises before droppedEvents does, which makes it the
+        field worth alerting on rather than the drop counter itself
+    - vendor: pqTotalBytes
+      type: bytes
+      description: data currently held in persistent queues across all Destinations
+      ecs: null
+      status: unmapped
+      custom: cribl.pq.total_bytes
+    - vendor: pqInEvents
+      type: long
+      description: events written to persistent queues across all Destinations during the window
+      ecs: null
+      status: unmapped
+      custom: cribl.pq.in_events
+    - vendor: pqOutEvents
+      type: long
+      description: events flushed from persistent queues across all Destinations during the window
+      ecs: null
+      status: unmapped
+      custom: cribl.pq.out_events
+    - vendor: starttime
+      type: integer
+      description: epoch-second start of the one-minute window the _raw stats counters cover
+      ecs: event.start
+      status: partial
+      transform: >
+        epoch seconds, so it needs multiplying to milliseconds or explicit
+        date-format parsing before it is a valid ECS date. Beware a documented
+        casing inconsistency: the vendor field-description table names this
+        startTime while the vendor's own sample event emits starttime, so a
+        parser must tolerate both
+    - vendor: endtime
+      type: integer
+      description: epoch-second end of the counter window, always 60 seconds after the start
+      ecs: event.end
+      status: partial
+      transform: >
+        same epoch-second conversion and the same startTime/starttime casing
+        caveat; because the window is fixed at 60 seconds, a gap between
+        consecutive windows is itself a Worker Process restart signal worth
+        surfacing
+    - vendor: cpuPerc
+      type: float
+      description: >-
+        combined user and system CPU utilization of the Worker Process over
+        the last 60 seconds
+      ecs: host.cpu.usage
+      status: partial
+      transform: >
+        the vendor value is a percentage that exceeds 100 on multi-core Nodes
+        (the documented sample is 101.09), whereas ECS host.cpu.usage is a 0-1
+        fraction already normalized by core count - so it must be divided by
+        100 and by the core count. It is also process-scoped rather than
+        host-scoped, so a Node running several Worker Processes will emit
+        several of these and they must not be summed onto one host document
+    - vendor: mem.rss
+      type: integer
+      description: resident set size of the Worker Process, in megabytes
+      ecs: null
+      status: unmapped
+      custom: cribl.stats.mem_rss
+      notes: >
+        unit trap - this log field is in MB while the system.mem_rss internal
+        metric on the metrics dataset reports the same concept in bytes, so a
+        dashboard that charts both will be off by six orders of magnitude
+        unless one is converted
+    - vendor: host
+      type: string
+      description: >-
+        hostname of the Cribl instance, added to every event by the Cribl
+        Internal Source
+      ecs: host.name
+      status: mapped
+      notes: >
+        added by the source rather than present in the log file, so it
+        identifies the Node that emitted the telemetry; it is not the host
+        characteristic of any customer data flowing through that Node, which
+        is a different field on the metrics dataset
+    - vendor: source
+      type: string
+      description: constant value cribl, added to every event by the Cribl Internal Source
+      ecs: event.module
+      status: partial
+      notes: >
+        a constant, useful only as a routing discriminator; it is worth
+        setting event.dataset explicitly alongside it rather than relying on
+        this single token to separate the four Cribl internal feeds from one
+        another
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Parse and shape low-side into ECS JSON - a thin envelope would be
+          pure overhead here, since the record is already flat JSON with
+          stable keys and there is no Elastic integration waiting to extract
+          it. The concrete work is deriving event.action from the message
+          token (message is a fixed discriminator such as "_raw stats",
+          "Successful login" or a backpressure notice, not free prose),
+          converting the epoch-second starttime/endtime pair into event.start
+          and event.end, normalizing cpuPerc into the 0-1 fraction ECS
+          expects, and stamping the worker-group and tier identity on every
+          record before it leaves the enclave so the two halves of the feed
+          stay distinguishable after the merge. Validate against a Schema
+          Library schema with a dead-letter route, run the guard destination
+          on Persistent Queue backpressure and never Block, and keep _raw on
+          this route: it is low volume and it is the evidence trail for the
+          cutover.
+        elastic: >
+          Own a custom logs-cribl_internal.logs ingest pipeline and explicit
+          custom-namespace index-template mappings - cribl.stats.in_events,
+          .out_events, .dropped_events and .blocked_ep and
+          cribl.pq.total_bytes as long, cribl.worker_group and log.logger as
+          keyword - because dynamic mapping will otherwise type the first-seen
+          counter and then reject the rest. Build the reconciliation view here
+          rather than in a dashboard afterthought: sum the per-minute counters
+          by (cribl.worker_group, hour) and alert on low-side outEvents
+          diverging from high-side inEvents, on any non-zero droppedEvents,
+          and on blockedEP or pqTotalBytes rising - those three are the
+          silent-drop, backpressure and queue-accumulation signals
+          respectively, and during the ArcSight cutover they are the
+          feed-parity acceptance evidence. Alert on absence too: a worker
+          group that stops emitting its one-minute stats record is a dead
+          tier, not a quiet one.
+        relay: >
+          Full ECS-shaped NDJSON crosses the guard (envelope mode B) - UTF-8,
+          LF-terminated, compression disabled, nesting held to two levels with
+          short ASCII keys - because the guard filter is custom work and this
+          is the one route that must never be ambiguous to it. The
+          content-filter friction is narrow and easy to bound: everything
+          except message and any error context is a number or a short
+          identifier, so cap message, strip control characters, and reject
+          rather than truncate anything that fails the schema so a mangled
+          record is visibly dead-lettered instead of silently reshaped. Carry
+          _raw across permanently on this route rather than dropping it once
+          the parser is proven, and reconcile counts per (dataset, hour) -
+          this feed is the reconciliation instrument, so it needs its own
+          independent proof of delivery. Transport is confirmed rather than
+          assumed: the plan of record is a low-side Cribl HTTP Destination to
+          a high-side Cribl HTTP Source carrying that NDJSON, replacing the
+          current Cribl Syslog Destination leg (a CEF-structured __syslogout
+          value that the high side recovers from _raw with an Extract JSON
+          parser before Cribl fields and Routes), with AST/file drop kept only
+          as a replay-capable fallback. Until the cutover, be deliberate about
+          the _raw collision on this route - the carried-across _raw of the
+          source record and the _raw the high-side parser consumes as the
+          crossing envelope are two different things, and conflating them will
+          corrupt exactly the feed the reconciliation depends on.
+      direct:
+        parse_location: low
+        cribl: >
+          Parse and shape at the source into ECS JSON - a thin envelope would
+          be pure overhead here, since the record is already flat JSON with
+          stable keys and there is no Elastic integration waiting to extract
+          it. The concrete work is deriving event.action from the message
+          token (message is a fixed discriminator such as "_raw stats",
+          "Successful login" or a backpressure notice, not free prose),
+          converting the epoch-second starttime/endtime pair into event.start
+          and event.end, normalizing cpuPerc into the 0-1 fraction ECS
+          expects, and stamping the worker-group and tier identity on every
+          record so this high-side tier's feed stays distinguishable in the
+          shared data stream. Validate against a Schema Library schema with a
+          dead-letter route, run the Elastic destination on Persistent Queue
+          backpressure and never Block, and keep _raw on this route: it is low
+          volume and it is the evidence trail for the ArcSight cutover.
+        elastic: >
+          Own a custom logs-cribl_internal.logs ingest pipeline and explicit
+          custom-namespace index-template mappings - cribl.stats.in_events,
+          .out_events, .dropped_events and .blocked_ep and
+          cribl.pq.total_bytes as long, cribl.worker_group and log.logger as
+          keyword - because dynamic mapping will otherwise type the first-seen
+          counter and then reject the rest. With no guard on this path there
+          is no crossing to reconcile, so build the operational view on the
+          counters themselves: sum the per-minute counters by
+          (cribl.worker_group, hour) and alert on any non-zero droppedEvents
+          and on blockedEP or pqTotalBytes rising - the drop, backpressure and
+          queue-accumulation signals - and during the ArcSight cutover use
+          them as this tier's feed-parity evidence. Alert on absence too: a
+          worker group that stops emitting its one-minute stats record is a
+          dead tier, not a quiet one.
+- id: internal-metrics
+  name: Cribl internal metrics
+  description: |
+    The numeric half of the pipeline's self-observability, exposed by the CriblMetrics option on the Cribl Internal Source. Cribl generates these every 2 seconds at Worker Process granularity as metric events carrying _metric, _metric_type, _value and _time plus a set of dimensions, with a configurable name prefix defaulting to cribl.logstream.
+    This is the dataset the reconciliation consumer actually runs on. total.in_events and total.out_events per input and output give the sent-versus-received counts on each side of the guard; total.dropped_events and pq.dropped_events give the shed counts; pq.queue_size, backpressure.outputs and blocked.outputs give the backpressure state that explains them; and health.inputs / health.outputs give the 0/1/2 green/yellow/red state per Source and per Destination. The group dimension carries the Worker Group name and is therefore the low-side versus high-side discriminator that the whole doctrine depends on.
+    One behaviour must be understood before any alert is written: counter-type metrics reset at the end of each reporting period and are NOT reported when their value is zero. A missing total.dropped_events series means no drops, not missing telemetry - but a missing total.in_events series for a worker group means the tier is dead. Any consumer that cannot tell those two cases apart will either alert constantly or never.
+  event_categories:
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge Cribl worker group, on-prem enclave (low side)
+      notes: >
+        The low-side tier's metrics cross the guard to be comparable against
+        the high-side tier's in Elastic; that crossed low-side series is what
+        gives the reconciliation two sides to compare.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >
+        allow-list on the metrics-cribl_internal.metrics destination data
+        stream only; every value is a number or a short identifier, so the
+        allowlisted key set can be tight and the length caps small
+      notes: >
+        Same confirmed crossing as the internal-logs route: current transport
+        is a Cribl Syslog Destination on the __syslogout internal field
+        carrying a CEF-structured string, with the high side parsing _raw
+        through Extract JSON before Cribl fields and Routes; that leg is being
+        retired in favour of the confirmed plan of record, a low-side Cribl
+        HTTP Destination to a high-side Cribl HTTP Source carrying NDJSON.
+        Rolled-up metric records are small, so the syslog leg's message-size
+        limits are not the constraint here - sample rate against it is.
+    - hop: cribl
+      location: core worker group, Elastic side (high side)
+      notes: >
+        Where the two tiers' series are merged; the group dimension must
+        survive the crossing intact or the merged series is uninterpretable
+    - hop: elastic
+      data_stream: metrics-cribl_internal.metrics
+    direct:
+    - hop: cribl
+      location: edge Cribl worker group
+      notes: >
+        The high-side tier's metrics go straight to Elastic with no guard hop;
+        worker-group identity is stamped on every record so this high-side
+        tier's series stays distinguishable in the shared data stream.
+    - hop: cribl
+      location: core worker group, Elastic side (high side)
+      notes: >
+        Where the two tiers' series are merged; the group dimension must
+        survive the crossing intact or the merged series is uninterpretable
+    - hop: elastic
+      data_stream: metrics-cribl_internal.metrics
+  formats:
+  - format: json
+    recommended: true
+    recommended_because: >-
+      notification webhooks carry discrete condition events, not the metrics
+      rollup this dataset describes; the internal telemetry pipeline is the
+      metrics feed.
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        custom Cribl internal telemetry pipeline, with the bundled
+        cribl-metrics_rollup pre-processing Pipeline
+      notes: >
+        No integration or pack parses these. Cribl ships a
+        cribl-metrics_rollup Pipeline intended to be attached to the Cribl
+        Internal Source as a pre-processing Pipeline; its Rollup Metrics
+        Function defaults to a 30-second Time Window, which is the right first
+        lever against the raw 2-second cadence. Metric granularity is also
+        controllable at source through the per-integration Metrics Levels
+        setting (Minimal / Basic / Detailed) and the Worker Group metrics
+        limits, including a never-drop list.
+    fields:
+    - vendor: _time
+      type: timestamp
+      description: Unix time the metric sample was taken
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: _metric
+      type: string
+      description: >-
+        metric name, prefixed by default with cribl.logstream. - e.g.
+        total.in_events, total.dropped_events, pq.queue_size, health.outputs
+      ecs: null
+      status: unmapped
+      custom: cribl.metric.name
+      notes: >
+        the prefix is configurable on the Cribl Internal Source, so any query
+        keyed on the full dotted name breaks if a deployment changes it;
+        normalize the prefix off low-side and keep the bare metric name here
+    - vendor: _value
+      type: float
+      description: numeric value of the metric sample
+      ecs: null
+      status: unmapped
+      custom: cribl.metric.value
+      notes: >
+        holds counts, byte totals, percentages, millisecond percentiles and
+        0/1/2 health codes depending on _metric, so it must be mapped as a
+        double explicitly - a long mapping inferred from the first counter
+        will reject p95_duration_millis and cpu percentages
+    - vendor: _metric_type
+      type: enum
+      description: metric kind - counter, gauge or timer
+      ecs: null
+      status: unmapped
+      custom: cribl.metric.type
+      notes: >
+        decisive for correct arithmetic. Cribl counters do not monotonically
+        increase; they reset at the end of each reporting period and are
+        omitted entirely when zero, so they must be summed over a window
+        rather than differenced, and gauges such as pq.queue_size must be
+        taken last-value rather than summed
+    - vendor: input
+      type: string
+      description: full Input ID including its type prefix, e.g. cribl:CriblLogs or tcp:in_syslog
+      ecs: null
+      status: unmapped
+      custom: cribl.metric.input
+      notes: >
+        the per-Source discriminator for total.in_events and source.in_events;
+        it replaces the ci dimension deprecated in 4.1.2, and any dashboard
+        still keyed on ci needs migrating before the 4.x line drops it
+    - vendor: output
+      type: string
+      description: full Output ID including its type prefix, e.g. elastic:to_elastic
+      ecs: null
+      status: unmapped
+      custom: cribl.metric.output
+      notes: >
+        the per-Destination discriminator for pq.* and total.dropped_events;
+        replaces the deprecated co dimension. The guard destination's own
+        output id is the one to watch hardest
+    - vendor: group
+      type: string
+      description: name of the Cribl Worker Group the metric came from
+      ecs: null
+      status: unmapped
+      custom: cribl.worker_group
+      notes: >
+        the low-side versus high-side discriminator, and therefore the single
+        most load-bearing dimension in this file - every reconciliation query
+        groups by it. Do not rely on it arriving by default; stamp it
+        explicitly low-side and treat its absence on a record as a parse
+        failure
+    - vendor: cribl_wp
+      type: string
+      description: identifier of the Worker/Edge Node Process that produced the metric
+      ecs: service.node.name
+      status: partial
+      notes: >
+        the metric-side equivalent of the cid field on the internal-logs
+        dataset; it is the main cardinality multiplier on this feed, so it is
+        also the first dimension to consider rolling away low-side
+    - vendor: event_host
+      type: string
+      description: hostname of the machine the metric came from
+      ecs: host.name
+      status: mapped
+      notes: >
+        Cribl emits this event_-prefixed duplicate precisely because
+        downstream services frequently overwrite the plain host field; prefer
+        this one and treat a disagreement between the two as evidence
+        something upstream is rewriting host
+    - vendor: event_source
+      type: string
+      description: constant value cribl, the event_-prefixed duplicate of source
+      ecs: event.module
+      status: partial
+      notes: same constant-value caveat as the source field on the internal-logs dataset
+    - vendor: failure_reason
+      type: enum
+      description: whether a failed Destination request is retryable or non_retryable
+      ecs: event.reason
+      status: partial
+      notes: >
+        only present on failure-related integration metrics; the non_retryable
+        case is the one that turns into a permanent loss on an at-most-once
+        route and deserves its own alert rather than being aggregated with
+        retryable failures
+    - vendor: status_code
+      type: integer
+      description: HTTP status code (4xx or 5xx) for a failed Destination request
+      ecs: http.response.status_code
+      status: mapped
+      notes: >
+        distinguishes an Elastic destination rejecting documents (4xx, usually
+        a mapping conflict) from one being unavailable (5xx) - two very
+        different incidents that both surface as rising pq.queue_size
+    - vendor: reject_reason
+      type: enum
+      description: >-
+        reason an inbound connection was rejected - concurrency_limit,
+        high_load, ip_validation_failed
+      ecs: null
+      status: unmapped
+      custom: cribl.metric.reject_reason
+      notes: >
+        ip_validation_failed is a security signal rather than a capacity one
+        and should not share an alert with the other two
+    - vendor: host
+      type: string
+      description: >-
+        host dimension of the data flowing through Cribl, used by the
+        host.in_events and host.in_bytes metric families
+      ecs: null
+      status: unmapped
+      custom: cribl.data.host
+      notes: >
+        a genuine trap - this is a characteristic of the customer data being
+        processed, not the Cribl Node processing it, so mapping it to
+        host.name would silently attribute vendor-device hostnames to the
+        pipeline. It is also a top cardinality driver and a strong candidate
+        for dropping low-side
+    - vendor: index
+      type: string
+      description: >-
+        index dimension of the data flowing through Cribl, used by the
+        index.in_events and index.in_bytes metric families
+      ecs: null
+      status: unmapped
+      custom: cribl.data.index
+      notes: >
+        a Splunk-era destination-index concept carried through Cribl; it is
+        useful during the ArcSight cutover for proving per-destination parity,
+        and droppable afterwards
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Roll up before the crossing, not after: attach cribl-metrics_rollup
+          as a pre-processing Pipeline on the Cribl Internal Source and widen
+          its Time Window to 30 or 60 seconds, because 2-second metric events
+          at Worker Process granularity are the wrong shape for an
+          at-most-once boundary and will dominate the guard's throughput with
+          data nobody queries. Cut cardinality low-side by dropping the
+          per-host and per-index dimension families (host.in_events,
+          index.in_events and friends) while pinning total.in_events,
+          total.out_events, total.dropped_events, pq.dropped_events,
+          pq.queue_size, health.inputs and health.outputs onto the metrics
+          never-drop list so the reconciliation inputs survive any limit that
+          trips. Stamp the worker-group and tier identity explicitly rather
+          than trusting the group dimension to arrive, replace the deprecated
+          ci and co dimensions with input and output, and run the guard
+          destination on Persistent Queue backpressure.
+        elastic: >
+          Own a custom metrics-cribl_internal.metrics ingest pipeline and map
+          the series as a time-series data stream with cribl.metric.name,
+          cribl.metric.type, cribl.worker_group, cribl.metric.input and
+          cribl.metric.output as keyword dimensions and cribl.metric.value as
+          a double, because dynamic mapping will guess long off the first
+          counter it sees and then reject every float. Build the
+          reconciliation consumer here: compare low-side total.out_events
+          against high-side total.in_events per (cribl.worker_group, _dataId,
+          hour) and alert on divergence beyond a tolerance, and encode the
+          zero-suppression rule explicitly - treat an absent counter series as
+          zero, but treat an absent total.in_events series for a worker group
+          as a tier outage, since those two cases look identical in the data
+          and only the second is an incident. health.inputs and health.outputs
+          are composite 0/1/2 values, so alert on the transition to 2 per
+          Source and per Destination rather than averaging them into
+          meaninglessness.
+        relay: >
+          Rolled-up, fully shaped NDJSON crosses (envelope mode B): one JSON
+          object per line, UTF-8, LF-terminated, compression disabled, and no
+          nesting at all beyond the flat metric-plus-dimensions record. This
+          is the friendliest possible payload for a hand-written custom
+          content filter - every value is a number, a short identifier or a
+          0/1/2 health code - so hold that property deliberately by
+          allowlisting the dimension key set and rejecting unexpected keys
+          rather than letting new metric families leak across untyped. Volume
+          is the real relay risk, not content: without the rollup this dataset
+          alone can outweigh the vendor feeds it exists to measure, and
+          shedding the measurement to protect the measured is the exact
+          failure this route must not have. Transport is confirmed: a Cribl
+          Syslog Destination on a CEF-structured __syslogout value today, with
+          the high side parsing _raw through Extract JSON before Cribl fields
+          and Routes, retiring in favour of the confirmed plan of record - a
+          low-side Cribl HTTP Destination to a high-side Cribl HTTP Source
+          carrying this NDJSON. That cutover is itself a volume argument for
+          the rollup: per-message syslog framing is the worst possible fit for
+          a 2-second metric cadence, and AST/file drop remains a
+          replay-capable fallback rather than a co-equal design.
+      direct:
+        parse_location: low
+        cribl: >
+          Roll up at the source, not after: attach cribl-metrics_rollup as a
+          pre-processing Pipeline on the Cribl Internal Source and widen its
+          Time Window to 30 or 60 seconds, because 2-second metric events at
+          Worker Process granularity are needlessly fine for storage and will
+          dominate the index with data nobody queries. Cut cardinality at the
+          source by dropping the per-host and per-index dimension families
+          (host.in_events, index.in_events and friends) while pinning
+          total.in_events, total.out_events, total.dropped_events,
+          pq.dropped_events, pq.queue_size, health.inputs and health.outputs
+          onto the metrics never-drop list so the operationally important
+          series survive any limit that trips. Stamp the worker-group and tier
+          identity explicitly rather than trusting the group dimension to
+          arrive, replace the deprecated ci and co dimensions with input and
+          output, and run the Elastic destination on Persistent Queue
+          backpressure.
+        elastic: >
+          Own a custom metrics-cribl_internal.metrics ingest pipeline and map
+          the series as a time-series data stream with cribl.metric.name,
+          cribl.metric.type, cribl.worker_group, cribl.metric.input and
+          cribl.metric.output as keyword dimensions and cribl.metric.value as
+          a double, because dynamic mapping will guess long off the first
+          counter it sees and then reject every float. With no guard on this
+          path there is no crossing to reconcile, so build the consumer on the
+          series themselves and encode the zero-suppression rule explicitly -
+          treat an absent counter series as zero, but treat an absent
+          total.in_events series for a worker group as a tier outage, since
+          those two cases look identical in the data and only the second is an
+          incident. health.inputs and health.outputs are composite 0/1/2
+          values, so alert on the transition to 2 per Source and per
+          Destination rather than averaging them into meaninglessness.
+  - format: api-pull
+    enable: >
+      Beside the CriblMetrics event stream on the Cribl Internal Source, every
+      instance serves its own internal metrics over REST. GET /system/metrics
+      is Cribl's primary public metrics endpoint and returns the full internal
+      metric set; the vendor is explicit that this endpoint is a superset of
+      the event feed - a number of families (the iometrics.* connection and
+      latency timers, backpressure.outputs, blocked.outputs, the
+      system.load_avg / system.free_mem / system.disk_used host gauges, and
+      the per-source, per-sourcetype, per-route, per-pipe, per-pack and
+      per-project rollups) are documented as obtainable only through the REST
+      endpoints because the Cribl Internal Source does not export them to
+      Routes and Pipelines. Alongside it, GET /api/v1/health returns a tiny
+      liveness object and GET /api/v1/w/${nodeId}/health proxies the same call
+      to a named Node through the Leader. The global /health call needs no
+      authentication; the Node-scoped health call and /system/metrics are
+      authenticated API calls that take a Bearer token obtained from POST
+      /api/v1/auth/login (or a Cribl.Cloud API credential). Collect it with a
+      scheduled Cribl REST/API Collector, or any external poller, pointed at
+      the Leader or at each Worker on an interval; the pull cadence you choose
+      replaces the source-side 2-second emission cadence as the sample rate.
+    references:
+    - https://docs.cribl.io/stream/internal-metrics/
+    - https://docs.cribl.io/stream/monitoring/
+    - https://docs.cribl.io/cribl-as-code/query-health-endpoint/
+    - https://docs.cribl.io/stream/collectors-rest/
+    - https://docs.cribl.io/api-reference/
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        Cribl REST/API Collector against /system/metrics and /api/v1/health +
+        reshape pipeline feeding metrics-cribl_internal.metrics
+      notes: >
+        No Elastic integration and no Cribl pack parses this endpoint - the
+        handler is a scheduled REST collector plus the same custom reshape
+        pipeline the event feed needs, because the response carries the same
+        _metric / _value / _metric_type envelope and dimension set as the
+        CriblMetrics events rather than a distinct schema. The pull is a
+        genuine alternative on the collection side (it does not depend on the
+        Cribl Internal Source being configured, and it is the only way to
+        reach the REST-only families) but it changes nothing downstream:
+        _value still holds counts, byte totals, percentages, millisecond
+        percentiles and 0/1/2 health codes depending on _metric, so it must
+        still be mapped as a double, and the counter-versus-gauge arithmetic
+        still turns on _metric_type. Fold the /api/v1/health object in as a
+        second, low-cardinality branch keyed on its own two-field shape rather
+        than trying to force it through the metric grammar.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Understand first that a REST pull cannot itself cross the guard: the
+          boundary is a one-way protocol break with no return channel, so
+          nothing on the high side can poll a low-side endpoint. On the low
+          side this endpoint is therefore a collection substitute for the
+          CriblMetrics Source, not a substitute for the crossing - a low-side
+          REST/API Collector reads /system/metrics locally and the pulled
+          series then rides the same NDJSON guard route every other metric
+          takes. Its real low-side value is reach: pull it when you need the
+          iometrics.* latency timers or backpressure.outputs and
+          blocked.outputs that the event feed omits, then subject the result
+          to the identical discipline - roll up before the crossing, drop the
+          per-host and per-index dimension families, pin total.in_events,
+          total.out_events, total.dropped_events, pq.dropped_events,
+          pq.queue_size, health.inputs and health.outputs onto the never-drop
+          list, and stamp worker-group and tier identity explicitly. Pull
+          /api/v1/health on its own short interval as an independent liveness
+          beat.
+        elastic: >
+          Land the pulled series in the same custom
+          metrics-cribl_internal.metrics time-series data stream as the event
+          feed, with cribl.metric.name, cribl.metric.type, cribl.worker_group,
+          cribl.metric.input and cribl.metric.output as keyword dimensions and
+          cribl.metric.value as a double - do not stand up a parallel index
+          for the REST copy, or the reconciliation consumer has two homes to
+          join. Treat the health object as its own tiny document: map its
+          status to service.state and alert on the transition away from
+          healthy per Node, and treat the absence of a health beat from a
+          worker group as a tier outage on the same basis as an absent
+          total.in_events series. The REST-only latency and connection
+          families are worth an ingest-time rename into the cribl.metric
+          namespace so a p95_duration_millis timer never dynamically maps as a
+          long.
+        relay: >
+          Nothing new crosses here - the guard still carries rolled-up, fully
+          shaped NDJSON (envelope mode B): one flat metric-plus- dimensions
+          object per line, UTF-8, LF-terminated, compression disabled, every
+          value a number, a short identifier or a 0/1/2 health code. The only
+          relay consequence of choosing the pull is volume discipline: the
+          REST endpoint will hand you the full dimensioned set including the
+          per-host and per-index families the event feed can be told to omit,
+          so allowlist the dimension key set at the guard and reject
+          unexpected keys rather than letting the wider REST cardinality leak
+          across untyped. Carry the health object across on its own two-key
+          allowlist and reconcile counts per (dataset, hour); losing the
+          liveness beat is losing the one signal that separates a dead tier
+          from a quiet one.
+      direct:
+        parse_location: hybrid
+        cribl: >
+          For the high-side instances - which this technology has, since it
+          runs in both enclaves - polling /system/metrics and /api/v1/health
+          directly is a clean alternative to standing up the CriblMetrics
+          Source, and the only way to see the REST-only families without
+          routing internal metrics through Routes and Pipelines (which itself
+          generates more internal telemetry). Authenticate the collector with
+          a scoped Bearer token, poll the Leader for cluster-wide series and
+          each Worker's Node-scoped health for per-node liveness, and set the
+          interval deliberately: the pull cadence is now the sample rate, so a
+          30-to-60-second interval matches the rolled-up shape the
+          reconciliation wants without the raw 2-second cost. Cap nothing at
+          source that you cannot re-pull, since a REST page that returns short
+          under load has no acknowledgement to flag the gap.
+        elastic: >
+          Own the custom metrics-cribl_internal.metrics ingest pipeline and
+          time-series mappings exactly as for the event feed, and build the
+          reconciliation consumer here: compare total.out_events against
+          total.in_events per (cribl.worker_group, hour) and alert on
+          divergence, encoding the zero-suppression rule so an absent counter
+          reads as zero while an absent total.in_events series reads as a tier
+          outage. The direct pull makes one thing easier and one harder -
+          easier, because the health endpoint gives an authoritative per-Node
+          status to map to service.state and alert on rather than inferring
+          liveness from metric presence; harder, because a polled snapshot has
+          no delivery guarantee, so treat a missed poll interval as data
+          absence and alert on it rather than interpolating across the gap.
+    fields:
+    - vendor: _metric
+      type: string
+      description: >-
+        metric name in the REST response, e.g. total.in_events,
+        backpressure.outputs, iometrics.p95_duration_millis, health.outputs
+      ecs: null
+      status: unmapped
+      custom: cribl.metric.name
+      notes: >
+        same envelope as the CriblMetrics event feed, but the REST endpoint
+        carries families the event feed omits (iometrics.*,
+        backpressure.outputs, blocked.outputs, system.load_avg,
+        system.free_mem, system.disk_used, and the per-source / per-sourcetype
+        / per-route / per-pipe / per-pack / per-project rollups), so a query
+        keyed on a fixed metric list must be widened for the pulled copy
+    - vendor: _value
+      type: float
+      description: numeric value of the metric sample in the REST response
+      ecs: null
+      status: unmapped
+      custom: cribl.metric.value
+      notes: >
+        holds counts, byte totals, percentages, millisecond percentiles and
+        0/1/2 health codes depending on _metric, so map it as a double
+        explicitly - a long inferred from the first counter will reject the
+        iometrics timers and the load-average gauge
+    - vendor: _metric_type
+      type: enum
+      description: metric kind - counter, gauge or timer
+      ecs: null
+      status: unmapped
+      custom: cribl.metric.type
+      notes: >
+        Cribl counters reset at the end of each reporting period and are
+        omitted when zero, so they must be summed over a window rather than
+        differenced; gauges such as pq.queue_size and system.free_mem must be
+        taken last-value
+    - vendor: group
+      type: string
+      description: name of the Cribl Worker Group the metric came from
+      ecs: null
+      status: unmapped
+      custom: cribl.worker_group
+      notes: >
+        the low-side versus high-side discriminator and the single most
+        load-bearing dimension on this feed; do not rely on it arriving by
+        default, stamp it explicitly and treat its absence as a parse failure
+    - vendor: input
+      type: string
+      description: full Input ID including its type prefix, e.g. cribl:CriblLogs or tcp:in_syslog
+      ecs: null
+      status: unmapped
+      custom: cribl.metric.input
+      notes: >-
+        the per-Source discriminator for total.in_events and source.in_events;
+        it replaces the ci dimension deprecated in 4.1.2
+    - vendor: output
+      type: string
+      description: full Output ID including its type prefix, e.g. elastic:to_elastic
+      ecs: null
+      status: unmapped
+      custom: cribl.metric.output
+      notes: >-
+        the per-Destination discriminator for the pq.* and
+        total.dropped_events families; replaces the deprecated co dimension
+    - vendor: host
+      type: string
+      description: >-
+        host dimension of the data flowing through Cribl, used by the
+        host.in_events and host.in_bytes metric families
+      ecs: null
+      status: unmapped
+      custom: cribl.data.host
+      notes: >
+        a characteristic of the customer data being processed, not the Cribl
+        Node processing it, so it must not be mapped to host.name; it is also
+        a top cardinality driver the REST endpoint returns in full and a
+        strong candidate for dropping before ingest
+    - vendor: index
+      type: string
+      description: >-
+        index dimension of the data flowing through Cribl, used by the
+        index.in_events and index.in_bytes families
+      ecs: null
+      status: unmapped
+      custom: cribl.data.index
+      notes: >-
+        a Splunk-era destination-index concept carried through Cribl; useful
+        during the ArcSight cutover for per-destination parity and droppable
+        afterwards
+    - vendor: status
+      type: string
+      description: instance operational state from the /api/v1/health response, e.g. healthy
+      ecs: service.state
+      status: mapped
+      notes: >
+        the health endpoint's single status word; a 200 with status healthy
+        means the server runs, not that every configured Source is
+        functioning, and a 420 / shutting-down state is the one to alert on
+        per Node
+    - vendor: startTime
+      type: timestamp
+      description: epoch-millisecond time the instance started, from the /api/v1/health response
+      ecs: null
+      status: unmapped
+      custom: cribl.health.start_time
+      notes: >
+        epoch milliseconds; a change in this value between two polls of the
+        same Node is a restart signal worth surfacing, which is the main
+        analytic value of carrying it
+  - format: webhook
+    enable: >
+      Cribl Stream's Notifications feature emits internal operational state as
+      discrete condition events to a Webhook target, which is a Cribl-native
+      push alternative to polling the metrics. Create a Notification
+      (Notifications in the sidebar), bind it to a system condition, and
+      select a Webhook target: it POSTs (or PUTs / PATCHes) to a URL with
+      optional Bearer or Basic auth, and the Format control chooses NDJSON
+      (newline-delimited JSON, the default), JSON Array, or a Custom
+      JavaScript-shaped payload. The documented system conditions are an
+      unhealthy Destination, a Destination persistent-queue usage threshold,
+      backpressure activation (block or drop), source data-volume high/low
+      anomalies, a Source receiving no data over a time window, and license
+      expiration - which is precisely the backpressure, persistent- queue,
+      health and throughput signal set the metrics feed carries, delivered as
+      pushed alerts instead of a polled series. Each event carries a common
+      envelope (starttime, endtime, _time, cribl_host, cribl_notification,
+      origin_metadata) plus condition-specific keys.
+    references:
+    - https://docs.cribl.io/stream/webhook-notification-targets/
+    - https://docs.cribl.io/stream/notifications-targets/
+    - https://docs.cribl.io/stream/monitoring/
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        high-side Cribl HTTP/Webhook Source receiving the notification target
+        + branch-by-condition pipeline
+      notes: >
+        No integration or pack parses notification events; the receiver is a
+        Cribl HTTP Source (or any webhook endpoint) plus a pipeline that
+        branches on the condition. The common envelope is stable but the
+        condition-specific keys are a discriminated union keyed on _metric -
+        health.outputs carries health and output, system.pq_used carries usage
+        and usageThreshold, backpressure.outputs carries backpressure_type,
+        total.in_bytes carries bytes and input, and the license condition
+        carries severity, title and text and no _metric at all - so branch on
+        _metric (falling back to the license shape when it is absent) rather
+        than assuming one flat schema. This is derived alert data, not the raw
+        metric series, so it complements the metrics feed for alerting and
+        must never be treated as a counter source for reconciliation.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Unlike the REST pull, a notification is a push and can cross the
+          guard as an ordinary event: point the low-side Notification's
+          Webhook target at a low-side Cribl HTTP Source, shape the payload to
+          flat NDJSON, and let it ride the standard guard route. Derive
+          event.action and event.outcome from the condition rather than the
+          text - the backpressure and unhealthy-destination events are the
+          ones that matter on the boundary, and the backpressure_type value (1
+          Block, 2 Drop) distinguishes the two failure modes that both end in
+          dropped events. Cap _raw, title and text before the guard since they
+          are the only free-text keys, stamp worker-group and tier identity,
+          and keep the notification stream on its own route from the bulk
+          metrics so an alert about the pipeline shedding is never itself
+          shed.
+        elastic: >
+          Land these in a custom index alongside the metrics rather than in
+          the metrics time-series data stream - they are event documents, not
+          samples. Map cribl.notification.origin_type,
+          cribl.notification.origin_id and cribl.backpressure.type as keyword,
+          map rule.name from cribl_notification so the firing notification is
+          a first-class field, and set event.category from the condition. The
+          high-value correlation is to join a backpressure or
+          unhealthy-destination notification against the metrics feed's
+          concurrent pq.queue_size and blocked.outputs for the same worker
+          group and output: the notification says something fired, the metrics
+          say how bad and for how long, and only together do they size the
+          incident.
+        relay: >
+          These cross as flat ECS-shaped NDJSON (envelope mode B) on an
+          allowlisted key set - the payload is naturally friendly to a custom
+          filter since almost every key is a number, a short identifier or a
+          0/1/2 health code, the exceptions being _raw, title and text.
+          Sanitize and cap those three low-side, reject rather than truncate
+          anything failing the schema, and carry the whole event across rather
+          than pre-summarizing it, because volume here is trivially low: a
+          notification fires on a threshold, not per event. Reconcile counts
+          per (dataset, hour) so a dropped alert is visible.
+      direct:
+        parse_location: low
+        cribl: >
+          On the high-side instances, point the Webhook target straight at a
+          high-side Cribl HTTP Source or the SIEM's own ingest webhook and
+          skip the crossing entirely. Keep the shaping identical - branch on
+          _metric, derive outcome from the condition, cap the free-text keys -
+          so the notification schema stays consistent and mergeable across
+          every tier that emits it, and set the Notification's
+          repeat/timeWindow deliberately so a persistent condition does not
+          become a per-interval flood that buries the one transition that
+          matters.
+        elastic: >
+          Land these in a custom index alongside the metrics rather than in
+          the metrics time-series data stream - they are event documents, not
+          samples - and map cribl.notification.origin_type,
+          cribl.notification.origin_id and cribl.backpressure.type as keyword,
+          rule.name from cribl_notification as a first-class field, and
+          event.category from the condition. Alert on the transition into a
+          condition rather than on every repeat - health going to 2 on an
+          output, backpressure_type appearing at all, usage crossing
+          usageThreshold - and correlate against the metrics feed for
+          severity. Treat a license-expiration event (severity fatal) as its
+          own high-priority path, since it is the one condition here that ends
+          in the pipeline stopping rather than merely degrading.
+    fields:
+    - vendor: _time
+      type: timestamp
+      description: creation time of the notification event
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: starttime
+      type: timestamp
+      description: start of the time bucket the notification condition was evaluated over
+      ecs: event.start
+      status: partial
+      notes: >-
+        paired with endtime to bound the evaluation window; confirm the
+        emitted precision (epoch seconds vs ISO) against captured events
+        before parsing
+    - vendor: endtime
+      type: timestamp
+      description: end of the time bucket the notification condition was evaluated over
+      ecs: event.end
+      status: partial
+      notes: >-
+        with starttime, gives the window; a fixed cadence between consecutive
+        windows makes a gap a restart or evaluation-stall signal
+    - vendor: cribl_host
+      type: string
+      description: hostname of the machine that generated the notification
+      ecs: host.name
+      status: mapped
+    - vendor: cribl_notification
+      type: string
+      description: configured name/ID of the Notification that fired
+      ecs: rule.name
+      status: mapped
+      notes: >-
+        the firing rule identity; make it a first-class keyword so alerting
+        can group by which notification fired rather than by free text
+    - vendor: origin_metadata.type
+      type: string
+      description: >-
+        type of the object the notification originated from (e.g. the Source
+        or Destination kind)
+      ecs: null
+      status: unmapped
+      custom: cribl.notification.origin_type
+      notes: >-
+        part of the origin_metadata object present on every notification; the
+        type/id/subType triple is what attributes an alert to a concrete
+        pipeline object
+    - vendor: origin_metadata.id
+      type: string
+      description: id of the object the notification originated from
+      ecs: null
+      status: unmapped
+      custom: cribl.notification.origin_id
+    - vendor: origin_metadata.subType
+      type: string
+      description: sub-type of the originating object
+      ecs: null
+      status: unmapped
+      custom: cribl.notification.origin_subtype
+    - vendor: _metric
+      type: string
+      description: >-
+        the internal metric the condition is defined on, e.g. health.outputs,
+        system.pq_used, backpressure.outputs, total.in_bytes
+      ecs: null
+      status: unmapped
+      custom: cribl.metric.name
+      notes: >
+        the discriminator that determines which condition-specific keys are
+        present; absent on the license-expiration event, so branch on it and
+        fall back to the severity/title/text shape when it is missing
+    - vendor: health
+      type: integer
+      description: >-
+        composite health code on health-condition notifications - 0 green, 1
+        yellow, 2 red
+      ecs: null
+      status: unmapped
+      custom: cribl.stats.health
+      notes: >-
+        present on unhealthy-destination and source-volume conditions; alert
+        on the transition to 2 rather than averaging
+    - vendor: output
+      type: string
+      description: >-
+        Destination ID on unhealthy-destination, persistent-queue and
+        backpressure notifications
+      ecs: null
+      status: unmapped
+      custom: cribl.metric.output
+      notes: >-
+        same custom field as the metrics feed's output dimension, so a
+        notification and a throughput series join on it; the guard
+        destination's own output id is the one to watch hardest
+    - vendor: input
+      type: string
+      description: Source ID on source data-volume and no-data notifications
+      ecs: null
+      status: unmapped
+      custom: cribl.metric.input
+    - vendor: backpressure_type
+      type: integer
+      description: backpressure mode on a backpressure-activated notification - 1 Block, 2 Drop
+      ecs: null
+      status: unmapped
+      custom: cribl.backpressure.type
+      notes: >-
+        the Drop case is the one that ends in permanent loss on an
+        at-most-once route and deserves its own alert rather than sharing one
+        with Block
+    - vendor: usage
+      type: float
+      description: current persistent-queue utilization percentage on a queue-usage notification
+      ecs: null
+      status: unmapped
+      custom: cribl.pq.usage_percent
+    - vendor: usageThreshold
+      type: float
+      description: >-
+        the configured percentage threshold that the queue usage crossed to
+        fire the notification
+      ecs: null
+      status: unmapped
+      custom: cribl.pq.usage_threshold
+    - vendor: bytes
+      type: long
+      description: data received in the time bucket on a source data-volume notification
+      ecs: null
+      status: unmapped
+      custom: cribl.notification.bytes
+      notes: >-
+        the total.in_bytes value for the window; kept in a notification
+        namespace rather than the metric namespace since it is an alert
+        payload, not a counter sample
+    - vendor: timeWindow
+      type: string
+      description: the repeat interval configured on a persistent-queue-usage notification
+      ecs: null
+      status: unmapped
+      custom: cribl.notification.time_window
+      notes: >-
+        governs repeat cadence; use it to suppress per-interval floods and
+        alert only on the transition into the condition
+    - vendor: severity
+      type: enum
+      description: severity on a license-expiration notification - warn or fatal
+      ecs: log.level
+      status: partial
+      transform: >
+        only present on the license condition; warn maps directly but fatal
+        has no syslog equivalent and should also raise event.severity for
+        alert thresholds, since the fatal case ends in the pipeline stopping
+        rather than degrading
+    - vendor: title
+      type: string
+      description: expiration status message on a license notification
+      ecs: null
+      status: unmapped
+      custom: cribl.notification.title
+    - vendor: text
+      type: string
+      description: detailed license information on a license notification
+      ecs: null
+      status: unmapped
+      custom: cribl.notification.text
+      notes: >-
+        free text - cap and sanitize before it crosses the guard, since it is
+        one of only three unbounded keys on this feed
+    - vendor: _raw
+      type: string
+      description: human-readable message rendering of the notification
+      ecs: message
+      status: mapped
+      notes: >-
+        the only prose key on most conditions; cap it and strip control
+        characters, and drive event.action from the condition rather than from
+        substring tests on this text
+- id: audit
+  name: Leader audit log and configuration changes
+  description: |
+    Administrative change control on the pipeline itself, from the Leader Node's audit.log. The vendor documents this log as recording actions pertaining to files - create, update, commit, deploy, delete - which in Cribl terms means the full configuration lifecycle: editing a Route, Pipeline, Source or Destination, committing that change, and deploying the resulting config bundle to a Worker Group. A commit is documented as a point-in-time snapshot including the user who made the change and a description of the update.
+    This is the change-control record for the boundary itself. Someone who can edit a Route can silently stop a feed, redirect it, or strip fields from it before it crosses the guard, and no vendor device log anywhere else in the estate would show it - the missing data would simply look like a quiet source. Correlating a deploy here against a step change in the internal-metrics counters is the highest-value detection this technology supports.
+    HONESTY WARNING: Cribl publishes the existence, location and action vocabulary of audit.log but does NOT publish its per-record field schema. The five envelope fields below (time, cid, channel, level, message) are documented and are shared by every Cribl internal log; the context fields carrying the user, the changed object, the commit and the target Worker Group are PLACEHOLDER CONCEPT NAMES and are marked partial or unmapped throughout. Capture real audit.log records off the Leader and confirm every name below before building a parser or an alert on it.
+  event_categories:
+  - configuration
+  - iam
+  route:
+    direct:
+    - hop: cribl
+      location: core worker group, Elastic side
+      notes: >
+        Single-side by scope, and deliberately NOT given the guarded shape the
+        rest of this map now carries: this dataset is the high-side Leader's
+        audit trail, which the CSOC reads directly on the Elastic side. The
+        low-side Leader's own audit.log is a separate, currently uncollected
+        feed - nobody outside the low enclave can see who changed the low-side
+        pipeline, which is precisely the change most capable of making a feed
+        disappear without any other log recording it. That remains a coverage
+        finding to raise, not a parsing problem, and it is why no guard hop is
+        drawn here.
+    - hop: elastic
+      data_stream: logs-cribl_internal.audit
+  formats:
+  - format: json
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Cribl internal telemetry pipeline
+      notes: >
+        audit.log is a Leader-side file. The CriblLogs option on the Cribl
+        Internal Source forwards Worker Process logs only, so this dataset
+        cannot be collected the same way as the internal-logs dataset above -
+        it needs a File Monitor Source (or Cribl Edge on the Leader) pointed
+        at $CRIBL_HOME/log/audit.log, and the collection method must be
+        settled before any parsing work starts. Note also the 5 MB / five-file
+        rotation policy: a busy Leader can rotate an audit record out of
+        existence, so collection has to keep up.
+    fields:
+    - vendor: time
+      type: timestamp
+      description: ISO 8601 UTC time the Leader recorded the action
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: cid
+      type: string
+      description: 'identifier of the emitting process - api for the Leader''s API/main process'
+      ecs: service.node.name
+      status: partial
+      notes: documented envelope field; on Leader-side logs this is effectively a constant
+    - vendor: channel
+      type: string
+      description: name of the internal logger that emitted the record
+      ecs: log.logger
+      status: mapped
+    - vendor: level
+      type: enum
+      description: log severity - info, warn, error, debug, silly
+      ecs: log.level
+      status: mapped
+    - vendor: message
+      type: string
+      description: text describing the recorded action
+      ecs: message
+      status: partial
+      transform: >
+        the documented action vocabulary for this log is create, update,
+        commit, deploy and delete; until the record schema is confirmed,
+        assume the verb has to be recovered from this field and drive
+        event.action from a pinned lookup rather than substring matching
+    - vendor: user
+      type: string
+      description: account that performed the configuration action
+      ecs: user.name
+      status: partial
+      notes: >
+        the key name user is documented for Cribl's authentication records and
+        is the likely name here, but its presence on audit records is
+        unconfirmed. If audit records turn out not to carry an actor at all,
+        that is a finding to raise with the platform owner rather than
+        something to work around - an unattributable configuration change on
+        the boundary is not an acceptable state
+    - vendor: action
+      type: enum
+      description: the configuration operation performed - create, update, commit, deploy, delete
+      ecs: event.action
+      status: partial
+      notes: >
+        PLACEHOLDER key name; the vocabulary is vendor-documented but the
+        field carrying it is not. Preserve the raw token verbatim - commit and
+        deploy are distinct and consequential states, and collapsing them
+        loses the difference between a change that exists and a change that is
+        live on a Worker Group
+    - vendor: object
+      type: string
+      description: >-
+        configuration object the action was performed against - a Route,
+        Pipeline, Source, Destination or Pack
+      ecs: null
+      status: unmapped
+      custom: cribl.audit.target
+      notes: >
+        PLACEHOLDER key name. The object type matters more than the name for
+        alerting: a change to the guard Destination or to the Route feeding it
+        is the highest-value alert on this technology
+    - vendor: file
+      type: string
+      description: path of the configuration file the action touched
+      ecs: file.path
+      status: partial
+      notes: >
+        PLACEHOLDER key name, but plausible given the vendor describes this
+        log as recording actions pertaining to files; the config path is also
+        the most reliable way to derive the object type when no explicit type
+        field exists
+    - vendor: group
+      type: string
+      description: Worker Group or Fleet the change was made against or deployed to
+      ecs: null
+      status: unmapped
+      custom: cribl.worker_group
+      notes: >
+        PLACEHOLDER key name, same custom field as the metrics dataset so an
+        audit record and a throughput series join on one key. Without it a
+        deploy cannot be attributed to the low or the high tier, which makes
+        the deploy-versus-throughput correlation impossible
+    - vendor: commit
+      type: string
+      description: git commit identifier of the configuration snapshot
+      ecs: null
+      status: unmapped
+      custom: cribl.audit.commit_id
+      notes: >
+        PLACEHOLDER key name. Cribl's config management is git-backed and a
+        commit is documented as a point-in-time snapshot recording the user
+        and a description, so a commit hash is the natural join key between a
+        commit record and the deploy that later shipped it
+    - vendor: version
+      type: string
+      description: version of the config bundle deployed to the Worker Group
+      ecs: null
+      status: unmapped
+      custom: cribl.config.version
+      notes: >-
+        PLACEHOLDER key name; useful for proving which bundle a Worker Group
+        was actually running at a given time
+    - vendor: host
+      type: string
+      description: hostname of the Leader Node that recorded the action
+      ecs: host.name
+      status: mapped
+    recommendations:
+      direct:
+        parse_location: low
+        cribl: >
+          Settle collection before parsing: this file is not reachable through
+          CriblLogs, so stand up a File Monitor Source on the Leader against
+          $CRIBL_HOME/log/audit.log and confirm it keeps pace with the 5 MB /
+          five-file rotation, since a rotated-away audit record is gone
+          permanently. Once records are in hand, confirm the real context key
+          names against them - every field below except the five-key envelope
+          is a placeholder - then map the create / update / commit / deploy /
+          delete verb onto event.action while preserving the raw token, and
+          derive event.outcome from whatever the records actually carry rather
+          than assuming success, because a failed or rejected deploy is the
+          event most worth seeing. Stamp the target Worker Group on every
+          record so a change can be attributed to a tier, and mask any
+          configuration value that could carry a secret before the record
+          leaves the Leader.
+        elastic: >
+          Run a custom logs-cribl_internal.audit ingest pipeline with
+          custom-namespace keyword mappings for cribl.audit.target,
+          cribl.audit.commit_id, cribl.config.version and cribl.worker_group,
+          and set event.category to configuration and iam consistently so the
+          record lands in both the change-control and the identity views. The
+          detection to build the pipeline around is correlation rather than
+          pattern matching: join a deploy on this dataset against the
+          internal-metrics counters for the same Worker Group and alert when a
+          deploy is followed by a step change in total.in_events,
+          total.out_events or total.dropped_events for any input or output -
+          that is the signature of a config change silently killing or
+          reshaping a feed. Alert separately on any change touching the guard
+          destination or its Route, and on deploys outside a change window.
+  - format: api-pull
+    enable: >
+      The configuration change history that audit.log records as a flat log is
+      also reachable structurally through Cribl's config version-control API,
+      which is git-backed. POST /api/v1/version/commit takes a message (and,
+      in a distributed deployment, a group and an optional files array to
+      commit selectively) and returns a commit object; PATCH
+      /api/v1/products/${product}/groups/${groupId}/deploy takes the commit
+      hash as version and ships that bundle to a Worker Group, returning the
+      deployed group object. All of these are authenticated calls requiring a
+      Bearer token from POST /api/v1/auth/login whose credential holds the
+      necessary permissions. A collector can drive or read these endpoints to
+      capture the same create / commit / deploy lifecycle the audit.log
+      documents - as structured git metadata (branch, commit hash, the
+      changed-file diff, the deployed config version and target group) rather
+      than as free-text log lines - which is a materially better-typed feed
+      for the deploy-versus-throughput correlation this dataset exists to
+      support.
+    references:
+    - https://docs.cribl.io/cribl-as-code/commit-deploy/
+    - https://docs.cribl.io/stream/version-control/
+    - https://docs.cribl.io/api-reference/
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        Cribl REST/API Collector against the version-control endpoints +
+        reshape pipeline feeding logs-cribl_internal.audit
+      notes: >
+        No integration or pack parses these responses - a REST collector plus
+        a hand-built pipeline handles them. Prefer this API over tailing
+        audit.log where the structured diff matters: the commit response
+        carries an explicit changed-file inventory (files.modified,
+        files.created) and a summary of insertions and deletions that the log
+        line does not, and the deploy response carries the exact configVersion
+        a Worker Group is running, which is the cleanest possible key for
+        proving which bundle was live at a given time. One honest gap drives
+        the pipeline design: the documented commit response object surfaces
+        the structural diff (branch, commit, root, summary, files) but not the
+        acting user or a commit timestamp - those live in the underlying git
+        metadata - so actor attribution and event time still have to come from
+        audit.log or a direct git read, and this API cannot answer who made a
+        change on its own.
+    recommendations:
+      direct:
+        parse_location: low
+        cribl: >
+          This dataset is high-side-Leader-scoped and does not cross the CDS,
+          so the collector runs inside the enclave against the Leader's
+          version-control API on a schedule, authenticated with a scoped
+          Bearer token. Pull the commit and deploy objects, map the create /
+          commit / deploy lifecycle onto event.action while preserving the raw
+          verb, and derive event.outcome from whether the call succeeded
+          rather than assuming success, because a failed or rejected deploy is
+          the event most worth seeing. Stamp the target Worker Group
+          (cribl.worker_group) on every record so a change is attributable to
+          a tier, and mask any configuration content: the changed-file paths
+          are safe to carry but the file contents behind them can hold secrets
+          and must never be pulled into the record. Because the API omits the
+          actor and the commit time, pair this pull with audit.log collection
+          rather than treating it as a replacement - the API gives the
+          structured diff, the log gives who and when.
+        elastic: >
+          Run a custom logs-cribl_internal.audit ingest pipeline with
+          custom-namespace keyword mappings for cribl.audit.commit_id,
+          cribl.config.version, cribl.audit.branch and cribl.worker_group, and
+          set event.category to configuration and iam so the record lands in
+          both the change-control and identity views. Build the pipeline
+          around correlation, not pattern matching: join a deploy's
+          configVersion and worker group against the internal-metrics counters
+          for the same group and alert when a deploy is followed by a step
+          change in total.in_events, total.out_events or total.dropped_events
+          for any input or output - the signature of a config change silently
+          killing or reshaping a feed. Alert separately on any commit whose
+          files.modified touches the guard Destination or its Route. Because
+          the API record carries no actor, an alert built on it alone cannot
+          answer who deployed; enrich from the audit.log feed on commit_id
+          before the record is considered complete.
+    fields:
+    - vendor: commit
+      type: string
+      description: >-
+        git commit hash identifying the configuration snapshot, returned by
+        the commit call and echoed as the deploy version
+      ecs: null
+      status: unmapped
+      custom: cribl.audit.commit_id
+      notes: >-
+        the natural join key between a commit record and the deploy that later
+        ships it, and between this API feed and the audit.log feed that
+        carries the actor
+    - vendor: branch
+      type: string
+      description: git branch the commit was made on
+      ecs: null
+      status: unmapped
+      custom: cribl.audit.branch
+    - vendor: root
+      type: boolean
+      description: flag indicating whether the commit is the repository root commit
+      ecs: null
+      status: unmapped
+      custom: cribl.audit.root_commit
+    - vendor: message
+      type: string
+      description: the descriptive commit message supplied on the commit call
+      ecs: message
+      status: mapped
+      notes: >-
+        the human description of the change; it is the closest thing this API
+        gives to intent, so preserve it verbatim even though it is
+        operator-supplied and unvalidated
+    - vendor: summary.changes
+      type: integer
+      description: count of files changed in the commit
+      ecs: null
+      status: unmapped
+      custom: cribl.audit.changed_files
+    - vendor: summary.insertions
+      type: integer
+      description: 'count of inserted lines across the commit''s diff'
+      ecs: null
+      status: unmapped
+      custom: cribl.audit.insertions
+    - vendor: summary.deletions
+      type: integer
+      description: 'count of deleted lines across the commit''s diff'
+      ecs: null
+      status: unmapped
+      custom: cribl.audit.deletions
+      notes: >-
+        a large deletion count on a commit touching a Route or Destination is
+        a cheap heuristic for a change that removed rather than added feed
+        handling
+    - vendor: files.modified
+      type: string
+      description: array of paths of existing configuration files the commit modified
+      ecs: null
+      status: unmapped
+      custom: cribl.audit.files_modified
+      notes: >
+        the config path is the most reliable way to derive the object type
+        when no explicit type field exists; a path under a guard Destination
+        or its Route is the highest-value alert on this technology. Carry the
+        paths, never the file contents, which can hold credentials
+    - vendor: files.created
+      type: string
+      description: array of paths of new configuration files the commit created
+      ecs: null
+      status: unmapped
+      custom: cribl.audit.files_created
+    - vendor: version
+      type: string
+      description: commit hash supplied to the deploy call as the bundle to ship to a Worker Group
+      ecs: null
+      status: unmapped
+      custom: cribl.config.version
+      notes: >-
+        proves which config bundle a Worker Group was told to run; equals the
+        commit hash, so it joins a deploy back to its commit record
+    - vendor: id
+      type: string
+      description: identifier of the Worker Group the deploy targeted, from the deploy response
+      ecs: null
+      status: unmapped
+      custom: cribl.worker_group
+      notes: >-
+        the tier a change was deployed to; without it a deploy cannot be
+        attributed to the low or high tier, which makes the
+        deploy-versus-throughput correlation impossible
+    - vendor: description
+      type: string
+      description: description of the Worker Group from the deploy response
+      ecs: null
+      status: unmapped
+      custom: cribl.audit.group_description
+    - vendor: type
+      type: string
+      description: product type of the deployed group, e.g. stream
+      ecs: service.type
+      status: partial
+      notes: >-
+        effectively a constant on a Stream deployment, useful only as a
+        routing discriminator rather than per-record information
+    - vendor: configVersion
+      type: string
+      description: the deployed commit hash the group is now running, from the deploy response
+      ecs: null
+      status: unmapped
+      custom: cribl.config.version
+      notes: >
+        same custom field as version because they are the same concept from
+        two response shapes; on ingest, source it from whichever response is
+        present and do not emit both keys onto one document
+    - vendor: tags
+      type: string
+      description: tags associated with the deployed group
+      ecs: tags
+      status: partial
+      notes: >-
+        operator-assigned group tags; map to the ECS tags array but confirm
+        they are a flat string array in captured responses before relying on
+        the mapping
+    - vendor: lookupDeployments
+      type: string
+      description: array of lookup deployments included with the group deploy
+      ecs: null
+      status: unmapped
+      custom: cribl.audit.lookup_deployments
+      notes: >-
+        records which lookup files rode along with the config bundle; low
+        alerting value but part of the deploy provenance
+- id: access
+  name: API, UI access and authentication
+  description: |
+    Who touched the pipeline's control plane. Three related Leader-side logs: access.log records API calls (the vendor example is GET /api/v1/version/info), ui-access.log records interactions with UI components expressed as URLs (the vendor examples are /settings/apidocs and /dashboard/logs), and the authentication events themselves are written into cribl.log by the API process with cid api and channel cribl.
+    The authentication records ARE vendor-documented, with published sample event series: a successful login emits message "Successful login" with user and provider, a failure emits level warn and message "Failed login" with the provider error nested under details, and local-fallback behaviour emits its own intermediate records. There is no outcome field - success and failure are distinguishable only by the message token and the level - which makes deriving event.outcome the central parsing task on this dataset.
+    Field names for access.log and ui-access.log themselves are NOT published; the HTTP method and path fields below are marked partial accordingly and must be confirmed against captured records.
+  event_categories:
+  - authentication
+  - web
+  route:
+    direct:
+    - hop: cribl
+      location: core worker group, Elastic side
+      notes: >
+        Single-side by scope, on the same basis as the audit dataset: the
+        Leader in scope here is the high-side one, so no guard hop is drawn.
+        The low-side Leader's access and authentication records are not
+        collected today; that unmonitored low-side control plane is the same
+        coverage gap the audit dataset raises, one step earlier in the kill
+        chain.
+    - hop: elastic
+      data_stream: logs-cribl_internal.access
+  formats:
+  - format: json
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Cribl internal telemetry pipeline
+      notes: >
+        Leader-side files again, so the same File Monitor Source (or Cribl
+        Edge on the Leader) collection question applies as for the audit
+        dataset, across $CRIBL_HOME/log/access.log,
+        $CRIBL_HOME/log/ui-access.log and $CRIBL_HOME/log/cribl.log. The three
+        files share the JSON envelope but not their context keys, so they need
+        three branches off one pipeline rather than one grammar, and
+        log.file.path is the cleanest discriminator between them.
+    fields:
+    - vendor: time
+      type: timestamp
+      description: ISO 8601 UTC time the record was written
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: cid
+      type: string
+      description: >-
+        identifier of the emitting process - api for the Leader API process
+        that handles authentication and API calls
+      ecs: service.node.name
+      status: partial
+      notes: >-
+        documented as a constant api on these records, so it is a useful
+        filter but carries no per-record information
+    - vendor: channel
+      type: string
+      description: >-
+        internal logger name - cribl for the core authentication records,
+        LDAPMapper for external group resolution
+      ecs: log.logger
+      status: mapped
+      notes: >
+        the LDAPMapper channel is emitted at debug level, so external group
+        resolution is invisible at the default log level - worth knowing
+        before concluding that group mapping is not happening
+    - vendor: level
+      type: enum
+      description: >-
+        log severity - info on successful login, warn on failed login and on
+        provider errors
+      ecs: log.level
+      status: mapped
+      notes: >-
+        level is half of the outcome signal on this dataset, since no outcome
+        field exists
+    - vendor: message
+      type: string
+      description: >-
+        fixed record-type token - "Successful login", "Failed login",
+        "Attempting fallback to local authentication", "Authentication
+        Provider Error", "Running LDAP search"
+      ecs: event.action
+      status: partial
+      transform: >
+        the vendor publishes these tokens verbatim in its login-scenario
+        samples; pin them to a lookup that sets both event.action and
+        event.outcome, because the pair (message, level) is the only
+        success/failure signal in the record and a substring match on "login"
+        will match the failure and the fallback record alike
+    - vendor: user
+      type: string
+      description: account name that authenticated, on the login records
+      ecs: user.name
+      status: partial
+      notes: >
+        type collision in the same log stream - user is a plain string on the
+        "Successful login" and "Failed login" records but a nested object
+        carrying dn and memberOf on the "LDAP user search results" record.
+        Elastic will reject the second shape once the first has been
+        dynamically mapped, so the pipeline must normalize this before ingest
+        rather than after the first rejection
+    - vendor: username
+      type: string
+      description: >-
+        account name on the LDAP user-search records, emitted as REDACTED in
+        the vendor samples
+      ecs: user.name
+      status: partial
+      notes: >
+        a second key for the same concept on a different record type; the
+        vendor's own sample shows it redacted, so confirm whether the
+        deployment emits a real value before relying on it for correlation
+    - vendor: provider
+      type: string
+      description: >-
+        authentication provider that served the request - local, or an
+        ldap:<host>:<port> triple
+      ecs: null
+      status: unmapped
+      custom: cribl.auth.provider
+      notes: >
+        no ECS field models the authenticating provider identity in 9.4. The
+        value packs a scheme, hostname and port into one string, so split it
+        low-side and keep the host separately if provider-host correlation is
+        wanted; a login against local when an LDAP provider is configured is a
+        fallback worth alerting on
+    - vendor: user.dn
+      type: string
+      description: distinguished name of the directory account, on the LDAP search-result records
+      ecs: null
+      status: unmapped
+      custom: cribl.user.dn
+      notes: >
+        ECS 9.4 has no user.dn field; user.id is the nearest GA home but it
+        models an identifier rather than a directory path, so this stays
+        custom. Treat the value as disclosive - a DN reveals directory
+        structure - and confirm it may leave the enclave
+    - vendor: groups
+      type: string
+      description: >-
+        external directory groups resolved for the account, emitted as an
+        array on the LDAPMapper records
+      ecs: user.roles
+      status: partial
+      notes: >
+        these are the groups that get mapped onto Cribl Teams and Roles, so
+        user.roles is the right shape, but the mapping is one step removed - a
+        directory group is not yet an effective Cribl permission. The vendor
+        documents a failure mode where the array resolves to [null] or empty,
+        which is worth alerting on because it silently strips a user's
+        privileges
+    - vendor: details.message
+      type: string
+      description: >-
+        provider error text on a failed login, e.g. the raw LDAP
+        AcceptSecurityContext error
+      ecs: error.message
+      status: mapped
+      notes: >
+        carries the LDAP sub-status token (the data 52e style code) that
+        distinguishes a wrong password from a disabled or expired account -
+        extract it into a short keyed field rather than leaving it buried in
+        free text
+    - vendor: details.stack
+      type: string
+      description: full stack trace of the provider error
+      ecs: error.stack_trace
+      status: partial
+      notes: >
+        multi-kilobyte and, per the vendor's own samples, containing literal
+        NUL characters (\u0000 in the vendor sample) in the embedded LDAP
+        error - the most content-filter-hostile and parser-hostile value on
+        this technology. Cap and sanitize it before it goes anywhere
+    - vendor: reason
+      type: string
+      description: >-
+        why a fallback to local authentication was attempted - "failed login"
+        or "provider error"
+      ecs: event.reason
+      status: mapped
+      notes: >
+        only present on the fallback records; the provider error case is the
+        more serious of the two because it means the directory itself is
+        unreachable and every subsequent login is being served locally
+    - vendor: method
+      type: string
+      description: HTTP method of the API call, from access.log
+      ecs: http.request.method
+      status: partial
+      notes: >
+        PLACEHOLDER key name - the vendor documents access.log's content by
+        example (GET /api/v1/version/info) but does not publish its record
+        schema, so confirm whether the method and path are separate keys or
+        one combined string before parsing
+    - vendor: url
+      type: string
+      description: >-
+        request path of the API call or the UI component URL, e.g.
+        /api/v1/version/info, /settings/apidocs, /dashboard/logs
+      ecs: url.path
+      status: partial
+      notes: >
+        PLACEHOLDER key name, same caveat as method. url.path rather than
+        url.original because these are documented as paths without a scheme or
+        host; API paths under /api/v1/ that mutate configuration are the ones
+        to cross-check against the audit dataset
+    - vendor: host
+      type: string
+      description: hostname of the Leader Node that recorded the request
+      ecs: host.name
+      status: mapped
+    - vendor: log.file.path
+      type: string
+      description: >-
+        source file the record was collected from - access.log, ui-access.log
+        or cribl.log
+      ecs: log.file.path
+      status: mapped
+      notes: >
+        not a vendor key inside the record but the collection-time attribute
+        of the File Monitor Source; it is the cleanest discriminator between
+        the three files this dataset merges and should be set deliberately
+        rather than left to chance
+    recommendations:
+      direct:
+        parse_location: low
+        cribl: >
+          Branch one pipeline three ways on log.file.path - API access, UI
+          access and authentication events have the same envelope and
+          different context keys - and derive event.outcome from the message
+          token and level pair, since these records carry no outcome field at
+          all and "Successful login" versus "Failed login" is the only signal.
+          Sanitize hard on the way in: the authentication failure records
+          embed multi-kilobyte LDAP stack traces containing literal NUL
+          characters (\u0000 in the vendor sample), which will break naive
+          parsers and downstream consumers, so strip control characters, cap
+          the stack trace to a flagged length and keep the LDAP error code
+          (the data 52e style token distinguishing bad password from disabled
+          account) as a short extracted field rather than relying on the blob.
+          Resolve the user key's type collision before it reaches Elastic - it
+          is a string on login records and an object with dn and memberOf on
+          LDAP search records - and split the provider value's embedded host
+          and port.
+        elastic: >
+          Run a custom logs-cribl_internal.access ingest pipeline and map
+          cribl.auth.provider, cribl.user.dn and cribl.auth.error_code as
+          keyword, with user.name explicitly typed so the string-versus-object
+          collision on the vendor user key can never reach a mapping - that
+          single conflict will otherwise reject every LDAP search record in
+          the batch and take the successful logins down with them. Set
+          event.category to authentication for the login records and web for
+          the API and UI access records rather than tagging the whole dataset
+          uniformly, since the two halves answer different questions. The
+          alerts worth building are failed logins by source against the local
+          fallback records (a fallback to local authentication after a
+          provider error is a privileged-access path that should be rare and
+          loud), and any API access to configuration endpoints that has no
+          corresponding record on the audit dataset.

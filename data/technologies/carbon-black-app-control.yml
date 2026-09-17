@@ -1,0 +1,760 @@
+id: carbon-black-app-control
+name: Carbon Black App Control
+vendor: Broadcom
+versions: >-
+  Carbon Black App Control 8.7-8.12 (the product formerly sold as Bit9 Parity,
+  then Carbon Black Protection)
+draft: true
+references:
+- >-
+  https://techdocs.broadcom.com/content/dam/broadcom/techdocs/us/en/dita/carbon-black/carbon-black-app-control/Legacy-PDFs/PDFs/Carbon%20Black%20App%20Control%208.8%20Events-Guide.pdf
+- >-
+  https://techdocs.broadcom.com/us/en/carbon-black/app-control/carbon-black-app-control/8-11-4/app-control-events-guide-tile/GUID-4AC0C06A-2B54-43D7-8B8F-F902AA30A5D2-en/GUID-FB44DB5F-B6C1-4C30-8C43-39FD0AB9E820-en.html
+- >-
+  https://techdocs.broadcom.com/us/en/carbon-black/app-control/carbon-black-app-control/8-10-4/app-control-user-guide_tile/GUID-67590BCA-1415-4586-92D7-D9672C69F670-en/GUID-670A2774-0CEF-407B-8AE2-313A75FA7352-en/GUID-0DB65E05-937D-4D24-BDD1-E18AD684BB6C-en/GUID-610CCD1E-640A-43B3-BD7F-CC49213117D8-en.html
+datasets:
+- id: policy-enforcement
+  name: Policy enforcement event
+  description: >
+    What the agent allowed or blocked: execution blocks on unapproved or
+    banned files, write and read blocks from custom, registry, device and
+    memory rules, and the approvals granted by an Updater or a trusted user.
+    This is the alerting surface, and in a lockdown-mode estate it is also the
+    change-control record - a block here is usually an operational failure to
+    approve software, not an attack, and separating the two is the main
+    analytic problem this dataset poses.
+  event_categories:
+  - malware
+  - process
+  - file
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Receives CEF over syslog from the App Control Server. File paths and
+        command context are the free-text fields a content-inspection policy
+        will reject or truncate. CEF is the only App Control syslog format
+        whose field mapping the vendor documents completely, including the
+        nine named custom extensions that carry the product-specific security
+        data. The Basic (RFC3164) and Enhanced (RFC5424) formats carry a
+        message string without that breakdown, and LEEF exists for QRadar.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes. Volume is modest but bursty: a policy change or
+        a software deployment can turn a quiet feed into thousands of blocks
+        in minutes, which is a guard throughput question rather than an
+        Elastic storage one.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-carbon_black_app_control.enforcement
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Receives CEF over syslog from the App Control Server.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-carbon_black_app_control.enforcement
+  formats:
+  - format: syslog-cef
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: Cribl CEF parser plus an App Control custom-extension pipeline
+      notes: >
+        There is no Elastic integration for App Control. The Cribl CEF parser
+        recovers the header and the standard extensions; a second pipeline
+        stage renames the deviceCustomString/FloatingPoint/FlexString slots
+        using their emitted labels. Do not hard-code the slot numbers without
+        asserting the label - the mapping is stable in the documentation but
+        the labels are what make a record self-describing, and a future
+        release adding an extension could renumber them.
+    fields:
+    - vendor: externalId
+      type: integer
+      description: unique auto-incremented id of the App Control event
+      ecs: event.id
+      status: partial
+      transform: cast to string
+      notes: >-
+        server-assigned and monotonic, so it doubles as the resume point for a
+        gap-free replay; ECS types event.id as keyword, so the cast is
+        required
+    - vendor: DeviceEventCategory
+      type: string
+      description: >-
+        the App Control event type - Policy Enforcement, Discovery, Policy
+        Management, Server Management, Session Management, Computer Management
+      ecs: event.category
+      status: partial
+      transform: map the vendor taxonomy to the ECS event.category vocabulary
+      notes: >
+        the routing key for this whole technology. Every App Control event
+        rides the same CEF envelope, so the datasets here are a routing
+        decision on this field rather than different wire formats - which is
+        why the envelope rows repeat across them.
+    - vendor: Name
+      type: string
+      description: CEF header Name - the event subtype, e.g. "Execution block (unapproved file)"
+      ecs: event.action
+      status: mapped
+      notes: >-
+        the most specific statement of what happened; the subtype vocabulary
+        is large and is what detections should key on rather than the coarse
+        DeviceEventCategory
+    - vendor: SignatureID
+      type: integer
+      description: CEF header signature id - the numeric event subtype
+      ecs: event.code
+      status: partial
+      transform: cast to string
+      notes: >-
+        the stable form of Name; subtype wording has changed across releases
+        and the number has not
+    - vendor: Severity
+      type: integer
+      description: CEF header severity, 2 (least) to 9 (most)
+      ecs: event.severity
+      status: partial
+      transform: >-
+        already inverted by the server - CEF severity is 9 minus the App
+        Control severity; do not invert again
+      notes: >
+        App Control's native scale runs 7 (least severe) to 0 (most severe),
+        the opposite direction from CEF and from every other feed here. The
+        server does the inversion when it writes CEF, so the value on the wire
+        is already ascending-is-worse. A pipeline that "corrects" it will
+        silently rank every block as harmless.
+    - vendor: startTime
+      type: timestamp
+      description: when the event was created on the endpoint, UTC
+      ecs: '@timestamp'
+      status: mapped
+      notes: >-
+        endpoint time, not server time - preferred over ReceiptTime because an
+        agent that was offline reports late and the endpoint clock is what
+        orders the behaviour
+    - vendor: ReceiptTime
+      type: timestamp
+      description: when the App Control Server received the event, UTC
+      ecs: event.ingested
+      status: mapped
+      notes: >-
+        the gap between this and startTime is agent reporting lag and is worth
+        alerting on; it is not the Elastic ingest time
+    - vendor: Message
+      type: string
+      description: full text description of the event
+      ecs: message
+      status: mapped
+    - vendor: deviceHostName
+      type: string
+      description: hostname of the App Control Server
+      ecs: observer.name
+      status: partial
+      notes: >-
+        can be an IP address rather than a name, depending on what was entered
+        at server install
+    - vendor: destinationHostName
+      type: string
+      description: hostname of the endpoint that generated the event
+      ecs: host.hostname
+      status: mapped
+      notes: >-
+        CEF calls the endpoint the destination throughout this product; it is
+        the subject of the event, not a network peer
+    - vendor: destinationAddress
+      type: ip
+      description: IPv4 address of the endpoint
+      ecs: host.ip
+      status: partial
+      notes: >-
+        context-dependent and absent on server-side events; not source.ip or
+        destination.ip, because no network flow is being described
+    - vendor: deviceCustomIPv6Address3
+      type: ip
+      description: IPv6 address of the endpoint
+      ecs: host.ip
+      status: partial
+      notes: >-
+        shares host.ip with destinationAddress, which ECS allows as an array;
+        the CEF slot number carries no meaning
+    - vendor: destinationUserName
+      type: string
+      description: user that generated the event
+      ecs: user.name
+      status: partial
+      transform: split DOMAIN\user into user.domain and user.name
+      notes: >-
+        commonly NTAUTHORITY\SYSTEM for enforcement on service-launched
+        processes, which is a machine account rather than a person
+    - vendor: filePath
+      type: string
+      description: full pathname of the file that generated the event
+      ecs: file.path
+      status: mapped
+    - vendor: Fileld
+      type: integer
+      description: unique auto-incremented id of the file
+      ecs: null
+      status: partial
+      custom: carbon_black.file.id
+      transform: cast to string
+      notes: >
+        spelled Fileld in the vendor mapping table - a lowercase L where an
+        uppercase I belongs (File Id). Recorded as published because that is
+        what a parser must match; confirm against a live record before
+        treating the typo as fixed in a later release.
+    - vendor: deviceCustomString1
+      type: string
+      description: root hash of the file, labelled rootHash
+      ecs: file.hash.sha256
+      status: partial
+      notes: >-
+        App Control's root hash is SHA-256 on current releases but the field
+        is not self-describing; verify the digest length on a live record
+        before committing the mapping
+    - vendor: deviceCustomString2
+      type: string
+      description: installer filename of the file, labelled installerFilename
+      ecs: null
+      status: unmapped
+      custom: carbon_black.installer.name
+      notes: >-
+        the provenance chain App Control uses to decide trust - which
+        installer wrote this file - and the reason an allow-listing product
+        can approve by lineage rather than by hash
+    - vendor: deviceCustomString3
+      type: string
+      description: App Control policy applied to the endpoint, labelled policy
+      ecs: null
+      status: unmapped
+      custom: carbon_black.policy.name
+      notes: >-
+        the enforcement level the endpoint was in; the same action means
+        different things in a low-enforcement policy and a lockdown one
+    - vendor: deviceCustomFloatingPoint1
+      type: float
+      description: file trust from Carbon Black File Reputation, labelled fileTrust
+      ecs: null
+      status: unmapped
+      custom: carbon_black.file.trust
+      notes: >
+        -2 means the reputation lookup is pending and -1 means unknown; only
+        0-10 is a trust score. Those sentinels share the field with real
+        values, so any aggregation has to exclude negatives first - a mean
+        over the raw field is poisoned by every un-looked-up file.
+    - vendor: deviceCustomFlexString1
+      type: string
+      description: file threat from Carbon Black File Reputation, labelled fileThreat
+      ecs: null
+      status: unmapped
+      custom: carbon_black.file.threat
+      notes: >-
+        the vendor emits the display strings "pending", "unknown", "0 - No
+        threat", "1 - Potential risk" and "2 - Malicious" verbatim, number and
+        dash included, so a match on "2" alone will not fire
+    - vendor: deviceCustomFloatingPoint2
+      type: float
+      description: parent process trust, labelled processTrust
+      ecs: null
+      status: unmapped
+      custom: carbon_black.process.trust
+      notes: same -2 pending and -1 unknown sentinels as fileTrust
+    - vendor: deviceCustomFlexString2
+      type: string
+      description: parent process threat, labelled processThreat
+      ecs: null
+      status: unmapped
+      custom: carbon_black.process.threat
+      notes: same display-string vocabulary as fileThreat
+    - vendor: deviceCustomString4
+      type: string
+      description: name of the ban that blocked the file, labelled banName
+      ecs: rule.name
+      status: partial
+      notes: >
+        the vendor documents that some bans are unnamed, so this is absent on
+        a real subset of blocks. A detection that groups by rule.name will
+        silently drop those; group by SignatureID and treat this as a label.
+    - vendor: deviceCustomString5
+      type: string
+      description: name of the rule associated with the event, labelled ruleName
+      ecs: rule.name
+      status: partial
+      notes: >-
+        shares rule.name with banName and the two are mutually exclusive in
+        practice - a block comes from a ban or from a custom rule - but
+        nothing in the format guarantees it, so the pipeline must pick one
+        deterministically rather than letting the last writer win
+    - vendor: deviceCustomString6
+      type: string
+      description: name of the Updater associated with the event, labelled updaterName
+      ecs: null
+      status: unmapped
+      custom: carbon_black.updater.name
+      notes: >-
+        an Updater is a trusted installer whose writes are auto-approved; when
+        this is set, an approval was granted by provenance rather than by an
+        explicit decision, which is the thing to review when a supply-chain
+        question is asked
+- id: discovery
+  name: Discovery and reputation event
+  description: >
+    New things appearing: files never seen on this network before, devices
+    attached, and the verdicts Carbon Black File Reputation returns on them.
+    Distinct from enforcement because nothing was blocked - these are the
+    events that tell you what arrived, which is what a hunt starts from and
+    what an approval workflow queues on.
+  event_categories:
+  - file
+  - malware
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Receives CEF over syslog from the App Control Server. New-file
+        discovery is the highest-volume App Control feed in an estate that is
+        not yet fully approved. CEF rather than the Basic, Enhanced or LEEF
+        alternatives, for the reason given on the policy-enforcement dataset:
+        it is the only one whose custom extensions the vendor documents.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes. First-execution-on-network events carry full
+        file paths from user directories, which is the content a filter is
+        most likely to object to.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-carbon_black_app_control.discovery
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Receives CEF over syslog from the App Control Server.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-carbon_black_app_control.discovery
+  formats:
+  - format: syslog-cef
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: Cribl CEF parser plus an App Control custom-extension pipeline
+      notes: >
+        There is no Elastic integration for App Control. The Cribl CEF parser
+        recovers the header and the standard extensions; a second pipeline
+        stage renames the deviceCustomString/FloatingPoint/FlexString slots
+        using their emitted labels. Do not hard-code the slot numbers without
+        asserting the label - the mapping is stable in the documentation but
+        the labels are what make a record self-describing, and a future
+        release adding an extension could renumber them.
+    fields:
+    - vendor: externalId
+      type: integer
+      description: unique auto-incremented id of the App Control event
+      ecs: event.id
+      status: partial
+      transform: cast to string
+      notes: >-
+        server-assigned and monotonic, so it doubles as the resume point for a
+        gap-free replay; ECS types event.id as keyword, so the cast is
+        required
+    - vendor: DeviceEventCategory
+      type: string
+      description: >-
+        the App Control event type - Policy Enforcement, Discovery, Policy
+        Management, Server Management, Session Management, Computer Management
+      ecs: event.category
+      status: partial
+      transform: map the vendor taxonomy to the ECS event.category vocabulary
+      notes: >
+        the routing key for this whole technology. Every App Control event
+        rides the same CEF envelope, so the datasets here are a routing
+        decision on this field rather than different wire formats - which is
+        why the envelope rows repeat across them.
+    - vendor: Name
+      type: string
+      description: CEF header Name - the event subtype, e.g. "Execution block (unapproved file)"
+      ecs: event.action
+      status: mapped
+      notes: >-
+        the most specific statement of what happened; the subtype vocabulary
+        is large and is what detections should key on rather than the coarse
+        DeviceEventCategory
+    - vendor: SignatureID
+      type: integer
+      description: CEF header signature id - the numeric event subtype
+      ecs: event.code
+      status: partial
+      transform: cast to string
+      notes: >-
+        the stable form of Name; subtype wording has changed across releases
+        and the number has not
+    - vendor: Severity
+      type: integer
+      description: CEF header severity, 2 (least) to 9 (most)
+      ecs: event.severity
+      status: partial
+      transform: >-
+        already inverted by the server - CEF severity is 9 minus the App
+        Control severity; do not invert again
+      notes: >
+        App Control's native scale runs 7 (least severe) to 0 (most severe),
+        the opposite direction from CEF and from every other feed here. The
+        server does the inversion when it writes CEF, so the value on the wire
+        is already ascending-is-worse. A pipeline that "corrects" it will
+        silently rank every block as harmless.
+    - vendor: startTime
+      type: timestamp
+      description: when the event was created on the endpoint, UTC
+      ecs: '@timestamp'
+      status: mapped
+      notes: >-
+        endpoint time, not server time - preferred over ReceiptTime because an
+        agent that was offline reports late and the endpoint clock is what
+        orders the behaviour
+    - vendor: ReceiptTime
+      type: timestamp
+      description: when the App Control Server received the event, UTC
+      ecs: event.ingested
+      status: mapped
+      notes: >-
+        the gap between this and startTime is agent reporting lag and is worth
+        alerting on; it is not the Elastic ingest time
+    - vendor: Message
+      type: string
+      description: full text description of the event
+      ecs: message
+      status: mapped
+    - vendor: deviceHostName
+      type: string
+      description: hostname of the App Control Server
+      ecs: observer.name
+      status: partial
+      notes: >-
+        can be an IP address rather than a name, depending on what was entered
+        at server install
+    - vendor: destinationHostName
+      type: string
+      description: hostname of the endpoint that generated the event
+      ecs: host.hostname
+      status: mapped
+      notes: >-
+        CEF calls the endpoint the destination throughout this product; it is
+        the subject of the event, not a network peer
+    - vendor: destinationAddress
+      type: ip
+      description: IPv4 address of the endpoint
+      ecs: host.ip
+      status: partial
+      notes: >-
+        context-dependent and absent on server-side events; not source.ip or
+        destination.ip, because no network flow is being described
+    - vendor: deviceCustomIPv6Address3
+      type: ip
+      description: IPv6 address of the endpoint
+      ecs: host.ip
+      status: partial
+      notes: >-
+        shares host.ip with destinationAddress, which ECS allows as an array;
+        the CEF slot number carries no meaning
+    - vendor: destinationUserName
+      type: string
+      description: user that generated the event
+      ecs: user.name
+      status: partial
+      transform: split DOMAIN\user into user.domain and user.name
+      notes: >-
+        commonly NTAUTHORITY\SYSTEM for enforcement on service-launched
+        processes, which is a machine account rather than a person
+    - vendor: filePath
+      type: string
+      description: full pathname of the file that generated the event
+      ecs: file.path
+      status: mapped
+    - vendor: Fileld
+      type: integer
+      description: unique auto-incremented id of the file
+      ecs: null
+      status: partial
+      custom: carbon_black.file.id
+      transform: cast to string
+      notes: >
+        spelled Fileld in the vendor mapping table - a lowercase L where an
+        uppercase I belongs (File Id). Recorded as published because that is
+        what a parser must match; confirm against a live record before
+        treating the typo as fixed in a later release.
+    - vendor: deviceCustomString1
+      type: string
+      description: root hash of the file, labelled rootHash
+      ecs: file.hash.sha256
+      status: partial
+      notes: >-
+        App Control's root hash is SHA-256 on current releases but the field
+        is not self-describing; verify the digest length on a live record
+        before committing the mapping
+    - vendor: deviceCustomString2
+      type: string
+      description: installer filename of the file, labelled installerFilename
+      ecs: null
+      status: unmapped
+      custom: carbon_black.installer.name
+      notes: >-
+        the provenance chain App Control uses to decide trust - which
+        installer wrote this file - and the reason an allow-listing product
+        can approve by lineage rather than by hash
+    - vendor: deviceCustomString3
+      type: string
+      description: App Control policy applied to the endpoint, labelled policy
+      ecs: null
+      status: unmapped
+      custom: carbon_black.policy.name
+      notes: >-
+        the enforcement level the endpoint was in; the same action means
+        different things in a low-enforcement policy and a lockdown one
+    - vendor: deviceCustomFloatingPoint1
+      type: float
+      description: file trust from Carbon Black File Reputation, labelled fileTrust
+      ecs: null
+      status: unmapped
+      custom: carbon_black.file.trust
+      notes: >
+        -2 means the reputation lookup is pending and -1 means unknown; only
+        0-10 is a trust score. Those sentinels share the field with real
+        values, so any aggregation has to exclude negatives first - a mean
+        over the raw field is poisoned by every un-looked-up file.
+    - vendor: deviceCustomFlexString1
+      type: string
+      description: file threat from Carbon Black File Reputation, labelled fileThreat
+      ecs: null
+      status: unmapped
+      custom: carbon_black.file.threat
+      notes: >-
+        the vendor emits the display strings "pending", "unknown", "0 - No
+        threat", "1 - Potential risk" and "2 - Malicious" verbatim, number and
+        dash included, so a match on "2" alone will not fire
+    - vendor: deviceCustomFloatingPoint2
+      type: float
+      description: parent process trust, labelled processTrust
+      ecs: null
+      status: unmapped
+      custom: carbon_black.process.trust
+      notes: same -2 pending and -1 unknown sentinels as fileTrust
+    - vendor: deviceCustomFlexString2
+      type: string
+      description: parent process threat, labelled processThreat
+      ecs: null
+      status: unmapped
+      custom: carbon_black.process.threat
+      notes: same display-string vocabulary as fileThreat
+- id: server-audit
+  name: Server, session and policy administration
+  description: >
+    The administrative record: console logins and logouts, server and database
+    configuration, agent lifecycle, and every creation, change or deletion of
+    a policy, ban, approval or rule. Policy Management belongs here rather
+    than with enforcement because it is a change to the control itself - who
+    widened the allow-list is a different question from what the allow-list
+    blocked, and it is the one an inspector asks.
+  event_categories:
+  - iam
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Receives CEF over syslog from the App Control Server. Low volume and
+        high value; this feed should not be sampled. CEF rather than the
+        Basic, Enhanced or LEEF alternatives, for the reason given on the
+        policy-enforcement dataset.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes. Small enough that it is a candidate for a
+        stricter, allow-listed content-filter policy than the endpoint feeds
+        get.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-carbon_black_app_control.audit
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Receives CEF over syslog from the App Control Server.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-carbon_black_app_control.audit
+  formats:
+  - format: syslog-cef
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: Cribl CEF parser plus an App Control custom-extension pipeline
+      notes: >
+        There is no Elastic integration for App Control. The Cribl CEF parser
+        recovers the header and the standard extensions; a second pipeline
+        stage renames the deviceCustomString/FloatingPoint/FlexString slots
+        using their emitted labels. Do not hard-code the slot numbers without
+        asserting the label - the mapping is stable in the documentation but
+        the labels are what make a record self-describing, and a future
+        release adding an extension could renumber them.
+    fields:
+    - vendor: externalId
+      type: integer
+      description: unique auto-incremented id of the App Control event
+      ecs: event.id
+      status: partial
+      transform: cast to string
+      notes: >-
+        server-assigned and monotonic, so it doubles as the resume point for a
+        gap-free replay; ECS types event.id as keyword, so the cast is
+        required
+    - vendor: DeviceEventCategory
+      type: string
+      description: >-
+        the App Control event type - Policy Enforcement, Discovery, Policy
+        Management, Server Management, Session Management, Computer Management
+      ecs: event.category
+      status: partial
+      transform: map the vendor taxonomy to the ECS event.category vocabulary
+      notes: >
+        the routing key for this whole technology. Every App Control event
+        rides the same CEF envelope, so the datasets here are a routing
+        decision on this field rather than different wire formats - which is
+        why the envelope rows repeat across them.
+    - vendor: Name
+      type: string
+      description: CEF header Name - the event subtype, e.g. "Execution block (unapproved file)"
+      ecs: event.action
+      status: mapped
+      notes: >-
+        the most specific statement of what happened; the subtype vocabulary
+        is large and is what detections should key on rather than the coarse
+        DeviceEventCategory
+    - vendor: SignatureID
+      type: integer
+      description: CEF header signature id - the numeric event subtype
+      ecs: event.code
+      status: partial
+      transform: cast to string
+      notes: >-
+        the stable form of Name; subtype wording has changed across releases
+        and the number has not
+    - vendor: Severity
+      type: integer
+      description: CEF header severity, 2 (least) to 9 (most)
+      ecs: event.severity
+      status: partial
+      transform: >-
+        already inverted by the server - CEF severity is 9 minus the App
+        Control severity; do not invert again
+      notes: >
+        App Control's native scale runs 7 (least severe) to 0 (most severe),
+        the opposite direction from CEF and from every other feed here. The
+        server does the inversion when it writes CEF, so the value on the wire
+        is already ascending-is-worse. A pipeline that "corrects" it will
+        silently rank every block as harmless.
+    - vendor: startTime
+      type: timestamp
+      description: when the event was created on the endpoint, UTC
+      ecs: '@timestamp'
+      status: mapped
+      notes: >-
+        endpoint time, not server time - preferred over ReceiptTime because an
+        agent that was offline reports late and the endpoint clock is what
+        orders the behaviour
+    - vendor: ReceiptTime
+      type: timestamp
+      description: when the App Control Server received the event, UTC
+      ecs: event.ingested
+      status: mapped
+      notes: >-
+        the gap between this and startTime is agent reporting lag and is worth
+        alerting on; it is not the Elastic ingest time
+    - vendor: Message
+      type: string
+      description: full text description of the event
+      ecs: message
+      status: mapped
+    - vendor: deviceHostName
+      type: string
+      description: hostname of the App Control Server
+      ecs: observer.name
+      status: partial
+      notes: >-
+        can be an IP address rather than a name, depending on what was entered
+        at server install
+    - vendor: destinationHostName
+      type: string
+      description: hostname of the endpoint that generated the event
+      ecs: host.hostname
+      status: mapped
+      notes: >-
+        CEF calls the endpoint the destination throughout this product; it is
+        the subject of the event, not a network peer
+    - vendor: destinationAddress
+      type: ip
+      description: IPv4 address of the endpoint
+      ecs: host.ip
+      status: partial
+      notes: >-
+        context-dependent and absent on server-side events; not source.ip or
+        destination.ip, because no network flow is being described
+    - vendor: deviceCustomIPv6Address3
+      type: ip
+      description: IPv6 address of the endpoint
+      ecs: host.ip
+      status: partial
+      notes: >-
+        shares host.ip with destinationAddress, which ECS allows as an array;
+        the CEF slot number carries no meaning
+    - vendor: destinationUserName
+      type: string
+      description: user that generated the event
+      ecs: user.name
+      status: partial
+      transform: split DOMAIN\user into user.domain and user.name
+      notes: >-
+        commonly NTAUTHORITY\SYSTEM for enforcement on service-launched
+        processes, which is a machine account rather than a person
+    - vendor: deviceCustomString3
+      type: string
+      description: policy involved in the management action, labelled policy
+      ecs: null
+      status: unmapped
+      custom: carbon_black.policy.name
+      notes: >-
+        on a Policy Management event this names the policy that was created,
+        modified or deleted, rather than the policy an endpoint was in

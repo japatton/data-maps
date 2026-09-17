@@ -1,0 +1,2070 @@
+id: f5-bigip-asm
+name: F5 BIG-IP ASM / Advanced WAF
+vendor: F5
+versions: BIG-IP 15.1, 16.1, 17.1
+draft: true
+references:
+- >-
+  https://techdocs.f5.com/en-us/bigip-17-0-0/big-ip-asm-implementations/logging-application-security-events.html
+- >-
+  https://techdocs.f5.com/kb/en-us/products/big-ip_ltm/manuals/product/bigip-external-monitoring-implementations-13-0-0/15.html
+- >-
+  https://www.f5.com/images/solution-center/arcsight-f5-asm-certified-cef-onfiguration-guide.pdf
+- https://www.elastic.co/docs/reference/integrations/f5_bigip
+- >-
+  https://github.com/elastic/integrations/tree/main/packages/f5_bigip/data_stream/log
+- https://github.com/criblpacks/cribl-common-event-format
+datasets:
+- id: request-violation
+  name: Request / violation log
+  description: >
+    The primary ASM security event: one record per HTTP request that a
+    security policy flagged, blocked, or (if configured) passed. The
+    remote-logging profile emits this in one of two documented storage formats
+    - key-value pairs ("Reporting Server") or Common Event Format
+    ("ArcSight"). The org inherited the CEF profile from the ArcSight era, so
+    CEF is what arrives today. Note that the CEF form is materially lossier
+    than the key-value form: violations, sub_violations, sig_ids, sig_names,
+    username, session_id, virus_name and violation_rating are all present in
+    the key-value profile and absent from the certified CEF profile, which
+    collapses signature identity into the CEF header. CEF also uses csN/cnN
+    custom-field indirection, so every extension key must be resolved through
+    its paired csNLabel/cnNLabel before it means anything - and the same csN
+    slot carries a different field on the attack-event dataset below.
+  event_categories:
+  - web
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        BIG-IP security logging profiles forward to a Cribl syslog source over
+        TCP. Which side a given WAF sits on follows the virtual servers it
+        fronts.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-f5_bigip.log
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        BIG-IP security logging profiles forward to a Cribl syslog source over
+        TCP. Which side a given WAF sits on follows the virtual servers it
+        fronts.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-f5_bigip.log
+  formats:
+  - format: syslog-cef
+    parsing:
+      mechanism: cribl-pack
+      artifact: >-
+        Cribl Pack for Common Event Format and Log Event Extended Format, plus
+        Cribl Pack for F5 (ASM Syslog)
+      notes: >
+        No Elastic integration parses ASM CEF syslog. The stock F5 BIG-IP
+        integration (f5_bigip) expects JSON telemetry over an HTTP endpoint or
+        S3 for its ASM branch, so the CEF-to-JSON conversion has to happen in
+        Cribl. The CEF/LEEF pack already resolves the csN/cnN Label
+        indirection into named fields, which is the single hardest part of
+        this format; the F5 pack adds ASM-specific volume reduction on top.
+    fields:
+    - vendor: deviceEventClassId
+      type: string
+      description: >-
+        CEF header field carrying the attack signature id when a signature
+        fired, or the violation name when a non-signature violation fired
+      ecs: rule.id
+      status: partial
+      transform: >
+        numeric when a signature matched (e.g. 200000098) and a free-text
+        violation name otherwise (e.g. "Illegal query string length");
+        populate rule.id only for the numeric case and leave it unset for
+        violation-name events rather than storing prose in an id field
+      notes: >
+        paired with the CEF Name header field, which holds the human-readable
+        name of the SAME object, so rule.id/rule.name are a consistent pair
+        here - the Suricata/Cisco FTD case, not the Palo Alto case
+    - vendor: name
+      type: string
+      description: CEF header field carrying the human-readable attack signature or violation name
+      ecs: rule.name
+      status: mapped
+      notes: e.g. "XSS script tag (Parameter)" or "Illegal query string length"
+    - vendor: severity
+      type: integer
+      description: CEF header severity, 0-10 with 10 most severe
+      ecs: event.severity
+      status: partial
+      transform: >
+        ASM derives this 0-10 ascending value from its internal severity; the
+        key-value logging profile instead emits a syslog-style string
+        (Emergency/Alert/Critical/Error/Warning/Notice/Informational) and the
+        Application DoS profile emits a syslog-style NUMBER where lower is
+        more severe - all three must be normalized onto one scale before any
+        alerting threshold is written
+    - vendor: dvchost
+      type: string
+      description: fully qualified hostname of the BIG-IP that logged the request
+      ecs: observer.hostname
+      status: mapped
+    - vendor: cs1
+      type: string
+      description: ASM security policy that evaluated the request (cs1Label=policy_name)
+      ecs: rule.ruleset
+      status: partial
+      transform: resolve through cs1Label before use
+      notes: >
+        an ASM policy is a named collection of signatures and violations, so
+        it is modelled as the ruleset rather than the rule; rule.name and
+        rule.id are already occupied by the signature/violation identity
+    - vendor: externalId
+      type: string
+      description: >-
+        ASM support ID - the unique per-request identifier used to retrieve
+        the full request from the BIG-IP UI
+      ecs: event.id
+      status: mapped
+      notes: >
+        64-bit unsigned value rendered as a decimal string; keep it a keyword,
+        not a number, and preserve it verbatim because analyst workflow
+        depends on pasting it into the BIG-IP event log search
+    - vendor: act
+      type: enum
+      description: action ASM took on the request (alerted, blocked, passed)
+      ecs: event.action
+      status: mapped
+      transform: >
+        lowercase and copy to event.action verbatim, and drive event.outcome
+        from a lookup; the direction has to be decided once and applied
+        consistently across all four datasets, because "blocked" means the
+        request failed and the mitigation succeeded
+    - vendor: cn1
+      type: integer
+      description: HTTP status code returned to the client (cn1Label=response_code)
+      ecs: http.response.status_code
+      status: partial
+      transform: >
+        resolve through cn1Label - the same cn1 slot carries detection_average
+        on the attack-event dataset. A value of 0 means no response was sent
+        because the request was blocked, and must not be indexed as status
+        code zero
+    - vendor: src
+      type: ip
+      description: client IP address the request came from
+      ecs: source.ip
+      status: mapped
+    - vendor: spt
+      type: port
+      description: client source port
+      ecs: source.port
+      status: mapped
+    - vendor: dst
+      type: ip
+      description: IP address of the virtual server that received the request
+      ecs: destination.ip
+      status: mapped
+    - vendor: dpt
+      type: port
+      description: destination port of the virtual server
+      ecs: destination.port
+      status: mapped
+    - vendor: requestMethod
+      type: string
+      description: HTTP method of the request
+      ecs: http.request.method
+      status: mapped
+    - vendor: app
+      type: string
+      description: application-layer protocol of the request (HTTP or HTTPS)
+      ecs: network.protocol
+      status: partial
+      transform: >-
+        lowercase to match the ECS convention; HTTPS should also set tls
+        presence rather than being carried as a protocol value alone
+    - vendor: request
+      type: string
+      description: requested URI including query string
+      ecs: url.original
+      status: partial
+      notes: >
+        origin-form path and query only, with no scheme or authority;
+        url.original carries that value verbatim, since ECS defines it as the
+        url as seen in the event source. Split it into url.path and url.query
+        as this dataset's key-value form already does with uri/query_string,
+        and reconstruct url.full from the Host header lifted out of cs3. The
+        value is percent-encoded and frequently carries the attack payload
+        itself
+    - vendor: cs5
+      type: string
+      description: >-
+        value of the X-Forwarded-For request header
+        (cs5Label=x_forwarded_for_header_value)
+      ecs: network.forwarded_ip
+      status: partial
+      transform: >
+        resolve through cs5Label; the literal string "N/A" is emitted when the
+        header is absent and must be dropped rather than indexed, and a
+        multi-hop chain must be split before a single address is promoted
+    - vendor: cs4
+      type: string
+      description: ASM attack-type classification of the violation (cs4Label=attack_type)
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.log.attack.type
+      transform: resolve through cs4Label - cs4 carries attack_status on the attack-event dataset
+      notes: >
+        F5's own attack taxonomy (Cross Site Scripting (XSS), SQL-Injection,
+        Buffer Overflow, Non-browser Client, ...). Deliberately not mapped to
+        threat.technique.name or any threat.* field: those model threat-intel
+        provider taxonomy, not vendor detection classification
+    - vendor: cs6
+      type: string
+      description: geographic location of the client as resolved by ASM (cs6Label=geo_location)
+      ecs: source.geo.country_iso_code
+      status: partial
+      transform: >
+        resolve through cs6Label; two-letter ISO country code when resolved
+        and the literal "N/A" otherwise, so the placeholder must be dropped
+        before the field is populated
+    - vendor: cs3
+      type: string
+      description: >-
+        the complete raw HTTP request including request line, headers and body
+        (cs3Label=full_request)
+      ecs: null
+      status: partial
+      custom: f5_bigip.log.full_request
+      transform: >
+        resolve through cs3Label, then derive user_agent.original, url.domain
+        and http.version from the embedded headers before storing or
+        discarding the remainder
+      notes: >
+        kilobyte-scale free text with embedded CRLF, Cookie and Authorization
+        headers, and the raw attack payload; the highest-risk and least
+        bounded field on this technology
+    - vendor: rt
+      type: timestamp
+      description: CEF receipt time - when ASM logged the request
+      ecs: '@timestamp'
+      status: partial
+      notes: >
+        rendered as "MMM dd yyyy HH:mm:ss" in BIG-IP local time with no zone
+        or offset, so the parser needs an explicit per-device timezone; the
+        syslog header timestamp on the same line is a second, independently
+        skewed clock
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Parse CEF to JSON on the low side with the CEF/LEEF pack, resolving
+          every csN/cnN value through its paired Label field rather than
+          positionally - cs4 is attack_type here and attack_status on the
+          attack-event dataset, and cn1 is response_code here and
+          detection_average there, so a positional parser will silently
+          mis-populate fields. Promote the request value verbatim to
+          url.original, split it into url.path and url.query, and build
+          url.full by joining the Host header out of cs3 onto that path; run
+          the act-to-event.outcome lookup here, and mask cs3 aggressively: it
+          carries the entire raw HTTP request including Cookie and
+          Authorization headers. Add Schema Library validation
+          (C.Schema(...).validate) with a dead-letter route ahead of the
+          Elastic destination and Persistent Queue backpressure, never Block.
+        elastic: >
+          Land the pre-shaped documents in logs-f5_bigip.log and keep
+          high-side work to normalization the low side cannot cheaply do. Add
+          an @custom pipeline that reconciles the two severity scales this
+          technology emits - CEF header severity is 0-10 ascending, while the
+          key-value and DoS profiles emit a syslog-style scale where lower is
+          more severe - so event.severity means one thing across all four
+          datasets. Map the f5_bigip.log.* custom namespace explicitly as
+          keyword in the index template (attack.type, web_application_name,
+          support_id, full_request) instead of relying on dynamic mapping, and
+          run user_agent parsing off the extracted User-Agent header. Expect
+          url.original to hold the origin-form request value verbatim and the
+          Host-joined absolute URL to arrive in url.full, so anything querying
+          a full URL reads url.full rather than reassembling one on the fly.
+        relay: >
+          Low-side instances cross the guard: full ECS-shaped JSON crosses,
+          not CEF - the CEF-to-JSON conversion happens low-side and CEF stops
+          at the enclave boundary. The cs3 full_request field is the dominant
+          content-filter problem: it is kilobyte-scale, contains embedded
+          CRLF, percent- and unicode-encoded attack payloads, and arbitrary
+          binary in the body, which is exactly the shape a custom NDJSON
+          filter rule cannot cheaply reason about. Cap and sanitize it
+          low-side, hold the JSON to two levels of nesting with short ASCII
+          keys, and detect silent drops by reconciling low-side and high-side
+          support_id counts per hour rather than expecting acknowledgement.
+      direct:
+        parse_location: low
+        cribl: >
+          Parse CEF to JSON at the edge worker group with the CEF/LEEF pack,
+          resolving every csN/cnN value through its paired Label field rather
+          than positionally - cs4 is attack_type here and attack_status on the
+          attack-event dataset, and cn1 is response_code here and
+          detection_average there, so a positional parser will silently
+          mis-populate fields. Promote the request value verbatim to
+          url.original, split it into url.path and url.query, and build
+          url.full by joining the Host header out of cs3 onto that path; run
+          the act-to-event.outcome lookup here, and mask cs3 aggressively: it
+          carries the entire raw HTTP request including Cookie and
+          Authorization headers. Add Schema Library validation
+          (C.Schema(...).validate) with a dead-letter route ahead of the
+          direct Elastic destination and Persistent Queue backpressure, never
+          Block.
+        elastic: >
+          Land the pre-shaped documents in logs-f5_bigip.log and add an
+          @custom pipeline that reconciles the two severity scales this
+          technology emits - CEF header severity is 0-10 ascending, while the
+          key-value and DoS profiles emit a syslog-style scale where lower is
+          more severe - so event.severity means one thing across all four
+          datasets. Map the f5_bigip.log.* custom namespace explicitly as
+          keyword in the index template (attack.type, web_application_name,
+          support_id, full_request) instead of relying on dynamic mapping, and
+          run user_agent parsing off the extracted User-Agent header. Expect
+          url.original to hold the origin-form request value verbatim and the
+          Host-joined absolute URL to arrive in url.full, so anything querying
+          a full URL reads url.full rather than reassembling one on the fly.
+  - format: syslog-kv
+    enable: >
+      Security > Event Logs > Logging Profiles > (profile) > Application
+      Security > Storage Destination = Remote Storage, then set Logging Format
+      to "Splunk Key-Value Pairs" - choose the Extended variant ("recommended
+      for detailed logging") rather than Basic. This is the "Reporting Server"
+      storage form the profile offers as the peer of the "Common Event Format
+      (ArcSight)" option; on the same wire, over the same TCP syslog
+      destination as the CEF, but as comma/space-separated key="value" pairs
+      instead of a CEF header plus csN/cnN extensions. The Extended field list
+      is materially richer than the certified CEF: violations, sub_violations,
+      sig_ids, sig_names, username, session_id, virus_name, violation_rating,
+      threat_campaign_names, device_id and captcha_result are all first-class
+      named keys here and are either collapsed into the CEF header or absent
+      entirely from the ArcSight profile. The exact key set and order is
+      configurable through the Storage Format "Selected Items" list, so
+      confirm the deployed field order on-device before pinning an extraction.
+    references:
+    - >-
+      https://techdocs.f5.com/en-us/bigip-17-0-0/big-ip-asm-implementations/logging-application-security-events.html
+    - https://docs.logrhythm.com/devices/docs/syslog-f5-big-ip-asm-key-value-pairs
+    - >-
+      https://github.com/F5Networks/f5-telemetry-streaming/blob/master/examples/output/request_logs/asm_request_log.json
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Cribl key=value extraction pipeline (ASM Splunk storage format)
+      notes: >
+        The stock f5_bigip integration's ASM branch expects JSON telemetry,
+        not this key="value" syslog, and its bot-and-dos pipeline selects its
+        grammar from device_product, which the ASM request log does not carry
+        - so neither stock path parses this format. Extract with a KV function
+        keyed on the profile's declared field order, then split the
+        comma-joined list keys (violations, sig_ids, sig_names,
+        sub_violations, attack_type, threat_campaign_names) into arrays and
+        drop the "N/A" placeholder literals before mapping. No csN/cnN Label
+        indirection here - the value of this format over the CEF is that every
+        field is already named.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Parse the key="value" record to JSON low-side and emit the same
+          ECS-shaped outer schema the CEF route produces, so the two storage
+          forms converge on one downstream shape. Split every comma-joined
+          multi-value key (violations, sub_violations, sig_ids, sig_names,
+          attack_type, threat_campaign_names) into arrays here, run the
+          request_status-to-event.outcome lookup, normalize the string
+          severity scale (Emergency/Alert/Critical/Error/Warning/
+          Notice/Informational) onto the platform-wide numeric convention, and
+          mask the request key aggressively - it is the full raw HTTP request
+          with Cookie and Authorization headers, exactly the cs3 exposure the
+          CEF route carries. Drop the "N/A"/"not_received" placeholder
+          literals (geo_location, username, virus_name,
+          ip_address_intelligence, captcha_result) rather than indexing them.
+          Add Schema Library validation with a dead-letter route and
+          Persistent Queue backpressure ahead of the guard destination.
+        elastic: >
+          Land the pre-shaped documents in logs-f5_bigip.log and reconcile
+          severity through the same table the CEF, DoS and bot datasets use so
+          event.severity means one thing across the technology. Map the rich
+          keys this format carries and the CEF form loses -
+          f5_bigip.log.violations, sub_violations, sig_ids, sig_names,
+          virus_name, violation_rating, session_id, threat_campaign_names -
+          explicitly as keyword (arrays where multi-valued) in the index
+          template rather than relying on dynamic mapping, and run user_agent
+          parsing off the User-Agent header carried inside the request key.
+        relay: >
+          Low-side instances cross the guard as ECS-shaped JSON, so the
+          key="value" grammar never reaches the boundary - the parse happens
+          low-side exactly as on the CEF route. The dominant content-filter
+          problem is unchanged: the request key is kilobyte-scale, carries
+          embedded CRLF, percent- and unicode-encoded attack payloads and
+          arbitrary body bytes, so cap and sanitize it low-side, hold the JSON
+          to two levels of nesting with short ASCII keys, and detect silent
+          drops by reconciling low- and high-side support_id counts per
+          (dataset, hour) rather than expecting acknowledgement.
+      direct:
+        parse_location: low
+        cribl: >
+          High-side instances run the identical parse without the guard hops -
+          key="value" to ECS-shaped JSON with the multi-value splits,
+          placeholder drops and severity normalization done at the edge worker
+          group before the direct Elastic destination. There is no
+          transfer-budget pressure on this path, so the full field list can be
+          retained rather than trimmed, and the request key can carry more of
+          its raw content once redacted.
+        elastic: >
+          Land the pre-shaped documents in logs-f5_bigip.log and reconcile
+          severity through the same table the CEF, DoS and bot datasets use so
+          event.severity means one thing across the technology. Because the
+          richer key set arrives intact on this path, this is the route where
+          signature-level analytics (sig_ids/sig_names aggregation,
+          violation_rating thresholds) are worth building, since the CEF form
+          cannot feed them.
+    fields:
+    - vendor: hostname
+      type: string
+      description: hostname of the BIG-IP that logged the request
+      ecs: observer.hostname
+      status: mapped
+    - vendor: management_ip_address
+      type: ip
+      description: management IP address of the BIG-IP
+      ecs: observer.ip
+      status: mapped
+    - vendor: management_ip_address_2
+      type: ip
+      description: secondary management IP address of the BIG-IP, frequently empty
+      ecs: null
+      custom: f5_bigip.log.management_ip_address_2
+      status: unmapped
+    - vendor: http_class_name
+      type: string
+      description: >-
+        HTTP class / policy path that matched the request, e.g.
+        /Common/app.app/app_policy
+      ecs: null
+      custom: f5_bigip.log.http_class_name
+      status: unmapped
+    - vendor: web_application_name
+      type: string
+      description: name of the web application the security policy protects
+      ecs: null
+      custom: f5_bigip.log.web_application_name
+      status: unmapped
+    - vendor: policy_name
+      type: string
+      description: ASM security policy that evaluated the request
+      ecs: rule.ruleset
+      status: partial
+      notes: >
+        a policy is a named collection of signatures and violations, so it
+        models as the ruleset; rule.name/rule.id are occupied by the signature
+        or violation identity carried in sig_names/sig_ids
+    - vendor: policy_apply_date
+      type: timestamp
+      description: when the active policy was last applied, e.g. 2018-11-19 22:17:57
+      ecs: null
+      custom: f5_bigip.log.policy_apply_date
+      status: unmapped
+    - vendor: violations
+      type: string
+      description: names of the violations the request triggered, comma-joined
+      ecs: null
+      custom: f5_bigip.log.violations
+      status: unmapped
+      transform: >-
+        split the comma-joined list into an array so each violation aggregates
+        independently
+      notes: >-
+        absent from the certified CEF profile, which collapses signature and
+        violation identity into the CEF header - the primary reason this
+        storage form is richer
+    - vendor: support_id
+      type: string
+      description: >-
+        ASM support ID - the unique per-request identifier used to retrieve
+        the full request from the BIG-IP UI
+      ecs: event.id
+      status: mapped
+      notes: >-
+        64-bit unsigned value rendered as a decimal string; keep it a keyword
+        and preserve it verbatim for the analyst paste-into-UI workflow
+    - vendor: request_status
+      type: enum
+      description: action ASM took on the request (blocked, alerted, passed)
+      ecs: event.action
+      status: partial
+      transform: >
+        copy to event.action and drive event.outcome from a lookup, using the
+        same direction chosen on the CEF act field so "blocked" means the
+        request failed and the mitigation succeeded consistently across the
+        technology
+    - vendor: response_code
+      type: integer
+      description: HTTP status code returned to the client
+      ecs: http.response.status_code
+      status: partial
+      transform: >-
+        a value of 0 means no response was sent because the request was
+        blocked, and must not be indexed as status code zero
+    - vendor: ip_client
+      type: ip
+      description: client IP address the request came from
+      ecs: source.ip
+      status: mapped
+    - vendor: route_domain
+      type: integer
+      description: BIG-IP route domain the request was received on
+      ecs: null
+      custom: f5_bigip.log.route_domain
+      status: unmapped
+    - vendor: method
+      type: string
+      description: HTTP method of the request
+      ecs: http.request.method
+      status: mapped
+    - vendor: protocol
+      type: enum
+      description: application-layer protocol of the request (HTTP or HTTPS)
+      ecs: network.protocol
+      status: partial
+      transform: >-
+        lowercase to match the ECS convention; HTTPS should also set tls
+        presence rather than being carried as a protocol value alone
+    - vendor: query_string
+      type: string
+      description: query string portion of the request URI
+      ecs: url.query
+      status: partial
+      notes: >-
+        empty when the request had no query string; percent-encoded and
+        frequently carries the attack payload
+    - vendor: x_forwarded_for_header_value
+      type: string
+      description: value of the X-Forwarded-For request header
+      ecs: network.forwarded_ip
+      status: partial
+      transform: >-
+        the literal "N/A" is emitted when the header is absent and must be
+        dropped; a multi-hop chain must be split before a single address is
+        promoted
+    - vendor: sig_ids
+      type: string
+      description: numeric identifiers of the attack signatures that matched, comma-joined
+      ecs: null
+      custom: f5_bigip.log.sig_ids
+      status: unmapped
+      transform: split into an array; pairs positionally with sig_names
+      notes: absent from the certified CEF profile
+    - vendor: sig_names
+      type: string
+      description: human-readable names of the attack signatures that matched, comma-joined
+      ecs: null
+      custom: f5_bigip.log.sig_names
+      status: unmapped
+      transform: split into an array; pairs positionally with sig_ids
+    - vendor: date_time
+      type: timestamp
+      description: when ASM logged the request, e.g. 2018-11-19 22:34:40
+      ecs: '@timestamp'
+      status: partial
+      notes: >-
+        rendered with no zone or offset in BIG-IP local time, so the parser
+        needs an explicit per-device timezone
+    - vendor: severity
+      type: string
+      description: >-
+        syslog-style severity string (Emergency, Alert, Critical, Error,
+        Warning, Notice, Informational)
+      ecs: event.severity
+      status: partial
+      transform: >
+        a named string scale where Emergency is most severe - not the CEF
+        header's 0-10 ascending number and not the DoS profile's syslog
+        number; all three must be normalized onto one scale before any
+        alerting threshold is written
+    - vendor: attack_type
+      type: string
+      description: >-
+        ASM attack-type classification of the violation, e.g. Detection
+        Evasion,Path Traversal
+      ecs: null
+      custom: f5_bigip.log.attack.type
+      status: unmapped
+      transform: comma-joined when multiple types apply; split into an array
+      notes: >-
+        F5's own detection taxonomy, deliberately not mapped to threat.* which
+        models threat-intel provider taxonomy rather than vendor detection
+        classification
+    - vendor: geo_location
+      type: string
+      description: geographic location of the client as resolved by ASM
+      ecs: source.geo.country_iso_code
+      status: partial
+      transform: >-
+        two-letter ISO country code when resolved and the literal "N/A"
+        otherwise, so the placeholder must be dropped before the field is
+        populated
+    - vendor: ip_address_intelligence
+      type: string
+      description: IP reputation categories ASM attached to the client, or N/A when none
+      ecs: null
+      custom: f5_bigip.log.ip_address_intelligence
+      status: unmapped
+      transform: drop the "N/A" placeholder; split multiple categories into an array
+    - vendor: username
+      type: string
+      description: authenticated/session username associated with the request
+      ecs: user.name
+      status: partial
+      transform: >-
+        emits the literal "N/A" when no session identity is known; drop the
+        placeholder rather than indexing it
+      notes: >-
+        absent from the certified CEF profile - one of the richest additions
+        of the key-value form
+    - vendor: session_id
+      type: string
+      description: ASM session identifier for the request, e.g. f609d8a924419638
+      ecs: null
+      custom: f5_bigip.log.session_id
+      status: unmapped
+      notes: absent from the certified CEF profile
+    - vendor: src_port
+      type: port
+      description: client source port
+      ecs: source.port
+      status: mapped
+    - vendor: dest_port
+      type: port
+      description: destination port of the virtual server
+      ecs: destination.port
+      status: mapped
+    - vendor: dest_ip
+      type: ip
+      description: IP address of the virtual server that received the request
+      ecs: destination.ip
+      status: mapped
+    - vendor: sub_violations
+      type: string
+      description: >-
+        specific sub-violations under the parent violation, e.g. Evasion
+        technique detected:Directory traversals
+      ecs: null
+      custom: f5_bigip.log.sub_violations
+      status: unmapped
+      transform: colon- and comma-delimited; split into an array
+      notes: absent from the certified CEF profile
+    - vendor: virus_name
+      type: string
+      description: name of the virus the ASM anti-virus integration detected in the request, or N/A
+      ecs: null
+      custom: f5_bigip.log.virus_name
+      status: unmapped
+      transform: drop the "N/A" placeholder
+      notes: absent from the certified CEF profile
+    - vendor: violation_rating
+      type: integer
+      description: ASM confidence rating for the violation, 0-5
+      ecs: null
+      custom: f5_bigip.log.violation_rating
+      status: unmapped
+      notes: >-
+        absent from the certified CEF profile; the field a triage analyst
+        filters on first
+    - vendor: websocket_direction
+      type: string
+      description: direction of a WebSocket message, or N/A for non-WebSocket requests
+      ecs: null
+      custom: f5_bigip.log.websocket_direction
+      status: unmapped
+      transform: drop the "N/A" placeholder emitted for ordinary HTTP requests
+    - vendor: websocket_message_type
+      type: string
+      description: type of a WebSocket message, or N/A for non-WebSocket requests
+      ecs: null
+      custom: f5_bigip.log.websocket_message_type
+      status: unmapped
+    - vendor: device_id
+      type: string
+      description: Bot Defense device-ID fingerprint of the client, or N/A when not computed
+      ecs: null
+      custom: f5_bigip.log.device_id
+      status: unmapped
+    - vendor: staged_sig_ids
+      type: string
+      description: identifiers of signatures matched in staging (not enforced), comma-joined
+      ecs: null
+      custom: f5_bigip.log.staged_sig_ids
+      status: unmapped
+      transform: split into an array; staged signatures did not contribute to the block decision
+    - vendor: staged_sig_names
+      type: string
+      description: names of signatures matched in staging, comma-joined
+      ecs: null
+      custom: f5_bigip.log.staged_sig_names
+      status: unmapped
+    - vendor: threat_campaign_names
+      type: string
+      description: F5 threat-campaign names the request matched, comma-joined
+      ecs: null
+      custom: f5_bigip.log.threat_campaign_names
+      status: unmapped
+      transform: split into an array
+      notes: absent from the certified CEF profile
+    - vendor: staged_threat_campaign_names
+      type: string
+      description: threat-campaign names matched in staging, comma-joined
+      ecs: null
+      custom: f5_bigip.log.staged_threat_campaign_names
+      status: unmapped
+    - vendor: blocking_exception_reason
+      type: string
+      description: why a blockable request was allowed through, or N/A
+      ecs: null
+      custom: f5_bigip.log.blocking_exception_reason
+      status: unmapped
+    - vendor: captcha_result
+      type: enum
+      description: outcome of a CAPTCHA challenge (not_received, passed, failed, ...)
+      ecs: null
+      custom: f5_bigip.log.captcha_result
+      status: unmapped
+    - vendor: uri
+      type: string
+      description: request URI path without the query string
+      ecs: url.path
+      status: mapped
+    - vendor: fragment
+      type: string
+      description: fragment portion of the request URI
+      ecs: url.fragment
+      status: mapped
+    - vendor: request
+      type: string
+      description: the complete raw HTTP request including request line, headers and body
+      ecs: null
+      custom: f5_bigip.log.full_request
+      status: partial
+      transform: >-
+        derive user_agent.original, url.domain and http.version from the
+        embedded headers before storing or discarding the remainder
+      notes: >-
+        kilobyte-scale free text with embedded CRLF, Cookie and Authorization
+        headers, and the raw attack payload; the highest-risk and least
+        bounded field on this format
+  - format: json
+    enable: >
+      Install the F5 BIG-IP Telemetry Streaming iApp/RPM and POST a
+      declaration defining a Telemetry_Listener (default port 6514); on the
+      BIG-IP, create a remote high-speed-log destination pointing at the
+      listener pool, a formatted destination, and a log publisher, then bind
+      the Application Security section of the security logging profile to that
+      publisher. Telemetry Streaming classifies each ASM record with
+      telemetryEventCategory = "ASM" and forwards it as a single JSON object
+      carrying the same field set as the Splunk key-value form plus tenant/
+      application partition context. This is the "JSON telemetry over an HTTP
+      endpoint" shape the stock f5_bigip Elastic integration's ASM branch is
+      built to consume.
+    references:
+    - >-
+      https://github.com/F5Networks/f5-telemetry-streaming/blob/master/docs/event-listener.rst
+    - >-
+      https://github.com/F5Networks/f5-telemetry-streaming/blob/master/examples/output/request_logs/asm_request_log.json
+    - https://www.elastic.co/docs/reference/integrations/f5_bigip
+    parsing:
+      mechanism: elastic-integration
+      artifact: F5 BIG-IP integration (f5_bigip), log data stream (ASM JSON branch)
+      notes: >
+        This is the one ASM shape the stock f5_bigip integration parses
+        directly: the ASM branch of its log data stream expects exactly this
+        JSON telemetry over an HTTP/event endpoint. The security payload keys
+        are identical to the syslog-kv entry above (violations,
+        sub_violations, sig_ids, sig_names, attack_type, username, session_id,
+        virus_name, violation_rating, request, ...) with the same comma-joined
+        multi-value and "N/A"-placeholder handling; only the JSON envelope
+        keys listed below are additional. Selecting between this and the CEF
+        is therefore also a transport choice - HTTP event listener versus TCP
+        syslog - not only a format choice.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Because a stock integration parses this shape, ship the thin
+          envelope - {_dataId, @timestamp, host, _raw} with the JSON object
+          intact in _raw and _dataId set to the logs-f5_bigip.log route key -
+          rather than re-parsing at the edge. Do the volume-insensitive work
+          low-side only: redact the request key's Cookie and Authorization
+          headers, cap its length, and the virtual-server to application-owner
+          enrichment that is cheaper near the source. A cut JSON object is
+          unrecoverable high-side, so enforce a hard maximum record size
+          low-side and dead-letter oversize records rather than letting the
+          content filter trim them.
+        elastic: >
+          Let the f5_bigip integration's ASM branch parse, then add a
+          logs-f5_bigip.log@custom pipeline for the same two normalizations
+          the other datasets need: reconcile the string severity scale onto
+          the platform-wide numeric convention, and split the comma-joined
+          multi-value keys into arrays if the stock pipeline leaves them as
+          strings. Map the rich custom-namespace keys (sig_ids, sig_names,
+          violations, violation_rating, threat_campaign_names) explicitly as
+          keyword so signature analytics do not depend on dynamic mapping.
+        relay: >
+          A thin envelope crosses with the unparsed JSON in _raw, which makes
+          truncation unrecoverable at the boundary - unlike a cut CEF line, a
+          cut JSON object yields nothing - so the size and character policy
+          must be applied to the raw line itself low-side. The unbounded,
+          user-controlled content all lives inside the request key
+          (kilobyte-scale raw HTTP with embedded CRLF and encoded payloads),
+          so cap and sanitize it before the crossing and reconcile low- and
+          high-side support_id counts per (dataset, hour) as the drop
+          detector.
+      direct:
+        parse_location: high
+        cribl: >
+          High-side instances forward the thin envelope straight to the core
+          worker group with no guard hops; keep the edge a pass-through so the
+          stock integration remains the single parser, limiting edge work to
+          request-key redaction and Persistent Queue backpressure on the
+          Elastic destination.
+        elastic: >
+          Let the f5_bigip integration's ASM branch parse, then add a
+          logs-f5_bigip.log@custom pipeline that reconciles the string
+          severity scale onto the platform-wide numeric convention and splits
+          the comma-joined multi-value keys into arrays if the stock pipeline
+          leaves them as strings; this JSON-over-HTTP path is the
+          lowest-effort way to reach the full ASM field set in Elastic, since
+          it needs no CEF-to-JSON conversion and no custom KV extraction.
+    fields:
+    - vendor: telemetryEventCategory
+      type: string
+      description: >-
+        Telemetry Streaming event class, always "ASM" for this feed - the
+        routing discriminator
+      ecs: null
+      custom: f5_bigip.log.telemetry_event_category
+      status: unmapped
+    - vendor: tenant
+      type: string
+      description: BIG-IP administrative partition the policy lives in, e.g. Common
+      ecs: null
+      custom: f5_bigip.log.tenant
+      status: unmapped
+    - vendor: application
+      type: string
+      description: application/iApp context the policy belongs to, e.g. app.app
+      ecs: null
+      custom: f5_bigip.log.application
+      status: unmapped
+    - vendor: hostname
+      type: string
+      description: hostname of the BIG-IP that logged the request (JSON envelope)
+      ecs: observer.hostname
+      status: mapped
+    - vendor: management_ip_address
+      type: ip
+      description: management IP address of the BIG-IP (JSON envelope)
+      ecs: observer.ip
+      status: mapped
+- id: attack-event
+  name: Attack / anomaly event log
+  description: >
+    Aggregated ASM attack events rather than per-request violations -
+    brute-force attacks, IP enforcer, web scraping and session-anomaly
+    detections. These share the CEF envelope with the request log but reuse
+    the same csN/cnN slots for entirely different fields, and are emitted at
+    attack start, periodically while ongoing, and at attack end, so several
+    records share one attack_id.
+  event_categories:
+  - web
+  - authentication
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same security logging profile and syslog destination as the request
+        log.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-f5_bigip.log
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Same security logging profile and syslog destination as the request
+        log.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-f5_bigip.log
+  formats:
+  - format: syslog-cef
+    parsing:
+      mechanism: cribl-pack
+      artifact: >-
+        Cribl Pack for Common Event Format and Log Event Extended Format, plus
+        Cribl Pack for F5 (ASM Syslog)
+      notes: >
+        Parsed by the same CEF/LEEF pack as the request log, but it needs a
+        separate branch keyed on the CEF Device Event Class ID because the
+        csN/cnN Label mapping is different for attack events.
+    fields:
+    - vendor: deviceEventClassId
+      type: string
+      description: >-
+        CEF header field naming the ASM detection that fired (Brute Force
+        Attack, IP Enforcer Attack, Web Scraping Attack, ...)
+      ecs: rule.name
+      status: mapped
+      notes: >
+        unlike the request log this is a detection-feature name, not a
+        signature id; there is no numeric identifier in these events so
+        rule.id is deliberately left unpopulated rather than filled with the
+        per-incident attack_id
+    - vendor: name
+      type: string
+      description: >-
+        CEF header Name field - the configured mitigation mode for the attack
+        (Transparent, Blocking) or a repeat of the class id
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.log.attack.mitigation_name
+      notes: >
+        inconsistent between event classes: brute-force events put the
+        blocking mode here while IP-enforcer events duplicate the Device Event
+        Class ID, so it cannot be relied on as an action field
+    - vendor: severity
+      type: integer
+      description: CEF header severity, 0-10 with 10 most severe
+      ecs: event.severity
+      status: partial
+      transform: >-
+        same 0-10 ascending CEF scale as the request log; must be reconciled
+        with the syslog-style scales the key-value and DoS profiles emit
+    - vendor: act
+      type: enum
+      description: action ASM took against the attack (Alerted, Blocked)
+      ecs: event.action
+      status: mapped
+      transform: >
+        case is inconsistent with the request log, which emits lowercase
+        "alerted"/"blocked" - lowercase both before indexing, and derive
+        event.outcome from the same lookup used on the request dataset
+    - vendor: cn3
+      type: long
+      description: identifier correlating every record belonging to one attack (cn3Label=attack_id)
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.log.attack.id
+      transform: >
+        resolve through cn3Label; 64-bit unsigned values exceed the range of a
+        signed long, so store as keyword rather than a numeric type
+      notes: >
+        per-incident correlation id shared by the start, ongoing and end
+        records, not a signature identifier - deliberately not rule.id, which
+        would pair it with the detection-feature name as if they described the
+        same object
+    - vendor: cs4
+      type: enum
+      description: lifecycle state of the attack (cs4Label=attack_status - Started, Ongoing, Ended)
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.log.attack.status
+      transform: >-
+        resolve through cs4Label - the same cs4 slot carries attack_type on
+        the request log
+    - vendor: cs5
+      type: string
+      description: >-
+        what triggered the detection (cs5Label=detection_mode), e.g. "Number
+        of Failed Logins Increased"
+      ecs: event.reason
+      status: partial
+      transform: >-
+        resolve through cs5Label - the same cs5 slot carries
+        x_forwarded_for_header_value on the request log
+      notes: free-text vendor prose, useful for triage but not a stable enum to alert on
+    - vendor: cn1
+      type: long
+      description: >-
+        historical average of TPS, latency or failed logins that the
+        measurement was compared against (cn1Label=detection_average)
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.log.detection_average
+      transform: >-
+        resolve through cn1Label - the same cn1 slot carries response_code on
+        the request log
+      notes: >-
+        the baseline, not the observed rate that crossed the threshold; the
+        certified CEF anomaly envelope carries no companion field for the
+        measured value, so a rate-versus-baseline comparison is not available
+        from this format alone
+    - vendor: cn2
+      type: long
+      description: >-
+        number of requests dropped by the mitigation so far in this attack
+        (cn2Label=dropped_requests)
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.log.dropped_requests
+      transform: resolve through cn2Label
+    - vendor: cs1
+      type: string
+      description: ASM security policy that raised the attack event (cs1Label=policy_name)
+      ecs: rule.ruleset
+      status: partial
+      transform: resolve through cs1Label
+    - vendor: cs6
+      type: string
+      description: geographic location of the attacking client (cs6Label=geo_location)
+      ecs: source.geo.country_iso_code
+      status: partial
+      transform: >-
+        resolve through cs6Label; two-letter ISO country code, or the literal
+        "N/A" which must be dropped
+    - vendor: src
+      type: ip
+      description: IP address of the client conducting the attack
+      ecs: source.ip
+      status: mapped
+    - vendor: request
+      type: string
+      description: URI targeted by the attack, e.g. the login page for a brute-force event
+      ecs: url.original
+      status: partial
+      notes: >
+        present for brute-force and web-scraping events and absent from
+        IP-enforcer events; path and query only, with no scheme or host
+    - vendor: dvchost
+      type: string
+      description: fully qualified hostname of the BIG-IP that raised the attack event
+      ecs: observer.hostname
+      status: mapped
+    - vendor: rt
+      type: timestamp
+      description: CEF receipt time for this attack record
+      ecs: '@timestamp'
+      status: partial
+      notes: >-
+        BIG-IP local time with no zone or offset; needs a per-device timezone
+        in the parser
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Branch on the CEF Device Event Class ID before the csN/cnN Label
+          resolution so brute-force and IP-enforcer events do not inherit the
+          request log's field map, and emit the same outer JSON schema as the
+          request dataset so downstream consumers see one shape. Normalize
+          attack_status into a lifecycle value and carry attack_id as a
+          keyword so the start/ongoing/ended records for one incident
+          correlate, and do the source-IP to site/owner enrichment here where
+          the inventory lookup already lives. This dataset is very low volume
+          relative to the request log, so drop _raw last and keep Persistent
+          Queue backpressure on the destination.
+        elastic: >
+          Ingest into logs-f5_bigip.log and add an @custom pipeline that sets
+          event.kind and a stable event.category for the brute-force class -
+          these are authentication-attack events and should reach the
+          authentication alerting profile, not only the web one. Normalize the
+          CEF 0-10 severity through the same table as the other three
+          datasets, and map f5_bigip.log.attack.id, attack.status,
+          detection_average and dropped_requests explicitly in the index
+          template so the CSOC can aggregate an attack by id and chart
+          dropped-request volume over an incident.
+        relay: >
+          Low-side instances cross the guard as ECS-shaped JSON; the CEF the
+          vendor emits today is converted low-side and does not reach the
+          boundary. Content-filter friction is low here - the fields are
+          short, bounded and mostly enumerated, with the free-text
+          detection_mode string the only unbounded value - which makes this
+          the easiest of the four datasets to put behind a simple custom
+          filter rule. Because it is low volume and each record is
+          individually significant, per-(dataset, hour) low-side versus
+          high-side count reconciliation is the only viable drop detection.
+      direct:
+        parse_location: low
+        cribl: >
+          Branch on the CEF Device Event Class ID before the csN/cnN Label
+          resolution so brute-force and IP-enforcer events do not inherit the
+          request log's field map, and emit the same outer JSON schema as the
+          request dataset so downstream consumers see one shape. Normalize
+          attack_status into a lifecycle value and carry attack_id as a
+          keyword so the start/ongoing/ended records for one incident
+          correlate, and do the source-IP to site/owner enrichment here where
+          the inventory lookup already lives. This dataset is very low volume
+          relative to the request log, so drop _raw last and keep Persistent
+          Queue backpressure on the destination.
+        elastic: >
+          Ingest into logs-f5_bigip.log and add an @custom pipeline that sets
+          event.kind and a stable event.category for the brute-force class -
+          these are authentication-attack events and should reach the
+          authentication alerting profile, not only the web one. Normalize the
+          CEF 0-10 severity through the same table as the other three
+          datasets, and map f5_bigip.log.attack.id, attack.status,
+          detection_average and dropped_requests explicitly in the index
+          template so the CSOC can aggregate an attack by id and chart
+          dropped-request volume over an incident.
+  - format: syslog-kv
+    enable: >
+      The same Application Security section of the security logging profile,
+      with Logging Format set to "Splunk Key-Value Pairs" instead of "Common
+      Event Format (ArcSight)", emits the brute-force, web-scraping,
+      IP-enforcer and session-anomaly attack events as named key="value" pairs
+      rather than the CEF csN/cnN slots. F5's Event Messages and Attack Types
+      reference documents the anomaly-event field set - attack_id,
+      attack_status, detection_mode, detection_average, dropped_requests,
+      current_mitigation, anomaly_attack_type and violation_counter - so the
+      correlation and lifecycle fields the CEF form carries through reused
+      csN/cnN indirection arrive here already named, and current_mitigation
+      and violation_counter are additions the certified CEF profile does not
+      surface.
+    references:
+    - >-
+      https://techdocs.f5.com/kb/en-us/products/big-ip_ltm/manuals/product/bigip-external-monitoring-implementations-13-0-0/15.html
+    - >-
+      https://techdocs.f5.com/en-us/bigip-17-0-0/big-ip-asm-implementations/logging-application-security-events.html
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Cribl key=value extraction pipeline (ASM anomaly grammar)
+      notes: >
+        Neither stock path parses this: the f5_bigip integration's ASM branch
+        expects JSON and its bot-and-dos pipeline keys off device_product,
+        which the anomaly log does not carry. Extract with a KV function,
+        carry attack_id as a keyword so the started/ongoing/ended records for
+        one incident correlate, and normalize attack_status into a lifecycle
+        value. Because these are named keys, this format skips the CEF route's
+        hardest step - resolving cn3/cs4/cn1/cn2/cs5 through their paired
+        Label fields, where the same slots carry different fields on the
+        request log.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Parse to ECS-shaped JSON low-side and emit the same outer schema as
+          the request-violation route so downstream consumers see one shape.
+          Carry attack_id as a keyword (64-bit unsigned values exceed a signed
+          long) for start/ongoing/end correlation, normalize attack_status to
+          a lifecycle enum, and set a stable event.category for the
+          brute-force class so these authentication-attack events reach the
+          authentication alerting profile and not only the web one. Do the
+          source-IP to site/owner enrichment here where the inventory lookup
+          lives; this feed is very low volume, so keep Persistent Queue
+          backpressure on rather than sampling.
+        elastic: >
+          Ingest into logs-f5_bigip.log and add an @custom pipeline that sets
+          event.kind and reconciles the string severity scale with the other
+          datasets. Map f5_bigip.log.attack.id, attack.status,
+          detection_average, dropped_requests, attack.mitigation and
+          violation_counter explicitly in the index template so the CSOC can
+          aggregate an attack by id and chart dropped-request volume and
+          mitigation state over an incident.
+        relay: >
+          Low-side instances cross the guard as ECS-shaped JSON; the
+          key="value" grammar is converted low-side and does not reach the
+          boundary. Content-filter friction is low - the fields are short,
+          bounded and mostly enumerated, with the free-text detection_mode and
+          current_mitigation strings the only unbounded values - so this is an
+          easy dataset to put behind a simple custom filter rule. Because it
+          is low volume and each record is individually significant,
+          per-(dataset, hour) low- versus high-side count reconciliation is
+          the only viable drop detection.
+      direct:
+        parse_location: low
+        cribl: >
+          High-side instances run the identical parse without the guard hops,
+          emitting the same anomaly JSON schema straight to the core worker
+          group; retain the free-text detection_mode and current_mitigation in
+          full since there is no boundary to bound them for.
+        elastic: >
+          Ingest into logs-f5_bigip.log and add an @custom pipeline that sets
+          event.kind and reconciles the string severity scale with the other
+          datasets; this path is where an attack-by-id dashboard correlating
+          the started/ongoing/ended records is worth building.
+    fields:
+    - vendor: hostname
+      type: string
+      description: hostname of the BIG-IP that raised the attack event
+      ecs: observer.hostname
+      status: mapped
+    - vendor: attack_id
+      type: long
+      description: identifier correlating every record belonging to one attack
+      ecs: null
+      custom: f5_bigip.log.attack.id
+      status: unmapped
+      transform: 64-bit unsigned values exceed the range of a signed long, so store as keyword
+      notes: >-
+        per-incident correlation id shared by the start, ongoing and end
+        records - deliberately not rule.id, which would pair it with the
+        detection-feature name as if they described the same object
+    - vendor: attack_status
+      type: enum
+      description: lifecycle state of the attack (Started, Ongoing, Ended)
+      ecs: null
+      custom: f5_bigip.log.attack.status
+      status: unmapped
+    - vendor: anomaly_attack_type
+      type: enum
+      description: coarse class of the anomaly (DoS attack or Brute Force attack)
+      ecs: rule.name
+      status: partial
+      notes: >
+        the detection-feature name for the event; there is no numeric
+        signature id in these records, so rule.id is deliberately left
+        unpopulated rather than filled with the per-incident attack_id
+    - vendor: detection_mode
+      type: string
+      description: >-
+        what triggered the detection, e.g. Number of Failed Logins Increased
+        or TPS Increased
+      ecs: event.reason
+      status: partial
+      notes: free-text vendor prose, useful for triage but not a stable enum to alert on
+    - vendor: detection_average
+      type: long
+      description: >-
+        historical average of TPS, latency or failed logins that the
+        measurement was compared against
+      ecs: null
+      custom: f5_bigip.log.detection_average
+      status: unmapped
+    - vendor: dropped_requests
+      type: long
+      description: number of requests dropped by the mitigation so far in this attack
+      ecs: null
+      custom: f5_bigip.log.dropped_requests
+      status: unmapped
+    - vendor: current_mitigation
+      type: string
+      description: how the attack is currently being mitigated
+      ecs: null
+      custom: f5_bigip.log.attack.mitigation
+      status: unmapped
+      notes: not surfaced by the certified CEF profile - an addition of the key-value form
+    - vendor: violation_counter
+      type: long
+      description: number of violations counted for the attack (CEF cn4)
+      ecs: null
+      custom: f5_bigip.log.violation_counter
+      status: unmapped
+      notes: not surfaced by the certified CEF profile
+    - vendor: policy_name
+      type: string
+      description: ASM security policy that raised the attack event
+      ecs: rule.ruleset
+      status: partial
+    - vendor: web_application_name
+      type: string
+      description: name of the web application the policy protects
+      ecs: null
+      custom: f5_bigip.log.web_application_name
+      status: unmapped
+    - vendor: date_time
+      type: timestamp
+      description: time the BIG-IP raised the attack record
+      ecs: '@timestamp'
+      status: partial
+      notes: >-
+        BIG-IP local time with no zone or offset; needs a per-device timezone
+        in the parser
+  - format: json
+    enable: >
+      With Telemetry Streaming installed and the Application Security section
+      bound to the TS log publisher (as for the request-violation JSON feed),
+      the anomaly attack events are forwarded as JSON objects classified
+      telemetryEventCategory = "ASM" - brute-force, web-scraping and
+      session-anomaly detections are ASM anomaly events and route through the
+      same JSON category as the request violations, carrying the anomaly key
+      set (attack_id, attack_status, detection_mode, detection_average,
+      dropped_requests, current_mitigation, anomaly_attack_type,
+      violation_counter) as named JSON keys.
+    references:
+    - >-
+      https://github.com/F5Networks/f5-telemetry-streaming/blob/master/docs/event-listener.rst
+    - >-
+      https://techdocs.f5.com/kb/en-us/products/big-ip_ltm/manuals/product/bigip-external-monitoring-implementations-13-0-0/15.html
+    - https://www.elastic.co/docs/reference/integrations/f5_bigip
+    parsing:
+      mechanism: elastic-integration
+      artifact: F5 BIG-IP integration (f5_bigip), log data stream (ASM JSON branch)
+      notes: >
+        The stock f5_bigip ASM branch parses this JSON, but the anomaly key
+        set differs from the request-violation payload, so an @custom pipeline
+        branch keyed on the presence of attack_id is needed to promote the
+        lifecycle and correlation fields. The security payload keys are the
+        same named keys as the syslog-kv anomaly entry above; only the JSON
+        envelope keys (telemetryEventCategory, tenant, application) are
+        additional.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Ship the thin envelope with the JSON object intact in _raw and let
+          the stock integration parse high-side, doing only the source-IP
+          enrichment and a hard record-size cap low-side. This feed is low
+          volume, so there is no sampling pressure; dead-letter any oversize
+          record rather than letting the content filter cut a JSON object it
+          cannot recover.
+        elastic: >
+          Parse with the f5_bigip ASM branch, then branch a
+          logs-f5_bigip.log@custom pipeline on attack_id to set event.kind, a
+          stable authentication event.category, and keyword mappings for the
+          anomaly custom namespace so an attack aggregates by id across its
+          lifecycle records.
+        relay: >
+          Thin envelope crosses; the anomaly fields are short and bounded so
+          content-filter friction is minimal, and per-(dataset, hour) count
+          reconciliation between low and high sides is the drop detector for
+          this individually-significant, low-volume feed.
+      direct:
+        parse_location: high
+        cribl: >
+          Pass the thin envelope straight through with no guard hops; keep the
+          edge a pass-through so the integration stays the single parser.
+        elastic: >
+          Parse with the f5_bigip ASM branch, then branch a
+          logs-f5_bigip.log@custom pipeline on attack_id to set event.kind, a
+          stable authentication event.category, and keyword mappings for the
+          anomaly custom namespace so an attack aggregates by id across its
+          lifecycle records; the JSON-over-HTTP transport is the lowest-effort
+          route to the anomaly field set in Elastic.
+    fields:
+    - vendor: telemetryEventCategory
+      type: string
+      description: >-
+        Telemetry Streaming event class, "ASM" for anomaly events - the
+        routing discriminator
+      ecs: null
+      custom: f5_bigip.log.telemetry_event_category
+      status: unmapped
+    - vendor: tenant
+      type: string
+      description: BIG-IP administrative partition the policy lives in
+      ecs: null
+      custom: f5_bigip.log.tenant
+      status: unmapped
+    - vendor: application
+      type: string
+      description: application/iApp context the policy belongs to
+      ecs: null
+      custom: f5_bigip.log.application
+      status: unmapped
+    - vendor: hostname
+      type: string
+      description: hostname of the BIG-IP that raised the attack event (JSON envelope)
+      ecs: observer.hostname
+      status: mapped
+- id: bot-defense
+  name: Bot Defense log
+  description: >
+    Bot Defense / Proactive Bot Defense request events from the Bot Defense
+    section of the security logging profile. Unlike the ASM violation log
+    these are emitted as comma-separated key="value" pairs with
+    device_product="Application Security Module", and they carry the
+    browser-verification, CAPTCHA and device-ID challenge outcomes that
+    credential-stuffing and scraping detections depend on.
+  event_categories:
+  - web
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Bot Defense logging publisher forwards to the same Cribl syslog source
+        as the ASM profile.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-f5_bigip.log
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Bot Defense logging publisher forwards to the same Cribl syslog source
+        as the ASM profile.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-f5_bigip.log
+  formats:
+  - format: syslog-kv
+    parsing:
+      mechanism: elastic-integration
+      artifact: F5 BIG-IP integration (f5_bigip), bot-and-dos ingest pipeline
+      notes: >
+        The f5_bigip integration's ASM branch expects JSON telemetry, but its
+        Bot Defense and DoS branch parses this key=value format directly and
+        keys off device_product to select the comma-separated bot grammar.
+        Cribl can therefore forward these records into logs-f5_bigip.log and
+        reuse the stock pipeline rather than re-implementing the parse.
+    fields:
+    - vendor: hostname
+      type: string
+      description: hostname of the BIG-IP that logged the bot event
+      ecs: observer.hostname
+      status: mapped
+    - vendor: client_ip
+      type: ip
+      description: IP address of the client that issued the request
+      ecs: source.ip
+      status: mapped
+    - vendor: client_ip_geo_location
+      type: string
+      description: geographic location resolved for the client IP
+      ecs: source.geo.country_iso_code
+      status: partial
+      transform: >-
+        emits the literal "NA" or "N/A" when unresolved; drop the placeholder
+        rather than indexing it as a country code
+    - vendor: client_request_uri
+      type: string
+      description: URI path of the request that triggered the bot event
+      ecs: url.path
+      status: mapped
+    - vendor: dest_ip
+      type: ip
+      description: IP address of the virtual server that received the request
+      ecs: destination.ip
+      status: mapped
+    - vendor: dest_port
+      type: port
+      description: destination port of the virtual server
+      ecs: destination.port
+      status: mapped
+    - vendor: http_method
+      type: string
+      description: HTTP method of the request
+      ecs: http.request.method
+      status: mapped
+    - vendor: http_protocol_indication
+      type: enum
+      description: application-layer protocol of the request (HTTP or HTTPS)
+      ecs: network.protocol
+      status: partial
+      transform: lowercase to match the ECS convention
+    - vendor: support_id
+      type: string
+      description: unique per-request identifier used to retrieve the request from the BIG-IP UI
+      ecs: event.id
+      status: mapped
+      notes: keep as keyword - the value is a 64-bit unsigned decimal string
+    - vendor: action
+      type: enum
+      description: >-
+        enforcement action Bot Defense applied to the request (Blocking,
+        Alarm, undetermined, ...)
+      ecs: event.action
+      status: mapped
+    - vendor: request_status
+      type: enum
+      description: how Bot Defense classified the request (legal, illegal, blocked)
+      ecs: event.outcome
+      status: partial
+      transform: >
+        needs an explicit lookup; the natural reading is that illegal and
+        blocked are failures for the request, but that is the opposite of
+        reading them as a successful mitigation, and the direction must match
+        the choice made on the request-violation dataset's act field
+    - vendor: bot_signature
+      type: string
+      description: name of the bot signature that matched the request
+      ecs: rule.name
+      status: partial
+      notes: >
+        empty string when the detection came from anomalies rather than a
+        signature; there is no companion bot signature id in this log, so
+        rule.id stays unpopulated rather than being filled from an unrelated
+        identifier
+    - vendor: bot_signature_category
+      type: string
+      description: >-
+        category the matched bot signature belongs to (Search Engine, HTTP
+        Library, Exploit Tool, ...)
+      ecs: rule.category
+      status: mapped
+    - vendor: bot_name
+      type: string
+      description: name Bot Defense assigned to the detected client, e.g. "Presenting as CHROME"
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.log.bot_name
+    - vendor: class
+      type: enum
+      description: >-
+        classification assigned to the client (Browser, Suspicious Browser,
+        Malicious Bot, Trusted Bot, Unknown)
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.log.class
+      notes: the primary triage field for this dataset; no ECS equivalent
+    - vendor: client_type
+      type: enum
+      description: type of client detected (Browser, Mobile Application, Bot, ...)
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.log.client.type
+    - vendor: anomalies
+      type: string
+      description: >-
+        behavioural anomalies that fired, e.g. "Suspicious HTTP Headers
+        Presence or Order"
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.log.anomalies
+      transform: >-
+        multiple anomalies arrive in one delimited string; split into an array
+        so each value aggregates independently
+    - vendor: anomaly_categories
+      type: string
+      description: >-
+        categories of the anomalies that fired, e.g. "Suspicious Browsers and
+        Extensions"
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.log.anomaly_categories
+      transform: same delimited-string-to-array split as anomalies
+    - vendor: browser_verification_status
+      type: enum
+      description: result of the JavaScript browser-verification challenge
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.log.browser_verification_status
+    - vendor: http_request
+      type: string
+      description: the complete raw HTTP request line, headers and body that triggered the event
+      ecs: null
+      status: partial
+      custom: f5_bigip.log.request.detail
+      transform: >-
+        the integration pipeline dissects this to derive user_agent.original,
+        url.domain and the X-Forwarded-For chain
+      notes: >
+        unbounded free text with embedded CRLF, session cookies and
+        Authorization headers - redact before it leaves the enclave
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Keep the core worker group a pass-through for this route so the
+          stock bot-and-dos ingest pipeline stays the single parser - do not
+          pre-extract fields, because the pipeline selects its grammar from
+          the device_product value and a partially parsed record will fall
+          through. Limit low-side work to Persistent Queue backpressure on the
+          Elastic destination, the virtual-server to application-owner
+          enrichment that is cheaper near the source, and a redaction rule on
+          the http_request field's Cookie and Authorization headers.
+        elastic: >
+          Let the f5_bigip bot-and-dos pipeline parse, then add a
+          logs-f5_bigip.log@custom pipeline for the three gaps this map
+          records: derive event.outcome explicitly from request_status rather
+          than leaving legal/illegal uninterpreted, split the
+          semicolon-delimited anomalies and anomaly_categories strings into
+          arrays so they aggregate, and replace the "N/A"/"NA" placeholder
+          literals with nulls before geo and client-type fields are indexed.
+          Map f5_bigip.log.bot_name, class, client.type, anomalies and
+          anomaly_categories as keyword in the index template so bot
+          dashboards do not depend on dynamic mapping.
+        relay: >
+          Low-side instances cross the guard, so on that path this dataset
+          moves from high to a hybrid thin envelope - {_dataId, @timestamp,
+          host, _raw} with _dataId set to the logs-f5_bigip.log route key - so
+          the guard sees one stable JSON schema instead of a comma-separated
+          key="value" grammar, with the integration pipeline still doing the
+          extraction on the high side. The http_request field is the
+          content-filter exposure: full raw HTTP request text with cookies,
+          embedded CRLF and unbounded length, so cap and sanitize it low-side
+          before the crossing regardless of envelope mode.
+      direct:
+        parse_location: high
+        cribl: >
+          Keep the core worker group a pass-through for this route so the
+          stock bot-and-dos ingest pipeline stays the single parser - do not
+          pre-extract fields, because the pipeline selects its grammar from
+          the device_product value and a partially parsed record will fall
+          through. Limit edge work to Persistent Queue backpressure on the
+          Elastic destination, the virtual-server to application-owner
+          enrichment that is cheaper near the source, and a redaction rule on
+          the http_request field's Cookie and Authorization headers.
+        elastic: >
+          Let the f5_bigip bot-and-dos pipeline parse, then add a
+          logs-f5_bigip.log@custom pipeline for the three gaps this map
+          records: derive event.outcome explicitly from request_status rather
+          than leaving legal/illegal uninterpreted, split the
+          semicolon-delimited anomalies and anomaly_categories strings into
+          arrays so they aggregate, and replace the "N/A"/"NA" placeholder
+          literals with nulls before geo and client-type fields are indexed.
+          Map f5_bigip.log.bot_name, class, client.type, anomalies and
+          anomaly_categories as keyword in the index template so bot
+          dashboards do not depend on dynamic mapping.
+- id: dos-application
+  name: Application DoS log
+  description: >
+    Layer 7 DoS / DDoS protection events from the DoS Application section of
+    the security logging profile. Emitted as SEMICOLON-separated key=value
+    pairs with device_product=ASM - a different delimiter from the
+    comma-separated Bot Defense records on the same wire, which is a common
+    source of parser misfires. Records are attack-scoped rather than
+    request-scoped and are re-emitted while an attack is running.
+  event_categories:
+  - web
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        DoS Application logging publisher shares the Cribl syslog source with
+        the other ASM profiles.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-f5_bigip.log
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        DoS Application logging publisher shares the Cribl syslog source with
+        the other ASM profiles.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-f5_bigip.log
+  formats:
+  - format: syslog-kv
+    parsing:
+      mechanism: elastic-integration
+      artifact: F5 BIG-IP integration (f5_bigip), bot-and-dos ingest pipeline
+      notes: >
+        The same bot-and-dos ingest pipeline handles this format, selecting
+        the semicolon-delimited DoS grammar from device_product=ASM. Note the
+        pipeline matches on that value, so a Cribl rule that normalizes or
+        strips device_product will break the parse.
+    fields:
+    - vendor: hostname
+      type: string
+      description: hostname of the BIG-IP that raised the DoS event
+      ecs: observer.hostname
+      status: mapped
+    - vendor: bigip_mgmt_ip
+      type: ip
+      description: management IP address of the BIG-IP
+      ecs: observer.ip
+      status: mapped
+    - vendor: source_ip
+      type: ip
+      description: source IP of the entity the DoS detection is reported against
+      ecs: source.ip
+      status: partial
+      notes: >
+        only meaningful when reported_entity_type is "Source IP"; for URL,
+        Geolocation or Device ID scoped detections this holds the BIG-IP self
+        IP or a placeholder and must not be promoted to source.ip
+    - vendor: reported_entity_type
+      type: enum
+      description: >-
+        what the detection is scoped to (Source IP, URL, Device ID,
+        Geolocation, Site Wide)
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.log.reported_entity_type
+      notes: gates whether source_ip and client_request_uri are meaningful on a given record
+    - vendor: client_request_uri
+      type: string
+      description: URI the DoS detection is scoped to
+      ecs: url.path
+      status: partial
+      transform: >-
+        emits the literal "N/A" for non-URL-scoped detections; drop the
+        placeholder rather than indexing it as a path
+    - vendor: dos_attack_name
+      type: string
+      description: name of the DoS attack vector detected, e.g. "DOS L7 attack"
+      ecs: rule.name
+      status: mapped
+    - vendor: dos_attack_id
+      type: string
+      description: identifier correlating all records belonging to one DoS attack
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.log.dos.attack.id
+      notes: >
+        per-incident correlation id, not a signature identifier; kept custom
+        rather than paired with dos_attack_name under rule.* because the two
+        do not describe the same object
+    - vendor: dos_attack_event
+      type: enum
+      description: >-
+        lifecycle stage of the attack record (Attack started, Attack ended,
+        Suspicious entity, ...)
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.log.dos.attack.event
+    - vendor: dos_attack_detection_mode
+      type: enum
+      description: >-
+        which detection method fired (TPS Increased, Latency Increased,
+        Stress-based, ...)
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.log.dos.attack.detection_mode
+    - vendor: action
+      type: enum
+      description: enforcement mode in effect for the attack (Blocking, Alarm, Transparent)
+      ecs: event.action
+      status: mapped
+    - vendor: dos_mitigation_action
+      type: string
+      description: specific mitigation applied, e.g. "Source IP-Based Rate Limiting"
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.log.dos_mitigation.action
+    - vendor: dos_mitigation_reason
+      type: string
+      description: why the mitigation was chosen, e.g. "Abnormal volume"
+      ecs: event.reason
+      status: partial
+      notes: free-text vendor prose rather than a stable enum
+    - vendor: dos_attack_tps
+      type: string
+      description: measured transactions per second during the attack
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.log.dos.attack.tps
+      transform: >-
+        emitted as a string with a unit suffix ("4 tps"); strip the suffix and
+        convert to a number before it can be compared or charted
+    - vendor: dos_baseline_tps
+      type: string
+      description: learned baseline transactions per second the measurement was compared against
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.log.dos.baseline.tps
+      transform: same unit-suffixed string as dos_attack_tps
+    - vendor: dos_dropped_requests_count
+      type: long
+      description: number of requests dropped by the mitigation
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.log.dos.dropped_requests_count
+    - vendor: dos_incoming_requests_count
+      type: long
+      description: number of requests received during the measurement window
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.log.dos.incoming_requests_count
+    - vendor: severity
+      type: integer
+      description: numeric severity of the DoS event
+      ecs: event.severity
+      status: partial
+      transform: >
+        syslog-style scale where LOWER is more severe (3 = Error), the inverse
+        of the CEF header's 0-10 ascending scale on the other two datasets;
+        both must be normalized onto one direction or DoS events will rank
+        below trivial request violations
+    - vendor: errdefs_msgno
+      type: string
+      description: BIG-IP internal message number identifying the event type, e.g. 23003140
+      ecs: event.code
+      status: mapped
+    - vendor: profile_name
+      type: string
+      description: DoS profile that produced the event, e.g. /Common/dos
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.log.dos.profile_name
+    - vendor: date_time
+      type: timestamp
+      description: time the BIG-IP detected the event
+      ecs: '@timestamp'
+      status: partial
+      notes: >
+        rendered as "MMM dd yyyy HH:mm:ss" with no zone; the record also
+        carries a separate "timestamp" field for the same event at a different
+        offset, so the parser must pick one deliberately and apply a
+        per-device timezone
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Pass through unparsed so the stock pipeline can key off
+          device_product=ASM, and specifically do not rewrite or quote-strip
+          that field low-side. The only work worth doing near the source is
+          Persistent Queue backpressure on the Elastic destination and a route
+          that keeps the semicolon-delimited DoS records separate from the
+          comma-delimited Bot Defense records, since both arrive on the same
+          syslog listener and a shared kv extraction will mangle one of them.
+        elastic: >
+          Parse with the f5_bigip bot-and-dos pipeline and add a
+          logs-f5_bigip.log@custom pipeline for the numeric normalizations
+          this map flags: strip the unit suffixes from the tps values so rate
+          comparisons are arithmetic rather than string, and convert the
+          syslog-style severity - where lower is more severe - onto the same
+          event.severity scale the CEF datasets use, or DoS events will sort
+          as less severe than trivial violations. Map the f5_bigip.log.dos.*
+          namespace explicitly in the index template so attack id, mitigation
+          action and dropped/incoming counts can drive an attack-duration
+          dashboard.
+        relay: >
+          Low-side instances cross the guard on the same thin envelope as Bot
+          Defense so both share one JSON schema at the boundary. Content is
+          favourable for a simple custom filter rule: short, enumerated,
+          bounded values with no raw request payload - the only awkward values
+          are unit-suffixed rate strings such as "4 tps". Volume is low and
+          each attack produces few records, so per-(dataset, hour) count
+          reconciliation between the low and high sides is both cheap and the
+          only available drop detection.
+      direct:
+        parse_location: high
+        cribl: >
+          Pass through unparsed so the stock pipeline can key off
+          device_product=ASM, and specifically do not rewrite or quote-strip
+          that field at the edge. The only work worth doing near the source is
+          Persistent Queue backpressure on the Elastic destination and a route
+          that keeps the semicolon-delimited DoS records separate from the
+          comma-delimited Bot Defense records, since both arrive on the same
+          syslog listener and a shared kv extraction will mangle one of them.
+        elastic: >
+          Parse with the f5_bigip bot-and-dos pipeline and add a
+          logs-f5_bigip.log@custom pipeline for the numeric normalizations
+          this map flags: strip the unit suffixes from the tps values so rate
+          comparisons are arithmetic rather than string, and convert the
+          syslog-style severity - where lower is more severe - onto the same
+          event.severity scale the CEF datasets use, or DoS events will sort
+          as less severe than trivial violations. Map the f5_bigip.log.dos.*
+          namespace explicitly in the index template so attack id, mitigation
+          action and dropped/incoming counts can drive an attack-duration
+          dashboard.
+  - format: syslog-cef
+    enable: >
+      The Layer 7 DoS / anomaly events can be emitted in Common Event Format
+      instead of the semicolon key=value: set the security logging profile's
+      remote storage format to "Common Event Format (ArcSight)" (or attach an
+      ArcSight-type formatted high-speed-log destination), which BIG-IP
+      high-speed logging supports alongside Remote Syslog, Splunk and IPFIX
+      destination types. F5's Event Messages and Attack Types reference
+      documents the anomaly CEF envelope these events use -
+      cn3Label=attack_id, cs4Label=attack_status, cn1Label=detection_average,
+      cn2Label=dropped_requests, cs5Label=detection_mode and
+      cn4Label=violation_counter, with cs1=policy_name,
+      cs2=web_application_name and dvchost/rt on the header. This CEF form is
+      materially lossier than the key=value log, which additionally carries
+      dos_attack_name, dos_mitigation_action, reported_entity_type,
+      dos_attack_tps and dos_baseline_tps; confirm the exact extension set the
+      deployed DoS profile emits on-device before pinning a parser.
+    references:
+    - >-
+      https://techdocs.f5.com/kb/en-us/products/big-ip_ltm/manuals/product/bigip-external-monitoring-implementations-13-0-0/15.html
+    - >-
+      https://techdocs.f5.com/en-us/bigip-15-0-0/external-monitoring-of-big-ip-systems-implementations/configuring-remote-high-speed-logging-of-dos-protection-events.html
+    - >-
+      https://techdocs.f5.com/en-us/bigip-17-0-0/big-ip-asm-implementations/logging-application-security-events.html
+    parsing:
+      mechanism: cribl-pack
+      artifact: Cribl Pack for Common Event Format and Log Event Extended Format
+      notes: >
+        Parsed by the same CEF/LEEF pack as the request and attack CEF
+        datasets, on a branch keyed on the CEF Device Event Class ID because
+        the csN/cnN Label mapping is the anomaly/DoS set. The pack resolves
+        every csN/cnN value through its paired Label field, which is the
+        single hardest part of this format - the same cn1/cn2/cs4/cs5 slots
+        carry response_code, detection and X-Forwarded-For on the ASM request
+        log, so a positional parser will silently mis-populate.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Parse CEF to JSON low-side with the CEF/LEEF pack, resolving cn3/
+          cs4/cn1/cn2/cs5/cn4 through their paired Label fields rather than
+          positionally, and emit the same ECS-shaped outer schema as the DoS
+          key=value route so the two storage forms converge downstream. Carry
+          attack_id as a keyword for start/ongoing/end correlation, normalize
+          attack_status to a lifecycle enum, and reconcile the CEF header's
+          0-10 ascending severity with the syslog-style DoS number where lower
+          is more severe. Content is favourable - short, enumerated, bounded
+          values with no raw request payload - so validation and a dead-letter
+          route ahead of the guard destination are cheap.
+        elastic: >
+          Land in logs-f5_bigip.log and map the anomaly custom namespace
+          (f5_bigip.log.attack.id, attack.status, detection_average,
+          dropped_requests, violation_counter) explicitly as keyword so an
+          attack aggregates by id. Because this CEF form drops the rich DoS
+          fields the key=value carries, keep the two DoS storage forms on the
+          same event.severity scale so a CEF-sourced DoS event and a
+          key=value-sourced one rank identically.
+        relay: >
+          Low-side instances cross the guard as ECS-shaped JSON; the CEF is
+          converted low-side and stops at the boundary. Content-filter
+          friction is low - all values are short, enumerated and bounded with
+          no raw request payload - which makes this an easy dataset to put
+          behind a simple custom filter rule, with per-(dataset, hour) low-
+          versus high-side count reconciliation as the only viable drop
+          detection for this low-volume feed.
+      direct:
+        parse_location: low
+        cribl: >
+          High-side instances run the identical CEF-to-JSON parse without the
+          guard hops, resolving the csN/cnN Labels at the edge worker group
+          before the direct Elastic destination; no transfer-budget pressure
+          applies to this low-volume feed.
+        elastic: >
+          Land in logs-f5_bigip.log and map the anomaly custom namespace
+          (f5_bigip.log.attack.id, attack.status, detection_average,
+          dropped_requests, violation_counter) explicitly as keyword so an
+          attack aggregates by id; on this path the lossiness relative to the
+          key=value form is the reason to keep the DoS Application section on
+          key=value where the richer dos_* fields are needed and reserve CEF
+          for ArcSight-compatibility cases.
+    fields:
+    - vendor: deviceEventClassId
+      type: string
+      description: CEF header field naming the DoS/anomaly detection that fired
+      ecs: rule.name
+      status: mapped
+      notes: a detection-feature name, not a signature id; rule.id is left unpopulated
+    - vendor: cn3
+      type: long
+      description: identifier correlating every record belonging to one attack (cn3Label=attack_id)
+      ecs: null
+      custom: f5_bigip.log.dos.attack.id
+      status: unmapped
+      transform: >-
+        resolve through cn3Label; 64-bit unsigned values exceed a signed long,
+        so store as keyword
+    - vendor: cs4
+      type: enum
+      description: lifecycle state of the attack (cs4Label=attack_status - Started, Ongoing, Ended)
+      ecs: null
+      custom: f5_bigip.log.dos.attack.status
+      status: unmapped
+      transform: >-
+        resolve through cs4Label - the same cs4 slot carries attack_type on
+        the ASM request log
+    - vendor: cs5
+      type: string
+      description: which detection method fired (cs5Label=detection_mode), e.g. TPS Increased
+      ecs: event.reason
+      status: partial
+      transform: >-
+        resolve through cs5Label - the same cs5 slot carries
+        x_forwarded_for_header_value on the ASM request log
+    - vendor: cn1
+      type: long
+      description: >-
+        historical average of TPS, latency or failed logins that the
+        measurement was compared against (cn1Label=detection_average)
+      ecs: null
+      custom: f5_bigip.log.detection_average
+      status: unmapped
+      transform: >-
+        resolve through cn1Label - the same cn1 slot carries response_code on
+        the ASM request log
+      notes: >-
+        the baseline, not the observed rate; the key=value DoS form carries
+        the measured and learned values separately as dos_attack_tps and
+        dos_baseline_tps, and this CEF form has no companion field for the
+        measured rate
+    - vendor: cn2
+      type: long
+      description: number of requests dropped by the mitigation so far (cn2Label=dropped_requests)
+      ecs: null
+      custom: f5_bigip.log.dos.dropped_requests_count
+      status: unmapped
+      transform: resolve through cn2Label
+    - vendor: cn4
+      type: long
+      description: number of violations counted for the attack (cn4Label=violation_counter)
+      ecs: null
+      custom: f5_bigip.log.violation_counter
+      status: unmapped
+      transform: resolve through cn4Label
+    - vendor: cs1
+      type: string
+      description: ASM security policy that raised the DoS event (cs1Label=policy_name)
+      ecs: rule.ruleset
+      status: partial
+      transform: resolve through cs1Label
+    - vendor: cs2
+      type: string
+      description: web application the policy protects (cs2Label=web_application_name)
+      ecs: null
+      custom: f5_bigip.log.web_application_name
+      status: unmapped
+      transform: resolve through cs2Label
+    - vendor: severity
+      type: integer
+      description: CEF header severity, 0-10 with 10 most severe
+      ecs: event.severity
+      status: partial
+      transform: >
+        the CEF header's 0-10 ascending scale is the inverse of the
+        syslog-style DoS number the key=value form emits, where lower is more
+        severe; both must be normalized onto one direction
+    - vendor: dvchost
+      type: string
+      description: fully qualified hostname of the BIG-IP that raised the DoS event
+      ecs: observer.hostname
+      status: mapped
+    - vendor: rt
+      type: timestamp
+      description: CEF receipt time for the DoS record
+      ecs: '@timestamp'
+      status: partial
+      notes: >-
+        BIG-IP local time with no zone or offset; needs a per-device timezone
+        in the parser

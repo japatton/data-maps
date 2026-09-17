@@ -1,0 +1,1001 @@
+id: pacs-badge
+name: PACS Badge System
+vendor: Multiple
+versions: >-
+  Lenel OnGuard 7.x/8.x (class exemplar), Software House C•CURE 9000
+  v2.9/v3.x, AMAG Symmetry v9.x
+draft: true
+references:
+- https://cdn.lenel.com/oaap/DataConduIT.pdf
+- https://github.com/erwindevreugd/PSDataConduIT
+- >-
+  https://prod-edam.honeywell.com/content/dam/honeywell-edam/hbt/en-us/documents/manuals-and-guides/user-manuals/lenels2/hon-ba-security-openaccess-user-guide.pdf
+- >-
+  https://docs.cloud.google.com/chronicle/docs/ingestion/default-parsers/lenel-onguard
+- https://splunkbase.splunk.com/app/3499/
+- >-
+  https://community.splunk.com/t5/Knowledge-Management/Tyco-Software-House-CCURE-event-collection/m-p/411235
+datasets:
+- id: access-events
+  name: Badge access events (granted/denied)
+  description: >
+    Every badge read decided at a reader — access granted, access denied,
+    denied-unknown-badge, denied-wrong-time, denied-antipassback — plus the
+    cardholder, badge and door identifiers that make each read attributable.
+    This is the insider-threat and HSPD-12 correlation feed: it is what lets
+    the CSOC ask whether a network logon had a corresponding building entry.
+    Field names below are the Lenel OnGuard Lnl_LoggedEvent class properties
+    (reachable over DataConduIT/WMI and over the OpenAccess REST API), used
+    here as the class exemplar. The event CLASSES are universal across PACS
+    vendors — C•CURE 9000 exposes the same substance through its JournalLog
+    table (MessageUTC, MessageType, PrimaryObjectName, PrimaryObjectIdentity,
+    SecondaryObjectName, XmlMessage) and AMAG Symmetry through its own
+    transaction export — but the FIELD NAMES are not. The deployed vendor's
+    export format governs; treat the vendor column below as OnGuard-shaped and
+    re-key it per site before the map leaves draft.
+  event_categories:
+  - authentication
+  - iam
+  route:
+    guarded:
+    - hop: cribl
+      location: edge Cribl worker group, on-prem enclave
+      notes: >
+        No PACS in this class emits syslog natively — OnGuard is polled over
+        the OpenAccess REST API (the same approach Chronicle's LenelS2 parser
+        documents via middleware, and the Splunk add-on takes via DB Connect
+        against the AccessControl database). A Cribl REST Collector or
+        equivalent scheduled collector on the edge worker group is the
+        collection point, and it must run inside the physical-security enclave
+        and push across, since the guard carries no return channel for the API
+        request.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-pacs.access_events
+    direct:
+    - hop: cribl
+      location: edge Cribl worker group
+      notes: >
+        No PACS in this class emits syslog natively — OnGuard is polled over
+        the OpenAccess REST API (the same approach Chronicle's LenelS2 parser
+        documents via middleware, and the Splunk add-on takes via DB Connect
+        against the AccessControl database). A Cribl REST Collector or
+        equivalent scheduled collector on the edge worker group is the
+        collection point, co-located with the PACS so it can reach the
+        OpenAccess API directly.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-pacs.access_events
+  formats:
+  - format: api-pull
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom PACS access-event pipeline
+      notes: >
+        No Elastic integration and no Cribl pack exists for OnGuard, C•CURE or
+        Symmetry. The only public parsers are Chronicle's LenelS2 OnGuard
+        default parser (fed by custom middleware that polls OpenAccess and
+        posts NDJSON) and the Lenel OnGuard Add-on for Splunk (a DB Connect
+        query). Both confirm there is no vendor-native SIEM feed to lean on,
+        so the pipeline is hand-built and must be re-pointed per deployed
+        vendor.
+    fields:
+    - vendor: Time
+      type: timestamp
+      description: UTC time the panel recorded the badge read
+      ecs: '@timestamp'
+      status: mapped
+      transform: >
+        delivered as a WMI CIM_DATETIME string over DataConduIT (and as an
+        ISO-8601 string over OpenAccess); parse to UTC and prefer it over
+        collection time, since panels buffer and replay events after a comms
+        outage and arrival order is not event order
+    - vendor: SerialNumber
+      type: long
+      description: per-panel serial number the panel assigns to the event
+      ecs: event.id
+      status: partial
+      notes: >
+        only unique in combination with PanelID — the panel resets its counter
+        independently, so a bare SerialNumber collides across panels and must
+        be concatenated with PanelID to be a usable event id
+    - vendor: PanelID
+      type: integer
+      description: identifier of the access control panel (controller) that made the decision
+      ecs: null
+      status: unmapped
+      custom: pacs.panel.id
+    - vendor: DeviceID
+      type: integer
+      description: identifier of the reader/door on that panel, local to the panel
+      ecs: null
+      status: unmapped
+      custom: pacs.reader.id
+      notes: >-
+        reader id is panel-local; the globally unique door key is the
+        PanelID+DeviceID pair
+    - vendor: SecondaryDeviceID
+      type: integer
+      description: >-
+        identifier of a secondary device involved in the event (e.g. the
+        paired in/out reader)
+      ecs: null
+      status: unmapped
+      custom: pacs.reader.secondary_id
+    - vendor: Description
+      type: string
+      description: >-
+        the event's description text, e.g. "Access Granted" or "Access Denied
+        - Badge Not in Panel Database"
+      ecs: event.action
+      status: mapped
+      transform: >
+        vendor description strings are lowercased and underscored into a
+        stable action verb; the string set is vendor-specific, so the
+        normalization table has to be rebuilt if the site runs C•CURE or
+        Symmetry rather than OnGuard
+    - vendor: EventText
+      type: string
+      description: free-text operator-facing message accompanying the event
+      ecs: message
+      status: mapped
+    - vendor: Type
+      type: integer
+      description: numeric event type identifying the broad event family
+      ecs: event.code
+      status: partial
+      notes: >
+        OnGuard identifies an event by the (Type, SubType) pair, so Type alone
+        is ambiguous — several access outcomes share a Type and differ only in
+        SubType; the pair must be concatenated before event.code is a safe
+        alerting key
+    - vendor: SubType
+      type: integer
+      description: numeric event sub-type refining Type into the specific outcome
+      ecs: null
+      status: unmapped
+      custom: pacs.event.subtype_id
+    - vendor: AccessResult
+      type: enum
+      description: 'the panel''s decision on the read'
+      ecs: event.outcome
+      status: mapped
+      transform: >
+        documented enum 0=Other, 1=Unknown, 2=Granted, 3=Denied,
+        4=NotApplicable; 2 becomes success and 3 becomes failure, and 0/1/4
+        become unknown rather than being coerced to failure
+    - vendor: CardNumber
+      type: long
+      description: encoded badge/card number presented at the reader
+      ecs: null
+      status: unmapped
+      custom: pacs.badge.card_number
+      notes: >
+        ECS has no credential/card-number field; this is the primary
+        correlation key for badge activity and is credential-adjacent data, so
+        it should be tokenized or hashed before indexing
+    - vendor: IssueCode
+      type: integer
+      description: reissue counter distinguishing successive badges printed on the same card number
+      ecs: null
+      status: unmapped
+      custom: pacs.badge.issue_code
+      notes: >-
+        a stale issue code on an otherwise valid card number is a
+        cloned/retained-badge signal
+    - vendor: PersonID
+      type: integer
+      description: identifier of the cardholder record the badge belongs to
+      ecs: user.id
+      status: mapped
+      notes: >-
+        OnGuard cardholder (person) record id; stable across badge reissues,
+        unlike CardNumber
+    - vendor: CardholderEntered
+      type: boolean
+      description: >-
+        whether the door contact confirmed the cardholder actually passed
+        through after a grant
+      ecs: null
+      status: unmapped
+      custom: pacs.access.cardholder_entered
+      notes: >
+        a granted read with CardholderEntered false is the passback/handoff
+        signal, and a burst of entries with no matching grants is the
+        tailgating signal — no ECS field models this
+    - vendor: Duress
+      type: boolean
+      description: 'whether the read was made with the cardholder''s duress PIN'
+      ecs: null
+      status: unmapped
+      custom: pacs.access.duress
+      notes: highest-priority physical alert on this dataset; no ECS equivalent
+    - vendor: SegmentID
+      type: integer
+      description: OnGuard segment (tenant/site partition) the event belongs to
+      ecs: null
+      status: unmapped
+      custom: pacs.segment.id
+      notes: >-
+        segmentation is the site/agency boundary in multi-tenant OnGuard
+        installs; drives index routing and RBAC
+    - vendor: Lnl_Reader.Name
+      type: string
+      description: human-readable reader/door name resolved for the panel and device
+      ecs: observer.name
+      status: partial
+      notes: >
+        not carried on the logged event — it must be joined from Lnl_Reader on
+        PanelID+ReaderID; the reader is the observing device here, while
+        observer.vendor/observer.product identify the PACS head-end itself
+    - vendor: Lnl_Account.AccountID
+      type: string
+      description: external directory account linked to the cardholder record
+      ecs: user.name
+      status: partial
+      notes: >
+        joined from Lnl_Account/Lnl_Directory on PersonID, not present on the
+        event; this is the badge-to-AD join without which physical and logical
+        activity cannot be correlated, and many installs leave the link
+        unpopulated
+    - vendor: Lnl_Cardholder.LASTNAME
+      type: string
+      description: cardholder surname, joined with the first name to form the display name
+      ecs: user.full_name
+      status: partial
+      notes: >
+        requires a Lnl_Cardholder join on PersonID and concatenation with
+        FIRSTNAME; PII, so it should be carried only where the physical/
+        logical correlation use case justifies it
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Do the identifier joins on the edge worker group, because the lookup
+          tables live on the PACS side of the wire and are unreachable from an
+          Elastic ingest pipeline: PanelID+DeviceID to a reader/door name and
+          site, PersonID to the cardholder name and — critically — to the
+          linked directory account from Lnl_Account/Lnl_Directory, which is
+          the only thing that makes a badge tap joinable to a Windows or Entra
+          logon. Derive event.outcome here from the AccessResult enum (2
+          granted to success, 3 denied to failure, 0/1/4 to unknown) rather
+          than pattern matching the description string, tokenize or hash
+          CardNumber so raw credential numbers do not land in the index, and
+          run the collector's destination on Persistent Queue backpressure
+          with a dead-letter route keyed on records whose PersonID join
+          failed.
+        elastic: >
+          Own a custom logs-pacs.access_events ingest pipeline — there is no
+          stock integration to override — and keep its work to what the low
+          side could not finish: concatenating Type and SubType into a stable
+          event.code, and asserting user.name is populated so the badge feed
+          is actually joinable rather than silently landing as PersonID-only.
+          Declare explicit custom-namespace index-template mappings for
+          pacs.badge.card_number, pacs.panel.id, pacs.reader.id and
+          pacs.segment.id as keyword and pacs.access.cardholder_entered and
+          pacs.access.duress as boolean, since the tailgating and duress
+          detections depend on those two booleans surviving dynamic mapping.
+        relay: >
+          Full ECS-shaped NDJSON crosses (envelope mode B) — one decided read
+          per line, UTF-8, LF-terminated, compression disabled, nesting depth
+          at most two — because the badge-to-account enrichment has to happen
+          next to the PACS and a thin envelope would strand it. The
+          content-filter friction to settle with the guard owner is EventText,
+          an unbounded operator-facing free-text string that carries
+          cardholder names and site-specific wording; cap and allow-list it
+          low-side rather than assuming the custom NDJSON filter can inspect
+          it. If an ArcSight SmartConnector fronts the PACS today, CEF
+          conversion happens low-side and no CEF crosses; with no return
+          channel, reconcile low-side and high-side counts per (dataset, hour)
+          to detect silent drops.
+      direct:
+        parse_location: low
+        cribl: >
+          Do the identifier joins on the edge worker group, because the lookup
+          tables live on the PACS side of the wire and are unreachable from an
+          Elastic ingest pipeline: PanelID+DeviceID to a reader/door name and
+          site, PersonID to the cardholder name and — critically — to the
+          linked directory account from Lnl_Account/Lnl_Directory, which is
+          the only thing that makes a badge tap joinable to a Windows or Entra
+          logon. Derive event.outcome here from the AccessResult enum (2
+          granted to success, 3 denied to failure, 0/1/4 to unknown) rather
+          than pattern matching the description string, tokenize or hash
+          CardNumber so raw credential numbers do not land in the index, and
+          run the collector's destination on Persistent Queue backpressure
+          with a dead-letter route keyed on records whose PersonID join
+          failed.
+        elastic: >
+          Own a custom logs-pacs.access_events ingest pipeline — there is no
+          stock integration to override — and keep its work to what the edge
+          worker group could not finish: concatenating Type and SubType into a
+          stable event.code, and asserting user.name is populated so the badge
+          feed is actually joinable rather than silently landing as
+          PersonID-only. Declare explicit custom-namespace index-template
+          mappings for pacs.badge.card_number, pacs.panel.id, pacs.reader.id
+          and pacs.segment.id as keyword and pacs.access.cardholder_entered
+          and pacs.access.duress as boolean, since the tailgating and duress
+          detections depend on those two booleans surviving dynamic mapping.
+  - format: syslog-cef
+    enable: >
+      On the C•CURE 9000 Administration client create a Log Exporter object
+      (Objects -> More object types -> Server -> Log Exporter/SIEM), give it a
+      descriptive name (for example elastic-agent-cef), and set Export
+      Configuration to Enabled. On the object's Target settings enter the
+      collector's IP address or FQDN as the Target Server and the syslog port
+      it listens on as the Target Port, and select the Protocol (UDP or TCP)
+      to match the receiver. On the Data Manipulation page set the Format
+      dropdown to Common Event Format (CEF); the server then emits one
+      CEF-over-syslog frame per exported journal activity, with Device Vendor
+      fixed to "Software House" and Device Product to "C•CURE 9000". This is a
+      push transport, so unlike the OpenAccess/DataConduIT pull it needs no
+      return path into the PACS and can be received by a low-side collector
+      and forwarded one-way. Adding or editing the Log Exporter is itself a
+      journalled configuration change that appears in this feed. Which
+      activities are exported is governed by the C•CURE journal/event
+      configuration, so the access-decision subset must be confirmed against
+      the site's journal filter rather than assumed complete.
+    references:
+    - https://www.elastic.co/docs/reference/integrations/cef
+    - https://www.swhouse.com/products/ccure_9000.aspx
+    - >-
+      https://www.johnsoncontrols.com/-/media/project/jci-global/johnson-controls/us-region/united-states-johnson-controls/cyber-solutions/documents/ccure-9000-and-istar-v3003-hardening-guide-rev-c-final.pdf
+    parsing:
+      mechanism: elastic-integration
+      artifact: Elastic CEF integration (cef)
+      notes: >
+        The CEF header parses deterministically: the Elastic CEF integration
+        (or a Cribl CEF-parsing function on the Cribl side) splits the seven
+        pipe-delimited header fields to ECS - observer.vendor/product/
+        version, event.code from the Device Event Class ID, event.action from
+        Name and event.severity from the CEF 0-10 severity - so on this
+        transport event.code arrives ready-made rather than having to be
+        concatenated from a Type/SubType pair as on the OnGuard api-pull. The
+        badge-to-account and reader/door enrichment the api-pull feed does
+        low-side is still required here, because the C•CURE CEF line carries
+        names and identifiers but not the linked directory account. The
+        per-vendor CEF EXTENSION inventory (the cardholder, card, reader and
+        door key-value pairs after the header) is not published in the vendor
+        documentation and varies by C•CURE version and journal configuration;
+        it must be captured from a live Log Exporter sample on the deployed
+        site before those fields can be mapped. The header fields below are
+        the sourced, transport-guaranteed subset.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Terminate the C•CURE Log Exporter on a Syslog source on the edge
+          worker group and parse the CEF header low-side, then run the same
+          enrichment the api-pull branch needs: resolve the reader/door and
+          site so this feed carries the identical door key a co-running
+          OnGuard feed would, and resolve the cardholder to the linked
+          directory account so a badge tap is joinable to a Windows or Entra
+          logon - the CEF line does not carry that link. Derive event.outcome
+          from the Device Event Class ID / Name (card admitted to success, the
+          rejected/denied classes to failure) rather than from a severity
+          number, tokenize or hash any card number that appears in the
+          extension before it is indexed, and run the Syslog destination on
+          Persistent Queue backpressure with a dead-letter route for records
+          whose cardholder join fails. Length-cap and allow-list the CEF Name
+          and any free-text msg extension low-side, since those carry
+          cardholder names and site wording that the guard's content filter
+          cannot be assumed to inspect.
+        elastic: >
+          Own the same custom logs-pacs.access_events ingest pipeline the
+          technology already needs - do not let the stock CEF integration land
+          this feed in a logs-cef.* stream where it would be divorced from the
+          OnGuard-shaped records. Keep the pipeline's work to what the low
+          side could not finish: asserting user.name is populated so the badge
+          feed is joinable, normalizing the C•CURE event-class vocabulary onto
+          the same action verbs the OnGuard Description table produces so both
+          vendors alert alike, and declaring the same pacs.badge.card_number,
+          pacs.panel.id, pacs.reader.id keyword mappings and the
+          pacs.access.duress boolean so a C•CURE site and an OnGuard site
+          share one index template.
+        relay: >
+          Cross full ECS-shaped NDJSON (envelope mode B), one decided read per
+          line, with the identical outer envelope keys and bounded key set the
+          api-pull branch crosses, so the guard's custom content filter has
+          one shape to inspect for the whole technology regardless of which
+          PACS vendor a site runs. Do NOT cross the raw CEF frame: the CEF
+          Name and any msg extension are unbounded operator-facing free text
+          carrying cardholder names, so cap and allow-list them low-side, and
+          because the enrichment has to happen next to the C•CURE server a
+          thin envelope would strand it. With no return channel across the
+          guard, reconcile low-side and high-side counts per (dataset, hour)
+          to detect silent drops.
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side C•CURE with no guard the one decision that matters
+          is who parses the CEF: point the Log Exporter straight at an Elastic
+          Agent CEF input and let the stock integration do the header split,
+          or terminate it on the core worker group's Syslog source and parse
+          in Cribl. Either way pick ONE authoritative access transport per
+          site - do not run the C•CURE CEF Log Exporter and an OpenAccess/DB
+          collector against the same server in parallel except briefly during
+          cutover, and if both run, key de-duplication on the CEF Device Event
+          Class ID plus timestamp and reader rather than on a record id, since
+          the two transports assign different ids to the same read.
+        elastic: >
+          This is the one place the PACS class gets a stock parser: with no
+          guard in the path the Elastic CEF integration (cef) can carry the
+          header to ECS, so the custom logs-pacs.access_events pipeline
+          shrinks to the C•CURE-specific extension extraction, the
+          event-class-to-outcome derivation and the badge-to-account
+          enrichment. Keep the same pacs.* keyword mappings the api-pull feed
+          declares so the index shape does not fork by transport, and retain
+          the full CEF Name text for forensics rather than capping it, since
+          there is no boundary to protect.
+    fields:
+    - vendor: CEF Device Vendor
+      type: string
+      description: >-
+        fixed device-vendor header field, "Software House", identifying the
+        emitting PACS product line.
+      ecs: observer.vendor
+      status: mapped
+    - vendor: CEF Device Product
+      type: string
+      description: fixed device-product header field, "C•CURE 9000", identifying the PACS head-end.
+      ecs: observer.product
+      status: mapped
+    - vendor: CEF Device Version
+      type: string
+      description: C•CURE 9000 version string carried in the CEF header.
+      ecs: observer.version
+      status: mapped
+    - vendor: CEF Device Event Class ID
+      type: string
+      description: >-
+        signature/event-class identifier for the journal activity, e.g. the
+        code distinguishing a card-admitted read from a card-rejected one.
+      ecs: event.code
+      status: mapped
+      notes: >
+        on this transport the event identity is a single header value, so
+        event.code is ready-made and does not need the Type+SubType
+        concatenation the OnGuard api-pull requires
+    - vendor: CEF Name
+      type: string
+      description: human-readable event name for the read, e.g. "Card Admitted" or "Card Rejected".
+      ecs: event.action
+      status: mapped
+      transform: >
+        normalized to the same stable action verbs the OnGuard Description
+        table produces so both vendors alert on one vocabulary; the C•CURE
+        string set differs from OnGuard's, so it needs its own normalization
+        table
+    - vendor: CEF Severity
+      type: integer
+      description: CEF severity of the frame, an integer on the CEF 0-10 scale.
+      ecs: event.severity
+      status: partial
+      transform: >
+        the CEF 0-10 scale is not ECS's numeric long-scale severity, so it
+        needs a lookup rather than a straight copy, and it reflects the
+        journal severity of the activity rather than an access decision -
+        outcome is derived from the Device Event Class ID / Name, not from
+        this field
+    - vendor: syslog header timestamp
+      type: timestamp
+      description: time carried in the syslog/CEF frame the Log Exporter emits for the activity.
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        a BSD (RFC 3164) syslog header carries no year, so where the exporter
+        uses that framing the year must be reconciled at ingest; prefer an
+        in-frame CEF rt/end extension time over the header when the site's
+        export includes one
+- id: door-alarm-events
+  name: Door and reader alarm events
+  description: >
+    Door forced open, door held open, reader and cabinet tamper, and
+    alarm-input activations raised by the panels — the same Lnl_LoggedEvent
+    stream as the access dataset, filtered to the alarm event types rather
+    than the badge-decision types. These are the events that say a controlled
+    door opened without a valid read, or stayed open after one, which is the
+    physical analogue of an authentication bypass. Vendor field names are
+    OnGuard-shaped placeholders; C•CURE surfaces the same alarms through
+    JournalLog MessageType and Symmetry through its alarm transaction export.
+  event_categories:
+  - authentication
+  route:
+    guarded:
+    - hop: cribl
+      location: edge Cribl worker group, on-prem enclave
+      notes: >
+        Same collector as the access-events dataset — one poll of the logged
+        event stream, split into two datasets by event type in the pipeline.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-pacs.door_alarms
+    direct:
+    - hop: cribl
+      location: edge Cribl worker group
+      notes: >
+        Same collector as the access-events dataset — one poll of the logged
+        event stream, split into two datasets by event type in the pipeline.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-pacs.door_alarms
+  formats:
+  - format: api-pull
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom PACS alarm-event pipeline
+      notes: >
+        Shares the access-event pipeline's collector and vendor-normalization
+        table; the branch differs only in the Type/SubType filter and in
+        deriving outcome without an AccessResult to lean on.
+    fields:
+    - vendor: Time
+      type: timestamp
+      description: UTC time the panel recorded the alarm
+      ecs: '@timestamp'
+      status: mapped
+      transform: >-
+        parse the CIM_DATETIME/ISO-8601 value to UTC; panels replay buffered
+        alarms after a comms outage, so arrival order is not alarm order
+    - vendor: SerialNumber
+      type: long
+      description: per-panel serial number the panel assigns to the alarm event
+      ecs: event.id
+      status: partial
+      notes: >-
+        unique only in combination with PanelID, same collision caveat as the
+        access dataset
+    - vendor: PanelID
+      type: integer
+      description: identifier of the panel that raised the alarm
+      ecs: null
+      status: unmapped
+      custom: pacs.panel.id
+    - vendor: DeviceID
+      type: integer
+      description: identifier of the reader/door or alarm input the alarm is attached to
+      ecs: null
+      status: unmapped
+      custom: pacs.reader.id
+    - vendor: Description
+      type: string
+      description: >-
+        the alarm's description text, e.g. "Door Forced Open", "Door Held
+        Open", "Reader Tamper"
+      ecs: event.action
+      status: mapped
+      transform: >-
+        normalized to a stable action verb through the same vendor-specific
+        description table as the access dataset
+    - vendor: EventText
+      type: string
+      description: free-text operator-facing message accompanying the alarm
+      ecs: message
+      status: mapped
+    - vendor: Type
+      type: integer
+      description: numeric event type identifying the alarm family
+      ecs: event.code
+      status: partial
+      notes: >-
+        same (Type, SubType) pairing requirement as the access dataset; Type
+        alone does not distinguish forced from held
+    - vendor: SubType
+      type: integer
+      description: numeric event sub-type refining the alarm into the specific condition
+      ecs: null
+      status: unmapped
+      custom: pacs.event.subtype_id
+    - vendor: AccessResult
+      type: enum
+      description: access decision enum, carried on every logged event including alarms
+      ecs: event.outcome
+      status: partial
+      notes: >
+        on alarm records this is 4 (NotApplicable) rather than Granted or
+        Denied, so event.outcome for this dataset must be derived from the
+        alarm description/Type — mapping straight off this column marks every
+        door-forced alarm unknown
+    - vendor: CardNumber
+      type: long
+      description: badge number of the read that preceded the alarm, where one did
+      ecs: null
+      status: unmapped
+      custom: pacs.badge.card_number
+      notes: >
+        populated on held-open alarms that followed a valid read and empty on
+        forced-open alarms; its absence is itself the signal that the door
+        opened with no credential
+    - vendor: Priority
+      type: integer
+      description: alarm priority/severity assigned by the PACS
+      ecs: event.severity
+      status: partial
+      notes: >
+        placeholder — OnGuard carries priority on the alarm definition rather
+        than on the logged event, C•CURE exposes it through JournalLog
+        MessageType, and Symmetry uses its own scale; the deployed vendor's
+        export format governs both the field name and the numeric range, so
+        this needs a per-vendor lookup onto ECS's severity scale
+    - vendor: SegmentID
+      type: integer
+      description: OnGuard segment (tenant/site partition) the alarm belongs to
+      ecs: null
+      status: unmapped
+      custom: pacs.segment.id
+    - vendor: Lnl_Reader.Name
+      type: string
+      description: human-readable reader/door name resolved for the panel and device
+      ecs: observer.name
+      status: partial
+      notes: >-
+        joined from Lnl_Reader on PanelID+ReaderID; must resolve to the
+        identical door key the access dataset uses or the two cannot be
+        correlated
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Split this branch off the shared collector by Type/SubType on the
+          edge worker group and derive event.outcome from the alarm
+          description instead of AccessResult, which is NotApplicable on these
+          records and would otherwise silently mark every door-forced alarm
+          unknown. Resolve the PanelID+DeviceID to reader/door name and site
+          here alongside the access branch so both datasets carry the
+          identical door key, and normalize the vendor's alarm priority to a
+          single numeric scale low-side rather than shipping three vendors'
+          scales into one index.
+        elastic: >
+          Add a custom logs-pacs.door_alarms ingest pipeline that finishes the
+          correlation the low side cannot: window a forced/held alarm against
+          the preceding access grant on the same door key so an operator sees
+          whether the door was opened after a valid read or without one. Map
+          pacs.event.subtype_id and pacs.panel.id as keyword and confirm
+          event.severity carries the normalized numeric priority rather than
+          the raw vendor label, since this dataset's alerting is
+          severity-driven.
+        relay: >
+          Full ECS-shaped NDJSON crosses (envelope mode B), one alarm per
+          line, with the same outer envelope keys and bounded key set as the
+          access branch so the guard's custom content filter has one shape to
+          inspect rather than two. This dataset is low-volume and forensically
+          valuable, so carry _raw across the guard until the hand-built parser
+          is proven — drop it on the access branch first. The free-text
+          EventText is the same filter friction and should be length-capped
+          low-side.
+      direct:
+        parse_location: low
+        cribl: >
+          Split this branch off the shared collector by Type/SubType on the
+          edge worker group and derive event.outcome from the alarm
+          description instead of AccessResult, which is NotApplicable on these
+          records and would otherwise silently mark every door-forced alarm
+          unknown. Resolve the PanelID+DeviceID to reader/door name and site
+          here alongside the access branch so both datasets carry the
+          identical door key, and normalize the vendor's alarm priority to a
+          single numeric scale at the edge worker group rather than shipping
+          three vendors' scales into one index.
+        elastic: >
+          Add a custom logs-pacs.door_alarms ingest pipeline that finishes the
+          correlation the edge worker group cannot: window a forced/held alarm
+          against the preceding access grant on the same door key so an
+          operator sees whether the door was opened after a valid read or
+          without one. Map pacs.event.subtype_id and pacs.panel.id as keyword
+          and confirm event.severity carries the normalized numeric priority
+          rather than the raw vendor label, since this dataset's alerting is
+          severity-driven.
+  - format: syslog-cef
+    enable: >
+      The same Log Exporter/SIEM object configured for the access branch
+      (Objects -> More object types -> Server -> Log Exporter/SIEM, Export
+      Configuration Enabled, Data Manipulation Format set to Common Event
+      Format) also emits the door and reader alarm activities as CEF-over-
+      syslog frames, since alarms are journal activities in C•CURE. No second
+      object is needed; the alarm subset is separated downstream by the CEF
+      Device Event Class ID / Name. Confirm the site's journal/event
+      configuration actually routes the door-forced, door-held and tamper
+      activities to the Log Exporter, since a site can scope the exported
+      activity set and an unrouted alarm class simply never appears on the
+      wire.
+    references:
+    - https://www.elastic.co/docs/reference/integrations/cef
+    - https://www.swhouse.com/products/ccure_9000.aspx
+    - >-
+      https://www.johnsoncontrols.com/-/media/project/jci-global/johnson-controls/us-region/united-states-johnson-controls/cyber-solutions/documents/ccure-9000-and-istar-v3003-hardening-guide-rev-c-final.pdf
+    parsing:
+      mechanism: elastic-integration
+      artifact: Elastic CEF integration (cef)
+      notes: >
+        Shares the access branch's CEF header parsing; the difference is that
+        event.outcome cannot come from an access decision - a door-forced or
+        tamper activity carries an alarm event class, not a granted/denied one
+        - so outcome is derived from the Device Event Class ID / Name. The CEF
+        Severity here is the more useful of the header numbers because alarm
+        alerting is severity-driven, but it is still the CEF 0-10 scale and
+        needs mapping onto ECS numeric severity. As on the access branch, the
+        per-vendor CEF extension inventory (which reader/door the alarm is
+        attached to, and the preceding read where one exists) is not published
+        and must be captured from a live sample before those fields map.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Split the alarm branch off the shared C•CURE Log Exporter feed by
+          Device Event Class ID / Name on the edge worker group and derive
+          event.outcome from the alarm class rather than from any access
+          decision, which is absent on these frames. Resolve the reader/door
+          and site low-side to the identical door key the access branch and
+          any co-running OnGuard feed use, so a forced/held alarm can be
+          windowed against the preceding grant, and normalize the CEF 0-10
+          severity onto one numeric scale low-side rather than shipping raw
+          vendor severities into the index. Length-cap the CEF Name and any
+          free-text extension, the same content-filter friction as the access
+          branch.
+        elastic: >
+          Land this branch in the same custom logs-pacs.door_alarms ingest
+          pipeline the technology already defines, not a stock logs-cef.*
+          stream, and finish the correlation the low side cannot: window a
+          forced/held alarm against the preceding access grant on the same
+          door key. Map pacs.event.subtype_id and pacs.panel.id as keyword and
+          confirm event.severity carries the normalized numeric priority
+          rather than the raw CEF 0-10 value, since this dataset's alerting is
+          severity-driven and must behave identically whether the site runs
+          C•CURE or OnGuard.
+        relay: >
+          Cross full ECS-shaped NDJSON (envelope mode B), one alarm per line,
+          with the same outer envelope keys and bounded key set as the access
+          branch so the guard's custom content filter sees one shape for the
+          whole technology. This dataset is low-volume and forensically
+          valuable, so carry _raw (the original CEF frame) across the guard
+          until the hand-built alarm normalization is proven, dropping it on
+          the access branch first. The CEF Name is the same length-capped
+          free-text friction.
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side C•CURE with no guard, point the shared Log Exporter
+          at the Elastic Agent CEF input or terminate it on the core worker
+          group Syslog source, and split the alarm branch by Device Event
+          Class ID / Name after the header parse. Pick one authoritative alarm
+          transport per site so the CEF Log Exporter is not double-counted
+          against any co-running OpenAccess/DB alarm collector during cutover,
+          keying de-duplication on the CEF event class plus timestamp and
+          reader.
+        elastic: >
+          With no guard in the path, let the Elastic CEF integration (cef)
+          carry the header and keep the custom logs-pacs.door_alarms pipeline
+          to the alarm-class-to-outcome derivation, the door-key correlation
+          window and the severity normalization. Retain the full CEF Name for
+          triage rather than capping it, and keep the door key identical to
+          the access branch so open-door correlation works without a
+          downstream join.
+    fields:
+    - vendor: CEF Device Vendor
+      type: string
+      description: fixed device-vendor header field, "Software House".
+      ecs: observer.vendor
+      status: mapped
+    - vendor: CEF Device Product
+      type: string
+      description: fixed device-product header field, "C•CURE 9000".
+      ecs: observer.product
+      status: mapped
+    - vendor: CEF Device Event Class ID
+      type: string
+      description: >-
+        signature/event-class identifier for the alarm activity,
+        distinguishing door-forced from door-held from reader/cabinet tamper.
+      ecs: event.code
+      status: mapped
+      notes: >-
+        this is the field the alarm branch is split on downstream, and the
+        source event.outcome is derived from
+    - vendor: CEF Name
+      type: string
+      description: >-
+        human-readable alarm name, e.g. "Door Forced Open", "Door Held Open",
+        "Reader Tamper".
+      ecs: event.action
+      status: mapped
+      transform: >-
+        normalized to the same stable action verbs as the OnGuard Description
+        table through a C•CURE-specific normalization table
+    - vendor: CEF Severity
+      type: integer
+      description: CEF severity of the alarm frame on the CEF 0-10 scale.
+      ecs: event.severity
+      status: partial
+      transform: >
+        mapped onto ECS numeric severity through a lookup; it is the header
+        number this dataset actually alerts on, but the CEF 0-10 range is not
+        ECS's scale and must not be copied straight
+    - vendor: syslog header timestamp
+      type: timestamp
+      description: time carried in the syslog/CEF frame for the alarm activity.
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        reconcile the year at ingest where the exporter uses RFC 3164 framing
+        (no year in the header); panels can replay buffered alarms after a
+        comms outage, so arrival order is not alarm order
+- id: system-health
+  name: Panel and reader health
+  description: >
+    Thin starter — controller and reader online/offline transitions, comms
+    loss, cabinet tamper and power-fail conditions reported by the PACS
+    head-end. This is the "is the badge feed actually alive" dataset: a panel
+    that has been offline for a day produces no access events at all, which
+    looks identical to a quiet door unless this stream is watched. Field
+    coverage is deliberately shallow and needs a second pass before the map
+    leaves draft.
+  event_categories:
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge Cribl worker group, on-prem enclave
+      notes: >
+        Collected by the same scheduled collector as the event datasets, from
+        the panel/reader hardware-status surface rather than the logged event
+        stream.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-pacs.system_health
+    direct:
+    - hop: cribl
+      location: edge Cribl worker group
+      notes: >
+        Collected by the same scheduled collector as the event datasets, from
+        the panel/reader hardware-status surface rather than the logged event
+        stream.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-pacs.system_health
+  formats:
+  - format: api-pull
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom PACS health pipeline
+      notes: >
+        Hand-built; the status values are bitmasks rather than log lines, so
+        the pipeline is doing state-to-event conversion, not text parsing.
+    fields:
+    - vendor: Time
+      type: timestamp
+      description: UTC time the health state was observed or the transition recorded
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: PanelID
+      type: integer
+      description: identifier of the access control panel whose state changed
+      ecs: null
+      status: unmapped
+      custom: pacs.panel.id
+    - vendor: Lnl_Panel.Name
+      type: string
+      description: human-readable panel name
+      ecs: observer.name
+      status: partial
+      notes: >-
+        joined from Lnl_Panel on PanelID; not present on the hardware-status
+        response itself
+    - vendor: Lnl_Panel.Status
+      type: integer
+      description: 'panel hardware status bitmask returned by the panel''s hardware-status call'
+      ecs: null
+      status: unmapped
+      custom: pacs.panel.status_flags
+      notes: >
+        documented bit flags 0x1 Online, 0x2 OptionsMismatch, 0x4
+        CabinetTamper, 0x8 PowerFailure, 0x10 DownloadingFirmware; the Online
+        bit has to be decoded before any of this is alertable
+    - vendor: Lnl_Reader.Status
+      type: integer
+      description: 'reader hardware status bitmask returned by the reader''s hardware-status call'
+      ecs: null
+      status: unmapped
+      custom: pacs.reader.status_flags
+      notes: >
+        documented bit flags include 0x1 Online, 0x10 ReaderTamper, 0x20
+        DoorForced, 0x40 DoorHeld, 0x800000 LowBattery, 0x2000000
+        ReadHeadOffline and 0x8000000 DoorContactOffline; the door-forced and
+        door-held bits overlap the alarm dataset and should not be
+        double-counted as separate alerts
+    - vendor: Description
+      type: string
+      description: >-
+        description text of the health transition, e.g. "Panel Offline" or
+        "Cabinet Tamper"
+      ecs: event.action
+      status: mapped
+      transform: normalized to a stable action verb; the string set is vendor-specific
+    - vendor: SegmentID
+      type: integer
+      description: OnGuard segment (tenant/site partition) the panel belongs to
+      ecs: null
+      status: unmapped
+      custom: pacs.segment.id
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Decode the panel and reader status bitmasks on the edge worker group
+          into named boolean conditions and emit an event only on transition,
+          not on every poll, so a permanently offline panel does not generate
+          a constant stream. Keep a low-side per-panel last-seen state so a
+          panel that stops answering the collector entirely still produces an
+          offline event — an absent poll response is the failure mode this
+          dataset exists to catch, and it is invisible downstream.
+        elastic: >
+          Add a custom logs-pacs.system_health ingest pipeline that sets
+          event.outcome from the decoded Online bit, since no vendor column
+          carries an outcome on this dataset and the configuration profile
+          requires one. Map pacs.panel.status_flags and
+          pacs.reader.status_flags as long with the decoded condition names as
+          a separate keyword array, and build the alerting off panel-offline
+          duration rather than the raw flag value.
+        relay: >
+          This is the natural reconciliation heartbeat for the crossing:
+          because the guard gives no acknowledgement, emit a low-side
+          per-(dataset, hour) count alongside the health events and compare it
+          against the high-side count to detect silent drops on the access and
+          alarm branches. The records are small and fully structured, so hold
+          them to the same bounded NDJSON envelope and keep the key set
+          allow-listed.
+      direct:
+        parse_location: low
+        cribl: >
+          Decode the panel and reader status bitmasks on the edge worker group
+          into named boolean conditions and emit an event only on transition,
+          not on every poll, so a permanently offline panel does not generate
+          a constant stream. Keep a per-panel last-seen state at the edge
+          worker group so a panel that stops answering the collector entirely
+          still produces an offline event — an absent poll response is the
+          failure mode this dataset exists to catch, and it is invisible
+          downstream.
+        elastic: >
+          Add a custom logs-pacs.system_health ingest pipeline that sets
+          event.outcome from the decoded Online bit, since no vendor column
+          carries an outcome on this dataset and the configuration profile
+          requires one. Map pacs.panel.status_flags and
+          pacs.reader.status_flags as long with the decoded condition names as
+          a separate keyword array, and build the alerting off panel-offline
+          duration rather than the raw flag value.

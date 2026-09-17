@@ -1,0 +1,778 @@
+id: apache-httpd
+name: Apache httpd
+vendor: ASF
+versions: httpd 2.4.x (2.2.x legacy)
+draft: true
+references:
+- https://httpd.apache.org/docs/2.4/logs.html
+- https://httpd.apache.org/docs/2.4/mod/mod_log_config.html
+- https://httpd.apache.org/docs/2.4/mod/core.html#errorlogformat
+- https://www.elastic.co/docs/reference/integrations/apache
+- https://github.com/elastic/integrations/tree/main/packages/apache
+datasets:
+- id: access
+  name: Access log
+  description: >
+    Per-request transaction log written by mod_log_config. The realistic
+    default is Combined Log Format — %h %l %u %t "%r" %>s %b "%{Referer}i"
+    "%{User-Agent}i" — but the LogFormat directive means the on-disk format is
+    site-specific: many deployments add %D/%T timings, %I/%O byte counts, %v
+    virtual host, or X-Forwarded-For, and some still emit bare Common Log
+    Format with no referer or user agent. Fields below cover the Combined
+    baseline plus the LogFormat tokens most often bolted on; the deployed
+    httpd.conf LogFormat lines are the authoritative field list for any given
+    server.
+  event_categories:
+  - web
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Plain-text access lines collected by the Elastic Agent apache
+        integration (file tail) or shipped as raw syslog where httpd pipes to
+        logger. DMZ-facing web tiers are the low-side instances; internal
+        app-server httpd instances ship direct.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-apache.access
+    direct:
+    - hop: cribl
+      location: edge worker group
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-apache.access
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: elastic-integration
+      artifact: Apache HTTP Server integration (apache), access data stream
+      notes: >
+        The stock apache integration ships grok patterns for Common, Combined,
+        and a TLS-annotated variant, and populates apache.access.* alongside
+        ECS url/http/user_agent fields.
+    fields:
+    - vendor: '%h'
+      type: ip
+      description: IP address of the client that made the request
+      ecs: source.address
+      status: mapped
+      notes: >
+        an IP by default; with HostnameLookups On this is a reverse-resolved
+        hostname instead, so source.ip should only be populated when the value
+        parses as an address
+    - vendor: '%l'
+      type: string
+      description: RFC 1413 identity of the client reported by identd
+      ecs: null
+      status: unmapped
+      custom: apache.access.identity
+      transform: >-
+        literal "-" (the near-universal value when IdentityCheck is off)
+        should be dropped rather than stored
+    - vendor: '%u'
+      type: string
+      description: userid of the person requesting the document, from HTTP authentication
+      ecs: user.name
+      status: mapped
+      notes: >
+        "-" when the request was unauthenticated; the value is unreliable on
+        401 responses because the user had not yet authenticated successfully
+    - vendor: '%t'
+      type: timestamp
+      description: >-
+        time the request was received, formatted
+        [day/month/year:hour:minute:second zone]
+      ecs: '@timestamp'
+      status: mapped
+      transform: parse dd/MMM/yyyy:HH:mm:ss Z (e.g. 10/Oct/2000:13:55:36 -0700) to UTC
+    - vendor: '%r'
+      type: string
+      description: first line of the request as sent by the client (method, resource, protocol)
+      ecs: url.original
+      status: partial
+      notes: >
+        composite value like "GET /apache_pb.gif HTTP/1.0" that must be split
+        into http.request.method, url.original and http.version; malformed or
+        hostile requests put arbitrary unescaped bytes in this token, so the
+        split has to tolerate a non-conforming request line
+    - vendor: '%>s'
+      type: integer
+      description: final HTTP status code sent back to the client after any internal redirects
+      ecs: http.response.status_code
+      status: mapped
+      transform: also drives event.outcome — status < 400 is success, >= 400 is failure
+    - vendor: '%b'
+      type: bytes
+      description: size of the response body returned to the client, excluding headers
+      ecs: http.response.body.bytes
+      status: mapped
+      transform: emitted as "-" rather than 0 when no body was sent; convert to numeric 0
+    - vendor: '%{Referer}i'
+      type: string
+      description: Referer request header - the page the client was referred from
+      ecs: http.request.referrer
+      status: mapped
+    - vendor: '%{User-Agent}i'
+      type: string
+      description: User-Agent request header identifying the client browser or tool
+      ecs: user_agent.original
+      status: mapped
+      notes: >-
+        raw UA string only; parsed browser/os/device breakdown comes from the
+        ingest pipeline's user_agent processor
+    - vendor: '%m'
+      type: string
+      description: 'request method, when the site''s LogFormat logs it separately from %r'
+      ecs: http.request.method
+      status: mapped
+    - vendor: '%U'
+      type: string
+      description: URL path requested, not including any query string
+      ecs: url.path
+      status: mapped
+    - vendor: '%q'
+      type: string
+      description: query string, prefixed with ? when present and empty otherwise
+      ecs: url.query
+      status: mapped
+      transform: strip the leading "?" - ECS url.query holds the query without the delimiter
+    - vendor: '%H'
+      type: string
+      description: request protocol
+      ecs: http.version
+      status: partial
+      transform: >-
+        value is "HTTP/1.1" or "HTTP/2"; ECS http.version expects the bare
+        version ("1.1"), so the HTTP/ prefix must be stripped
+    - vendor: '%v'
+      type: string
+      description: canonical ServerName of the virtual host that served the request
+      ecs: destination.domain
+      status: mapped
+      notes: >
+        the vhost the request landed on, which is what the Elastic apache grok
+        places on destination.domain; absent from stock Combined Log Format,
+        so shared-hosting servers must add it to LogFormat
+    - vendor: '%p'
+      type: port
+      description: canonical port of the server serving the request
+      ecs: destination.port
+      status: mapped
+    - vendor: '%D'
+      type: integer
+      description: time taken to serve the request, in microseconds
+      ecs: event.duration
+      status: partial
+      transform: >-
+        multiply by 1000 - ECS event.duration is nanoseconds, %D is
+        microseconds (%T is the whole-second variant)
+    - vendor: '%I'
+      type: bytes
+      description: bytes received including the request line and headers (requires mod_logio)
+      ecs: http.request.bytes
+      status: mapped
+    - vendor: '%O'
+      type: bytes
+      description: bytes sent including response headers (requires mod_logio)
+      ecs: http.response.bytes
+      status: mapped
+    - vendor: '%{X-Forwarded-For}i'
+      type: string
+      description: >-
+        X-Forwarded-For request header, logged where httpd sits behind a load
+        balancer or reverse proxy
+      ecs: network.forwarded_ip
+      status: partial
+      notes: >
+        comma-separated proxy chain, client-supplied and therefore spoofable;
+        the left-most address beyond the trusted hops is the real client.ip
+        while %h is only the nearest proxy
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Keep the core worker group a pass-through and let the integration's
+          grok do the parsing, but do the two jobs that are cheaper near the
+          source: stamp the originating vhost/site and device owner onto each
+          event (the line itself often carries no %v), and normalise the
+          LogFormat variant per source so the high side knows which grok will
+          match instead of falling through three patterns. Run the Elastic
+          destination on Persistent Queue backpressure, and mask query-string
+          credentials (tokens, session ids, api_key in %q) before forwarding —
+          access logs routinely capture secrets in URLs.
+        elastic: >
+          Use the apache integration's access ingest pipeline as the parser
+          and add a logs-apache.access@custom pipeline for what it leaves
+          undone: strip the HTTP/ prefix off %H so http.version is a bare
+          version number, coerce the "-" placeholder in %b to 0 instead of a
+          null, and convert %D microseconds to event.duration nanoseconds.
+          Confirm event.outcome is derived from the status code (<400 success,
+          >=400 failure) rather than any single token, and resolve
+          X-Forwarded-For to a left-most client.ip with the trusted proxy hops
+          kept in network.forwarded_ip. Map apache.access.identity as keyword
+          in the custom-namespace index template.
+        relay: >
+          Low-side instances cross the guard as a thin NDJSON envelope (mode
+          A) — {_dataId, "@timestamp", host, _raw} — so the integration's grok
+          still runs high-side and one JSON schema faces the content filter
+          instead of three LogFormat grammars. The specific friction to settle
+          with the guard owner is unbounded attacker-controlled free-text: %r,
+          %q and %{User-Agent}i carry percent-encoded, non-ASCII and
+          multi-kilobyte values on any internet-facing vhost, so cap and flag
+          them low-side to a length a simple custom filter accepts. The feed
+          is raw text rather than CEF, so nothing CEF-shaped crosses; this is
+          a high-volume, moderate-forensic-value dataset, making it an early
+          candidate for dropping _raw once the grok is proven.
+      direct:
+        parse_location: high
+        cribl: >
+          Keep the core worker group a pass-through and let the integration's
+          grok do the parsing, but do the two jobs that are cheaper near the
+          source: stamp the originating vhost/site and device owner onto each
+          event (the line itself often carries no %v), and normalise the
+          LogFormat variant per source so the high side knows which grok will
+          match instead of falling through three patterns. Run the Elastic
+          destination on Persistent Queue backpressure, and mask query-string
+          credentials (tokens, session ids, api_key in %q) before forwarding —
+          access logs routinely capture secrets in URLs.
+        elastic: >
+          Use the apache integration's access ingest pipeline as the parser
+          and add a logs-apache.access@custom pipeline for what it leaves
+          undone: strip the HTTP/ prefix off %H so http.version is a bare
+          version number, coerce the "-" placeholder in %b to 0 instead of a
+          null, and convert %D microseconds to event.duration nanoseconds.
+          Confirm event.outcome is derived from the status code (<400 success,
+          >=400 failure) rather than any single token, and resolve
+          X-Forwarded-For to a left-most client.ip with the trusted proxy hops
+          kept in network.forwarded_ip. Map apache.access.identity as keyword
+          in the custom-namespace index template.
+  - format: json
+    enable: >
+      mod_log_config emits JSON when a LogFormat template interleaves the
+      normal % directives with literal JSON punctuation, e.g. LogFormat
+      '{"@timestamp":"%{%Y-%m-%dT%H:%M:%S%z}t","client_ip":"%a",
+      "user":"%u","method":"%m","path":"%U","query":"%q",
+      "protocol":"%H","status":%>s,"resp_bytes":%B,"bytes_in":%I,
+      "bytes_out":%O,"duration_us":%D,"vhost":"%v","port":%p,
+      "referer":"%{Referer}i","user_agent":"%{User-Agent}i",
+      "xff":"%{X-Forwarded-For}i"}' json  followed by CustomLog
+      "logs/access_json.log" json (or piped to a shipper / "|/usr/bin/logger
+      ... -t apache_json" for syslog transport). The JSON keys are
+      operator-chosen, so the deployed httpd.conf LogFormat line — not any ASF
+      field reference — is the authoritative key list for a given server; the
+      directives below are the tokens a typical JSON template carries. Note
+      the two number-vs-string choices that make JSON cleaner than the text
+      log: place numeric tokens (%>s, %B, %I, %O, %D, %p) OUTSIDE quotes so
+      they serialise as native JSON numbers, and prefer %B over %b so an empty
+      body is 0 rather than the CLF "-" placeholder.
+    references:
+    - https://httpd.apache.org/docs/2.4/mod/mod_log_config.html
+    - https://httpd.apache.org/docs/2.4/logs.html
+    parsing:
+      mechanism: elastic-ingest-pipeline
+      artifact: >-
+        logs-apache.access@custom (JSON decode + ECS rename), replacing the
+        stock apache-integration grok
+      notes: >
+        The stock Apache integration greps Common/Combined text and will not
+        match a JSON line, so a JSON feed needs a json processor at the head
+        of the pipeline (or ndjson decoding at the Elastic Agent / Cribl edge)
+        followed by rename-to-ECS, rather than the integration grok. One real
+        caveat governs the decoder choice: Apache's value escaping predates
+        JSON — non-printable bytes in %r, %i, %o, %q, %U, %u are written as
+        \xhh and C-style \n/\t sequences, and only " and \ are
+        backslash-escaped. \xhh is NOT a legal JSON string escape (RFC 8259
+        allows only \" \\ \/ \b \f \n \r \t and \uXXXX), so a strict parser
+        rejects any line that carried a control byte in a header. Use a
+        lenient/repairing JSON decoder or sanitise \xhh to \u00hh before the
+        strict parse. The upside of the same escaping is that " and \ ARE
+        backslash-escaped, so ordinary hostile input (quotes injected in a
+        User-Agent or request line) keeps the object well-formed.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Decode JSON at the edge worker group with a Parser (or Eval
+          JSON.parse) so the object is structured before it crosses, running
+          the sanitise-\xhh step here while the raw string is still in hand —
+          this is the natural place to do it and it lets the content filter
+          see one flat, typed object instead of a text line three grok
+          grammars have to disambiguate. Stamp originating vhost and device
+          owner (the line may omit %v), mask query-string and header
+          credentials in %q / %{X-Forwarded-For}i before forwarding, and cap
+          the unbounded free-text keys (see relay). Run the guard-facing
+          destination on Persistent Queue.
+        elastic: >
+          With the object already decoded and cleaned low-side, the high side
+          only reshapes: a logs-apache.access@custom pipeline that renames the
+          JSON keys to ECS (client_ip -> source.ip, user_agent ->
+          user_agent.original, ...), strips the "HTTP/" prefix off %H for
+          http.version, converts %D microseconds to event.duration
+          nanoseconds, and derives event.outcome from status. Because numerics
+          arrive as JSON numbers there is no "-"-to-0 coercion or
+          string-to-int cast to do. Resolve X-Forwarded-For to a left-most
+          client.ip with trusted hops in network.forwarded_ip, and map any
+          operator-named surplus keys into the apache.access.* custom
+          namespace as keyword.
+        relay: >
+          Cross as the same thin NDJSON envelope the raw access feed uses
+          (mode A) so one JSON schema faces the content filter — here the
+          payload is already the operator's JSON object rather than a _raw
+          text line, which is the whole reason to prefer this format at the
+          boundary. The friction to settle with the guard owner is identical
+          in kind: %r, %q and %{User-Agent}i still carry percent-encoded,
+          non-ASCII, multi-kilobyte attacker-controlled text (now as JSON
+          string values), so cap and flag their length low-side to what a
+          simple custom filter accepts, and pin down the \xhh-sanitisation
+          contract so the high side is never handed a string a strict parser
+          will reject. Nothing CEF-shaped crosses; high-volume,
+          moderate-forensic-value, an early candidate for dropping surplus
+          keys once the mapping is proven.
+      direct:
+        parse_location: high
+        cribl: >
+          High-side instances need no guard hops: keep the core worker group a
+          pass-through and let the ingest pipeline decode. If any source is on
+          a build old enough to emit control bytes in headers, do the \xhh
+          sanitise in a Cribl pipeline here so the Elastic json processor
+          never sees an illegal escape; otherwise a plain pass-through is
+          fine.
+        elastic: >
+          Point the source at a logs-apache.access@custom pipeline whose first
+          processor is a json decode (or enable ndjson on the agent input),
+          then rename the JSON keys to ECS (client_ip -> source.ip, user_agent
+          -> user_agent.original, ...), strip the "HTTP/" prefix off %H for
+          http.version, convert %D microseconds to event.duration nanoseconds,
+          and derive event.outcome from status. Because numerics arrive as
+          JSON numbers there is no "-"-to-0 coercion or string-to-int cast to
+          do. Add keyword index-template mappings for the apache.access.* keys
+          that have no ECS home.
+    fields:
+    - vendor: '%{%Y-%m-%dT%H:%M:%S%z}t'
+      type: timestamp
+      description: request-receipt time rendered with an explicit strftime template
+      ecs: '@timestamp'
+      status: mapped
+      transform: >
+        JSON deployments should use an ISO-8601 strftime template (as shown)
+        rather than the CLF %t "[10/Oct/2000:13:55:36 -0700]" rendering, so
+        the value parses directly with no custom date grok; parse to UTC
+    - vendor: '%a'
+      type: ip
+      description: client IP address of the request connection
+      ecs: source.ip
+      status: mapped
+      notes: >
+        preferred over %h in a JSON template because %a is always a numeric
+        address, whereas %h reverse-resolves to a hostname when
+        HostnameLookups is On and would not satisfy an ip-typed field
+    - vendor: '%{remote}p'
+      type: port
+      description: client (remote) TCP port of the request connection
+      ecs: source.port
+      status: mapped
+      notes: >-
+        optional; commonly added to a JSON template where the bare %p (server
+        port) alone is insufficient for flow correlation
+    - vendor: '%l'
+      type: string
+      description: RFC 1413 identity of the client reported by identd
+      ecs: null
+      status: unmapped
+      custom: apache.access.identity
+      transform: >-
+        literal "-" (the near-universal value when IdentityCheck is off)
+        should be dropped rather than stored
+    - vendor: '%u'
+      type: string
+      description: >-
+        userid from HTTP authentication, backslash-escaped for quotes and
+        non-printable bytes
+      ecs: user.name
+      status: mapped
+      notes: >
+        "-" when unauthenticated; unreliable on 401 responses; the
+        mod_log_config escaping rules apply to %u, so an embedded quote
+        arrives as \" and keeps the JSON string well-formed
+    - vendor: '%m'
+      type: string
+      description: request method, logged as its own JSON key rather than folded into %r
+      ecs: http.request.method
+      status: mapped
+    - vendor: '%U'
+      type: string
+      description: URL path requested, excluding the query string
+      ecs: url.path
+      status: mapped
+      notes: >-
+        escaped per mod_log_config's rules, so hostile bytes in the path
+        arrive as \xhh sequences that must survive JSON decoding
+    - vendor: '%q'
+      type: string
+      description: query string, prefixed with ? when present and empty otherwise
+      ecs: url.query
+      status: mapped
+      transform: strip the leading "?" — ECS url.query holds the query without the delimiter
+    - vendor: '%r'
+      type: string
+      description: >-
+        full first line of the request (method, resource, protocol) as a
+        single JSON string
+      ecs: url.original
+      status: partial
+      notes: >
+        JSON templates usually prefer the split %m/%U/%q keys, but where %r is
+        carried it is the composite request line that must be split into
+        http.request.method, url.original and http.version and must tolerate a
+        non-conforming, escaped request line
+    - vendor: '%H'
+      type: string
+      description: request protocol
+      ecs: http.version
+      status: partial
+      transform: >-
+        value is "HTTP/1.1" or "HTTP/2"; strip the "HTTP/" prefix so
+        http.version holds the bare version
+    - vendor: '%>s'
+      type: integer
+      description: >-
+        final HTTP status code after any internal redirects, emitted unquoted
+        as a JSON number
+      ecs: http.response.status_code
+      status: mapped
+      transform: also drives event.outcome — status < 400 success, >= 400 failure
+    - vendor: '%B'
+      type: integer
+      description: >-
+        response body size in bytes excluding headers, as a numeric value (0
+        for an empty body)
+      ecs: http.response.body.bytes
+      status: mapped
+      notes: >
+        JSON logs use %B rather than the CLF %b precisely because %B emits a
+        real 0 instead of the "-" placeholder, so no null-to-zero coercion is
+        needed downstream
+    - vendor: '%I'
+      type: integer
+      description: bytes received including request line and headers (requires mod_logio)
+      ecs: http.request.bytes
+      status: mapped
+    - vendor: '%O'
+      type: integer
+      description: bytes sent including response headers (requires mod_logio)
+      ecs: http.response.bytes
+      status: mapped
+    - vendor: '%D'
+      type: integer
+      description: time taken to serve the request, in microseconds, as a JSON number
+      ecs: event.duration
+      status: partial
+      transform: >-
+        multiply by 1000 — ECS event.duration is nanoseconds while %D is
+        microseconds; %{ms}T / %{us}T are unit-suffixed alternatives if the
+        template prefers them
+    - vendor: '%v'
+      type: string
+      description: canonical ServerName of the virtual host that served the request
+      ecs: destination.domain
+      status: mapped
+      notes: >-
+        absent from stock Combined output, so JSON templates on shared-hosting
+        servers must add it explicitly
+    - vendor: '%p'
+      type: port
+      description: canonical port of the server serving the request, emitted unquoted as a number
+      ecs: destination.port
+      status: mapped
+    - vendor: '%{Referer}i'
+      type: string
+      description: Referer request header
+      ecs: http.request.referrer
+      status: mapped
+      notes: >-
+        request-header token, so subject to mod_log_config escaping — an
+        injected quote arrives as \" and does not break the JSON object
+    - vendor: '%{User-Agent}i'
+      type: string
+      description: User-Agent request header identifying the client browser or tool
+      ecs: user_agent.original
+      status: mapped
+      notes: >
+        raw UA string only; a user_agent processor still supplies the parsed
+        browser/os/device breakdown. Escaped per the header rules, but a
+        control byte would surface as \xhh — an invalid JSON escape the
+        decoder must sanitise
+    - vendor: '%{X-Forwarded-For}i'
+      type: string
+      description: >-
+        X-Forwarded-For request header, present where httpd sits behind a load
+        balancer or reverse proxy
+      ecs: network.forwarded_ip
+      status: partial
+      notes: >
+        comma-separated, client-supplied and spoofable proxy chain; the
+        left-most address beyond the trusted hops is the real client.ip while
+        %a is only the nearest proxy
+    - vendor: '%k'
+      type: integer
+      description: number of keepalive requests already served on this connection (0 for the first)
+      ecs: null
+      status: unmapped
+      custom: apache.access.keepalive_requests
+      notes: >-
+        optional connection-diagnostic token some JSON templates add; no ECS
+        field models per-connection keepalive counts
+    - vendor: '%X'
+      type: string
+      description: >-
+        connection status when the response completed — X aborted, +
+        keep-alive, - will be closed
+      ecs: null
+      status: unmapped
+      custom: apache.access.connection_status
+      notes: single-character connection-disposition flag; no ECS field carries it
+- id: error
+  name: Error log
+  description: >
+    Diagnostic log written by the core server and by every loaded module,
+    covering startup and shutdown, configuration problems, module errors, and
+    per-request failures such as missing files, permission denials, and TLS
+    handshake errors. Format is governed by ErrorLogFormat; the 2.4
+    threaded-MPM default is "[%{u}t] [%-m:%l] [pid %P:tid %T] %7F: %E: [client
+    %a] %M% , referer %{Referer}i", which is why a typical line reads [Fri Sep
+    09 10:42:29.902022 2011] [core:error] [pid 35708:tid 4328636416] [client
+    72.15.99.187] AH00124: ... . Lower-volume than the access log but the
+    place where exploit attempts against modules surface.
+  event_categories:
+  - web
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same collection path as the access log - Elastic Agent file tail, or
+        raw syslog where ErrorLog is set to a syslog facility - with the same
+        split of instances across the two enclaves.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-apache.error
+    direct:
+    - hop: cribl
+      location: edge worker group
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-apache.error
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: elastic-integration
+      artifact: Apache HTTP Server integration (apache), error data stream
+      notes: >
+        The integration's error pipeline groks both the 2.4 module:loglevel /
+        pid:tid form and the older 2.2 form, and adds a second pass that pulls
+        file.path and http.request.referrer out of "File does not exist"
+        messages.
+    fields:
+    - vendor: '%{u}t'
+      type: timestamp
+      description: time the message was logged, including microseconds
+      ecs: '@timestamp'
+      status: mapped
+      transform: >
+        default rendering is "Fri Sep 09 10:42:29.902022 2011"; 2.4.58+
+        supports %{cu}t for compact ISO 8601, which parses far more cleanly
+        and should be preferred where the httpd version allows it
+    - vendor: '%m'
+      type: string
+      description: name of the module that logged the message (core, ssl, proxy, authz_core, ...)
+      ecs: null
+      status: unmapped
+      custom: apache.error.module
+      notes: >
+        the left half of the [core:error] token; the Elastic integration
+        stores it as apache.error.module and ECS has no module/component field
+        to carry it
+    - vendor: '%l'
+      type: enum
+      description: >-
+        loglevel of the message - emerg, alert, crit, error, warn, notice,
+        info, debug, trace1 through trace8
+      ecs: log.level
+      status: mapped
+      transform: >-
+        Apache's nine-plus level vocabulary needs a lookup to a numeric
+        event.severity; trace1-8 all collapse to trace-equivalent severity
+    - vendor: '%P'
+      type: integer
+      description: process ID of the httpd child process that logged the message
+      ecs: process.pid
+      status: mapped
+    - vendor: '%T'
+      type: long
+      description: thread ID of the worker thread that logged the message
+      ecs: process.thread.id
+      status: mapped
+      notes: >-
+        present only under threaded MPMs (event, worker); prefork error lines
+        carry pid alone
+    - vendor: '%a'
+      type: string
+      description: client IP address and port of the request the message relates to
+      ecs: source.address
+      status: partial
+      transform: >
+        rendered as "IP:port" (or bare IP on older builds); split so source.ip
+        and source.port are both populated. Absent entirely on startup,
+        configuration, and shutdown messages that have no request context.
+    - vendor: '%M'
+      type: string
+      description: the actual log message text
+      ecs: message
+      status: mapped
+      notes: >
+        free-text and module-specific; carries attacker-supplied paths and
+        header fragments verbatim on internet-facing servers, so it is both
+        the highest-value field for triage and the least bounded
+    - vendor: AHnnnnn
+      type: string
+      description: >-
+        Apache's unique message identifier, emitted as the leading token of %M
+        (e.g. AH00124)
+      ecs: error.code
+      status: partial
+      notes: >
+        stable per-message id that is the right key for alert rules, but the
+        stock integration pipeline leaves it inside message rather than
+        extracting it; needs a custom grok pass
+    - vendor: '%E'
+      type: string
+      description: >-
+        APR/OS error status code and its string form, for messages caused by a
+        system call failure
+      ecs: null
+      status: unmapped
+      custom: apache.error.os_error
+      notes: >
+        the underlying errno and text (e.g. "(13)Permission denied") that
+        distinguishes a filesystem/SELinux denial from an application error;
+        no ECS field models an OS-level error status
+    - vendor: '%F'
+      type: string
+      description: source file name and line number of the log call inside httpd
+      ecs: null
+      status: unmapped
+      custom: apache.error.source_location
+      notes: >-
+        developer-facing pointer into the httpd source, present in the 2.4
+        default format as %7F; useful only for vendor escalation
+    - vendor: '%L'
+      type: string
+      description: >-
+        log ID of the request, correlating error-log lines with the matching
+        access-log entry
+      ecs: null
+      status: unmapped
+      custom: apache.error.log_id
+      notes: >
+        requires %L in both LogFormat and ErrorLogFormat to be useful; where
+        it is configured it is the only reliable join between the two
+        datasets, since timestamp plus client IP is ambiguous under load
+    - vendor: '%{Referer}i'
+      type: string
+      description: >-
+        Referer request header, appended by the default ErrorLogFormat to
+        request-scoped messages
+      ecs: http.request.referrer
+      status: partial
+      notes: >
+        appended as ", referer: <url>" on the tail of the message rather than
+        emitted as its own delimited field, so it has to be split back out of
+        %M; the Elastic pipeline only does this for "File does not exist"
+        messages
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Pass through unparsed with Persistent Queue backpressure and keep
+          _raw: this dataset is low-volume and high-forensic-value, so it is
+          the last Apache stream to trim. The one job worth doing low-side is
+          reassembling multi-line entries - mod_ssl and CGI stderr write
+          stack-style continuations that arrive as separate lines - so the
+          high-side grok sees one event per message rather than orphaned
+          fragments.
+        elastic: >
+          Parse with the apache integration's error pipeline and add a
+          logs-apache.error@custom pipeline that extracts the AHnnnnn message
+          id from the head of %M into error.code, so alerting can key on a
+          stable identifier instead of matching free-text; the stock pipeline
+          leaves it embedded in message. Normalise Apache's loglevel
+          vocabulary (emerg/alert/crit/error/warn/notice/info/debug/trace1-8)
+          onto a consistent log.level and numeric event.severity, and split
+          the "IP:port" form of %a into source.ip and source.port. Add keyword
+          index-template mappings for apache.error.module,
+          apache.error.os_error, apache.error.log_id and
+          apache.error.source_location.
+        relay: >
+          Low-side instances use the same thin NDJSON envelope as the access
+          dataset (mode A) so both Apache streams present one schema to the
+          content filter, and carry _raw across for this one - error lines are
+          the forensic record of exploit attempts and cannot be reconstructed
+          high-side after an at-most-once drop. The friction to raise with the
+          guard owner is %M: unbounded free-text that echoes attacker-supplied
+          paths, headers and TLS error strings with arbitrary byte sequences,
+          plus multi-kilobyte module diagnostics, so cap and flag length
+          low-side. Nothing CEF-shaped crosses, and with no return channel,
+          reconcile low-side and high-side counts per (dataset, hour) to
+          detect silent drops.
+      direct:
+        parse_location: high
+        cribl: >
+          Keep the core worker group a pass-through and let the integration's
+          error pipeline do the parsing, with Persistent Queue backpressure on
+          the Elastic destination; this dataset is low-volume and
+          high-forensic-value, so it is the last Apache stream to trim under
+          pressure. The one job worth doing near the source is reassembling
+          multi-line entries - mod_ssl and CGI stderr write stack-style
+          continuations that arrive as separate lines - so the grok sees one
+          event per message rather than orphaned fragments.
+        elastic: >
+          Parse with the apache integration's error pipeline and add a
+          logs-apache.error@custom pipeline that extracts the AHnnnnn message
+          id from the head of %M into error.code, so alerting can key on a
+          stable identifier instead of matching free-text; the stock pipeline
+          leaves it embedded in message. Normalise Apache's loglevel
+          vocabulary (emerg/alert/crit/error/warn/notice/info/debug/trace1-8)
+          onto a consistent log.level and numeric event.severity, and split
+          the "IP:port" form of %a into source.ip and source.port. Add keyword
+          index-template mappings for apache.error.module,
+          apache.error.os_error, apache.error.log_id and
+          apache.error.source_location.

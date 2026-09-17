@@ -1,0 +1,1208 @@
+id: aws-guardduty
+name: AWS GuardDuty
+vendor: AWS
+versions: finding schemaVersion 2.0; GovCloud (us-gov-west-1, us-gov-east-1)
+draft: true
+references:
+- https://docs.aws.amazon.com/guardduty/latest/ug/guardduty_finding-format.html
+- https://docs.aws.amazon.com/guardduty/latest/APIReference/API_Finding.html
+- https://docs.aws.amazon.com/guardduty/latest/ug/guardduty_findings-severity.html
+- https://docs.aws.amazon.com/guardduty/latest/ug/guardduty_exportfindings.html
+- https://docs.aws.amazon.com/govcloud-us/latest/UserGuide/govcloud-guardduty.html
+- https://www.elastic.co/docs/reference/integrations/aws/guardduty
+- >-
+  https://github.com/elastic/integrations/blob/main/packages/aws/data_stream/guardduty/fields/fields.yml
+datasets:
+- id: findings
+  name: Findings (EventBridge delivery)
+  description: >
+    GuardDuty threat-detection findings as JSON documents. Every active
+    finding is published to Amazon EventBridge within about five minutes of
+    generation, and subsequent occurrences of an existing finding are
+    re-published on the configured cadence (15 minutes, 1 hour, or the 6-hour
+    default). The finding object itself sits under the EventBridge envelope's
+    `detail` key, with `detail-type` set to "GuardDuty Finding" - the vendor
+    field names below are the paths inside that finding object. Archived and
+    suppressed findings are never published, so suppression rules silently
+    remove events from this feed. In GovCloud the entity-lists capability, the
+    GuardDuty Investigation preview, several EKS audit finding types, and
+    CredentialAccess:IAMUser/CompromisedCredentials are unavailable, so the
+    finding-type vocabulary is a subset of the commercial one.
+  event_categories:
+  - network
+  - dns
+  - iam
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        A GuardDuty EventBridge rule fans findings out to SQS (or Kinesis Data
+        Streams) and Cribl reads them with an SQS/Kinesis source.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-aws.guardduty
+      notes: >
+        shared with the S3 export dataset below; documents from both paths
+        carry the same finding id, so a dedup/last-write-wins rule on (id,
+        updatedAt) is needed if both are enabled
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        A GuardDuty EventBridge rule fans findings out to SQS (or Kinesis Data
+        Streams) and Cribl reads them with an SQS/Kinesis source.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-aws.guardduty
+      notes: >
+        shared with the S3 export dataset below; documents from both paths
+        carry the same finding id, so a dedup/last-write-wins rule on (id,
+        updatedAt) is needed if both are enabled
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: AWS integration - GuardDuty (aws.guardduty data stream)
+      notes: >
+        The stock data stream ships two inputs: an httpjson input that polls
+        the GuardDuty API
+        (https://guardduty.<region>.<tld>/detector/<detector-id>/findings,
+        chained to findings/get - the Top Level Domain option is what covers
+        the GovCloud endpoints) and an aws-s3 input. Neither consumes
+        EventBridge directly, so on this route Cribl must unwrap the
+        EventBridge envelope and hand the bare finding object to the
+        integration's ingest pipeline, which expects it under `json`.
+    fields:
+    - vendor: id
+      type: string
+      description: unique identifier of the finding within the detector
+      ecs: event.id
+      status: mapped
+    - vendor: type
+      type: string
+      description: >
+        finding type in
+        ThreatPurpose:ResourceTypeAffected/ThreatFamilyName.DetectionMechanism!Artifact
+        form, e.g. UnauthorizedAccess:EC2/SSHBruteForce
+      ecs: rule.name
+      status: mapped
+      notes: >
+        the detection identity for this dataset; the stock pipeline also groks
+        rule.ruleset and rule.category off the leading
+        ThreatPurpose:ResourceType segment. Deliberately not rule.id - the
+        finding `id` is a per-occurrence instance identifier (event.id), not a
+        signature id, so pairing them under one rule.* object would mislead
+        any dashboard reading them as a name/id pair. Not threat.indicator.*
+        either: this is detection-rule identity, not TI-provider indicator
+        identity.
+    - vendor: severity
+      type: float
+      description: severity of the finding on the 1.0-10.0 scale
+      ecs: event.severity
+      status: partial
+      transform: >
+        AWS bands the value as Low 1.0-3.9, Medium 4.0-6.9, High 7.0-8.9 and
+        Critical 9.0-10.0. ECS event.severity is a long, so the stock convert
+        truncates the double (8.9 becomes 8) and collapses the High band; keep
+        the raw double in a custom namespace field and derive the band label
+        with a lookup. The stock band lookup has only High/Medium/Low branches
+        and leaves Critical findings - attack sequences - with no band label
+        at all.
+    - vendor: description
+      type: string
+      description: >-
+        human-readable narrative of the finding, with the involved principals
+        and addresses interpolated
+      ecs: message
+      status: mapped
+    - vendor: createdAt
+      type: timestamp
+      description: ISO8601 time the finding was first generated
+      ecs: event.created
+      status: mapped
+    - vendor: updatedAt
+      type: timestamp
+      description: ISO8601 time the finding was last updated with a new occurrence
+      ecs: '@timestamp'
+      status: partial
+      notes: >
+        the stock pipeline sets @timestamp from updatedAt, so every
+        re-emission of an aggregated finding re-stamps the same finding id
+        forward in time; event.created holds the original generation time and
+        service.eventFirstSeen the first observed activity
+    - vendor: accountId
+      type: string
+      description: twelve-digit AWS account in which the finding was generated
+      ecs: cloud.account.id
+      status: mapped
+    - vendor: region
+      type: string
+      description: AWS region where the finding was generated, e.g. us-gov-west-1
+      ecs: cloud.region
+      status: mapped
+    - vendor: partition
+      type: string
+      description: AWS partition the finding belongs to
+      ecs: cloud.provider
+      status: partial
+      transform: >
+        in GovCloud this value is aws-us-gov, and the stock pipeline copies it
+        into cloud.provider verbatim; ECS expects the provider name "aws", so
+        set cloud.provider to aws and keep the partition in a custom field -
+        otherwise every GovCloud document falls outside provider-scoped
+        dashboards and detection rules
+    - vendor: resource.instanceDetails.instanceId
+      type: string
+      description: EC2 instance identified as the target or actor of the activity
+      ecs: cloud.instance.id
+      status: mapped
+      notes: >
+        resource.resourceType selects which resource.* subtree is populated
+        (Instance, AccessKey, S3Bucket, EKSCluster, Container, RDSDBInstance,
+        ...); the stock pipeline copies this value to host.id as well, but
+        host.name still has no source - the private DNS name under
+        resource.instanceDetails.networkInterfaces or the instance Name tag
+        has to be lifted into it
+    - vendor: resource.accessKeyDetails.userName
+      type: string
+      description: name of the IAM user, role, or root principal whose credentials were used
+      ecs: user.name
+      status: mapped
+    - vendor: service.action.awsApiCallAction.api
+      type: string
+      description: >-
+        name of the AWS API operation that triggered the finding, e.g.
+        CreateUser or PutBucketPolicy
+      ecs: null
+      status: unmapped
+      custom: aws.guardduty.service.action.aws_api_call.api
+      notes: >
+        the operation name has no ECS home on this dataset because
+        event.action is already occupied by the coarse actionType vocabulary;
+        keep it custom and keyword-mapped so IAM-abuse hunting can pivot on
+        the operation
+    - vendor: service.action.actionType
+      type: enum
+      description: >
+        class of activity the finding describes - NETWORK_CONNECTION,
+        AWS_API_CALL, DNS_REQUEST, PORT_PROBE, KUBERNETES_API_CALL or
+        RDS_LOGIN_ATTEMPT
+      ecs: event.action
+      status: mapped
+      transform: >
+        copied verbatim by the stock pipeline; lowercase and hyphenate it to
+        match the ECS event.action convention, and note that it also
+        determines which service.action.* subtree below is populated
+    - vendor: service.action.networkConnectionAction.connectionDirection
+      type: enum
+      description: direction of the connection, INBOUND or OUTBOUND
+      ecs: network.direction
+      status: mapped
+      transform: >
+        lowercase to the ECS inbound/outbound vocabulary; this value also
+        decides which end of the connection is the source and which the
+        destination for the four address and port fields below
+    - vendor: service.action.networkConnectionAction.remoteIpDetails.ipAddressV4
+      type: ip
+      description: IPv4 address of the remote end of the connection
+      ecs: source.ip
+      status: partial
+      notes: >
+        only the source on INBOUND findings; on OUTBOUND findings the remote
+        address is the destination and the stock pipeline routes it to
+        destination.address accordingly. IPv6 remotes are not carried in this
+        field at all. The geo and ASN members alongside it (city, country,
+        organization.asn/asnorg/isp/org) are AWS enrichment that lands on
+        source.geo.* and source.as.*
+    - vendor: service.action.networkConnectionAction.localIpDetails.ipAddressV4
+      type: ip
+      description: IPv4 address of the AWS-side end of the connection
+      ecs: destination.ip
+      status: partial
+      notes: >
+        mirror of the remote address - the local address is the destination
+        only on INBOUND findings and the source on OUTBOUND ones; both are
+        appended as strings to source.address / destination.address by the
+        stock pipeline rather than typed ip fields
+    - vendor: service.action.networkConnectionAction.remotePortDetails.port
+      type: port
+      description: port number on the remote end of the connection
+      ecs: destination.port
+      status: partial
+      notes: >
+        same direction inversion as the addresses; the sibling
+        localPortDetails.port carries the AWS-side port and the portName
+        member carries the well-known service label
+    - vendor: service.action.networkConnectionAction.protocol
+      type: string
+      description: transport protocol of the connection (TCP, UDP, ICMP)
+      ecs: network.transport
+      status: mapped
+      transform: lowercase to the ECS network.transport vocabulary
+    - vendor: service.action.networkConnectionAction.blocked
+      type: boolean
+      description: whether EC2 (security group or network ACL) blocked the connection
+      ecs: event.outcome
+      status: partial
+      transform: >
+        true means the attempt was blocked (failure) and false means it
+        completed (success); GuardDuty has no universal outcome column, so
+        this boolean and awsApiCallAction.errorCode are the only two sources -
+        findings from every other action type must leave event.outcome unknown
+        rather than guess
+    - vendor: service.action.dnsRequestAction.domain
+      type: string
+      description: domain name the EC2 instance queried
+      ecs: dns.question.name
+      status: mapped
+      notes: >-
+        the sibling blocked member records whether the DNS request was blocked
+        by a sinkhole
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Unwrap the EventBridge envelope low-side and emit the thin envelope
+          (_dataId set to the logs-aws.guardduty route key, @timestamp, host,
+          _raw holding the bare finding object) rather than teaching the
+          low-side pipeline the whole GuardDuty finding grammar - the record
+          is already JSON and the integration pipeline is the parser. Flatten
+          the two list-valued members that make the JSON deeper than two
+          levels before they move (portProbeDetails and
+          instanceDetails.networkInterfaces), cap the free-text description
+          and title, and validate the envelope with a Schema Library schema
+          (C.Schema(...).validate) plus a dead-letter route for failures. Keep
+          _raw here: findings are IDS-class, low-volume and forensically worth
+          the bytes.
+        elastic: >
+          Let the AWS integration's guardduty ingest pipeline extract, and
+          layer a logs-aws.guardduty@custom pipeline for the three
+          normalizations this map records: rewrite cloud.provider to "aws"
+          because the GovCloud partition value aws-us-gov is copied verbatim
+          and is not an ECS cloud.provider value; keep the 1.0-10.0 severity
+          as a double in the custom namespace instead of relying on the stock
+          long conversion, and extend the severity-band lookup with the
+          Critical (9.0-10.0) branch the stock pipeline is missing; and derive
+          event.outcome from networkConnectionAction.blocked and
+          awsApiCallAction.errorCode instead of leaving it unset. Populate
+          host.name from the EC2 instance's private DNS name or Name tag -
+          every alerting profile on this dataset requires it and no finding
+          field supplies it directly.
+        relay: >
+          Only the thin envelope crosses, so the guard sees one stable JSON
+          schema shared with the export dataset rather than a vendor grammar.
+          The content-filter friction is the finding description and title -
+          unbounded free text that embeds attacker-controlled values such as
+          remote IPs, domains and S3 object keys - so cap their length and
+          strip control and non-UTF-8 characters before the guard destination;
+          a custom NDJSON filter (likely LUA) is the realistic option, so keep
+          keys short, ASCII and allow-listed. Use Persistent Queue
+          backpressure, never Block, and reconcile low-side and high-side
+          finding counts per (dataset, hour) because the crossing is
+          at-most-once with no return channel.
+      direct:
+        parse_location: hybrid
+        cribl: >
+          High side with no guard: Cribl still unwraps the EventBridge
+          envelope and hands the bare finding object to the integration's
+          guardduty ingest pipeline, which expects it under `json` because
+          neither stock input consumes EventBridge directly. Nothing is shaped
+          for a crossing, so no thin-envelope projection, Schema Library
+          validation or dead-letter route is needed - route the unwrapped
+          record straight to Elastic. Keep the full finding body including
+          _raw for hunting; findings are IDS-class and low-volume, so the
+          bytes are worth keeping.
+        elastic: >
+          Let the AWS integration's guardduty ingest pipeline extract, and
+          layer a logs-aws.guardduty@custom pipeline for the three
+          normalizations this map records: rewrite cloud.provider to "aws"
+          because the GovCloud partition value aws-us-gov is copied verbatim
+          and is not an ECS cloud.provider value; keep the 1.0-10.0 severity
+          as a double in the custom namespace instead of relying on the stock
+          long conversion, and extend the severity-band lookup with the
+          Critical (9.0-10.0) branch the stock pipeline is missing; and derive
+          event.outcome from networkConnectionAction.blocked and
+          awsApiCallAction.errorCode instead of leaving it unset. Populate
+          host.name from the EC2 instance's private DNS name or Name tag -
+          every alerting profile on this dataset requires it and no finding
+          field supplies it directly.
+  - format: api-pull
+    enable: >
+      No delivery configuration is created on the GuardDuty side at all - any
+      principal with guardduty:ListFindings and guardduty:GetFindings on the
+      detector can pull findings on a schedule. The collector lists finding
+      ids for the detector with ListFindings (optionally narrowed by a
+      FindingCriteria filter on service.archived, updatedAt, severity, type,
+      etc. and ordered by a SortCriteria on updatedAt), pages through the ids
+      with NextToken, then hydrates them in batches of up to fifty with
+      GetFindings, which returns the full native finding objects. This is
+      exactly what the Elastic AWS integration's httpjson input does
+      (guardduty/<region>/<tld>/detector/<detector-id>/findings chained to
+      findings/get); the Top Level Domain option is what points the input at
+      the GovCloud endpoints guardduty.us-gov-west-1.amazonaws.com and
+      guardduty.us-gov-east-1.amazonaws.com. Only active findings are
+      returnable - archived and suppressed findings are excluded from the list
+      unless the FindingCriteria explicitly asks for service.archived true, so
+      suppression rules remove events from this feed as they do from the push
+      transports.
+    references:
+    - https://docs.aws.amazon.com/guardduty/latest/APIReference/API_ListFindings.html
+    - https://docs.aws.amazon.com/guardduty/latest/APIReference/API_GetFindings.html
+    - https://docs.aws.amazon.com/guardduty/latest/APIReference/API_Finding.html
+    - https://www.elastic.co/docs/reference/integrations/aws/guardduty
+    parsing:
+      mechanism: elastic-integration
+      artifact: AWS integration - GuardDuty (aws.guardduty data stream, httpjson input)
+      notes: >
+        The httpjson input hands each GetFindings result element to the same
+        guardduty ingest pipeline as the S3 and (unwrapped) EventBridge paths
+        - the finding body is byte-identical to the json native record, so the
+        field inventory is the json findings field list and is deliberately
+        not re-documented here. What differs from the push transports is
+        entirely operational: the input keeps a last-updatedAt cursor to page
+        forward, so aggregated findings re-appear each time their updatedAt
+        advances and must be deduped on (id, updatedAt) exactly as the shared
+        data stream requires; the pull is at-least-once (a retried page
+        re-delivers), the opposite failure mode from the at-most-once guard
+        crossing; and the poll cadence, not EventBridge's five-minute publish,
+        sets end-to-end latency.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Prefer the push transports (EventBridge or S3) for the primary feed
+          and treat API pull as the gap-filler: it is the only path that can
+          re-list a finding after the fact, so point backfill and
+          reconciliation tooling at it rather than making it the steady-state
+          collector. If it is the steady-state collector on a low-side
+          instance, run the poller low-side, unwrap nothing (there is no
+          envelope), and emit the same thin envelope the EventBridge route
+          uses - {_dataId set to the logs-aws.guardduty route key, @timestamp,
+          host, _raw holding the bare finding} - so the guard sees one schema
+          across all finding transports. Hold a low-side (id, updatedAt)
+          suppression window because the pull is at-least-once and will
+          re-deliver a page on retry.
+        elastic: >
+          Identical guardduty ingest pipeline and logs-aws.guardduty@custom
+          overrides as the json feed - rewrite the GovCloud aws-us-gov
+          partition to cloud.provider aws, keep the 1.0-10.0 severity as a
+          double and extend the band lookup with the Critical branch, derive
+          event.outcome from networkConnectionAction.blocked and
+          awsApiCallAction.errorCode, and populate host.name from the EC2
+          private DNS name or Name tag. The only pull-specific addition is a
+          last-write-wins rule on (id, updatedAt) at ingest so a re-listed
+          aggregated finding overwrites rather than duplicates.
+        relay: >
+          The thin envelope that crosses is the same one the EventBridge and
+          S3 datasets emit, so the guard's content filter stays a single rule
+          set across every finding transport. The unbounded,
+          attacker-influenced values are the finding description and title
+          (remote IPs, domains, S3 object keys interpolated in) - cap their
+          length and strip control and non-UTF-8 characters before the guard
+          destination as on the push feeds. Because the pull is at-least-once
+          and the crossing at-most-once, the two error directions cancel
+          unpredictably: reconcile low- and high-side finding counts per
+          (id-set, hour) rather than assuming either side is authoritative.
+      direct:
+        parse_location: hybrid
+        cribl: >
+          High side with no guard: run the Elastic Agent's httpjson input
+          directly against the GuardDuty endpoint and let Cribl drop out of
+          the path entirely, or drain a Cribl REST Collector on the same
+          ListFindings/GetFindings chain if Cribl is already the house
+          collector. The single decision that matters is deduplication against
+          any co-collected push feed for the same detector - key on (id,
+          updatedAt) so a finding that arrives by both EventBridge and API
+          pull is not double-counted.
+        elastic: >
+          Identical guardduty ingest pipeline and logs-aws.guardduty@custom
+          overrides as the json feed - rewrite the GovCloud aws-us-gov
+          partition to cloud.provider aws, keep the 1.0-10.0 severity as a
+          double and extend the band lookup with the Critical branch, derive
+          event.outcome from networkConnectionAction.blocked and
+          awsApiCallAction.errorCode, and populate host.name from the EC2
+          private DNS name or Name tag. Retain the full finding body for
+          hunting and rely on the (id, updatedAt) last-write-wins rule at
+          ingest to collapse the at-least-once re-deliveries the poller
+          produces.
+    fields_omitted: >
+      Each GetFindings result element is byte-identical to the native finding
+      record the json entry inventories, so that field list stands for this
+      entry too. What the pull changes is purely operational — the updatedAt
+      paging cursor, at-least-once re-delivery, and poll-driven latency — not
+      the finding body.
+    fields: []
+  - format: asff
+    enable: >
+      Enable AWS Security Hub in the GovCloud Region(s) and accept the
+      automatic GuardDuty integration (in Security Hub, Integrations -> Amazon
+      GuardDuty -> Accept findings; it is on by default once both services are
+      enabled in the account). Security Hub then ingests every new GuardDuty
+      finding, re-normalizes it from the native finding schema to ASFF under
+      ProductArn arn:aws:securityhub:<region>::product/aws/ guardduty, and
+      republishes it. Two vendor-side export paths carry the ASFF record off
+      Security Hub: an EventBridge rule on the default bus matching
+      {"source":["aws.securityhub"],"detail-type":["Security Hub Findings -
+      Imported"]}, targeting SQS/Kinesis for a collector to drain; or the
+      Security Hub GetFindings API (securityhub:GetFindings) polled on a
+      schedule. In GovCloud confirm the GuardDuty->Security Hub integration is
+      available and enabled in the partition before relying on this path,
+      since the Security Hub product-integration catalog differs from
+      commercial.
+    references:
+    - >-
+      https://docs.aws.amazon.com/securityhub/latest/userguide/securityhub-findings-format.html
+    - >-
+      https://docs.aws.amazon.com/securityhub/latest/userguide/securityhub-findings-format-attributes.html
+    - >-
+      https://docs.aws.amazon.com/securityhub/latest/userguide/asff-resourcedetails-awsguardduty.html
+    - >-
+      https://docs.aws.amazon.com/securityhub/latest/userguide/securityhub-cwe-integration-types.html
+    - >-
+      https://docs.aws.amazon.com/guardduty/latest/ug/guardduty_securityhub-integration.html
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        custom Security Hub ASFF pipeline (feeding a
+        logs-aws.securityhub-style data stream, not the guardduty data stream)
+      notes: >
+        This is NOT the GuardDuty finding schema and the AWS integration's
+        guardduty ingest pipeline cannot parse it - ASFF renames every field
+        (Id, Severity.Normalized, Resources[], ProductFields) and, crucially
+        for GuardDuty, collapses the native service.action.* network, DNS and
+        API subtree into free-text ProductFields keys
+        (aws/guardduty/service/action/...), so the typed source.ip,
+        destination.port and dns.question.name the native finding feed carries
+        do not survive as first-class fields on this path. The Elastic AWS
+        integration ships a separate securityhub data stream (findings input)
+        that parses ASFF; on the EventBridge export the envelope must be
+        unwrapped first, and on the API export the finding arrives bare. Treat
+        this as a Security Hub feed that happens to carry GuardDuty
+        detections, not as a GuardDuty feed.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Adopt this path only where Security Hub is already the intended
+          low-side aggregation point for all AWS security services; for
+          GuardDuty alone it is strictly lossier than the native finding feed
+          because the network/DNS detail lands in ProductFields free text
+          rather than typed fields. If used, drain the EventBridge rule target
+          (or poll GetFindings) low-side, strip the EventBridge envelope, and
+          keep the ASFF record as _raw so the Security Hub parser owns the
+          mapping. Length-cap Title, Description and the ProductFields values
+          before the guard destination - the same attacker-influenced free
+          text as the native description, now spread across more keys - and
+          validate the record against a Schema Library schema with a
+          dead-letter route.
+        elastic: >
+          Route this to a logs-aws.securityhub data stream and its ingest
+          pipeline, not the guardduty pipeline. Layer a custom pipeline to
+          recover the GuardDuty-specific signals ASFF buries: derive
+          event.severity from Severity.Normalized (0-100) rather than the band
+          Label, keep the raw GuardDuty finding type out of
+          ProductFields["aws/guardduty/service/action/..."] and into a
+          queryable aws.securityhub.* keyword, and map ProductFields to a
+          flattened field so the collapsed native network/DNS keys stay
+          searchable. Do not expect host.name, source.ip or dns.question.name
+          to populate on this path - they are inside ProductFields, so any
+          detection that needs them must reach into the flattened object or
+          read the native finding feed instead.
+        relay: >
+          What crosses is the unwrapped ASFF JSON, never the EventBridge
+          envelope. The unbounded, content-inspection-relevant payload is
+          wider than on the native feed: Title, Description, and the
+          open-ended ProductFields map (which carries the interpolated remote
+          IPs, domains and object keys the native description also carries) -
+          so flatten ProductFields to a bounded, size-capped set of ASCII keys
+          low-side, cap the free-text fields, hold the record to a declared
+          nesting depth, and treat the crossing as at-most-once with
+          per-(detector, hour) reconciliation.
+      direct:
+        parse_location: high
+        cribl: >
+          High side with no guard: run the Elastic Security Hub integration's
+          findings input directly, or drain the EventBridge/GetFindings export
+          through Cribl with light shaping and pass the ASFF record through as
+          _raw. Dedupe against any co-collected native GuardDuty feed for the
+          same detector - the ASFF Id embeds the native finding id, so key on
+          that to avoid counting the same detection twice across the two
+          schemas.
+        elastic: >
+          Route this to a logs-aws.securityhub data stream and its ingest
+          pipeline, not the guardduty pipeline. Layer a custom pipeline to
+          recover the GuardDuty-specific signals ASFF buries: derive
+          event.severity from Severity.Normalized (0-100) rather than the band
+          Label, keep the raw GuardDuty finding type out of ProductFields and
+          into a queryable aws.securityhub.* keyword, and map ProductFields to
+          a flattened field so the collapsed native network/DNS keys stay
+          searchable. Retain the full ProductFields map for hunting rather
+          than capping it, and treat this feed as complementary to - not a
+          replacement for - the native finding feed, which preserves the typed
+          source.ip, destination.port and dns.question.name the ASFF reshape
+          collapses.
+    fields:
+    - vendor: Id
+      type: string
+      description: >-
+        ASFF finding identifier - the finding ARN Security Hub assigns,
+        embedding region, account and the native finding id
+      ecs: event.id
+      status: mapped
+      notes: >-
+        carries the native GuardDuty finding id as its trailing segment, so it
+        is the join key back to the native and OCSF representations of the
+        same detection
+    - vendor: ProductArn
+      type: string
+      description: >-
+        ARN identifying the finding product -
+        arn:aws:securityhub:<region>::product/aws/guardduty for GuardDuty
+        findings
+      ecs: null
+      status: unmapped
+      custom: aws.securityhub.product_arn
+      notes: >-
+        the source discriminator on a mixed Security Hub feed;
+        product/aws/guardduty separates GuardDuty detections from Macie,
+        Inspector and control findings sharing the stream
+    - vendor: ProductName
+      type: string
+      description: 'friendly product name, ''GuardDuty'' for these findings'
+      ecs: observer.product
+      status: mapped
+    - vendor: CompanyName
+      type: string
+      description: 'company that produced the finding, ''Amazon'' for GuardDuty'
+      ecs: observer.vendor
+      status: mapped
+    - vendor: GeneratorId
+      type: string
+      description: >-
+        identifier of the finding generator - the GuardDuty finding type for
+        these findings, e.g. UnauthorizedAccess:EC2/SSHBruteForce
+      ecs: rule.name
+      status: mapped
+      notes: >-
+        the detection identity on this path, analogous to the native finding
+        `type`; not rule.id, which would misread a type name as a signature id
+    - vendor: AwsAccountId
+      type: string
+      description: twelve-digit AWS account the finding was generated in
+      ecs: cloud.account.id
+      status: mapped
+    - vendor: Region
+      type: string
+      description: AWS Region the finding was generated in, e.g. us-gov-west-1
+      ecs: cloud.region
+      status: mapped
+    - vendor: Types
+      type: array
+      description: >-
+        ASFF finding-type taxonomy, e.g. ['TTPs/Initial
+        Access/UnauthorizedAccess:EC2-SSHBruteForce']
+      ecs: null
+      status: unmapped
+      custom: aws.securityhub.types
+      notes: >-
+        the namespaced classification Security Hub derives from the native
+        finding type; kept custom because it is a slash-delimited taxonomy
+        string, not an ECS event.category/type vocabulary value
+    - vendor: Title
+      type: string
+      description: short human-readable title of the finding
+      ecs: null
+      status: unmapped
+      custom: aws.securityhub.title
+      notes: >-
+        kept custom so message carries the fuller Description narrative below
+        rather than the terse title
+    - vendor: Description
+      type: string
+      description: >-
+        human-readable narrative of the finding, with involved principals and
+        addresses interpolated
+      ecs: message
+      status: mapped
+      notes: >-
+        the same attacker-influenced free text as the native finding
+        description; length-cap and control-strip before any guard crossing
+    - vendor: Severity.Normalized
+      type: integer
+      description: >-
+        0-100 normalized severity Security Hub derives from the native
+        1.0-10.0 finding severity
+      ecs: event.severity
+      status: partial
+      transform: >
+        Security Hub multiplies the native GuardDuty severity by ten (native
+        5.0 -> 50), so this is a 0-100 integer, not the native 1.0-10.0
+        double; either rescale to the platform severity convention or keep the
+        native double from ProductFields, and note the band Label below is
+        derived from this value
+    - vendor: Severity.Label
+      type: string
+      description: severity band - INFORMATIONAL, LOW, MEDIUM, HIGH, CRITICAL
+      ecs: null
+      status: unmapped
+      custom: aws.securityhub.severity_label
+      notes: >-
+        ASFF banding of Severity.Normalized; keep as the label alongside the
+        numeric severity rather than overwriting event.severity with a string
+    - vendor: CreatedAt
+      type: timestamp
+      description: ISO8601 time Security Hub first recorded the finding
+      ecs: event.created
+      status: mapped
+    - vendor: UpdatedAt
+      type: timestamp
+      description: ISO8601 time the finding was last updated
+      ecs: '@timestamp'
+      status: partial
+      notes: >-
+        as on the native feed, an aggregated finding re-stamps this forward on
+        each new occurrence; event.created holds the original time and
+        FirstObservedAt the first observed activity
+    - vendor: FirstObservedAt
+      type: timestamp
+      description: ISO8601 first time the activity behind the finding was observed
+      ecs: event.start
+      status: mapped
+    - vendor: LastObservedAt
+      type: timestamp
+      description: ISO8601 most recent time the activity behind the finding was observed
+      ecs: event.end
+      status: mapped
+    - vendor: Resources
+      type: array
+      description: >-
+        affected AWS resources - each with Type, Id, Partition, Region and,
+        for GuardDuty, an AwsGuardDutyDetector / instance detail block
+      ecs: null
+      status: unmapped
+      custom: aws.securityhub.resources
+      notes: >
+        the native resource.instanceDetails / accessKeyDetails subtree is
+        carried here as an array of ASFF resource objects rather than the
+        typed cloud.instance.id / user.name fields the native finding feed
+        maps; lift Resources[].Id for the EC2 instance and the access-key
+        principal from here if this path is the sole collector
+    - vendor: SourceUrl
+      type: string
+      description: deep link back to the finding in the GuardDuty or Security Hub console
+      ecs: event.reference
+      status: mapped
+    - vendor: ProductFields
+      type: object
+      description: >-
+        product-specific key-value map; for GuardDuty it carries the native
+        service.action.* network/DNS/API detail, service.count, the raw
+        finding type and detector id
+      ecs: null
+      status: unmapped
+      custom: aws.securityhub.product_fields
+      notes: >
+        the reshape's lossy point - the native finding's typed
+        service.action.networkConnectionAction / dnsRequestAction /
+        awsApiCallAction fields (remote IP, port, protocol, queried domain,
+        API name) are flattened into free-text keys here, so source.ip,
+        destination.port and dns.question.name do not populate on this path
+        unless they are re-extracted from this map; map as flattened and
+        size-cap before any guard crossing
+    - vendor: RecordState
+      type: string
+      description: 'ACTIVE or ARCHIVED - Security Hub''s lifecycle state for the finding'
+      ecs: null
+      status: unmapped
+      custom: aws.securityhub.record_state
+      notes: >-
+        archived findings are excluded from GuardDuty's own feeds, so a mixed
+        Security Hub stream can surface ARCHIVED states the native feed never
+        shows
+    - vendor: Workflow.Status
+      type: string
+      description: analyst triage state - NEW, NOTIFIED, RESOLVED, SUPPRESSED
+      ecs: null
+      status: unmapped
+      custom: aws.securityhub.workflow_status
+      notes: >-
+        a Security Hub triage overlay with no equivalent on the native
+        GuardDuty feed; useful for suppressing already-worked detections but
+        not a GuardDuty-side attribute
+  - format: ocsf
+    enable: >
+      GuardDuty is not a direct Amazon Security Lake source - it reaches
+      Security Lake through Security Hub. Enable Security Hub with the
+      GuardDuty integration (as for the ASFF path above), then enable Amazon
+      Security Lake in the GovCloud Region(s) - available at
+      securitylake.us-gov-west-1.amazonaws.com and
+      securitylake.us-gov-east-1.amazonaws.com - and add "AWS Security Hub"
+      (sourceName SH_FINDINGS) as an ingested AWS log source. Security Lake
+      collects Security Hub findings through its own independent duplicated
+      stream, normalizes each ASFF finding to OCSF, and writes Parquet objects
+      partitioned by time/region/account to the managed S3 bucket; GuardDuty's
+      threat-detection findings map to the OCSF Detection Finding class
+      (class_uid 2004, category_uid 2), the class Security Lake uses for
+      GuardDuty, Macie and other threat-detection providers. Create a
+      subscriber with data-access (S3/SQS) so a collector can drain the
+      objects; Security Lake writes an object and emits an SQS notification
+      per write.
+    references:
+    - >-
+      https://docs.aws.amazon.com/security-lake/latest/userguide/security-hub-findings.html
+    - >-
+      https://docs.aws.amazon.com/security-lake/latest/userguide/open-cybersecurity-schema-framework.html
+    - >-
+      https://github.com/ocsf/examples/tree/main/mappings/markdown/AWS/v1.1.0/Security%20Hub/Detection%20Finding
+    - https://docs.aws.amazon.com/general/latest/gr/securitylake.html
+    - https://www.elastic.co/docs/reference/integrations/amazon_security_lake
+    parsing:
+      mechanism: elastic-integration
+      artifact: Elastic Amazon Security Lake integration (OCSF), S3/SQS input
+      notes: >
+        The Elastic Amazon Security Lake integration reads the OCSF Parquet
+        objects from the subscriber bucket in S3-polling or S3-SQS mode - a
+        different integration from the AWS guardduty data stream, expecting
+        OCSF field names (finding_info.uid, severity_id, cloud.account.uid),
+        not the native finding and not ASFF. This path is doubly reshaped:
+        native finding -> ASFF (Security Hub) -> OCSF Detection Finding
+        (Security Lake), so the native GuardDuty network/DNS action detail
+        that ASFF already pushed into ProductFields is even further from typed
+        fields here, surfacing only inside the OCSF resources[] and unmapped
+        objects. metadata.uid / finding_info.uid carry the native finding id,
+        which is the join key back to the other two representations.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Adopt only where OCSF is already the low-side house schema across
+          all AWS security services; for GuardDuty specifically this is the
+          most reshaped and most lossy of the three alternates and the native
+          finding feed is preferable for detection fidelity. If used, drain
+          the subscriber SQS with a Cribl S3 source, keep the Parquet-decoded
+          OCSF record as _raw, and do not try to reconstruct the native
+          finding - carry the OCSF field names across and let Elastic's
+          Security Lake integration own the OCSF-to-ECS mapping. Because
+          Security Lake runs its own duplicated stream on top of Security
+          Hub's, reconcile counts per (detector, hour) against any native feed
+          so divergence across the collection paths is visible.
+        elastic: >
+          Use the stock Amazon Security Lake integration, not the guardduty
+          integration, then layer a custom pipeline to restore the signals two
+          reshapes buried: derive event.severity from severity_id (an OCSF 0-6
+          ordinal, not the native 1.0-10.0 double) via a lookup and keep the
+          native double if it survives in the unmapped object; map the OCSF
+          resources[] and unmapped catch-all as flattened so the collapsed
+          native instance, access-key and network detail stay searchable; and
+          confirm cloud.account.uid feeds cloud.account.id. Do not expect
+          typed source.ip / dns.question.name here at all.
+        relay: >
+          What crosses is OCSF JSON decoded from Parquet, not ASFF, not the
+          native finding and not the Parquet container. The unbounded,
+          content-inspection-relevant values are finding_info.desc,
+          finding_info.title and the resources[]/unmapped free-form objects
+          (which carry the interpolated remote IPs, domains and object keys),
+          so flatten and size-cap them low-side, hold the record to a declared
+          nesting depth, and treat the crossing as at-most-once with
+          per-(detector, hour) reconciliation.
+      direct:
+        parse_location: high
+        cribl: >
+          High side with no guard: drain the subscriber SQS with a Cribl S3
+          source and pass the OCSF record through with minimal shaping, or run
+          the Security Lake integration's S3-SQS input directly from Elastic
+          Agent. Dedupe against any co-collected native or ASFF feed for the
+          same detector on finding_info.uid (the native finding id), since
+          Security Lake is an independent duplicated stream layered on
+          Security Hub's own duplicated stream.
+        elastic: >
+          Use the stock Amazon Security Lake integration, not the guardduty
+          integration, then layer a custom pipeline to restore the signals two
+          reshapes buried: derive event.severity from severity_id (an OCSF 0-6
+          ordinal, not the native 1.0-10.0 double) via a lookup and keep the
+          native double if it survives in the unmapped object; map the OCSF
+          resources[] and unmapped catch-all as flattened so the collapsed
+          native instance, access-key and network detail stay searchable; and
+          confirm cloud.account.uid feeds cloud.account.id. Retain the
+          resources[] and unmapped objects for hunting rather than capping
+          them, and treat this feed as complementary to the native finding
+          feed, which preserves the typed source.ip and dns.question.name both
+          the ASFF and OCSF reshapes collapse.
+    fields:
+    - vendor: time
+      type: timestamp
+      description: event time in epoch milliseconds, from the ASFF UpdatedAt
+      ecs: '@timestamp'
+      status: partial
+      notes: >-
+        OCSF also carries time_dt as an ISO string; as on the native feed this
+        advances on each re-aggregation, so event.created below holds the
+        original time
+    - vendor: finding_info.uid
+      type: string
+      description: >-
+        unique finding identifier, from the ASFF Id (which embeds the native
+        GuardDuty finding id)
+      ecs: event.id
+      status: mapped
+      notes: the join key back to the ASFF and native representations of the same detection
+    - vendor: finding_info.title
+      type: string
+      description: short finding title, from the ASFF Title
+      ecs: null
+      status: unmapped
+      custom: aws.securitylake.finding_title
+    - vendor: finding_info.desc
+      type: string
+      description: human-readable finding narrative, from the ASFF Description
+      ecs: message
+      status: mapped
+      notes: >-
+        same attacker-influenced free text as the native description;
+        length-cap and control-strip before any guard crossing
+    - vendor: finding_info.types
+      type: array
+      description: finding-type taxonomy, from the ASFF Types array
+      ecs: null
+      status: unmapped
+      custom: aws.securitylake.finding_types
+      notes: >-
+        carries the native GuardDuty finding type inside the OCSF taxonomy
+        strings; kept custom rather than forced into an ECS category
+        vocabulary
+    - vendor: finding_info.created_time_dt
+      type: timestamp
+      description: time the finding was first recorded, from the ASFF CreatedAt
+      ecs: event.created
+      status: mapped
+    - vendor: finding_info.first_seen_time_dt
+      type: timestamp
+      description: first time the activity was observed, from the ASFF FirstObservedAt
+      ecs: event.start
+      status: mapped
+    - vendor: finding_info.last_seen_time_dt
+      type: timestamp
+      description: most recent time the activity was observed, from the ASFF LastObservedAt
+      ecs: event.end
+      status: mapped
+    - vendor: metadata.product.name
+      type: string
+      description: 'producing product, ''GuardDuty'', from the ASFF ProductName'
+      ecs: observer.product
+      status: mapped
+    - vendor: metadata.product.vendor_name
+      type: string
+      description: 'producing vendor, ''Amazon'', from the ASFF CompanyName'
+      ecs: observer.vendor
+      status: mapped
+    - vendor: class_uid
+      type: integer
+      description: >-
+        OCSF class identifier - 2004 (Detection Finding) for GuardDuty
+        threat-detection findings
+      ecs: null
+      status: unmapped
+      custom: aws.securitylake.class_uid
+      notes: >-
+        the OCSF-schema discriminator that separates GuardDuty detections from
+        the Compliance Finding (2003) and Vulnerability Finding (2002) classes
+        other Security Hub sources map to; distinct from ECS
+        event.category/event.kind, which must not be fed from this integer
+    - vendor: category_uid
+      type: integer
+      description: OCSF category - 2 (Findings) for this class
+      ecs: null
+      status: unmapped
+      custom: aws.securitylake.category_uid
+    - vendor: severity_id
+      type: integer
+      description: >-
+        OCSF severity ordinal (0 Unknown - 6 Fatal), derived from the ASFF
+        Severity.Label
+      ecs: event.severity
+      status: partial
+      transform: >
+        a 0-6 OCSF ordinal, two reshapes removed from the native 1.0-10.0
+        double - Security Hub first banded the double into a Label, then
+        Security Lake mapped the Label to this ordinal; rescale via a lookup
+        to the platform severity convention and recover the native double from
+        the unmapped object if fidelity matters
+    - vendor: status
+      type: string
+      description: >-
+        finding workflow status, from the ASFF Workflow.Status (New, Notified,
+        Resolved, Suppressed)
+      ecs: null
+      status: unmapped
+      custom: aws.securitylake.status
+      notes: >-
+        a Security Hub triage overlay with no native GuardDuty equivalent,
+        carried through the OCSF reshape
+    - vendor: cloud.account.uid
+      type: string
+      description: account the finding was generated in, from the ASFF AwsAccountId
+      ecs: cloud.account.id
+      status: mapped
+    - vendor: cloud.region
+      type: string
+      description: Region the finding was generated in, from the ASFF Region
+      ecs: cloud.region
+      status: mapped
+    - vendor: cloud.provider
+      type: string
+      description: 'constant ''AWS'''
+      ecs: cloud.provider
+      status: mapped
+    - vendor: resources
+      type: array
+      description: >-
+        affected resources, from the ASFF Resources[] - EC2 instance, access
+        key, S3 bucket, EKS cluster detail as OCSF resource objects
+      ecs: null
+      status: unmapped
+      custom: aws.securitylake.resources
+      notes: >
+        the native resource.instanceDetails / accessKeyDetails typed subtree,
+        twice reshaped, lands here as an OCSF resource array rather than typed
+        cloud.instance.id / user.name; map as flattened and lift the instance
+        id and principal from here if this is the sole collector
+    - vendor: unmapped
+      type: string
+      description: >-
+        OCSF catch-all holding ASFF/native fields with no OCSF Detection
+        Finding home - the GuardDuty ProductFields service.action.*
+        network/DNS/API detail, service.count, detector id, RecordState
+      ecs: null
+      status: unmapped
+      custom: aws.securitylake.unmapped
+      notes: >
+        map as flattened; the native GuardDuty network/DNS action detail -
+        already collapsed into ProductFields by the ASFF reshape - is inside
+        this object here, so any hunting on remote IP, port or queried domain
+        must reach into unmapped rather than reading typed source.ip /
+        destination.port / dns.question.name fields, which do not populate on
+        this path
+- id: findings-s3-export
+  name: Findings S3 export
+  description: >
+    The same finding records delivered as a batch export instead of an event
+    stream: GuardDuty writes gzipped JSON Lines objects to a KMS-encrypted S3
+    bucket at
+    <bucket>/<prefix>/AWSLogs/<account>/GuardDuty/<region>/UUID.jsonl.gz, new
+    findings within about five minutes and updated findings on the export
+    frequency (6 hours by default). Export settings are per region, and
+    archived findings are excluded. Only the fields that carry export and
+    aggregation semantics are mapped here - the finding body is identical to
+    the findings dataset above, which holds the full field list.
+  event_categories:
+  - network
+  - iam
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        A Cribl S3 source driven by an S3 event notification on the export
+        bucket reads the gzipped JSON Lines objects.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-aws.guardduty
+      notes: same data stream as the EventBridge dataset; dedup on finding id and updatedAt
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        A Cribl S3 source driven by an S3 event notification on the export
+        bucket reads the gzipped JSON Lines objects.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-aws.guardduty
+      notes: same data stream as the EventBridge dataset; dedup on finding id and updatedAt
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: AWS integration - GuardDuty (aws.guardduty data stream, aws-s3 input)
+      notes: >
+        The aws-s3 input decompresses the objects and splits JSON Lines
+        natively, then hands each bare finding to the same guardduty ingest
+        pipeline as the EventBridge path - no envelope unwrapping is needed
+        here. The agent role needs kms:Decrypt on the export key as well as
+        s3:GetObject.
+    fields:
+    - vendor: schemaVersion
+      type: string
+      description: version of the finding schema, currently 2.0
+      ecs: null
+      status: unmapped
+      custom: aws.guardduty.schema_version
+      notes: >-
+        pin the parser to this value so a schema bump fails loudly instead of
+        silently dropping fields
+    - vendor: arn
+      type: string
+      description: ARN of the finding, carrying region, account and detector id
+      ecs: null
+      status: unmapped
+      custom: aws.guardduty.arn
+      notes: >-
+        no ECS home; the stable pivot back to the GuardDuty console and a
+        convenient dedup key across the two delivery paths
+    - vendor: resource.resourceType
+      type: enum
+      description: >
+        type of AWS resource the finding is about - Instance, AccessKey,
+        S3Bucket, EKSCluster, ECSCluster, Container, RDSDBInstance, Lambda,
+        KubernetesCluster
+      ecs: null
+      status: unmapped
+      custom: aws.guardduty.resource.type
+      notes: >-
+        discriminator selecting which resource.* subtree is populated in the
+        record; no ECS equivalent
+    - vendor: service.archived
+      type: boolean
+      description: whether the finding has been archived (by a suppression rule or by an analyst)
+      ecs: null
+      status: unmapped
+      custom: aws.guardduty.service.archived
+      notes: >
+        effectively always false in this feed - archived findings are not
+        exported at all, so suppression rules remove events silently and the
+        SOC cannot see what was suppressed from Elastic alone
+    - vendor: service.count
+      type: integer
+      description: total number of occurrences aggregated into this finding
+      ecs: null
+      status: unmapped
+      custom: aws.guardduty.service.count
+      notes: >
+        GuardDuty aggregates repeat activity into one finding and re-exports
+        it with a higher count, so document counts in Elastic measure exports,
+        not activity; alerting on volume must read this field rather than
+        count documents
+    - vendor: service.eventFirstSeen
+      type: timestamp
+      description: first time the activity described by the finding was observed
+      ecs: event.start
+      status: mapped
+    - vendor: service.eventLastSeen
+      type: timestamp
+      description: most recent time the activity described by the finding was observed
+      ecs: event.end
+      status: mapped
+    - vendor: service.detectorId
+      type: string
+      description: identifier of the GuardDuty detector that produced the finding
+      ecs: null
+      status: unmapped
+      custom: aws.guardduty.service.detector_id
+      notes: >
+        detectors are per account and per region, so this is the closest thing
+        the record has to a sensor identity; not observer.* because nothing
+        else in the record describes the detector as a device
+    - vendor: service.featureName
+      type: string
+      description: >-
+        GuardDuty protection plan that generated the finding, e.g.
+        RuntimeMonitoring, EksAudit, MalwareProtection, DnsLogs
+      ecs: null
+      status: unmapped
+      custom: aws.guardduty.service.feature_name
+      notes: >
+        the coverage key for GovCloud, where several protection plans behave
+        differently - Malware Protection skips marketplace product codes,
+        backup recovery-point scanning is unavailable, and a number of EKS
+        audit finding types are not generated
+    - vendor: service.evidence.threatIntelligenceDetails.threatListName
+      type: string
+      description: name of the threat list whose entry matched the observed activity
+      ecs: threat.feed.name
+      status: partial
+      notes: >
+        list-valued in the record, with the matched entries in the sibling
+        threatNames member; in GovCloud only AWS-managed lists and customer IP
+        address lists can populate it, since the entity lists capability is
+        unavailable there. Mapped to the feed name rather than any
+        threat.indicator.* field - the record identifies the list, not an
+        indicator document
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Keep this route a pass-through: the aws-s3 input already handles
+          gzip, JSON Lines splitting and KMS decryption, so low-side work
+          should be limited to Persistent Queue backpressure on the Elastic
+          destination and a suppression filter for findings already delivered
+          by the EventBridge path, keyed on (id, updatedAt), so the shared
+          data stream does not double-count aggregated re-exports. If the
+          export bucket is only reachable from the low side, this is the route
+          to point the backfill and replay tooling at, since S3 objects are
+          re-readable and the event stream is not.
+        elastic: >
+          Same guardduty ingest pipeline and the same
+          logs-aws.guardduty@custom overrides as the EventBridge dataset. Add
+          custom-namespace keyword and numeric mappings for the lifecycle
+          fields this dataset carries - detector id, feature name, occurrence
+          count, archived flag and schema version - so per-detector coverage
+          and finding-aggregation dashboards can aggregate on them, and assert
+          schemaVersion is 2.0 on ingest so a future schema bump surfaces as a
+          mapping failure rather than silent field loss.
+        relay: >
+          Low-side instances cross the guard, and the objects cannot cross as
+          they are: compression must be explicitly disabled, so Cribl has to
+          decompress and re-emit LF-terminated NDJSON low-side, one finding
+          per line, with the same envelope keys the EventBridge dataset uses
+          so the guard's content filter stays a single rule set. The S3-object
+          metadata (bucket name, object key) is attacker-influenced free text
+          in some finding types and should be length-capped and
+          ASCII-normalized before the crossing.
+      direct:
+        parse_location: high
+        cribl: >
+          High side with no guard: Elastic Agent's aws-s3 input (SQS mode) can
+          read the export bucket directly and drop Cribl from the path, since
+          it already handles gzip, JSON Lines splitting and KMS decryption. If
+          Cribl stays in the path, keep it a pass-through - Persistent Queue
+          backpressure on the Elastic destination plus a suppression filter
+          for findings already delivered by the EventBridge path, keyed on
+          (id, updatedAt), so the shared data stream does not double-count
+          aggregated re-exports. Because S3 objects are re-readable and the
+          event stream is not, point backfill and replay tooling at this
+          route.
+        elastic: >
+          Same guardduty ingest pipeline and the same
+          logs-aws.guardduty@custom overrides as the EventBridge dataset. Add
+          custom-namespace keyword and numeric mappings for the lifecycle
+          fields this dataset carries - detector id, feature name, occurrence
+          count, archived flag and schema version - so per-detector coverage
+          and finding-aggregation dashboards can aggregate on them, and assert
+          schemaVersion is 2.0 on ingest so a future schema bump surfaces as a
+          mapping failure rather than silent field loss.

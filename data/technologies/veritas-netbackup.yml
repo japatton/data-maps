@@ -1,0 +1,1398 @@
+id: veritas-netbackup
+name: NetBackup
+vendor: Veritas
+versions: 9.1, 10.x (OCSF-formatted audit events from 10.4)
+draft: true
+references:
+- >-
+  https://www.veritas.com/support/en_US/doc/15263389-161340675-0/v38711607-161340675
+- >-
+  https://www.veritas.com/support/en_US/doc/21733320-165970098-0/v141930078-165970098
+- >-
+  https://www.veritas.com/support/en_US/doc/160799157-166974689-0/v141930078-166974689
+- >-
+  https://www.veritas.com/support/en_US/doc/103228346-163076612-0/v164904928-163076612
+- >-
+  https://www.veritas.com/support/en_US/doc/150157642-154787255-0/v149894961-154787255
+- >-
+  https://www.veritas.com/support/en_US/doc/150157642-165935937-0/v149894763-165935937
+- >-
+  https://sort.veritas.com/public/documents/nbu/10.3/windowsandunix/productguides/html/getting-started/
+datasets:
+- id: audit
+  name: NetBackup audit events
+  description: >
+    User-action audit records written by the NetBackup Audit Manager (nbaudit)
+    on the primary server and forwarded to the host system log via Security >
+    Security events > "Send the audit events to the system logs". Records are
+    keyed by an audit CATEGORY (POLICY, LOGIN, JOB, DATAACCESS, CERT, TOKEN,
+    SEC_CONFIG, USER, HOLD, ANOMALY, ...) and carry the operator identity, the
+    action, and a rendered before/after change description. This is the
+    primary accountability feed for a backup platform: policy and retention
+    edits, restore/browse initiations, credential and certificate changes, and
+    hold operations all land here. From 10.4 the same events can be emitted in
+    OCSF v1.0.0 JSON instead of the native text format via
+    SYSLOG_AUDIT_USE_OCSF_FORMAT; deployment must decide which format the
+    primary servers actually emit before the low-side parser is written.
+  event_categories:
+  - configuration
+  - iam
+  - authentication
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        NetBackup primary servers ship audit records to the host syslog
+        daemon, which relays them to Cribl. Backup fabrics that sit in their
+        own management enclave on the low side cross the guard as shown.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-veritas_netbackup.audit
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        NetBackup primary servers ship audit records to the host syslog
+        daemon, which relays them to Cribl.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-veritas_netbackup.audit
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom NetBackup audit pipeline
+      notes: >
+        No Elastic integration and no Cribl pack exist for NetBackup, so this
+        is a hand-built pipeline. It must handle both the native text
+        rendering and, where SYSLOG_AUDIT_USE_OCSF_FORMAT is set, the OCSF
+        v1.0.0 JSON rendering (optionally reshaped by the site's
+        audit_ocsf_mapper.json).
+    fields:
+    - vendor: USER
+      type: string
+      description: >-
+        identity of the user who performed the audited action, rendered as
+        username@domain or username@hostname
+      ecs: user.name
+      status: partial
+      transform: >
+        split on the final '@' so the account lands in user.name and the
+        authentication domain or host in user.domain; operations that require
+        no credentials are logged with an empty identity
+    - vendor: TIMESTAMP
+      type: timestamp
+      description: time the audited action occurred, in UTC and expressed in seconds
+      ecs: '@timestamp'
+      status: mapped
+      transform: epoch seconds in UTC, converted to ISO-8601
+    - vendor: CATEGORY
+      type: enum
+      description: >-
+        audit category of the user action (POLICY, LOGIN, JOB, DATAACCESS,
+        CERT, TOKEN, SEC_CONFIG, USER, HOLD, ANOMALY, ...)
+      ecs: null
+      status: partial
+      custom: netbackup.audit.category
+      notes: >
+        the vendor's own taxonomy of audited subsystems; it is the field that
+        selects which ECS event.category applies, but it has no direct ECS
+        equivalent and must not be written into event.category verbatim
+    - vendor: ACTION
+      type: enum
+      description: >-
+        the activity that was performed within the category (CREATE, MODIFY,
+        DELETE, LOGIN, ...)
+      ecs: event.action
+      status: mapped
+      transform: lowercased; the vendor emits upper-case verbs
+    - vendor: DESCRIPTION
+      type: string
+      description: >-
+        rendered detail of the action performed, including new values for
+        modified or newly created objects
+      ecs: message
+      status: mapped
+      notes: >
+        free-text prose of unbounded length; it is also the only place LOGIN
+        and DATAACCESS success/failure is stated, so it is the source for the
+        derived event.outcome
+    - vendor: REASON
+      type: string
+      description: >-
+        operator-supplied justification for the action, present only when a
+        reason was recorded for the change
+      ecs: event.reason
+      status: mapped
+    - vendor: DETAILS
+      type: string
+      description: >-
+        per-attribute change record emitted by -fmt PARSABLE as ATTR_num
+        entries with OLDV and NEWV pairs
+      ecs: null
+      status: unmapped
+      custom: netbackup.audit.details
+      notes: >
+        pipe-delimited attribute blob carrying the full before/after diff for
+        the audited object; needs splitting into discrete attribute/old/new
+        triples before it is queryable
+    - vendor: OLD VALUE
+      type: string
+      description: >-
+        prior value of a changed attribute, shown as a column in the -fmt
+        DETAIL audit report
+      ecs: null
+      status: unmapped
+      custom: netbackup.audit.old_value
+    - vendor: NEW VALUE
+      type: string
+      description: >-
+        new value of a changed attribute, shown as a column in the -fmt DETAIL
+        audit report
+      ecs: null
+      status: unmapped
+      custom: netbackup.audit.new_value
+      notes: >
+        the load-bearing value for retention-shortening and policy-disable
+        detections; pair it with OLD VALUE and the attribute name
+    - vendor: hostname (syslog header)
+      type: string
+      description: >-
+        hostname in the syslog header, the NetBackup primary server that
+        recorded the audit event
+      ecs: observer.name
+      status: mapped
+      notes: >
+        the primary server is the auditing device, not the asset acted upon,
+        so it belongs on observer.* and leaves host.name free for the client
+        or media server named in the action
+    - vendor: nbaudit (syslog tag)
+      type: string
+      description: >-
+        syslog program tag identifying the NetBackup Audit Manager process
+        that emitted the record
+      ecs: process.name
+      status: mapped
+      notes: >-
+        distinguishes audit records from other NetBackup daemons sharing the
+        host syslog stream
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Parse the audit record low-side into a stable JSON shape — split the
+          username@domain identity into user.name and user.domain, convert the
+          UTC-seconds TIMESTAMP to an ISO-8601 @timestamp, lowercase ACTION,
+          and branch on whether the primary emits native text or OCSF JSON so
+          both renderings converge on one schema rather than two grammars
+          reaching Elastic. Derive event.outcome here for LOGIN- and
+          DATAACCESS-category records, because success/failure is only stated
+          inside the DESCRIPTION prose and is far cheaper to pattern-match
+          once at the edge than per query. Bound DESCRIPTION and DETAILS
+          lengths and mask any credential or token material that the
+          change-detail text can echo, and run the Elastic destination on
+          Persistent Queue backpressure, never Block.
+        elastic: >
+          Own a custom logs-veritas_netbackup.audit ingest pipeline that maps
+          the NetBackup CATEGORY enum onto ECS event.category/event.type
+          through an explicit lookup (LOGIN to authentication, USER/CERT/TOKEN
+          to iam, POLICY/SEC_CONFIG/STU to configuration) instead of leaving
+          it as an opaque keyword, and that copies the primary server into
+          observer.name while leaving host.name for the asset the action
+          targeted. Add custom-namespace index-template mappings for
+          netbackup.audit.category, .action, .details, .old_value and
+          .new_value as keyword so before/after change diffing stays queryable
+          under dynamic mapping. Build the ransomware-adjacent detections off
+          this dataset: DATAACCESS restores by unexpected identities,
+          POLICY/RETENTION_LEVEL edits that shorten retention, and SEC_CONFIG
+          or TOKEN changes clustered in time.
+        relay: >
+          Low-side instances cross with full ECS-shaped NDJSON (envelope mode
+          B) — one audit record per line, UTF-8, LF-terminated, compression
+          disabled, nesting depth 2 or less — since there is no integration on
+          the high side to finish a thin envelope. The content-filter friction
+          to settle with the guard owner is the free-text DESCRIPTION and the
+          DETAILS attribute blob, both unbounded prose that can carry policy
+          names, file paths and non-ASCII object names; cap and flag them
+          low-side rather than relying on a silent guard truncation. Nothing
+          CEF-shaped crosses because NetBackup emits native text or OCSF JSON,
+          not CEF; carry _raw across until the hand-built parser is proven,
+          and detect silent drops by reconciling low-side and high-side counts
+          per (category, hour) since the crossing is at-most-once.
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side primary with no guard, run the audit parse at the
+          core worker group into a stable JSON shape — split the
+          username@domain identity into user.name and user.domain, convert the
+          UTC-seconds TIMESTAMP to an ISO-8601 @timestamp, lowercase ACTION,
+          and branch on whether the primary emits native text or OCSF JSON so
+          both renderings converge on one schema rather than two grammars
+          reaching Elastic. Derive event.outcome here for LOGIN- and
+          DATAACCESS-category records, because success/failure is only stated
+          inside the DESCRIPTION prose and is far cheaper to pattern-match
+          once at the collector than per query. Bound DESCRIPTION and DETAILS
+          lengths and mask any credential or token material that the
+          change-detail text can echo, and run the Elastic destination on
+          Persistent Queue backpressure, never Block.
+        elastic: >
+          Own a custom logs-veritas_netbackup.audit ingest pipeline that maps
+          the NetBackup CATEGORY enum onto ECS event.category/event.type
+          through an explicit lookup (LOGIN to authentication, USER/CERT/TOKEN
+          to iam, POLICY/SEC_CONFIG/STU to configuration) instead of leaving
+          it as an opaque keyword, and that copies the primary server into
+          observer.name while leaving host.name for the asset the action
+          targeted. Add custom-namespace index-template mappings for
+          netbackup.audit.category, .action, .details, .old_value and
+          .new_value as keyword so before/after change diffing stays queryable
+          under dynamic mapping. Build the ransomware-adjacent detections off
+          this dataset: DATAACCESS restores by unexpected identities,
+          POLICY/RETENTION_LEVEL edits that shorten retention, and SEC_CONFIG
+          or TOKEN changes clustered in time.
+  - format: ocsf
+    enable: >
+      On each primary server set SYSLOG_AUDIT_USE_OCSF_FORMAT to 1 in the
+      NetBackup configuration (bpsetconfig / nbsetconfig, or bpsetconfig -h
+      <primary>); the default is 0, native text. This only changes the
+      rendering — the records still leave the host over the same system-log
+      forwarding enabled by Security > Security events > "Send the audit
+      events to the system logs" (nbaudit), so the syslog daemon relays them
+      to Cribl exactly as for the native feed. To reshape the OCSF output
+      (which OCSF class each NetBackup CATEGORY maps to, and which attributes
+      populate) clone var/global/audit_ocsf_mapper.json.template to
+      var/global/audit_ocsf_mapper.json on the primary and edit it; leaving it
+      absent emits Veritas's default v1.0.0 mapping. The current supported
+      OCSF version is v1.0.0.
+    references:
+    - https://www.veritas.com/support/en_US/article.100063252
+    - >-
+      https://www.veritas.com/support/en_US/doc/103228346-163076612-0/v164904928-163076612
+    - >-
+      https://www.veritas.com/support/en_US/doc/21733320-165970098-0/v141930078-165970098
+    - >-
+      https://www.veritas.com/support/en_US/doc/160799157-166974689-0/v141930078-166974689
+    - https://schema.ocsf.io/1.0.0/base_event
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom NetBackup audit pipeline (OCSF branch)
+      notes: >
+        There is no Elastic integration and no Cribl pack for NetBackup, so
+        the OCSF payload is handled by the same hand-built audit pipeline that
+        parses the native text — an Extract JSON / eval front end that
+        branches on whether _raw is a delimited nbaudit line or an OCSF object
+        (detect by a leading '{' and the presence of class_uid), then
+        converges both renderings on one internal schema before Routes. The
+        advantage over the native text is that outcome, severity and the
+        operator identity arrive as discrete typed keys (status_id,
+        severity_id, actor.user) instead of being buried in the DESCRIPTION
+        prose, so the derive-outcome pattern-match becomes a lookup; the cost
+        is that anything NetBackup could not place in an OCSF attribute lands
+        in the free-form unmapped object and still needs shaping. Because the
+        class per CATEGORY is mapper-driven, key the
+        CATEGORY-to-event.category lookup off the NetBackup value carried in
+        unmapped, not off class_uid, unless the site's mapper is pinned.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Parse the OCSF object low-side into the same stable shape the native
+          branch produces so both renderings reach Elastic as one schema:
+          convert the OCSF `time` epoch-milliseconds to an ISO-8601 @timestamp
+          (note it is milliseconds here, not the native feed's UTC seconds),
+          read event.outcome directly from status_id (1 Success, 2 Failure, 0
+          Unknown) instead of pattern-matching the DESCRIPTION, and split the
+          actor.user identity into user.name and user.domain. Lift the
+          NetBackup CATEGORY and ACTION out of the unmapped object and the
+          mapper-selected class so the downstream CATEGORY-to-event.category
+          lookup does not depend on a pinned OCSF class. Bound `message` and
+          the unmapped blob and mask any credential or token material the
+          change detail can echo, and run the Elastic destination on
+          Persistent Queue backpressure, never Block.
+        elastic: >
+          Own the same custom logs-veritas_netbackup.audit ingest pipeline the
+          native feed lands in, and assert the OCSF branch has already
+          populated event.outcome and @timestamp so no OCSF-specific logic
+          runs at ingest. Copy metadata.product.name/vendor_name to
+          observer.product/observer.vendor, keep observer.name on the primary
+          that emitted the record, and map netbackup.audit.category, .action,
+          .old_value, .new_value and the OCSF unmapped remainder as keyword so
+          before/after diffing stays queryable under dynamic mapping. Build
+          the ransomware-adjacent detections off this dataset exactly as for
+          the native feed: DATAACCESS restores by unexpected identities,
+          POLICY/RETENTION_LEVEL edits that shorten retention, and SEC_CONFIG
+          or TOKEN changes clustered in time.
+        relay: >
+          Low-side instances cross with the fully shaped ECS NDJSON (envelope
+          mode B) — one audit record per line, UTF-8, LF-terminated,
+          compression disabled, nesting depth 2 or less — since there is no
+          integration on the high side to finish a thin envelope. OCSF does
+          not change the content-filter friction: the free-text `message` and
+          the unmapped attribute blob are still unbounded prose that can carry
+          policy names, file paths and non-ASCII object names, so cap and flag
+          them low-side rather than trust a silent guard truncation. Carry the
+          OCSF JSON as _raw across until the hand-built parser is proven, and
+          detect silent drops by reconciling low-side and high-side counts per
+          (category, hour) since the crossing is at-most-once.
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side primary with no guard, run the OCSF shaping parse at
+          the core worker group — there is no reason to defer OCSF shaping to
+          Elastic when the JSON already carries typed outcome and identity.
+          Pick either the OCSF syslog push OR the native push per primary as
+          the authoritative audit feed so the same records are not counted
+          twice, and keep the credential masking regardless of the boundary
+          since the change detail still carries secrets.
+        elastic: >
+          Land in the shared logs-veritas_netbackup.audit pipeline and confirm
+          event.category was resolved from the NetBackup CATEGORY rather than
+          left as an opaque OCSF class_uid. Because status_id already carries
+          the outcome, drop the DESCRIPTION outcome-parsing branch for
+          OCSF-sourced documents (detect them by the presence of class_uid) so
+          the two renderings do not each run their own outcome logic.
+    fields:
+    - vendor: time
+      type: timestamp
+      description: OCSF primary event time, epoch milliseconds
+      ecs: '@timestamp'
+      status: mapped
+      transform: >-
+        epoch milliseconds, converted to ISO-8601 (native syslog feed carries
+        UTC seconds)
+    - vendor: message
+      type: string
+      description: human-readable rendering of the audited action
+      ecs: message
+      status: mapped
+      notes: OCSF equivalent of the native DESCRIPTION; unbounded prose
+    - vendor: status_id
+      type: integer
+      description: normalized OCSF outcome of the audited action (1 Success, 2 Failure, 0 Unknown)
+      ecs: event.outcome
+      status: partial
+      transform: >
+        lookup 1 to success, 2 to failure, 0 to unknown; populated only where
+        the mapper derives it, so keep the DESCRIPTION-based derivation as a
+        fallback for LOGIN and DATAACCESS records
+    - vendor: severity_id
+      type: integer
+      description: normalized OCSF severity of the event on the 0-6 (Unknown..Fatal) scale
+      ecs: event.severity
+      status: partial
+      transform: >-
+        OCSF 0-6 severity carried as the ECS numeric severity; not the same
+        scale as the anomaly feed's event.risk_score
+    - vendor: class_uid
+      type: integer
+      description: >-
+        OCSF class the audit record was mapped into; selected per NetBackup
+        CATEGORY by audit_ocsf_mapper.json
+      ecs: null
+      status: unmapped
+      custom: netbackup.audit.ocsf_class_uid
+      notes: >
+        site-configurable via the mapper, so it is not a stable selector for
+        ECS event.category; resolve event.category from the NetBackup CATEGORY
+        carried in the class body / unmapped object instead
+    - vendor: category_uid
+      type: integer
+      description: OCSF category the class belongs to
+      ecs: null
+      status: unmapped
+      custom: netbackup.audit.ocsf_category_uid
+    - vendor: activity_id
+      type: integer
+      description: >-
+        normalized OCSF activity that triggered the event; corresponds to the
+        NetBackup ACTION verb
+      ecs: null
+      status: unmapped
+      custom: netbackup.audit.ocsf_activity_id
+    - vendor: type_uid
+      type: integer
+      description: OCSF event type, computed as class_uid * 100 + activity_id
+      ecs: null
+      status: unmapped
+      custom: netbackup.audit.ocsf_type_uid
+    - vendor: actor.user
+      type: object
+      description: >-
+        OCSF actor identity that performed the action, populated in the
+        IAM/authentication classes the mapper selects
+      ecs: user.name
+      status: partial
+      transform: >
+        carries the same username@domain identity as the native USER field;
+        split on the final '@' into user.name and user.domain. Present only in
+        classes whose schema defines an actor, so credential-less operations
+        and non-actor classes leave it empty
+    - vendor: metadata.product.name
+      type: string
+      description: OCSF event-producer product name; vendor_name carries Veritas
+      ecs: observer.product
+      status: mapped
+      notes: >-
+        metadata.product.vendor_name maps to observer.vendor; the primary that
+        emitted the record stays on observer.name
+    - vendor: metadata.version
+      type: string
+      description: OCSF schema version the event conforms to (1.0.0)
+      ecs: null
+      status: unmapped
+      custom: netbackup.audit.ocsf_schema_version
+    - vendor: unmapped
+      type: object
+      description: >-
+        OCSF container for NetBackup attributes with no OCSF home, shaped by
+        audit_ocsf_mapper.json
+      ecs: null
+      status: unmapped
+      custom: netbackup.audit.unmapped
+      notes: >
+        where the NetBackup CATEGORY name and the before/after change detail
+        (the native DETAILS / OLD VALUE / NEW VALUE material) land when the
+        default mapper cannot place them; split into discrete
+        attribute/old/new triples before it is queryable, same as the native
+        DETAILS blob
+  - format: api-pull
+    enable: >
+      Create an API key for a NetBackup user with a role that can read the
+      audit log (NetBackup Security Administrator or a custom role granting
+      the audit view), and poll GET /security/auditlogs on the primary's API
+      port (default 1556, /netbackup/security/auditlogs) with the key in the
+      Authorization header. Page with page[offset] and page[limit] and bound
+      each poll with the OData `filter` parameter on the audit timestamp so
+      only records after the last watermark are returned; sort ascending on
+      time to make watermarking deterministic. Request the native shape with
+      Accept: application/vnd.netbackup+json (default) or, to receive the same
+      records as OCSF v1.0.0, Accept:
+      application/vnd.netbackup+ocsf+json;version=11.0. No host-side syslog
+      forwarding configuration is required — the records are read on demand
+      from the audit store.
+    references:
+    - >-
+      https://sort.veritas.com/public/documents/nbu/8.2/windowsandunix/productguides/html/security_api/security.yaml
+    - >-
+      https://www.veritas.com/support/en_US/doc/150157642-160924992-0/v159634804-160924992
+    - >-
+      https://www.veritas.com/support/en_US/doc/138468309-138468313-0/v136631063-138468313
+    - >-
+      https://sort.veritas.com/public/documents/nbu/8.3/windowsandunix/productguides/html/getting-started/
+    - https://www.veritas.com/support/en_US/article.100063252
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom NetBackup audit REST-collector pipeline
+      notes: >
+        No Elastic integration and no Cribl pack exists, so this is a Cribl
+        REST Collector (or an Elastic httpjson custom input) that pages the
+        endpoint and hands the JSON:API data[] array to the shared audit
+        pipeline. The advantage over the syslog push is that the record
+        arrives already structured — the operator identity is a discrete
+        auditUserIdentity object rather than a username@domain string, and the
+        before/after diff is auditRecordAttributeList rather than a
+        pipe-delimited DETAILS blob — so less parsing is needed on our side;
+        the cost is that it is a poll, so it inherits a collection lag and a
+        gap mode (records missed if the poll interval exceeds the audit-log
+        retention under load) and needs (auditTime) watermarking so a restart
+        does not re-ship the window. Because the same records also arrive on
+        the syslog feed, pick one authoritative source per primary to avoid
+        double-counting.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Run the REST Collector low-side against the primary's API and fully
+          shape the record before the crossing, exactly as for the mode-B
+          syslog path: convert auditTime (milliseconds since epoch) to
+          @timestamp, flatten auditUserIdentity into user.name/user.domain and
+          drop domainType into the custom namespace, and resolve
+          categoryIdDisplayString and operationIdDisplayString into the
+          NetBackup CATEGORY/ACTION the ingest lookup keys on. Split
+          auditRecordAttributeList into attribute/old/new triples here so the
+          before/after diff is queryable, and derive event.outcome from the
+          messageIdDisplayString for LOGIN and DATAACCESS records the same way
+          the syslog branch does. Hold the API key in a Cribl secret, page
+          with a tight filter watermark, and mask credential material in the
+          resolved message and the attribute list before it leaves the
+          enclave.
+        elastic: >
+          Land in the shared logs-veritas_netbackup.audit ingest pipeline so
+          the REST and syslog forms converge: detect the REST source by the
+          presence of categoryId/auditTime, assert event.outcome and
+          @timestamp are already populated, and add keyword mappings for
+          netbackup.audit.category, .action, .details, .old_value, .new_value
+          and the numeric
+          netbackup.audit.category_id/.operation_id/.message_id. Copy the
+          primary into observer.name and keep host.name for the asset the
+          action targeted. Reuse the same ransomware-adjacent detections as
+          the syslog feed; do not run the syslog DETAILS-splitting logic on
+          REST documents since auditRecordAttributeList is already structured.
+        relay: >
+          An audit poll cannot reach across a one-way guard, so on low-side
+          instances the REST Collector runs on the NetBackup side and pushes
+          full ECS-shaped NDJSON (envelope mode B) through the guard rather
+          than polling across it. The content-filter friction to settle with
+          the guard owner is the resolved message text and the attribute-list
+          values, both of which can carry policy names, file paths and
+          non-ASCII object names; cap and flag them low-side. This form emits
+          JSON, not CEF, so nothing CEF-shaped crosses; with no return
+          channel, reconcile the collector's fetched-record count against the
+          high-side ingested count per (category, hour) to detect silent drops
+          on the at-most-once path.
+      direct:
+        parse_location: high
+        cribl: >
+          For a high-side primary with no guard, point the REST Collector at
+          the core worker group and let it page the API directly; there is no
+          need to shape low-side. Keep the auditTime watermarking and the
+          credential masking regardless, since the resolved message and
+          attribute list still carry secrets even without a boundary, and
+          choose either the REST poll or the syslog stream as the
+          authoritative audit feed per primary.
+        elastic: >
+          Land in the shared logs-veritas_netbackup.audit pipeline and flatten
+          auditUserIdentity and auditRecordAttributeList at ingest for
+          high-side clusters, resolving the display strings to CATEGORY/ACTION
+          and deriving event.outcome. Detect the REST source by categoryId
+          presence so the syslog pairing/splitting logic does not run on
+          already-structured documents.
+    fields:
+    - vendor: auditTime
+      type: integer
+      description: >-
+        milliseconds since the Epoch (1970-01-01 00:00:00 +0000) when the
+        audited action occurred
+      ecs: '@timestamp'
+      status: mapped
+      transform: epoch milliseconds, converted to ISO-8601 (the syslog feed carries UTC seconds)
+    - vendor: categoryIdDisplayString
+      type: string
+      description: >-
+        resolved audit CATEGORY name (POLICY, LOGIN, JOB, DATAACCESS, ...)
+        from categoryId
+      ecs: null
+      status: partial
+      custom: netbackup.audit.category
+      notes: >-
+        selects which ECS event.category applies via lookup; must not be
+        written into event.category verbatim, same as the native CATEGORY
+    - vendor: categoryId
+      type: integer
+      description: numeric category ID of the audit record
+      ecs: null
+      status: unmapped
+      custom: netbackup.audit.category_id
+    - vendor: operationIdDisplayString
+      type: string
+      description: resolved operation/action name from operationId
+      ecs: event.action
+      status: mapped
+      transform: lowercased; the resolved verb equivalent of the native ACTION
+    - vendor: operationId
+      type: integer
+      description: numeric operation ID of the audit record
+      ecs: null
+      status: unmapped
+      custom: netbackup.audit.operation_id
+    - vendor: messageIdDisplayString
+      type: string
+      description: resolved UMI message text describing the action
+      ecs: message
+      status: mapped
+      notes: >-
+        the REST equivalent of the native DESCRIPTION; also the source for the
+        derived event.outcome on LOGIN and DATAACCESS records
+    - vendor: messageId
+      type: integer
+      description: numeric UMI message ID of the audit record
+      ecs: null
+      status: unmapped
+      custom: netbackup.audit.message_id
+    - vendor: reason
+      type: string
+      description: operator-supplied justification for the action, when recorded
+      ecs: event.reason
+      status: mapped
+    - vendor: auditUserIdentity.userName
+      type: string
+      description: account name of the identity that performed the action
+      ecs: user.name
+      status: mapped
+    - vendor: auditUserIdentity.domainName
+      type: string
+      description: authentication domain of the identity
+      ecs: user.domain
+      status: mapped
+    - vendor: auditUserIdentity.domainType
+      type: string
+      description: domain type of the identity (NIS, NT/AD, vx, unixpwd, ...)
+      ecs: null
+      status: unmapped
+      custom: netbackup.audit.domain_type
+    - vendor: auditRecordAttributeList
+      type: array
+      description: list of the audit record attributes carrying the before/after change detail
+      ecs: null
+      status: unmapped
+      custom: netbackup.audit.details
+      notes: >-
+        structured array (unlike the syslog pipe-delimited DETAILS blob);
+        split into attribute/old/new triples, populating
+        netbackup.audit.old_value and .new_value
+    - vendor: auditKeyList
+      type: array
+      description: list of the audit placeholder values used to render the message
+      ecs: null
+      status: unmapped
+      custom: netbackup.audit.key_list
+      notes: >-
+        the substitution values behind messageIdDisplayString; carry for
+        message reconstruction, low forensic value on its own
+- id: jobs
+  name: Job status and completion
+  description: >
+    Per-job records for backup, restore, duplication, image-delete and catalog
+    operations, collected from the primary server's job database. NetBackup
+    does not push job completion to syslog, so the realistic SIEM feed is a
+    scheduled pull of GET /admin/jobs from the NetBackup REST API (the
+    bpdbjobs -all_columns comma-delimited export carries the same information
+    for older primaries). For a SOC this is the volumetric ransomware signal:
+    clustered job failures, backup windows that stop completing, sudden
+    collapses in deduplication ratio, and restore jobs initiated outside
+    change windows.
+  event_categories:
+  - file
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Cribl polls the NetBackup REST API on the primary server with an API
+        key and paginates the job list. Polling cannot reach across a one-way
+        guard, so on the low side the collector runs on the NetBackup side and
+        pushes.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-veritas_netbackup.jobs
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Cribl polls the NetBackup REST API on the primary server with an API
+        key and paginates the job list.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-veritas_netbackup.jobs
+  formats:
+  - format: api-pull
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom NetBackup jobs collector and pipeline
+      notes: >
+        No Elastic integration or Cribl pack exists; this is a Cribl REST
+        collector plus a hand-built pipeline that flattens the JSON:API
+        data[].attributes envelope into flat events.
+    fields:
+    - vendor: jobId
+      type: integer
+      description: numeric identifier the primary server assigned to the job
+      ecs: null
+      status: unmapped
+      custom: netbackup.job.id
+      notes: >-
+        the join key between this dataset, the JOB-category audit events, and
+        anomaly records
+    - vendor: jobType
+      type: enum
+      description: >-
+        the operation the job performs (BACKUP, RESTORE, DUPLICATION,
+        IMAGEDELETE, VERIFY, IMPORT, ...)
+      ecs: event.action
+      status: mapped
+      transform: lowercased; RESTORE is the value SOC restore-initiation detections key on
+    - vendor: state
+      type: enum
+      description: lifecycle state of the job (QUEUED, ACTIVE, REQUEUED, DONE)
+      ecs: null
+      status: unmapped
+      custom: netbackup.job.state
+      notes: >
+        job lifecycle, not an outcome; only DONE records carry a meaningful
+        status, so detections must filter on this before reading the status
+        code
+    - vendor: status
+      type: integer
+      description: NetBackup job status code, 0 for success and a non-zero error code otherwise
+      ecs: event.code
+      status: mapped
+      transform: >
+        0 = success, 1 = partial success, any other value = failure;
+        event.outcome is derived from this code because NetBackup emits no
+        separate outcome field, and the partial-success case must not be
+        silently folded into success
+    - vendor: policyName
+      type: string
+      description: name of the backup policy that governs the job
+      ecs: rule.name
+      status: mapped
+      notes: >
+        the backup policy is the rule object that generated the job, so it
+        occupies rule.name for this technology; any NetBackup detection
+        identifier therefore stays in a custom namespace
+    - vendor: scheduleName
+      type: string
+      description: name of the schedule within the policy that triggered the job
+      ecs: null
+      status: unmapped
+      custom: netbackup.job.schedule_name
+    - vendor: clientName
+      type: string
+      description: NetBackup client whose data the job backed up or restored
+      ecs: host.name
+      status: mapped
+      notes: >
+        the asset the job acted on; kept on host.name rather than
+        host.target.name so it joins directly against endpoint and auditd
+        telemetry for the same host
+    - vendor: startTime
+      type: timestamp
+      description: time the job started
+      ecs: event.start
+      status: mapped
+    - vendor: endTime
+      type: timestamp
+      description: time the job finished
+      ecs: event.end
+      status: mapped
+      transform: >-
+        also the source for @timestamp on completed jobs; unset while the job
+        is still running
+    - vendor: elapsedTime
+      type: integer
+      description: job runtime in seconds
+      ecs: event.duration
+      status: mapped
+      transform: seconds, converted to nanoseconds for ECS event.duration
+    - vendor: kilobytesTransferred
+      type: long
+      description: volume of data the job moved, in kilobytes
+      ecs: null
+      status: unmapped
+      custom: netbackup.job.kilobytes_transferred
+      notes: >-
+        baseline for image-size deviation analytics; ECS has no generic
+        transferred-bytes field outside network.*
+    - vendor: numberOfFiles
+      type: long
+      description: number of files the job processed
+      ecs: null
+      status: unmapped
+      custom: netbackup.job.file_count
+    - vendor: dedupRatio
+      type: float
+      description: deduplication ratio achieved by the job
+      ecs: null
+      status: unmapped
+      custom: netbackup.job.dedup_ratio
+      notes: >
+        a sharp collapse against the client's own baseline is the classic
+        indicator that source data was bulk-re-encrypted between backups
+    - vendor: auditUserName
+      type: string
+      description: >-
+        account name of the identity that initiated the job through the web
+        UI, CLI or API
+      ecs: user.name
+      status: mapped
+      notes: >
+        the human actor, as opposed to jobOwner which is usually a service
+        account; this is the field restore-initiation detections must key on
+    - vendor: auditDomainName
+      type: string
+      description: authentication domain of the initiating identity
+      ecs: user.domain
+      status: mapped
+    - vendor: jobOwner
+      type: string
+      description: OS account the job ran as on the primary or media server
+      ecs: null
+      status: unmapped
+      custom: netbackup.job.owner
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Do the collector work low-side: flatten the JSON:API
+          data[].attributes envelope into one flat event per job, deduplicate
+          on jobId plus lastUpdateTime so repeated polls do not re-emit
+          running jobs, and emit only state DONE transitions to the detection
+          index while sampling in-flight states. Derive event.outcome from the
+          numeric status here (0 success, 1 partial success, anything else
+          failure) and convert elapsedTime seconds to event.duration
+          nanoseconds rather than pushing both conversions into an ingest
+          pipeline. Enrich clientName to site and owner at the edge where the
+          asset inventory lives, and hold the API credential in a Cribl
+          secret, never in the pipeline body.
+        elastic: >
+          Own a custom logs-veritas_netbackup.jobs ingest pipeline that
+          resolves the NetBackup status code to a readable failure reason
+          through an enrich policy, and asserts event.outcome is the derived
+          enum rather than the raw integer. Map netbackup.job.id, .state,
+          .schedule_name and .owner as keyword and .kilobytes_transferred,
+          .file_count and .dedup_ratio as numeric in the custom-namespace
+          index template so the ransomware-adjacent analytics work:
+          failure-rate spikes per policy, clients that silently stop appearing
+          in successful jobs, and deduplication-ratio collapse that signals
+          bulk re-encryption of source data.
+        relay: >
+          On the low-side instances this feed inverts badly — an API pull
+          cannot reach across a one-way guard, so the Cribl REST collector
+          must run on the NetBackup side and push full ECS-shaped NDJSON
+          (envelope mode B) through the guard rather than polling across it.
+          The crossing content is well-bounded — numeric counters, enums and
+          short names — so it is the easiest of the three datasets for a
+          custom NDJSON filter to allowlist; constrain it further by dropping
+          currentFile and the free-text queue reason before the guard. This is
+          the highest-volume, lowest-forensic-value NetBackup dataset, so drop
+          _raw here first once the parser is proven.
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side primary with no guard, do the collector work at the
+          core worker group: flatten the JSON:API data[].attributes envelope
+          into one flat event per job, deduplicate on jobId plus
+          lastUpdateTime so repeated polls do not re-emit running jobs, and
+          emit only state DONE transitions to the detection index while
+          sampling in-flight states. Derive event.outcome from the numeric
+          status here (0 success, 1 partial success, anything else failure)
+          and convert elapsedTime seconds to event.duration nanoseconds rather
+          than pushing both conversions into an ingest pipeline. Enrich
+          clientName to site and owner at the edge where the asset inventory
+          lives, and hold the API credential in a Cribl secret, never in the
+          pipeline body.
+        elastic: >
+          Own a custom logs-veritas_netbackup.jobs ingest pipeline that
+          resolves the NetBackup status code to a readable failure reason
+          through an enrich policy, and asserts event.outcome is the derived
+          enum rather than the raw integer. Map netbackup.job.id, .state,
+          .schedule_name and .owner as keyword and .kilobytes_transferred,
+          .file_count and .dedup_ratio as numeric in the custom-namespace
+          index template so the ransomware-adjacent analytics work:
+          failure-rate spikes per policy, clients that silently stop appearing
+          in successful jobs, and deduplication-ratio collapse that signals
+          bulk re-encryption of source data.
+  - format: csv-file
+    enable: >
+      Schedule `bpdbjobs -report -all_columns -file <path>` (append mode, or
+      to stdout) on the primary server on the interval the SOC needs —
+      commonly via cron / Scheduled Task — and have Cribl tail the file, or
+      run bpdbjobs under a Cribl Exec/Script collector. Each line is one job
+      as a comma-delimited record in a fixed column order; use `-all_columns`
+      for the full set (or `-most_columns` for the stable subset). There is no
+      host-side forwarding to configure — the command reads the primary's job
+      database directly, so it works on primaries without the REST API and
+      inside enclaves a poll cannot reach. Pin the parser to the running
+      NetBackup version, because Veritas documents that the -all_columns field
+      values and order can change from release to release without notice.
+    references:
+    - >-
+      https://www.veritas.com/support/en_US/doc/15263389-150229497-0/v14660746-150229497
+    - >-
+      https://www.veritas.com/support/en_US/doc/15263389-144882499-0/v14660746-144882499
+    - https://www.tek-tips.com/threads/bpdbjobs-all_columns-field-descriptions.855463/
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom NetBackup jobs bpdbjobs export pipeline
+      notes: >
+        No Elastic integration or Cribl pack exists; this is a Cribl file tail
+        (or Exec collector running bpdbjobs) plus a hand-built pipeline that
+        splits the fixed comma-delimited column order into fields. Two hazards
+        over the REST feed: string columns (client paths, policy names) can
+        themselves contain commas, so a naive comma split misdivides —
+        constrain the split to the leading fixed-width numeric/enum columns
+        and treat trailing free-text columns carefully, or prefer the REST
+        feed where reachable; and the column set is release-dependent, so the
+        parser must be pinned to the primary's version. The export also omits
+        the REST feed's auditUserName/auditDomainName, so it cannot attribute
+        a restore/duplication to the human who initiated it — only jobOwner
+        (the OS/service account) is present. Deduplicate on jobid plus
+        try/ended so repeated exports do not re-emit the same completed job.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Do the split low-side: turn each bpdbjobs line into one flat event,
+          derive event.outcome from the numeric status (0 success, 1 partial
+          success, anything else failure), convert elapsed seconds to
+          event.duration nanoseconds and the epoch-second started/ended
+          columns to event.start/event.end, and emit only state DONE (state 3)
+          transitions to the detection index while sampling in-flight states.
+          Enrich client to site/owner at the edge, hold nothing secret (the
+          export carries no credentials, only the jobOwner account), and cap
+          the trailing free-text columns (operation, pathlastwritten) before
+          they cross. Reconcile against the REST feed where both run so the
+          same job is not counted twice.
+        elastic: >
+          Land in the shared custom logs-veritas_netbackup.jobs ingest
+          pipeline the REST feed uses, mapping the class column to rule.name,
+          jobtype to event.action, status to event.code with the derived
+          event.outcome, and client to host.name — so bpdbjobs-sourced and
+          REST-sourced jobs share one schema. Map netbackup.job.id, .state,
+          .schedule_name, .owner, .storage_unit and .retention_period as
+          keyword and .kilobytes_transferred and .file_count as numeric in the
+          custom-namespace template so the ransomware-adjacent analytics work:
+          failure-rate spikes per policy, clients that stop appearing in
+          successful jobs, and retention-shortening edits (cross-referenced
+          against the audit feed, since the human actor is not in this
+          export).
+        relay: >
+          A file export cannot poll across a one-way guard, so the bpdbjobs
+          collector runs on the NetBackup side and pushes full ECS-shaped
+          NDJSON (envelope mode B) through the guard. The crossing content is
+          well-bounded — numeric counters, enums and short names — so it is
+          easy for a custom NDJSON filter to allowlist; constrain it further
+          by dropping the free-text operation and pathlastwritten columns
+          before the guard. This is the highest-volume, lowest-forensic-value
+          NetBackup dataset, so drop _raw here first once the parser is
+          proven, and detect silent drops by reconciling low-side and
+          high-side job counts per (policy, hour) on the at-most-once path.
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side primary, run the same bpdbjobs tail/exec at the core
+          worker group and split it there; there is no benefit to deferring
+          the fixed-column split to Elastic. Keep the dedup on jobid plus
+          try/ended, and pick either the bpdbjobs export or the REST poll as
+          the authoritative jobs feed per primary so completed jobs are not
+          double-counted.
+        elastic: >
+          Land in the shared logs-veritas_netbackup.jobs pipeline and confirm
+          the status-to-event.outcome enum and the elapsed-to-nanoseconds
+          conversion ran on the collector, not at ingest. Because the export
+          lacks the human initiator, join to the JOB/DATAACCESS audit events
+          on jobid to attribute restore and duplication jobs to an operator.
+    fields:
+    - vendor: jobid
+      type: integer
+      description: numeric identifier the primary assigned to the job (field 1)
+      ecs: null
+      status: unmapped
+      custom: netbackup.job.id
+      notes: join key to the JOB-category audit events and anomaly records
+    - vendor: jobtype
+      type: enum
+      description: operation the job performs (0 backup, 1 archive, 2 restore, 6 duplication, ...)
+      ecs: event.action
+      status: mapped
+      transform: lowercased label; restore is the value SOC restore-initiation detections key on
+    - vendor: state
+      type: enum
+      description: lifecycle state of the job (0 queued, 1 active, 2 requeued, 3 done, ...)
+      ecs: null
+      status: unmapped
+      custom: netbackup.job.state
+      notes: >-
+        only state done carries a meaningful status; detections must filter on
+        this first
+    - vendor: status
+      type: integer
+      description: NetBackup job status code, 0 for success and a non-zero error code otherwise
+      ecs: event.code
+      status: mapped
+      transform: >-
+        0 success, 1 partial success, any other value failure; event.outcome
+        is derived from this and partial must not be folded into success
+    - vendor: class
+      type: string
+      description: 'name of the backup policy governing the job (legacy ''class'' column name)'
+      ecs: rule.name
+      status: mapped
+      notes: >-
+        the backup policy is the rule object that generated the job,
+        consistent with the REST jobs feed
+    - vendor: schedule
+      type: string
+      description: name of the schedule within the policy that triggered the job
+      ecs: null
+      status: unmapped
+      custom: netbackup.job.schedule_name
+    - vendor: client
+      type: string
+      description: NetBackup client whose data the job backed up or restored
+      ecs: host.name
+      status: mapped
+      notes: >-
+        the asset the job acted on, kept on host.name so it joins
+        endpoint/auditd telemetry for the same host
+    - vendor: server
+      type: string
+      description: server that ran the job (primary or media server)
+      ecs: observer.name
+      status: mapped
+      notes: the executing backup server, not the client asset
+    - vendor: started
+      type: timestamp
+      description: epoch-second time the job started
+      ecs: event.start
+      status: mapped
+      transform: epoch seconds, converted to ISO-8601
+    - vendor: elapsed
+      type: integer
+      description: job runtime in seconds
+      ecs: event.duration
+      status: mapped
+      transform: seconds, converted to nanoseconds for ECS event.duration
+    - vendor: ended
+      type: timestamp
+      description: epoch-second time the job finished
+      ecs: event.end
+      status: mapped
+      transform: also the source for @timestamp on completed jobs; unset while running
+    - vendor: stunit
+      type: string
+      description: storage unit the job wrote to
+      ecs: null
+      status: unmapped
+      custom: netbackup.job.storage_unit
+    - vendor: try
+      type: integer
+      description: attempt number of the job
+      ecs: null
+      status: unmapped
+      custom: netbackup.job.try
+    - vendor: operation
+      type: string
+      description: current operation the job is performing
+      ecs: null
+      status: unmapped
+      custom: netbackup.job.operation
+      notes: free-text; cap and drop before the guard
+    - vendor: kbytes
+      type: long
+      description: volume of data the job moved, in kilobytes
+      ecs: null
+      status: unmapped
+      custom: netbackup.job.kilobytes_transferred
+      notes: >-
+        baseline for image-size deviation analytics; ECS has no generic
+        transferred-bytes field outside network.*
+    - vendor: files
+      type: long
+      description: number of files the job processed
+      ecs: null
+      status: unmapped
+      custom: netbackup.job.file_count
+    - vendor: pathlastwritten
+      type: string
+      description: last path the job wrote
+      ecs: null
+      status: unmapped
+      custom: netbackup.job.path_last_written
+      notes: >-
+        free-text path; can contain commas that break a naive split, and
+        carries object names — cap before the guard
+    - vendor: jobpid
+      type: integer
+      description: process identifier of the job on the executing server
+      ecs: null
+      status: unmapped
+      custom: netbackup.job.pid
+    - vendor: owner
+      type: string
+      description: OS account the job ran as on the primary or media server
+      ecs: null
+      status: unmapped
+      custom: netbackup.job.owner
+      notes: >-
+        the service account, not the human initiator; the -all_columns export
+        does not carry the audit initiator identity
+    - vendor: subtype
+      type: enum
+      description: job subtype (e.g. immediate, scheduled, user)
+      ecs: null
+      status: unmapped
+      custom: netbackup.job.subtype
+    - vendor: priority
+      type: integer
+      description: scheduling priority of the job
+      ecs: null
+      status: unmapped
+      custom: netbackup.job.priority
+    - vendor: group
+      type: string
+      description: job group the job belongs to
+      ecs: null
+      status: unmapped
+      custom: netbackup.job.group
+    - vendor: masterserver
+      type: string
+      description: primary (master) server name for the job
+      ecs: null
+      status: unmapped
+      custom: netbackup.job.master_server
+      notes: 'kept distinct from the ''server'' column that ran the job'
+    - vendor: retentionperiod
+      type: integer
+      description: 'retention duration configured for the job''s images'
+      ecs: null
+      status: unmapped
+      custom: netbackup.job.retention_period
+      notes: load-bearing for retention-shortening detection; pair with retentionunits
+    - vendor: retentionunits
+      type: enum
+      description: unit for the retention period (days, weeks, ...)
+      ecs: null
+      status: unmapped
+      custom: netbackup.job.retention_units
+    - vendor: compression
+      type: integer
+      description: whether compression was applied
+      ecs: null
+      status: unmapped
+      custom: netbackup.job.compression
+    - vendor: trycount
+      type: integer
+      description: total number of attempts made for the job
+      ecs: null
+      status: unmapped
+      custom: netbackup.job.try_count
+      notes: >-
+        the trailing per-try columns (kbyteslastwritten, fileslastwritten,
+        filelistcount, trybyteswritten, tryfileswritten) follow and are
+        release-dependent
+- id: anomaly
+  name: Backup anomaly detection
+  description: >
+    Findings from the NetBackup 10.x anomaly detection engine, which scores
+    each completed backup job against the historical cluster of similar jobs
+    for that client and policy. Deviations in backup image size, file count,
+    data transferred, deduplication ratio or job completion time produce a
+    scored anomaly. Anomalies are surfaced in the web UI and REST API and are
+    also audited under the ANOMALY category, so a site that already forwards
+    audit events gets a lower-fidelity copy on the syslog feed; the scored
+    detail below comes from the API. Thin starter — the engine's per-feature
+    output is documented by column rather than by wire field name.
+  event_categories:
+  - malware
+  - file
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Collected alongside the job feed from the same primary-server REST
+        endpoint and API key; on the low side the collector likewise runs on
+        the NetBackup side and pushes rather than polls.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-veritas_netbackup.anomaly
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Collected alongside the job feed from the same primary-server REST
+        endpoint and API key.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-veritas_netbackup.anomaly
+  formats:
+  - format: api-pull
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom NetBackup anomaly collector and pipeline
+      notes: >
+        No Elastic integration or Cribl pack exists; the same hand-built
+        collector that pulls jobs pulls anomalies and normalises them.
+    fields:
+    - vendor: Job ID
+      type: integer
+      description: identifier of the backup job the anomaly was detected for
+      ecs: null
+      status: unmapped
+      custom: netbackup.anomaly.job_id
+      notes: joins this dataset to the jobs feed and to JOB-category audit events
+    - vendor: Client name
+      type: string
+      description: NetBackup client on which the anomaly was detected
+      ecs: host.name
+      status: mapped
+    - vendor: Policy name
+      type: string
+      description: backup policy of the associated job
+      ecs: rule.name
+      status: mapped
+      notes: >-
+        kept consistent with the jobs dataset, where the backup policy is the
+        rule object
+    - vendor: Schedule name
+      type: string
+      description: schedule of the associated backup job
+      ecs: null
+      status: unmapped
+      custom: netbackup.anomaly.schedule_name
+    - vendor: Score
+      type: float
+      description: >-
+        anomaly score, the deviation of the observation from the historical
+        cluster in standard-deviation scale
+      ecs: event.risk_score
+      status: mapped
+      notes: >-
+        documented bands are below 10 low, 10 to 15 medium, 15 and above high;
+        carried unscaled so the bands stay meaningful
+    - vendor: Anomaly severity
+      type: enum
+      description: severity label assigned to the anomalies notified for the job
+      ecs: event.severity
+      status: partial
+      transform: 'Low/Medium/High label needs a lookup to ECS''s numeric severity scale'
+    - vendor: Count
+      type: integer
+      description: number of anomalies detected for the job
+      ecs: null
+      status: unmapped
+      custom: netbackup.anomaly.count
+    - vendor: Anomaly summary
+      type: string
+      description: rendered summary of which metadata features deviated for the job
+      ecs: null
+      status: partial
+      custom: netbackup.anomaly.summary
+      notes: >
+        prose listing the deviating features (image size, number of backup
+        files, data transferred, deduplication rate, job completion time);
+        needs splitting into a per-feature structure before any of the
+        individual deviations are queryable
+    - vendor: Feature details
+      type: string
+      description: >-
+        observed feature value shown against its usual range, e.g. "100MB
+        (Usual 350MB, 450MB)"
+      ecs: null
+      status: unmapped
+      custom: netbackup.anomaly.feature_details
+      notes: >-
+        combined observed-value and expected-range string; split into observed
+        value and expected bounds low-side
+    - vendor: Received
+      type: timestamp
+      description: date the anomaly was notified
+      ecs: '@timestamp'
+      status: mapped
+      notes: 'notification time, which lags the backup job''s own start and end times'
+    - vendor: Review status
+      type: enum
+      description: >-
+        analyst disposition of the anomaly - reported as a false positive, an
+        actual anomaly, or ignored
+      ecs: null
+      status: unmapped
+      custom: netbackup.anomaly.review_status
+      notes: >-
+        a feedback field written back by NetBackup operators; useful for
+        suppression but never as ground truth for a CSOC alert
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Normalise the anomaly record low-side: convert the Low/Medium/High
+          severity label to ECS's numeric event.severity, carry the raw Score
+          through to event.risk_score unchanged, and split the rendered
+          feature summary ("image size 100MB (Usual 350MB, 450MB)") into a
+          per-feature structure with observed value and expected range so the
+          deviation is machine-readable before it leaves the edge. Enrich each
+          anomaly with the matching job's clientName and policyName from the
+          jobs feed at the edge, and suppress records whose review status is
+          already marked false positive so analyst dispositions do not
+          re-alert.
+        elastic: >
+          Own a custom logs-veritas_netbackup.anomaly ingest pipeline that
+          sets event.kind to alert and confirms event.severity is the derived
+          numeric value rather than the vendor label, and that leaves
+          event.risk_score carrying the raw NetBackup score so the documented
+          10 and 15 thresholds stay usable as query bands. Map
+          netbackup.anomaly.job_id, .review_status and .schedule_name as
+          keyword and .score, .count and .feature_details as appropriately
+          typed fields in the custom-namespace index template. Treat this as a
+          corroborating signal rather than a standalone alert: join it to the
+          jobs dataset on job id and to DATAACCESS audit events on client, so
+          a scored anomaly plus an out-of-window restore plus a retention edit
+          escalates together.
+        relay: >
+          Low-side instances cross with full ECS-shaped NDJSON (envelope mode
+          B) — this is a low-volume, high-value detection feed with no Elastic
+          integration to finish a thin envelope on the high side. The only
+          content-filter friction is the anomaly summary string, which is
+          rendered prose containing feature names, units and parenthesised
+          ranges; cap it low-side and carry the parsed per-feature structure
+          alongside so the custom NDJSON filter can allowlist bounded numeric
+          keys instead of inspecting free text. Keep _raw for this dataset
+          even after the parser is proven — the volume is trivial and the
+          forensic value during a ransomware investigation is high.
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side primary with no guard, normalise the anomaly record
+          at the core worker group: convert the Low/Medium/High severity label
+          to ECS's numeric event.severity, carry the raw Score through to
+          event.risk_score unchanged, and split the rendered feature summary
+          ("image size 100MB (Usual 350MB, 450MB)") into a per-feature
+          structure with observed value and expected range so the deviation is
+          machine-readable before it leaves the edge. Enrich each anomaly with
+          the matching job's clientName and policyName from the jobs feed at
+          the edge, and suppress records whose review status is already marked
+          false positive so analyst dispositions do not re-alert.
+        elastic: >
+          Own a custom logs-veritas_netbackup.anomaly ingest pipeline that
+          sets event.kind to alert and confirms event.severity is the derived
+          numeric value rather than the vendor label, and that leaves
+          event.risk_score carrying the raw NetBackup score so the documented
+          10 and 15 thresholds stay usable as query bands. Map
+          netbackup.anomaly.job_id, .review_status and .schedule_name as
+          keyword and .score, .count and .feature_details as appropriately
+          typed fields in the custom-namespace index template. Treat this as a
+          corroborating signal rather than a standalone alert: join it to the
+          jobs dataset on job id and to DATAACCESS audit events on client, so
+          a scored anomaly plus an out-of-window restore plus a retention edit
+          escalates together.

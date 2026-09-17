@@ -1,0 +1,1177 @@
+id: cisco-esa
+name: Cisco Secure Email Gateway (ESA)
+vendor: Cisco
+versions: AsyncOS 14.x, 15.x, 16.x (Consolidated Event Logs require AsyncOS 13.0+)
+draft: true
+references:
+- >-
+  https://www.cisco.com/c/en/us/td/docs/security/esa/esa16-0-1/user_guide/b_ESA_Admin_Guide_16-0-1/b_ESA_Admin_Guide_12_1_chapter_0100111.html
+- https://www.elastic.co/docs/reference/integrations/cisco_secure_email_gateway
+- >-
+  https://github.com/elastic/integrations/tree/main/packages/cisco_secure_email_gateway/data_stream/log/elasticsearch/ingest_pipeline
+- https://docs.sekoia.com/integration/categories/email/cisco_esa/
+datasets:
+- id: consolidated-event
+  name: Consolidated Event Log (CEF)
+  description: >
+    One CEF event per message (event class ESA_CONSOLIDATED_LOG_EVENT),
+    introduced in AsyncOS 13.0. Flattens the multi-line ICID/MID/DCID mail-log
+    conversation into a single record carrying sender, recipients, subject,
+    every scanning verdict (AMP, anti-spam, antivirus, graymail, outbreak
+    filters, content filters, DLP), SPF/DKIM/DMARC results, attachment hashes,
+    URL reputation, and the final action. Also carries startTime/endTime and
+    the inbound/outbound TLS parameters. This is the modern SIEM feed and
+    should be the primary dataset for the CSOC.
+  event_categories:
+  - malware
+  - web
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        The ESA pushes the Consolidated Event Log subscription over syslog to
+        Cribl. On the low-side crossing, note that subjects (msg), attachment
+        filenames (ESAAttachmentDetails) and URLs (ESAURLDetails) are
+        unbounded free text carrying inbound adversary-controlled content and
+        will need an explicit content-inspection / length policy.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cisco_secure_email_gateway.log
+      notes: >
+        the Elastic integration ships a single 'log' data stream; the
+        consolidated, text-mail, and authentication subscriptions all land in
+        it and are separated downstream by event.dataset/message shape
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        The ESA pushes the Consolidated Event Log subscription over syslog to
+        Cribl, which forwards it to Elastic with no guard crossing.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cisco_secure_email_gateway.log
+      notes: >
+        the Elastic integration ships a single 'log' data stream; the
+        consolidated, text-mail, and authentication subscriptions all land in
+        it and are separated downstream by event.dataset/message shape
+  formats:
+  - format: syslog-cef
+    parsing:
+      mechanism: elastic-integration
+      artifact: Cisco Secure Email Gateway integration (pipeline_consolidated_event)
+      notes: >
+        The integration groks the CEF header, then key/value-splits the
+        extension and renames the ESA* keys into
+        cisco_secure_email_gateway.log.esa.*. No Cribl pack exists for this
+        product, so a Cribl-side implementation would be a hand-built CEF
+        pipeline replicating the same renames.
+    fields:
+    - vendor: ESAMID
+      type: long
+      description: >-
+        appliance-local Message ID assigned at injection; the join key for
+        every log line about this message
+      ecs: email.local_id
+      status: partial
+      notes: >
+        the Elastic pipeline renames ESAMID straight into email.message_id,
+        but the MID is an appliance-local counter, not the RFC 5322
+        Message-ID; it is not globally unique and collides across appliances.
+        email.local_id — the unique identifier given by the source — is its
+        ECS home and the rename off email.message_id is still outstanding;
+        email.message_id belongs to cs4/ExternalMsgID. MID-keyed aggregation
+        is only safe once the value is scoped by appliance serial.
+    - vendor: ESAICID
+      type: long
+      description: >-
+        injection connection ID of the inbound SMTP conversation that
+        delivered the message
+      ecs: null
+      status: unmapped
+      custom: cisco_secure_email_gateway.log.esa.injection_connection_id
+      notes: >-
+        no ECS equivalent; required to correlate a consolidated event back to
+        the ICID lines in the text mail log
+    - vendor: ESADCID
+      type: long
+      description: >-
+        delivery connection ID of the outbound SMTP conversation used to
+        deliver the message
+      ecs: null
+      status: unmapped
+      custom: cisco_secure_email_gateway.log.esa.delivery_connection_id
+    - vendor: deviceExternalId
+      type: string
+      description: appliance serial number or UUID identifying which ESA emitted the event
+      ecs: host.id
+      status: partial
+      notes: >
+        the integration renames it to host.id; observer.serial_number is the
+        better ECS home for an appliance serial and would leave host.* free
+        for the mail host. Note the malware/web alerting profiles want
+        host.name, which this dataset never supplies — it has to be derived
+        from the syslog envelope.
+    - vendor: src
+      type: ip
+      description: >-
+        IP address of the sending mail server (also emitted as sourceAddress
+        on some AsyncOS builds)
+      ecs: source.ip
+      status: mapped
+      notes: >-
+        both spellings (src and sourceAddress) are handled; whichever is
+        present converts to source.ip
+    - vendor: shost
+      type: string
+      description: reverse-DNS hostname of the sending mail server (also emitted as sourceHostName)
+      ecs: source.domain
+      status: mapped
+      transform: URL-decoded before assignment
+    - vendor: suser
+      type: string
+      description: envelope sender (MAIL FROM) address
+      ecs: email.from.address
+      status: mapped
+    - vendor: duser
+      type: string
+      description: envelope recipient (RCPT TO) address
+      ecs: email.to.address
+      status: partial
+      notes: >
+        a message with several recipients emits duser once per recipient or a
+        comma-joined list depending on AsyncOS build; the rename is scalar, so
+        multi-recipient messages need splitting into the email.to.address
+        array before recipient-based alerting works
+    - vendor: msg
+      type: string
+      description: message Subject header
+      ecs: email.subject
+      status: mapped
+      transform: >-
+        leading/trailing single or double quotes are stripped by a gsub before
+        assignment
+    - vendor: cs4
+      type: string
+      description: >-
+        labelled custom string carrying ExternalMsgID — the real RFC 5322
+        Message-ID of the message
+      ecs: null
+      status: partial
+      custom: cisco_secure_email_gateway.log.cs4
+      notes: >
+        the meaning lives in the companion cs4Label key (=ExternalMsgID), so
+        the label must be read before the value can be trusted. This is the
+        globally unique Message-ID and is the value that should own ECS
+        email.message_id; today it stays in the vendor namespace with only the
+        angle brackets stripped.
+    - vendor: act
+      type: enum
+      description: final disposition of the message (DELIVERED, QUARANTINED, DROPPED, BOUNCED, ...)
+      ecs: null
+      status: partial
+      custom: cisco_secure_email_gateway.log.act
+      notes: >
+        this is the closest thing the dataset has to event.action /
+        event.outcome, but the integration leaves it in the vendor namespace.
+        Both the malware and web profiles require event.action and
+        event.outcome, so a lookup (DELIVERED/QUARANTINED -> success,
+        DROPPED/BOUNCED -> failure) is the highest-value fix on this dataset.
+    - vendor: deviceDirection
+      type: enum
+      description: message direction as seen by the appliance, 0 = incoming, 1 = outgoing
+      ecs: email.direction
+      status: partial
+      transform: >
+        the integration only normalizes 0/1 into the vendor field
+        (incoming/outgoing) and sets ECS email.direction from the listener
+        name (Incomingmail/Outcomingmail) instead; sites whose listeners are
+        named anything else get no email.direction at all
+    - vendor: ESAAMPVerdict
+      type: enum
+      description: >-
+        Advanced Malware Protection file-reputation verdict for the message
+        (FILE UNKNOWN, CLEAN, MALICIOUS, LOW RISK, NOT_EVALUATED, SKIPPED)
+      ecs: null
+      status: partial
+      custom: cisco_secure_email_gateway.log.esa.amp_verdict
+      notes: >
+        ECS has no scanning-verdict field; MALICIOUS is the signal the CSOC
+        alerts on, so this needs a derived event.outcome/threat enrichment
+        rather than living only in the vendor namespace
+    - vendor: ESAASVerdict
+      type: enum
+      description: anti-spam (CASE) verdict — POSITIVE, SUSPECT, NEGATIVE, NOT_EVALUATED
+      ecs: null
+      status: unmapped
+      custom: cisco_secure_email_gateway.log.esa.as_verdict
+    - vendor: ESAAVVerdict
+      type: enum
+      description: antivirus engine (Sophos/McAfee) verdict — NEGATIVE, POSITIVE, NOT_EVALUATED
+      ecs: null
+      status: unmapped
+      custom: cisco_secure_email_gateway.log.esa.av_verdict
+    - vendor: ESACFVerdict
+      type: enum
+      description: >-
+        content-filter verdict — MATCH or NO_MATCH, indicating whether a
+        policy content filter fired
+      ecs: null
+      status: unmapped
+      custom: cisco_secure_email_gateway.log.esa.content_filter_verdict
+      notes: >
+        only says that some filter matched; the filter name is not in the CEF
+        extension, so rule.name cannot be populated from this dataset
+    - vendor: ESADMARCVerdict
+      type: enum
+      description: DMARC evaluation result for the sending domain (pass, fail, Skipped, ...)
+      ecs: null
+      status: unmapped
+      custom: cisco_secure_email_gateway.log.esa.dmarc_verdict
+      notes: >-
+        sibling keys ESASPFVerdict and ESADKIMVerdict map the same way;
+        ESASPFVerdict is a nested Python-dict literal (mailfrom/helo/pra), not
+        a scalar
+    - vendor: ESAAttachmentDetails
+      type: string
+      description: >-
+        per-attachment analysis results — a map keyed by filename holding the
+        AMP verdict and the file's SHA-256
+      ecs: email.attachments.file.hash.sha256
+      status: partial
+      transform: >
+        the value is a single Python-dict literal (single-quoted keys, e.g.
+        {'resume.docx': {'AMP': {'Verdict': 'MALICIOUS', 'fileHash':
+        '<sha256>'}}}) that the integration stores verbatim as text. It must
+        be normalized to JSON and expanded into an email.attachments array
+        before file.name / hash-based alerting works; the malware profile's
+        required file.hash.sha256 and file.path are both trapped inside this
+        blob.
+    - vendor: ESAURLDetails
+      type: string
+      description: URLs found in the message body with their Web-Based Reputation Score
+      ecs: url.original
+      status: partial
+      transform: >
+        same Python-dict-literal problem as ESAAttachmentDetails
+        ({'http://...': {'WbrsScore': 9.2}}); needs parsing and expansion into
+        a url.original array plus a per-URL reputation field. Only present
+        when URL filtering is enabled.
+    - vendor: cfp1
+      type: float
+      description: >-
+        labelled custom float carrying the SenderBase Reputation Score (SBRS),
+        roughly -10.0 (worst) to +10.0 (best)
+      ecs: null
+      status: partial
+      custom: cisco_secure_email_gateway.log.cfp1
+      notes: >
+        meaning comes from cfp1Label=SBRSScore. The field is not always
+        numeric — 'None', 'not enabled' and 'rfc1918' are emitted for unscored
+        senders and fail the float conversion, so the ingest pipeline drops
+        them and appends an error.message
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Own the CEF exit here: parse the CEF header and key/value extension
+          in a hand-built pipeline that resolves the csN/cnN values through
+          their companion Label keys, so cs4 becomes the RFC 5322 Message-ID
+          and cfp1 becomes the SBRS score rather than position-dependent
+          customs. Normalize the two Python-dict-literal blobs low-side —
+          JavaScript handles the single-quoted literal that a painless script
+          cannot — expanding ESAAttachmentDetails into parallel filename /
+          SHA-256 / AMP-verdict arrays and ESAURLDetails into parallel URL and
+          WBRS-score arrays, split multi-recipient duser into an array, and
+          coerce the non-numeric cfp1 sentinels ("None", "not enabled",
+          "rfc1918") to null so the float conversion stops appending
+          error.message. Set host.name/observer.name from the syslog envelope
+          and Cribl input metadata, because the CEF payload itself never
+          carries the appliance hostname the malware and web profiles require.
+        elastic: >
+          With CEF already flattened, land this on a custom ingest pipeline
+          (or a logs-cisco_secure_email_gateway.log@custom override) instead
+          of pipeline_consolidated_event, and apply the normalizations the
+          stock pipeline never does: an act lookup filling event.action and
+          event.outcome (DELIVERED/QUARANTINED -> success, DROPPED/BOUNCED ->
+          failure), cs4/ExternalMsgID onto email.message_id with the
+          appliance-local ESAMID demoted to email.local_id, deviceExternalId
+          onto observer.serial_number rather than host.id, and email.direction
+          derived from deviceDirection instead of the listener name. Drive
+          threat enrichment and event.outcome off ESAAMPVerdict=MALICIOUS so
+          the AMP result is alertable without a vendor-namespace query, and
+          add index-template mappings for the
+          cisco_secure_email_gateway.log.esa.* custom fields plus the expanded
+          email.attachments and url.original arrays.
+        relay: >
+          On the low-side crossing the parse does not move — CEF is already
+          gone before the crossing — but the JSON shape must be constrained:
+          keep attachment and URL data as flat parallel arrays rather than
+          nested per-filename objects so nesting stays within two levels and
+          the custom (likely LUA) NDJSON content filter stays simple, and
+          bound msg, attachment filenames and URLs, which are unbounded,
+          adversary-supplied free text arriving from outside. Validate with
+          C.Schema(...) into a low-side dead-letter route immediately before
+          the guard destination, run that destination with Persistent Queue
+          backpressure rather than Block, and carry _raw across only until the
+          hand-built CEF parser is proven, then drop it.
+      direct:
+        parse_location: low
+        cribl: >
+          Own the CEF exit here: parse the CEF header and key/value extension
+          in a hand-built pipeline that resolves the csN/cnN values through
+          their companion Label keys, so cs4 becomes the RFC 5322 Message-ID
+          and cfp1 becomes the SBRS score rather than position-dependent
+          customs. Normalize the two Python-dict-literal blobs in Cribl —
+          JavaScript handles the single-quoted literal that a painless script
+          cannot — expanding ESAAttachmentDetails into parallel filename /
+          SHA-256 / AMP-verdict arrays and ESAURLDetails into parallel URL and
+          WBRS-score arrays, split multi-recipient duser into an array, and
+          coerce the non-numeric cfp1 sentinels ("None", "not enabled",
+          "rfc1918") to null so the float conversion stops appending
+          error.message. Set host.name/observer.name from the syslog envelope
+          and Cribl input metadata, because the CEF payload itself never
+          carries the appliance hostname the malware and web profiles require.
+        elastic: >
+          With CEF already flattened, land this on a custom ingest pipeline
+          (or a logs-cisco_secure_email_gateway.log@custom override) instead
+          of pipeline_consolidated_event, and apply the normalizations the
+          stock pipeline never does: an act lookup filling event.action and
+          event.outcome (DELIVERED/QUARANTINED -> success, DROPPED/BOUNCED ->
+          failure), cs4/ExternalMsgID onto email.message_id with the
+          appliance-local ESAMID demoted to email.local_id, deviceExternalId
+          onto observer.serial_number rather than host.id, and email.direction
+          derived from deviceDirection instead of the listener name. Drive
+          threat enrichment and event.outcome off ESAAMPVerdict=MALICIOUS so
+          the AMP result is alertable without a vendor-namespace query, and
+          add index-template mappings for the
+          cisco_secure_email_gateway.log.esa.* custom fields plus the expanded
+          email.attachments and url.original arrays.
+- id: mail-logs
+  name: Text Mail Logs (mail_logs)
+  description: >
+    The classic per-message text mail log: many free-text lines per message,
+    correlated by ICID (injection connection), MID (message), DCID (delivery
+    connection) and RID (recipient). Carries the SMTP conversation,
+    From:/To:/Subject, per-engine verdicts, attachment SHA-256 and filename,
+    and the final delivery/bounce status. Retained as the secondary feed
+    because it is the only source for detail the consolidated CEF event omits,
+    and the only feed on appliances not yet on AsyncOS 13+.
+  event_categories:
+  - malware
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Received as raw syslog from the mail_logs subscription (or pulled by
+        FTP into a directory the Elastic Agent watches). On the low-side
+        crossing, note that the lines are unstructured free text with no
+        length bound — subjects, filenames and SMTP server responses all cross
+        verbatim.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cisco_secure_email_gateway.log
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Received as raw syslog from the mail_logs subscription (or pulled by
+        FTP into a directory the Elastic Agent watches).
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cisco_secure_email_gateway.log
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: elastic-integration
+      artifact: Cisco Secure Email Gateway integration (pipeline_text_mail_logs)
+      notes: >
+        A ~35-pattern grok chain, one pattern per known message shape, with a
+        catch-all that dumps unmatched lines into
+        cisco_secure_email_gateway.log.message. Line shapes drift between
+        AsyncOS releases, so unmatched-line volume is the metric to watch
+        after any appliance upgrade. Note the ESA does NOT stitch these lines
+        together: one message produces a dozen documents sharing a MID, and
+        any per-message alerting has to aggregate on MID itself.
+    fields:
+    - vendor: ICID
+      type: long
+      description: >-
+        injection connection ID — identifies the inbound SMTP connection;
+        present on connection-open, From:/To:, and connection-close lines
+      ecs: null
+      status: unmapped
+      custom: cisco_secure_email_gateway.log.injection_connection_id
+    - vendor: MID
+      type: long
+      description: >-
+        message ID assigned at injection; the join key across every line
+        describing one message
+      ecs: email.local_id
+      status: partial
+      notes: >
+        same appliance-local-counter caveat as ESAMID on the consolidated
+        dataset: the stock grok chain lands the MID on email.message_id, but
+        it is not the RFC 5322 Message-ID, so the rename onto email.local_id
+        is outstanding. The text mail log never carries the RFC 5322
+        Message-ID at all, so email.message_id has no source on this format.
+    - vendor: DCID
+      type: long
+      description: >-
+        delivery connection ID — identifies the outbound SMTP connection used
+        to hand the message off
+      ecs: null
+      status: unmapped
+      custom: cisco_secure_email_gateway.log.delivery_connection_id
+    - vendor: RID
+      type: string
+      description: recipient ID, a per-message index distinguishing recipients of the same MID
+      ecs: null
+      status: unmapped
+      custom: cisco_secure_email_gateway.log.recipient_id
+    - vendor: 'From:'
+      type: string
+      description: envelope sender, from the "MID n ICID n From <addr>" line
+      ecs: email.from.address
+      status: mapped
+    - vendor: 'To:'
+      type: string
+      description: envelope recipient, from the "MID n ICID n RID n To <addr>" line
+      ecs: email.to.address
+      status: mapped
+    - vendor: Subject
+      type: string
+      description: 'message subject, from the ''MID n Subject "..."'' line'
+      ecs: null
+      status: partial
+      custom: cisco_secure_email_gateway.log.subject
+      notes: >
+        the subject arrives on its own line, so it is a separate document from
+        the From:/To: lines. The integration also routes it to the vendor
+        namespace rather than ECS email.subject on most branches — a rename
+        plus a MID-keyed enrichment is needed to get subject onto the same
+        document as sender and recipient.
+    - vendor: SHA
+      type: string
+      description: >-
+        SHA-256 of a message attachment, from the "MID n SHA <hash> filename
+        <name>" line
+      ecs: file.hash.sha256
+      status: mapped
+      notes: >-
+        satisfies the malware profile's file.hash.sha256; only emitted when
+        file reputation (AMP) is enabled
+    - vendor: filename
+      type: string
+      description: attachment filename accompanying the SHA on the same line
+      ecs: file.name
+      status: partial
+      notes: >
+        the grok splits name and extension only when the filename has a clean
+        single extension; double extensions and names containing spaces fall
+        through to a looser pattern. The malware profile's required file.path
+        is never available — the ESA has no filesystem path for an attachment.
+    - vendor: address
+      type: ip
+      description: >-
+        peer IP address on connection lines ("New SMTP ICID n interface
+        Management (ip) address <ip>")
+      ecs: null
+      status: partial
+      custom: cisco_secure_email_gateway.log.address
+      notes: >
+        significant gap — this is the sending mail server's IP, but the
+        integration lands it in the vendor namespace (and related.ip) rather
+        than source.ip, so the network profile's source.ip is unmet on this
+        dataset even though the value is present
+    - vendor: interface
+      type: ip
+      description: >-
+        IP address of the appliance listener interface the connection arrived
+        on or left from
+      ecs: null
+      status: partial
+      custom: cisco_secure_email_gateway.log.interface
+      notes: >-
+        would be better as destination.ip (inbound) / source.ip (outbound) or
+        observer.ip; direction has to be inferred from the surrounding line
+        shape first
+    - vendor: reverse dns host
+      type: string
+      description: >-
+        PTR record of the connecting mail server, resolved by the appliance at
+        connection time
+      ecs: dns.question.name
+      status: partial
+      notes: >
+        the integration maps it to dns.question.name, which is wrong in spirit
+        — this is a PTR *answer*, not a query the ESA is asking on behalf of a
+        client. source.domain (or source.registered_domain) is the correct
+        target; leaving it here pollutes DNS analytics.
+    - vendor: verdict
+      type: string
+      description: >
+        per-engine scan result, from the "MID n <engine>: verdict <value>"
+        lines (anti-spam, antivirus, graymail, outbreak filters)
+      ecs: null
+      status: unmapped
+      custom: cisco_secure_email_gateway.log.verdict_scale
+    - vendor: engine
+      type: string
+      description: >-
+        name of the scanning engine that produced the verdict (CASE, Sophos,
+        McAfee, AMP, ...)
+      ecs: null
+      status: unmapped
+      custom: cisco_secure_email_gateway.log.engine
+    - vendor: message_status
+      type: string
+      description: >-
+        delivery outcome phrase — "queued for delivery", "Delivered",
+        "Bounced", "Message finished MID n done"
+      ecs: null
+      status: partial
+      custom: cisco_secure_email_gateway.log.message_status
+      notes: >-
+        the natural source for event.action/event.outcome, but it is free text
+        spread across several line shapes and needs a normalization lookup
+    - vendor: policy
+      type: string
+      description: >-
+        per-recipient mail policy the message matched ("matched all recipients
+        for per-recipient policy X in the inbound table")
+      ecs: null
+      status: unmapped
+      custom: cisco_secure_email_gateway.log.policy
+      notes: rule.name is the obvious ECS target; left unmapped today
+    - vendor: Response
+      type: string
+      description: SMTP response string returned by the downstream MTA for a given MID/RID
+      ecs: null
+      status: unmapped
+      custom: cisco_secure_email_gateway.log.response
+      notes: >-
+        contains the remote 2xx/4xx/5xx code and text; useful for bounce
+        triage, no ECS home
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Do the correlation groundwork low-side where it is cheap and
+          lossless: stamp every line with a MID key scoped by appliance
+          serial, since the MID is an appliance-local counter that collides
+          across appliances and any MID-keyed aggregation is unsafe without
+          that scope. Route lines that match none of the known shapes onto an
+          explicit dead-letter/tag path instead of letting them fall into the
+          generic message field, and alert on that route's volume — it is the
+          metric that exposes grok drift after an AsyncOS upgrade. Keep _raw
+          on this feed: it is the only source for the detail the consolidated
+          event omits.
+        elastic: >
+          Keep the stock pipeline_text_mail_logs and add a
+          logs-cisco_secure_email_gateway.log@custom pipeline for the
+          misroutings the map documents: rename the connection-line `address`
+          onto source.ip (the network profile's requirement is unmet today
+          even though the value is present), move the PTR result off
+          dns.question.name onto source.domain so it stops polluting DNS
+          analytics, promote Subject into email.subject, move the MID off
+          email.message_id onto email.local_id (it is an appliance-local
+          counter, not an RFC 5322 Message-ID), and map `policy` onto
+          rule.name. Add a message_status normalization lookup filling
+          event.action and event.outcome from the queued-for-delivery /
+          Delivered / Bounced phrasings, and infer interface direction from
+          the line shape before assigning destination.ip or observer.ip;
+          expect file.path to remain unavailable.
+        relay: >
+          For low-side instances this dataset flips to low, because reassembly
+          has to happen before the crossing — an at-most-once transfer that
+          drops one line of a dozen leaves a MID that can never be rejoined
+          high-side, and no acknowledgement will tell you it happened. Build a
+          stateful low-side aggregation emitting one bounded JSON document per
+          MID at "Message finished" or window expiry, cap the free-text
+          members (Subject, filename, the SMTP Response string) before the
+          guard destination, and reconcile low-side and high-side counts per
+          (dataset, hour) to detect silent drops.
+      direct:
+        parse_location: high
+        cribl: >
+          Do the correlation groundwork at the edge Cribl where it is cheap:
+          stamp every line with a MID key scoped by appliance serial, since
+          the MID is an appliance-local counter that collides across
+          appliances and any MID-keyed aggregation is unsafe without that
+          scope. Route lines that match none of the known shapes onto an
+          explicit dead-letter/tag path instead of letting them fall into the
+          generic message field, and alert on that route's volume — it is the
+          metric that exposes grok drift after an AsyncOS upgrade. Keep _raw
+          on this feed: it is the only source for the detail the consolidated
+          event omits.
+        elastic: >
+          Keep the stock pipeline_text_mail_logs and add a
+          logs-cisco_secure_email_gateway.log@custom pipeline for the
+          misroutings the map documents: rename the connection-line `address`
+          onto source.ip (the network profile's requirement is unmet today
+          even though the value is present), move the PTR result off
+          dns.question.name onto source.domain so it stops polluting DNS
+          analytics, promote Subject into email.subject, move the MID off
+          email.message_id onto email.local_id (it is an appliance-local
+          counter, not an RFC 5322 Message-ID), and map `policy` onto
+          rule.name. Add a message_status normalization lookup filling
+          event.action and event.outcome from the queued-for-delivery /
+          Delivered / Bounced phrasings, and infer interface direction from
+          the line shape before assigning destination.ip or observer.ip;
+          expect file.path to remain unavailable.
+  - format: csv-file
+    enable: >
+      System Administration > Log Subscriptions > Add Log Subscription, Log
+      Type = "Delivery Logs" (CLI: logconfig > new > choose Delivery Logs).
+      Delivery Logs cannot be sent by Syslog Push - the retrieval method must
+      be FTP Poll, FTP Push or SCP Push, because the rolled files are binary.
+      The emitted files are then post-processed with the Cisco-contributed
+      conversion utility to produce XML or CSV; only after that conversion is
+      the data human- or parser-readable. Message size and the SMTP response
+      fields appear only in the converted output, not on the wire.
+    references:
+    - >-
+      https://www.cisco.com/c/en/us/td/docs/security/esa/esa16-0-2/user_guide/b_ESA_Admin_Guide_16-0-2/b_ESA_Admin_Guide_12_1_chapter_0100111.html
+    parsing:
+      mechanism: none
+      artifact: >-
+        none - Cisco contributed offline binary->XML/CSV utility, then a
+        generic CSV/XML reader
+      notes: >
+        There is no streaming parser for Delivery Logs on either side: the
+        stock Elastic cisco_secure_email_gateway integration parses only the
+        Text Mail / Consolidated / auth log shapes, and Cribl cannot inspect
+        or decode the appliance's binary delivery format at the edge. The only
+        supported path is Cisco's offline utility producing CSV, which a
+        generic CSV ingest pipeline could then read. Because the Text Mail
+        Logs already carry per-recipient delivery and bounce status inline
+        (Delivered / Bounced / "Message finished" lines) with a stock grok
+        chain, Delivery Logs add no field this map needs and are not a
+        recommended feed - the value of documenting them is to explain why the
+        binary form is a dead end for the CDS.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Do not select Delivery Logs as the crossing feed. A CDS content
+          filter cannot inspect an opaque binary delivery file, and the file
+          is only complete after a rollover, so there is no line-at-a-time
+          stream to relay. If a site already produces Delivery Logs and they
+          must be carried, run the Cisco conversion utility LOW-SIDE to emit
+          CSV, then treat the result as a csv-file feed: parse the columns
+          into the cisco_secure_email_gateway.log.delivery.* names below in a
+          hand-built pipeline, split the Rcpt Rid multi-recipient records into
+          per-recipient events, and coerce the SMTP Code to an integer with
+          the non-numeric bounce sentinels nulled. Prefer routing the Text
+          Mail Logs instead - they carry the same delivery verbs as
+          inspectable text.
+        elastic: >
+          With no packaged pipeline for this type, land the converted CSV on a
+          custom ingest pipeline: map Delivery status onto event.outcome
+          (Success -> success, bounce -> failure), Del_time onto
+          email.delivery_timestamp and Inj_time onto event.start with
+          event.duration derived as the queue dwell (Del_time - Inj_time),
+          recipient host Ip onto destination.ip and Source_ip onto source.ip,
+          and keep Code/Reply/Reason/Error in the delivery vendor namespace
+          for bounce triage. Treat Mid as email.local_id (the
+          appliance-assigned id), not email.message_id, since Delivery Logs
+          never carry the RFC 5322 Message-ID.
+        relay: >
+          Never cross the raw binary Delivery Log - it is un-inspectable at
+          the guard and incomplete until rollover. Convert to CSV or NDJSON
+          low-side first, cap the two unbounded free-text members (the SMTP
+          Reply string and, on bounces, the Error string) before the guard
+          destination, validate with C.Schema(...) into a dead-letter route,
+          and run the destination with Persistent Queue backpressure.
+          Reconcile low-side vs high-side record counts per (dataset, hour),
+          since the per-recipient split makes a dropped record hard to notice
+          downstream.
+      direct:
+        parse_location: high
+        cribl: >
+          For a high-side appliance with no guard, prefer the Text Mail Logs
+          and do not stand up a Delivery Log path. If Delivery Logs already
+          exist, run the Cisco conversion utility to CSV on the collector and
+          hand the CSV to Cribl purely for routing - there is no benefit to
+          interposing Cribl on a batch file beyond that.
+        elastic: >
+          With no packaged pipeline for this type, land the converted CSV on a
+          custom ingest pipeline: map Delivery status onto event.outcome
+          (Success -> success, bounce -> failure), Del_time onto
+          email.delivery_timestamp and Inj_time onto event.start with
+          event.duration derived as the queue dwell (Del_time - Inj_time),
+          recipient host Ip onto destination.ip and Source_ip onto source.ip,
+          and keep Code/Reply/Reason/Error in the delivery vendor namespace
+          for bounce triage, treating Mid as email.local_id (the
+          appliance-assigned id) rather than email.message_id since Delivery
+          Logs never carry the RFC 5322 Message-ID. Without a boundary you may
+          retain the full Reply/Error strings, but the calculus is unchanged:
+          Delivery Logs are a redundant, offline-converted view of delivery
+          status the Text Mail Logs already stream, so treat them as a
+          migration-era fallback only.
+    fields:
+    - vendor: Delivery status
+      type: enum
+      description: outcome of the delivery attempt - Success (delivered) or bounce (hard bounced)
+      ecs: event.outcome
+      status: partial
+      transform: >
+        Success maps to event.outcome=success and bounce to
+        event.outcome=failure; a normalization lookup is required because the
+        raw token is the vendor word, not the ECS enum.
+    - vendor: Del_time
+      type: date
+      description: delivery time - the moment the recipient message left the appliance
+      ecs: email.delivery_timestamp
+      status: mapped
+    - vendor: Inj_time
+      type: date
+      description: >-
+        injection time - when the appliance accepted the message; Del_time
+        minus Inj_time is the queue dwell time
+      ecs: event.start
+      status: partial
+      notes: >
+        this is the appliance-local injection timestamp, a reasonable
+        event.start; the queue dwell (Del_time - Inj_time) is the natural
+        source for event.duration and is not emitted pre-computed.
+    - vendor: Bytes
+      type: long
+      description: size of the delivered message in bytes
+      ecs: null
+      status: unmapped
+      custom: cisco_secure_email_gateway.log.delivery.bytes
+      notes: >-
+        ECS has no email message-size field in this dictionary version, so the
+        byte count stays in the vendor namespace
+    - vendor: Mid
+      type: long
+      description: >-
+        appliance-local Message ID, the join key across every delivery record
+        for one message
+      ecs: email.local_id
+      status: partial
+      notes: >
+        email.local_id (the id assigned by the MTA that created the event) is
+        the correct ECS home, not email.message_id - the MID is an
+        appliance-local counter that collides across appliances, and Delivery
+        Logs never carry the globally unique RFC 5322 Message-ID.
+    - vendor: Ip
+      type: ip
+      description: >-
+        recipient host IP - the address of the downstream MTA that received or
+        bounced the message
+      ecs: destination.ip
+      status: mapped
+      notes: >-
+        this is the delivery peer (destination), distinct from Source_ip which
+        is the injecting host
+    - vendor: From
+      type: string
+      description: Envelope From (Envelope Sender / MAIL FROM)
+      ecs: email.from.address
+      status: mapped
+    - vendor: Source_ip
+      type: ip
+      description: source host IP - the address of the host that injected the incoming message
+      ecs: source.ip
+      status: mapped
+    - vendor: Code
+      type: integer
+      description: SMTP response code returned by the recipient host for this delivery attempt
+      ecs: null
+      status: unmapped
+      custom: cisco_secure_email_gateway.log.delivery.response_code
+      notes: >-
+        no smtp.* ECS field set exists in this dictionary version; the
+        2xx/4xx/5xx code stays custom
+    - vendor: Reply
+      type: string
+      description: SMTP response message (text) returned by the recipient host
+      ecs: null
+      status: unmapped
+      custom: cisco_secure_email_gateway.log.delivery.response_text
+      notes: unbounded remote-supplied free text; length-cap before any crossing
+    - vendor: Rcpt Rid
+      type: string
+      description: >-
+        recipient ID, starting at <0>; a message with multiple recipients
+        emits multiple Rcpt Rid values
+      ecs: null
+      status: unmapped
+      custom: cisco_secure_email_gateway.log.delivery.recipient_id
+      notes: >-
+        multi-recipient messages must be split into per-recipient events
+        before recipient-based alerting works
+    - vendor: To
+      type: string
+      description: Envelope To (recipient address) for this Rcpt Rid
+      ecs: email.to.address
+      status: mapped
+    - vendor: Attempts
+      type: integer
+      description: number of delivery attempts made for this recipient before the recorded outcome
+      ecs: null
+      status: unmapped
+      custom: cisco_secure_email_gateway.log.delivery.attempts
+    - vendor: Reason
+      type: string
+      description: >-
+        RFC 1893 Enhanced Mail Status Code interpretation of the SMTP response
+        (bounced records only)
+      ecs: event.reason
+      status: partial
+      notes: >
+        present only on bounced deliveries (Table 8); it is the interpreted
+        status string rather than a raw code, so event.reason is a reasonable
+        home but the enhanced-status code itself is not broken out separately.
+    - vendor: Error
+      type: string
+      description: >-
+        SMTP response message from the recipient host for a bounced delivery
+        (bounced records only)
+      ecs: null
+      status: unmapped
+      custom: cisco_secure_email_gateway.log.delivery.error
+      notes: >-
+        bounce-only free text, overlaps Reply; keep for bounce triage,
+        length-cap before crossing
+  - format: other
+    enable: >
+      System Administration > Log Subscriptions > Add Log Subscription, Log
+      Type = "qmail Format Mail Logs" (CLI: logconfig > new > choose qmail
+      Format Mail Logs). Retrieval is FTP Poll / FTP Push / SCP Push; the
+      content is the delivery/bounce event set of the Delivery Logs rendered
+      in qmail-compatible text so that qmail log-analysis tooling can read it.
+    references:
+    - >-
+      https://www.cisco.com/c/en/us/td/docs/security/esa/esa16-0-2/user_guide/b_ESA_Admin_Guide_16-0-2/b_ESA_Admin_Guide_12_1_chapter_0100111.html
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        hand-built qmail-format delivery-log pipeline (no packaged Elastic
+        integration or Cribl pack exists)
+      notes: >
+        The stock Elastic cisco_secure_email_gateway integration does not
+        recognize the qmail serialization, and there is no Cribl pack for it,
+        so any use would require a hand-built pipeline that decodes the qmail
+        tai64n timestamps and the tagged delivery/bounce fields into the
+        cisco_secure_email_gateway.log.delivery.* names documented on the
+        Delivery Logs entry above. Cisco documents the field CONTENT (it is
+        the Delivery Log statistics set) but does not publish the
+        qmail-specific per-tag layout in the accessible AsyncOS logging
+        chapter, so the qmail-tag field reference is a documented gap (see
+        fields note). As with Delivery Logs, the Text Mail Logs already stream
+        the same delivery verbs as parseable text with a stock grok chain, so
+        qmail Format Mail Logs are only worth wiring up where a qmail log
+        toolchain already exists.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Prefer the Text Mail Logs; select qmail Format Mail Logs only if
+          they are the sole available delivery feed. If carried, parse them
+          low-side in a hand-built pipeline - decode the tai64n timestamps to
+          @timestamp/email.delivery_timestamp, split multi-recipient records
+          into per-recipient events, and normalize the delivery/bounce tag
+          into event.outcome - so that structured, inspectable JSON (not the
+          raw qmail text) is what reaches the crossing.
+        elastic: >
+          Land the parsed events on a custom ingest pipeline mapping the same
+          delivery fields as the Delivery Logs entry (Delivery status ->
+          event.outcome, recipient host IP -> destination.ip, Source_ip ->
+          source.ip, Mid -> email.local_id, From/To -> email.from/to.address),
+          since qmail Format Mail Logs carry the identical delivery
+          information in a different envelope.
+        relay: >
+          qmail records are text, so unlike the binary Delivery Logs they are
+          directly inspectable at the guard - but the same two unbounded
+          members (the SMTP response text and any bounce reason string) must
+          be length-capped and the record validated with C.Schema(...) into a
+          dead-letter route before the guard destination. Cross parsed NDJSON
+          rather than the raw qmail lines so the high-side does not have to
+          carry the tai64n decode across the boundary.
+      direct:
+        parse_location: high
+        cribl: >
+          High-side with no guard: the recommendation collapses to "use the
+          Text Mail Logs instead." If qmail Format Mail Logs must be used,
+          terminate them at a single collector, decode the qmail layout in one
+          hand-built pipeline, and route the structured result - there is no
+          packaged parser to lean on.
+        elastic: >
+          Land the parsed events on a custom ingest pipeline mapping the
+          delivery fields (Delivery status -> event.outcome, recipient host IP
+          -> destination.ip, Source_ip -> source.ip, Mid -> email.local_id,
+          From/To -> email.from/to.address), since qmail Format Mail Logs
+          carry the identical delivery information in a different envelope.
+          Without a boundary, the free-text response strings need not be
+          capped.
+    fields_omitted: >
+      The payload is the same Delivery Log statistics set the csv-file entry
+      on this dataset inventories, re-rendered as qmail-compatible text, but
+      Cisco does not publish the qmail-specific per-tag layout in the
+      accessible AsyncOS logging chapter - so the tag names and tai64n-stamped
+      record shape that carry those values here cannot be listed, only
+      recovered from a live sample off an appliance running the subscription.
+    fields: []
+- id: admin-access
+  name: Authentication and GUI logs
+  description: >
+    Administrative access to the appliance itself — CLI/SSH and web GUI logon,
+    logoff, session timeout, privilege level, per-request GUI HTTP access
+    lines, and configuration commits. Small but disproportionately important:
+    it is the only feed showing who changed mail policy on the gateway.
+  event_categories:
+  - authentication
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        The authentication_logs, gui_logs and system_logs subscriptions all
+        push here as raw syslog.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cisco_secure_email_gateway.log
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        The authentication_logs, gui_logs and system_logs subscriptions all
+        push here as raw syslog.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cisco_secure_email_gateway.log
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: elastic-integration
+      artifact: >-
+        Cisco Secure Email Gateway integration (pipeline_authentication,
+        pipeline_gui_logs, pipeline_system)
+    fields:
+    - vendor: user
+      type: string
+      description: >-
+        administrator account name, from "user:<name>" or "The user <name>
+        ..." phrasings
+      ecs: user.name
+      status: mapped
+    - vendor: from <ip>
+      type: ip
+      description: >-
+        client address the administrator connected from ("An authentication
+        attempt by the user X from <ip> succeeded")
+      ecs: host.ip
+      status: partial
+      notes: >
+        significant gap — the integration groks this into host.ip, which reads
+        as the appliance's own address. The authentication profile requires
+        source.ip; a rename is needed, and host.name (also required) has to
+        come from the syslog envelope.
+    - vendor: session
+      type: string
+      description: >-
+        GUI or CLI session identifier, used to tie a logon to its later
+        timeout/logoff line
+      ecs: null
+      status: unmapped
+      custom: cisco_secure_email_gateway.log.session
+    - vendor: privilege
+      type: string
+      description: >-
+        role granted to the session (Administrator, Operator, Read-Only
+        Operator, Guest, ...)
+      ecs: null
+      status: unmapped
+      custom: cisco_secure_email_gateway.log.privilege
+      notes: >-
+        no ECS role field in 8.11; user.roles exists but is not populated by
+        the integration
+    - vendor: action
+      type: string
+      description: >-
+        what the administrator did — "logged on", "logged off", "was
+        authenticated", "session expired"
+      ecs: null
+      status: partial
+      custom: cisco_secure_email_gateway.log.action
+      notes: >-
+        free-text verb phrase; needs a normalization lookup to fill the
+        event.action required by both the authentication and configuration
+        profiles
+    - vendor: outcome
+      type: string
+      description: >-
+        result verb captured from the authentication sentence — "succeeded",
+        "failed", "successfully"
+      ecs: event.outcome
+      status: partial
+      transform: >
+        the pipeline sets event.outcome by matching the verb, but the
+        vocabulary varies by message shape (succeeded/successfully/failed/
+        denied); unmatched shapes leave event.outcome empty
+    - vendor: connection type
+      type: enum
+      description: protocol the administrative session used (SSH, HTTPS, HTTP, FTP, Telnet)
+      ecs: network.protocol
+      status: mapped
+      transform: lowercased on ingest
+    - vendor: 'req:'
+      type: ip
+      description: >-
+        client IP on a GUI access line ("req:<ip> user:<name> id:<n> 200 GET
+        /path HTTP/1.1 <ua>")
+      ecs: client.ip
+      status: partial
+      notes: >-
+        mapped to client.ip on the GUI branch while the authentication branch
+        uses host.ip for the same concept — the two need reconciling on
+        source.ip
+    - vendor: 'id:'
+      type: string
+      description: GUI request identifier
+      ecs: event.id
+      status: mapped
+    - vendor: HTTP method
+      type: string
+      description: HTTP verb of the GUI request (GET, POST, ...)
+      ecs: http.request.method
+      status: mapped
+    - vendor: HTTP status
+      type: integer
+      description: HTTP response status code returned by the appliance GUI
+      ecs: http.response.status_code
+      status: mapped
+    - vendor: request path
+      type: string
+      description: GUI URL path requested
+      ecs: url.path
+      status: mapped
+    - vendor: user agent
+      type: string
+      description: browser user-agent string on GUI access lines
+      ecs: user_agent.original
+      status: mapped
+    - vendor: PID
+      type: integer
+      description: >
+        process ID on a configuration-commit line ("PID n: User X commit
+        changes:...")
+      ecs: process.pid
+      status: mapped
+    - vendor: commit changes
+      type: string
+      description: >-
+        free-text comment the administrator supplied when committing a
+        configuration change
+      ecs: null
+      status: partial
+      custom: cisco_secure_email_gateway.log.commit_changes
+      notes: >
+        the comment only, not a diff — the ESA does not log what actually
+        changed, so before/after configuration state is unavailable and the
+        configuration profile's event.action must be synthesized from the line
+        shape
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Never sample or drop this feed and keep _raw indefinitely: it is
+          tiny and it is the only evidence that mail policy changed on the
+          gateway. Tag each of the three subscriptions (authentication_logs,
+          gui_logs, system_logs) at the input so downstream branch selection
+          does not rest on message shape alone, and enrich low-side with an
+          appliance -> owning site / administrator lookup while that identity
+          is still locally resolvable.
+        elastic: >
+          The highest-value fix is a
+          logs-cisco_secure_email_gateway.log@custom pipeline that reconciles
+          the client address: the authentication branch's host.ip and the GUI
+          branch's client.ip describe the same thing and both belong on
+          source.ip, with host.name taken from the syslog envelope so the
+          authentication profile's requirements are actually met. Add a
+          normalization lookup turning the free-text verb phrases ("logged
+          on", "logged off", "session expired", "was authenticated") into
+          event.action, widen the event.outcome matcher beyond
+          succeeded/successfully/failed/denied so unmatched shapes stop
+          leaving it empty, copy privilege into user.roles, and synthesize a
+          configuration event.action for commit lines since the ESA logs no
+          diff.
+        relay: >
+          On the low-side crossing, treat this as the dataset where a silent
+          drop costs the most — a lost commit line is an unlogged policy
+          change — so make it the first candidate for per (dataset, hour)
+          count reconciliation, and prefer the filesystem/drop-box fallback
+          transport here for its replay story. Bound the two unbounded members
+          that cross (the commit-changes comment and the GUI user-agent
+          string) and validate with C.Schema(...) into a dead-letter route
+          before the guard destination.
+      direct:
+        parse_location: high
+        cribl: >
+          Never sample or drop this feed and keep _raw indefinitely: it is
+          tiny and it is the only evidence that mail policy changed on the
+          gateway. Tag each of the three subscriptions (authentication_logs,
+          gui_logs, system_logs) at the input so downstream branch selection
+          does not rest on message shape alone, and enrich at the edge Cribl
+          with an appliance -> owning site / administrator lookup while that
+          identity is still locally resolvable.
+        elastic: >
+          The highest-value fix is a
+          logs-cisco_secure_email_gateway.log@custom pipeline that reconciles
+          the client address: the authentication branch's host.ip and the GUI
+          branch's client.ip describe the same thing and both belong on
+          source.ip, with host.name taken from the syslog envelope so the
+          authentication profile's requirements are actually met. Add a
+          normalization lookup turning the free-text verb phrases ("logged
+          on", "logged off", "session expired", "was authenticated") into
+          event.action, widen the event.outcome matcher beyond
+          succeeded/successfully/failed/denied so unmatched shapes stop
+          leaving it empty, copy privilege into user.roles, and synthesize a
+          configuration event.action for commit lines since the ESA logs no
+          diff.

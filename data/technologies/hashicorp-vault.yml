@@ -1,0 +1,894 @@
+id: hashicorp-vault
+name: HashiCorp Vault
+vendor: HashiCorp
+versions: Vault 1.15.x, 1.16.x, 1.17.x, 1.18.x (Community and Enterprise)
+draft: true
+references:
+- https://developer.hashicorp.com/vault/docs/audit
+- https://developer.hashicorp.com/vault/docs/audit/schema
+- https://developer.hashicorp.com/vault/docs/audit/file
+- https://developer.hashicorp.com/vault/docs/audit/socket
+- https://www.elastic.co/docs/reference/integrations/hashicorp_vault
+- https://github.com/elastic/integrations/tree/main/packages/hashicorp_vault
+datasets:
+- id: audit
+  name: Audit device log
+  description: >
+    Vault's authoritative record of every authenticated API request and
+    response, written by an enabled audit device (file, socket, or syslog) as
+    JSON — one object per line, one object per record. Each API call produces
+    TWO records sharing a request.id: a `request` record written before the
+    operation and a `response` record written after it, so naive event
+    counting doubles and only the response record carries the outcome. Covers
+    machine-credential issuance (auth/*/login, AppRole, cert, Kubernetes),
+    secret retrieval on kv / database / pki / transit mounts, and Vault
+    self-administration under sys/ (mount, policy, entity, and audit-device
+    changes) — which is why this dataset spans authentication and iam and also
+    carries the configuration-change trail. The load-bearing caveat for
+    detection design: Vault writes a keyed HMAC-SHA256 of most string values,
+    not the values themselves. Tokens, accessors, and every key inside
+    request.data / response.data arrive as opaque hex digests unless the audit
+    device is enabled with log_raw, or the specific mount is tuned with
+    audit_non_hmac_request_keys / audit_non_hmac_response_keys. HMACs are
+    stable under one Vault cluster's audit key, so they correlate across
+    events but never resolve to a real token, and they break correlation
+    across clusters or after a key rotation. Request headers are omitted
+    entirely unless explicitly allow-listed through
+    /sys/config/auditing/request-headers, so there is no user agent.
+  event_categories:
+  - authentication
+  - iam
+  route:
+    guarded:
+    - hop: cribl
+      location: edge Cribl worker group, on-prem enclave
+      notes: >
+        Receives the audit device stream either as newline-delimited JSON over
+        TCP from a socket audit device, or by tailing the file audit device's
+        log with the Elastic Agent / a Cribl file source. The file device is
+        the safer receiver: Vault refuses to serve API requests when it cannot
+        write to any enabled audit device, so a stalled or unreachable socket
+        destination can wedge the cluster, and a socket device has no replay
+        path for records dropped while it was down. Vault sits in the same
+        enclave as the workloads whose credentials it issues.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-hashicorp_vault.audit
+    direct:
+    - hop: cribl
+      location: edge Cribl worker group, on-prem enclave
+      notes: >
+        Receives the audit device stream either as newline-delimited JSON over
+        TCP from a socket audit device, or by tailing the file audit device's
+        log with the Elastic Agent / a Cribl file source. The file device is
+        the safer receiver: Vault refuses to serve API requests when it cannot
+        write to any enabled audit device, so a stalled or unreachable socket
+        destination can wedge the cluster, and a socket device has no replay
+        path for records dropped while it was down. Vault sits in the same
+        enclave as the workloads whose credentials it issues.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-hashicorp_vault.audit
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: Hashicorp Vault integration (audit data stream)
+      notes: >
+        The integration ingests the raw audit JSON unchanged into
+        hashicorp_vault.audit.* and adds a thin ECS layer on top (@timestamp,
+        event.action/id/outcome, source.ip/port, geo). It is a genuine,
+        maintained package, but its ECS coverage of the principal is weak:
+        user.id and user.email are populated only from
+        auth.metadata.account_id / .email, which exist on the AWS auth method,
+        and auth.display_name is never copied to user.name — so most events
+        land with no ECS user at all. Same collection mechanism whether the
+        source is the file device or the socket device.
+    fields:
+    - vendor: time
+      type: timestamp
+      description: ISO 8601 time the audit record was written
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: type
+      type: enum
+      description: kind of audit record - request or response
+      ecs: null
+      status: unmapped
+      custom: hashicorp_vault.audit.type
+      notes: >
+        every API call emits one request record and one response record
+        sharing request.id; only the response record carries error,
+        response.data and the real outcome, so alerting on request records
+        alone reports success for calls that were denied. The Elastic package
+        declares this field as hashicorp_vault.audit.response.type, which does
+        not match where the value actually sits in the raw JSON.
+    - vendor: error
+      type: string
+      description: error message returned to the client; absent on successful operations
+      ecs: error.message
+      status: partial
+      notes: >
+        the stock integration pipeline copies this string into `message` and
+        derives event.outcome success/failure purely from its presence;
+        error.message is the correct ECS home and should be populated
+        alongside, so `message` is not overloaded
+    - vendor: auth.display_name
+      type: string
+      description: >-
+        non-security human-readable identifier for the authenticated
+        principal, e.g. ldap-jdoe, approle, token
+      ecs: user.name
+      status: partial
+      notes: >
+        usually the only readable principal on the record, but it is a display
+        label composed from the auth method and mount, not a unique identity,
+        and the stock pipeline never copies it to user.name - a custom
+        pipeline must
+    - vendor: auth.entity_id
+      type: string
+      description: identity-store entity ID of the authenticated client
+      ecs: user.id
+      status: partial
+      notes: >
+        the stable principal identifier across auth methods and the best
+        available user.id, but the stock pipeline instead sets user.id from
+        auth.metadata.account_id, which only exists on the AWS auth method;
+        entity_id is also empty for tokens created outside the identity system
+        (root and some batch tokens)
+    - vendor: auth.client_token
+      type: string
+      description: keyed HMAC-SHA256 of the Vault token that performed the request
+      ecs: null
+      status: unmapped
+      custom: hashicorp_vault.audit.auth.client_token
+      notes: >
+        an opaque digest, not a token - it is stable under one cluster's audit
+        HMAC key so it joins events belonging to the same token, but it never
+        resolves to a token id and correlation breaks across clusters and
+        across an audit-key rotation. Cleartext only if the audit device was
+        enabled with log_raw, which is not the default and should not be
+    - vendor: auth.accessor
+      type: string
+      description: keyed HMAC-SHA256 of the token accessor
+      ecs: null
+      status: unmapped
+      custom: hashicorp_vault.audit.auth.accessor
+      notes: >
+        the accessor is the operational revocation handle, so an
+        incident-response runbook that pivots from an alert to a token revoke
+        needs this value un-hashed - which requires enabling the audit device
+        with hmac_accessor=false, a decision to take deliberately rather than
+        by default
+    - vendor: auth.policies
+      type: string
+      description: list of ACL policy names in effect for the authenticated client
+      ecs: user.roles
+      status: partial
+      notes: >
+        array field; this is the effective union of auth.token_policies and
+        auth.identity_policies, both of which Vault also emits separately -
+        mapping only the union to user.roles loses whether a privilege came
+        from the token or from group membership, which is exactly the
+        distinction a privilege-escalation detection needs
+    - vendor: auth.token_type
+      type: enum
+      description: token class - service, batch, or default-service/default-batch
+      ecs: null
+      status: unmapped
+      custom: hashicorp_vault.audit.auth.token_type
+      notes: >
+        batch tokens are not persisted in the token store and cannot be listed
+        or revoked individually, so this field decides whether a detection's
+        response action is even possible
+    - vendor: auth.metadata
+      type: string
+      description: >-
+        key/value metadata associated with the authenticated client, populated
+        per auth method
+      ecs: null
+      status: partial
+      custom: hashicorp_vault.audit.auth.metadata
+      notes: >
+        flattened object whose keys are auth-method specific (AWS
+        account_id/role_id, Kubernetes service_account_name/namespace, LDAP
+        username); the stock pipeline mines only account_id and email out of
+        it, leaving the Kubernetes and LDAP identities unmapped
+    - vendor: auth.policy_results.allowed
+      type: boolean
+      description: whether the ACL evaluation permitted the request
+      ecs: null
+      status: partial
+      custom: hashicorp_vault.audit.auth.policy_results.allowed
+      notes: >
+        the explicit authorization decision, and a far cleaner denial signal
+        than string-matching the generic permission-denied error; emitted by
+        newer Vault versions only, alongside policy_results.granting_policies
+        naming the policy that granted access. Not consulted by the stock
+        event.outcome logic
+    - vendor: request.id
+      type: string
+      description: unique random identifier assigned to the API request
+      ecs: event.id
+      status: mapped
+      notes: the join key between the request and response records of the same call
+    - vendor: request.operation
+      type: enum
+      description: operation performed - create, read, update, delete, or list
+      ecs: event.action
+      status: mapped
+      transform: >
+        the raw verb is used as event.action directly; note that read on a kv
+        mount is a secret retrieval while read on sys/ is a config query, so
+        event.action is only meaningful together with request.path and
+        request.mount_type
+    - vendor: request.path
+      type: string
+      description: >-
+        Vault logical API path the operation targeted, e.g. auth/approle/login
+        or secret/data/prod/db
+      ecs: url.path
+      status: partial
+      notes: >
+        the single most detection-relevant field in the dataset - mount plus
+        secret path is the authorization boundary every Vault detection pivots
+        on. url.path is the closest ECS home but is a wildcard field modelling
+        an HTTP URL path, whereas this is the logical path with the /v1 prefix
+        stripped, so keep the keyword original for exact-match aggregation.
+        The stock integration leaves it custom-only
+    - vendor: request.mount_type
+      type: string
+      description: >-
+        type of the secret engine or auth method serving the path, e.g. kv,
+        approle, pki, database, transit, cert
+      ecs: null
+      status: unmapped
+      custom: hashicorp_vault.audit.request.mount_type
+      notes: >
+        separates credential issuance (auth methods) from secret retrieval
+        (secret engines) without parsing the path string; no ECS field models
+        a backend/plugin type
+    - vendor: request.remote_address
+      type: ip
+      description: IP address of the client that issued the request
+      ecs: source.ip
+      status: mapped
+    - vendor: request.remote_port
+      type: integer
+      description: TCP source port of the client connection
+      ecs: source.port
+      status: mapped
+    - vendor: request.client_certificate_serial_number
+      type: string
+      description: serial number of the client TLS certificate presented for mutual authentication
+      ecs: tls.client.x509.serial_number
+      status: mapped
+      notes: >
+        present on cert auth method logins and on any mTLS-fronted request;
+        the strongest non-HMAC identifier of a machine principal in this
+        dataset
+    - vendor: request.data
+      type: string
+      description: request payload as key/value pairs
+      ecs: null
+      status: unmapped
+      custom: hashicorp_vault.audit.request.data
+      notes: >
+        flattened object; values are HMAC digests unless the mount is tuned
+        with audit_non_hmac_request_keys, so it is normally useful only for
+        which keys were supplied, not their values. Keys are site-specific and
+        unbounded - map as flattened, never let dynamic mapping index it
+    - vendor: request.headers
+      type: string
+      description: HTTP request headers, restricted to those explicitly configured for auditing
+      ecs: null
+      status: unmapped
+      custom: hashicorp_vault.audit.request.headers
+      notes: >
+        empty by default - headers appear only after being allow-listed
+        through /sys/config/auditing/request-headers, which is why this
+        dataset has no user_agent.original and no request-correlation header
+        unless an operator opts in
+    - vendor: response.data
+      type: string
+      description: response payload as key/value pairs, present on response records only
+      ecs: null
+      status: unmapped
+      custom: hashicorp_vault.audit.response.data
+      notes: >
+        flattened and HMAC'd like request.data; its presence and key set
+        confirm a secret was actually returned rather than merely requested.
+        Large list responses should be collapsed at the source with the audit
+        device's elide_list_responses option
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Keep the edge worker group a pass-through: the source is already one
+          JSON object per line, so there is no low-side grammar to parse and
+          nothing to gain from re-shaping it before the integration's
+          pipeline. Spend the low-side budget on two things instead — run
+          Persistent Queue backpressure on the Elastic destination and never
+          Block, because Vault stops serving API requests when no enabled
+          audit device can be written to and a blocked receiver therefore
+          becomes a cluster outage rather than a logging gap; and attach the
+          mount-to-owning-system and namespace-to-mission enrichment here
+          where the inventory lookup already lives. Add a masking rule for any
+          mount tuned with audit_non_hmac_request_keys, since those keys are
+          the only place cleartext secret material can appear in this feed.
+        elastic: >
+          Let the stock hashicorp_vault integration pipeline parse, then own a
+          logs-hashicorp_vault.audit@custom pipeline for the four gaps this
+          map records: populate user.name from auth.display_name and user.id
+          from auth.entity_id instead of the AWS-only
+          auth.metadata.account_id, so events have an ECS principal at all;
+          copy request.path into url.path for prefix hunting while keeping the
+          keyword original for exact-match aggregation; treat
+          auth.policy_results.allowed = false as event.outcome failure rather
+          than deriving outcome purely from the presence of the error string;
+          and move the error text to error.message instead of overwriting
+          message. Deduplicate or tag the request/response record pair by
+          request.id so dashboards stop double-counting, and pin
+          index-template mappings for the custom namespace — request.path,
+          request.mount_type, auth.policies, auth.token_type and the HMAC
+          fields as keyword, request.data and response.data as flattened — so
+          site-specific secret key names cannot explode the field count under
+          dynamic mapping.
+        relay: >
+          The crossing format is nearly free here: the audit device already
+          emits UTF-8 LF-terminated NDJSON, nothing CEF-shaped is involved,
+          and the HMAC digests are fixed-length hex that a content filter can
+          validate cheaply. The friction to settle with the guard owner is
+          request.data, response.data and request.headers — unbounded
+          flattened objects whose key names are site-specific and whose values
+          run to kilobytes when a mount is tuned for non-HMAC keys or a list
+          response is not elided; allow-list and cap those low-side (and
+          enable elide_list_responses on the audit device) so a custom NDJSON
+          filter can stay simple, and hold the record to shallow nesting with
+          short ASCII keys. Because the crossing is at-most-once with no
+          return channel, prefer the file audit device plus a Filesystem
+          collector over the socket device on a guarded route — it is the only
+          option with a replay story — and detect silent drops by reconciling
+          low-side and high-side counts per (dataset, hour). Carry _raw
+          end-to-end: this is the credential-issuance record of last resort
+          and the last dataset on which to drop it.
+      direct:
+        parse_location: high
+        cribl: >
+          Keep the edge worker group a pass-through: the source is already one
+          JSON object per line, so there is no grammar to parse and nothing to
+          gain from re-shaping it before the integration's pipeline. Spend the
+          edge budget on two things instead — run Persistent Queue
+          backpressure on the Elastic destination and never Block, because
+          Vault stops serving API requests when no enabled audit device can be
+          written to and a blocked receiver therefore becomes a cluster outage
+          rather than a logging gap; and attach the mount-to-owning-system and
+          namespace-to-mission enrichment here where the inventory lookup
+          already lives. Add a masking rule for any mount tuned with
+          audit_non_hmac_request_keys, since those keys are the only place
+          cleartext secret material can appear in this feed.
+        elastic: >
+          Let the stock hashicorp_vault integration pipeline parse, then own a
+          logs-hashicorp_vault.audit@custom pipeline for the four gaps this
+          map records: populate user.name from auth.display_name and user.id
+          from auth.entity_id instead of the AWS-only
+          auth.metadata.account_id, so events have an ECS principal at all;
+          copy request.path into url.path for prefix hunting while keeping the
+          keyword original for exact-match aggregation; treat
+          auth.policy_results.allowed = false as event.outcome failure rather
+          than deriving outcome purely from the presence of the error string;
+          and move the error text to error.message instead of overwriting
+          message. Deduplicate or tag the request/response record pair by
+          request.id so dashboards stop double-counting, and pin
+          index-template mappings for the custom namespace — request.path,
+          request.mount_type, auth.policies, auth.token_type and the HMAC
+          fields as keyword, request.data and response.data as flattened — so
+          site-specific secret key names cannot explode the field count under
+          dynamic mapping.
+  - format: other
+    enable: >
+      Set format=jsonx when enabling or tuning any audit device - file,
+      socket, or syslog - e.g. `vault audit enable file
+      file_path=/var/log/vault/audit.log format=jsonx`, or PUT
+      /sys/audit/<path> with options.format=jsonx. The default is json; jsonx
+      must be selected explicitly and "formats the normal log entries as XML".
+      Every field the JSON device emits (time, type, auth.*, request.*,
+      response.*) appears as an XML element with the same name and nesting,
+      and all other device options behave identically - the HMAC of string
+      values, log_raw, hmac_accessor, elide_list_responses and prefix are
+      unchanged, so the same cleartext-only-under-log_raw and
+      request-headers-allow-list caveats hold.
+    references:
+    - https://developer.hashicorp.com/vault/api-docs/system/audit
+    - https://developer.hashicorp.com/vault/docs/audit
+    - https://developer.hashicorp.com/vault/docs/audit/schema
+    - https://developer.hashicorp.com/vault/docs/audit/file
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        custom jsonx-to-JSON reshape pipeline feeding the Hashicorp Vault
+        integration (audit data stream)
+      notes: >
+        The stock Elastic hashicorp_vault integration parses only JSON audit
+        records; it has no XML branch, so a jsonx feed must be decoded back to
+        the JSON audit object tree upstream of the integration pipeline - a
+        Cribl XML parse function or an Elastic ingest XML processor rebuilds
+        the same object the json device would have emitted, which the stock
+        pipeline then handles unchanged. Because jsonx carries the identical
+        schema, the reshape is serialization-only with no field-name remapping
+        and no detection gains anything over json; the value of this entry is
+        recognizing a jsonx source and normalizing it onto the json path, not
+        adopting jsonx. jsonx serializes the entire audit-record schema
+        (docs/audit/schema) as XML - every field the JSON device emits appears
+        as a same-named XML element with the same nesting - so only
+        representative ECS anchors are tabled below; the full field inventory
+        is the json audit field list. Once decoded those anchors map exactly
+        as on the json feed, including the HMAC'd token/accessor and the
+        flattened request.data / response.data the json entry carries.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Decode jsonx to the JSON audit shape on the edge worker group with
+          an XML parse function so what crosses the guard is byte-compatible
+          with the json audit feed and only one crossing policy has to be
+          certified - never ship XML across the guard. Keep the same
+          Persistent-Queue-never-Block discipline the json feed requires:
+          Vault stops serving API requests when no enabled audit device can be
+          written, so a blocked receiver is a cluster outage regardless of
+          serialization. Attach the mount-to-owning-system and
+          namespace-to-mission enrichment here as on the json feed, and mask
+          any mount tuned with audit_non_hmac_request_keys.
+        elastic: >
+          Once the XML is gone upstream, the stock hashicorp_vault integration
+          pipeline and the same logs-hashicorp_vault.audit@custom fixes the
+          json feed needs apply unchanged - populate user.name from
+          auth.display_name and user.id from auth.entity_id rather than the
+          AWS-only auth.metadata.account_id, copy request.path into url.path
+          while keeping the keyword original, treat
+          auth.policy_results.allowed = false as event.outcome failure, move
+          the error text to error.message, and pin request.data /
+          response.data as flattened. There is nothing jsonx-specific to do at
+          the SIEM.
+        relay: >
+          The crossing must be the reshaped NDJSON, never raw XML - XML's
+          unbounded element nesting and attribute surface is far harder for a
+          content filter to validate than the fixed-shape NDJSON the json feed
+          already crosses, so decode jsonx low-side and hold the identical
+          allow-list and size-cap discipline on request.data, response.data
+          and request.headers (and enable elide_list_responses on the device).
+          Because the crossing is at-most-once with no return channel, prefer
+          the file audit device with format=jsonx plus a Filesystem collector
+          over the socket device for its replay story, and reconcile low-side
+          and high-side counts per (dataset, hour).
+      direct:
+        parse_location: low
+        cribl: >
+          High side with no guard: still decode jsonx to JSON before the
+          integration, but the choice is purely operational - jsonx buys
+          nothing analytically, so migrate the device to format=json unless an
+          external consumer requires XML audit. If XML must stay, decode in
+          Cribl or with an Elastic ingest XML processor and pass the
+          reconstructed JSON record through to the stock pipeline.
+        elastic: >
+          With the record already JSON, the stock hashicorp_vault integration
+          pipeline plus a logs-hashicorp_vault.audit@custom pipeline apply as
+          on any Vault audit feed - populate user.name from auth.display_name
+          and user.id from auth.entity_id rather than the AWS-only
+          auth.metadata.account_id, copy request.path into url.path while
+          keeping the keyword original, treat auth.policy_results.allowed =
+          false as event.outcome failure, and move the error text to
+          error.message. There is nothing jsonx-specific to do at the SIEM.
+    fields:
+    - vendor: time
+      type: timestamp
+      description: ISO 8601 time the audit record was written, as an XML <time> element
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: type
+      type: enum
+      description: kind of audit record - request or response - as an XML element
+      ecs: null
+      status: unmapped
+      custom: hashicorp_vault.audit.type
+      notes: >
+        same request/response pairing on a shared request.id as the json feed;
+        only the response record carries error, response.data and the real
+        outcome, so alerting on request records alone reports success for
+        denied calls
+    - vendor: error
+      type: string
+      description: error message returned to the client; absent on successful operations
+      ecs: error.message
+      status: partial
+      notes: >
+        copy to error.message in the custom pipeline; do not let the stock
+        logic overload `message` and derive outcome purely from its presence
+    - vendor: auth.display_name
+      type: string
+      description: >-
+        non-security human-readable identifier for the authenticated
+        principal, e.g. ldap-jdoe, approle, token
+      ecs: user.name
+      status: partial
+      notes: >
+        usually the only readable principal on the record but a display label,
+        not a unique identity; the stock pipeline never copies it to
+        user.name, so the custom pipeline must - identical to the json feed
+    - vendor: auth.entity_id
+      type: string
+      description: identity-store entity ID of the authenticated client
+      ecs: user.id
+      status: partial
+      notes: >
+        the stable cross-method principal and the best user.id; empty for
+        tokens created outside the identity system (root and some batch
+        tokens), as on the json feed
+    - vendor: request.id
+      type: string
+      description: unique random identifier assigned to the API request
+      ecs: event.id
+      status: mapped
+      notes: the join key between the request and response XML records of the same call
+    - vendor: request.operation
+      type: enum
+      description: operation performed - create, read, update, delete, or list
+      ecs: event.action
+      status: mapped
+      transform: >
+        the raw verb is used as event.action directly; meaningful only
+        together with request.path and request.mount_type, since read on a kv
+        mount is secret retrieval while read on sys/ is a config query
+    - vendor: request.path
+      type: string
+      description: >-
+        Vault logical API path the operation targeted, e.g. auth/approle/login
+        or secret/data/prod/db
+      ecs: url.path
+      status: partial
+      notes: >
+        the single most detection-relevant field; url.path is the closest ECS
+        home but this is a logical path with the /v1 prefix stripped, so keep
+        the keyword original for exact-match aggregation
+    - vendor: request.mount_type
+      type: string
+      description: >-
+        type of the secret engine or auth method serving the path, e.g. kv,
+        approle, pki, database, transit, cert
+      ecs: null
+      status: unmapped
+      custom: hashicorp_vault.audit.request.mount_type
+      notes: >-
+        separates credential issuance from secret retrieval without parsing
+        the path; no ECS field models a backend/plugin type
+    - vendor: request.remote_address
+      type: ip
+      description: IP address of the client that issued the request
+      ecs: source.ip
+      status: mapped
+    - vendor: request.remote_port
+      type: integer
+      description: TCP source port of the client connection
+      ecs: source.port
+      status: mapped
+    - vendor: request.client_certificate_serial_number
+      type: string
+      description: serial number of the client TLS certificate presented for mutual authentication
+      ecs: tls.client.x509.serial_number
+      status: mapped
+      notes: >-
+        present on cert auth logins and any mTLS-fronted request; the
+        strongest non-HMAC machine-principal identifier in this dataset
+    - vendor: request.data
+      type: string
+      description: request payload key/value pairs, rendered as nested XML elements
+      ecs: null
+      status: unmapped
+      custom: hashicorp_vault.audit.request.data
+      notes: >
+        values are HMAC digests unless the mount is tuned with
+        audit_non_hmac_request_keys; keys are site-specific and unbounded -
+        map as flattened after decode, never let dynamic mapping index it, and
+        the XML nesting is the reason to cap it before a guard crossing
+    - vendor: response.data
+      type: string
+      description: >-
+        response payload key/value pairs, present on response records only, as
+        nested XML elements
+      ecs: null
+      status: unmapped
+      custom: hashicorp_vault.audit.response.data
+      notes: >-
+        flattened and HMAC'd like request.data; collapse large list responses
+        at the source with elide_list_responses
+- id: operational
+  name: Server operational log
+  description: >
+    Thin secondary - the Vault server's own stdout/stderr log (hclog),
+    carrying seal/unseal, storage backend, cluster leadership and replication
+    messages. It is the only place non-API operational failures appear, but it
+    is not an audit record and must not be treated as one. Vault emits this as
+    plain text unless the server is configured with log_format = "json"; in
+    JSON mode hclog uses @-prefixed keys and appends arbitrary per-message
+    key/value pairs that no schema enumerates.
+  event_categories:
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge Cribl worker group, on-prem enclave
+      notes: >
+        Collected from the Vault server log file (or the container's stdout)
+        on the same hosts as the audit device above, and crosses along with
+        the audit stream.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-hashicorp_vault.log
+    direct:
+    - hop: cribl
+      location: edge Cribl worker group, on-prem enclave
+      notes: >
+        Collected from the Vault server log file (or the container's stdout)
+        on the same hosts as the audit device above, and travels with the
+        audit stream.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-hashicorp_vault.log
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: Hashicorp Vault integration (log data stream)
+      notes: >
+        The integration's pipeline branches on whether the line starts with
+        "{": JSON lines are parsed and the four @-prefixed keys are renamed to
+        ECS, while plain-text lines are passed through as `message` with no
+        field extraction at all. Setting log_format = "json" on the Vault
+        server is therefore a prerequisite for this dataset being worth
+        anything.
+    fields:
+    - vendor: '@timestamp'
+      type: timestamp
+      description: ISO 8601 time the server emitted the log line
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: '@level'
+      type: enum
+      description: hclog severity - trace, debug, info, warn, error
+      ecs: log.level
+      status: mapped
+      notes: >-
+        lowercase hclog strings; normalize if the rest of the estate uses
+        uppercase or numeric severities
+    - vendor: '@message'
+      type: string
+      description: human-readable log message text
+      ecs: message
+      status: mapped
+    - vendor: '@module'
+      type: string
+      description: emitting Vault subsystem, e.g. core, storage.raft, secrets.kv, replication
+      ecs: log.logger
+      status: mapped
+      notes: >
+        the practical filter for this dataset - core carries seal/unseal and
+        leadership, storage.* carries backend failures
+    - vendor: file_path
+      type: string
+      description: >-
+        filesystem path referenced by the message, emitted on file-backed
+        subsystem messages such as audit device configuration
+      ecs: file.path
+      status: mapped
+    - vendor: error
+      type: string
+      description: error detail attached as an hclog key/value pair on failure messages
+      ecs: error.message
+      status: partial
+      notes: >
+        one of the arbitrary trailing key/value pairs rather than a schema
+        field; the stock pipeline leaves it inside the flattened
+        hashicorp_vault.log object, so it needs an explicit promotion to
+        error.message to be alertable
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Pass through unparsed on the edge worker group with Persistent Queue
+          backpressure, and confirm log_format = "json" is set on every Vault
+          server before onboarding - the integration silently degrades text
+          lines to a bare message field, so a text-mode server produces a
+          dataset that looks healthy and carries no structure. Suppress
+          debug/trace level noise low-side rather than shipping it, and enrich
+          with the cluster/node identity that the log line itself does not
+          carry.
+        elastic: >
+          The stock log data-stream pipeline handles the four standard hclog
+          keys (@timestamp, @level, @message, @module); add a
+          logs-hashicorp_vault.log@custom pipeline to lift the per-message
+          key/value pairs that matter out of the flattened remainder - promote
+          the hclog `error` key to error.message and normalize the lowercase
+          hclog level strings so log.level agrees with the rest of the estate.
+          Map hashicorp_vault.log as flattened in the index template, since
+          the trailing key set is unbounded and version dependent, and set
+          service.name so these lines correlate with the audit dataset from
+          the same host.
+        relay: >
+          This dataset crosses as the same NDJSON envelope as the audit stream
+          and is the first place to drop _raw, since the parsed message loses
+          nothing forensically. The only content-filter friction is @message
+          plus the arbitrary hclog key/value tail: unbounded free text with an
+          unenumerated key set, which should be length-capped and
+          key-allow-listed low-side so the custom filter does not need to
+          reason about a schema that changes between Vault versions.
+      direct:
+        parse_location: high
+        cribl: >
+          Pass through unparsed on the edge worker group with Persistent Queue
+          backpressure, and confirm log_format = "json" is set on every Vault
+          server before onboarding - the integration silently degrades text
+          lines to a bare message field, so a text-mode server produces a
+          dataset that looks healthy and carries no structure. Suppress
+          debug/trace level noise at the edge rather than shipping it, and
+          enrich with the cluster/node identity that the log line itself does
+          not carry.
+        elastic: >
+          The stock log data-stream pipeline handles the four standard hclog
+          keys (@timestamp, @level, @message, @module); add a
+          logs-hashicorp_vault.log@custom pipeline to lift the per-message
+          key/value pairs that matter out of the flattened remainder - promote
+          the hclog `error` key to error.message and normalize the lowercase
+          hclog level strings so log.level agrees with the rest of the estate.
+          Map hashicorp_vault.log as flattened in the index template, since
+          the trailing key set is unbounded and version dependent, and set
+          service.name so these lines correlate with the audit dataset from
+          the same host.
+  - format: syslog-raw
+    enable: >
+      Leave -log-format at its default value standard (or omit log_format from
+      the server HCL / VAULT_LOG_FORMAT) and the Vault server writes hclog
+      plain-text lines to stdout/stderr and the server log file. A standard
+      line is `<RFC3339 timestamp> [<LEVEL>] <module>: <message>[: key=value
+      ...]`, e.g. `2026-01-02T15:04:05.000Z [INFO]  core: post-unseal setup
+      complete`. The level is an UPPERCASE bracketed token and the trailing
+      pairs are space-separated key=value tokens - unlike the @-prefixed JSON
+      keys (@timestamp/@level/@module/@message) the json format emits.
+      -log-level (default info) gates which lines appear in either format.
+    references:
+    - https://developer.hashicorp.com/vault/docs/commands/server
+    - https://developer.hashicorp.com/vault/docs/configuration
+    - https://www.elastic.co/docs/reference/integrations/hashicorp_vault
+    parsing:
+      mechanism: elastic-ingest-pipeline
+      artifact: >-
+        logs-hashicorp_vault.log@custom grok pipeline (or an equivalent
+        low-side Cribl grok)
+      notes: >
+        The stock hashicorp_vault integration log pipeline branches on a
+        leading "{" - a standard-format line never matches, so it passes
+        through as a bare `message` with no field extraction at all, which is
+        exactly why the json feed sets log_format=json. To get any structure
+        from a standard-format server the line must be grokked: timestamp to
+        @timestamp, the bracketed level to log.level, the module segment to
+        log.logger, the remainder to message, and any trailing key=value pairs
+        (notably error=) lifted individually. The uppercase bracketed level
+        also needs normalizing to agree with the lowercase hclog level strings
+        the json feed carries.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          The strongest move is to fix the source - set log_format=json on the
+          Vault server so this dataset carries structure natively and matches
+          the crossing shape of every other feed; a standard-format server
+          produces a log that looks healthy and is a bare message field
+          end-to-end. Where the server cannot be reconfigured, grok the hclog
+          line on the edge worker group into the same field set the json feed
+          emits so what crosses the guard is structured NDJSON rather than
+          free text, suppress debug/trace noise low-side, and enrich with the
+          cluster/node identity the line itself does not carry.
+        elastic: >
+          If the text still arrives unstructured, own a
+          logs-hashicorp_vault.log@custom pipeline whose grok parses the
+          RFC3339 timestamp, the bracketed level, the module and the message,
+          normalizes the uppercase level to lowercase log.level, and promotes
+          a trailing error= token to error.message. Map hashicorp_vault.log as
+          flattened for the unbounded, version-dependent key tail and set
+          service.name so these lines correlate with the audit dataset from
+          the same host.
+        relay: >
+          Free text is the worst crossing shape for a content filter - an
+          unstructured hclog line has no bounded schema - so grok it into the
+          json feed's field set low-side and cross structured NDJSON, exactly
+          as the json feed does; do not cross raw text. Length-cap @message
+          and the trailing key/value tail, key-allow-list that tail so the
+          filter need not reason about a schema that changes between Vault
+          versions, and drop _raw once parsed since the structured line loses
+          nothing forensically.
+      direct:
+        parse_location: hybrid
+        cribl: >
+          High side with no guard: the same fix-the-source-first advice
+          applies - set log_format=json - otherwise grok in Cribl or lean on
+          the stock text passthrough and grok high-side. There is no crossing
+          discipline to satisfy, so the only question is whether structure is
+          worth a grok, and for an operational log carrying seal/unseal and
+          storage failures it usually is.
+        elastic: >
+          Own a logs-hashicorp_vault.log@custom pipeline whose grok parses the
+          RFC3339 timestamp, the bracketed level, the module and the message,
+          normalizes the uppercase level to lowercase log.level, and promotes
+          a trailing error= token to error.message; map hashicorp_vault.log as
+          flattened for the unbounded, version-dependent key tail and set
+          service.name so these lines correlate with the audit dataset from
+          the same host. Without a boundary the raw text can be grokked at
+          ingest rather than in Cribl.
+    fields:
+    - vendor: timestamp
+      type: timestamp
+      description: leading RFC3339 timestamp of the hclog line
+      ecs: '@timestamp'
+      status: mapped
+      notes: >
+        a grok-extracted positional token, not a named key - standard-format
+        lines have no field names, so every field here is a capture group from
+        the line grammar rather than a JSON key
+    - vendor: level
+      type: enum
+      description: bracketed severity - [TRACE] [DEBUG] [INFO] [WARN] [ERROR]
+      ecs: log.level
+      status: mapped
+      transform: >
+        standard mode emits UPPERCASE bracketed tokens whereas the json feed
+        carries lowercase @level strings; lowercase this so log.level agrees
+        across the estate
+    - vendor: module
+      type: string
+      description: >-
+        emitting Vault subsystem preceding the message, e.g. core,
+        storage.raft, secrets.kv, replication
+      ecs: log.logger
+      status: mapped
+      notes: >-
+        the practical filter for this dataset - core carries seal/unseal and
+        leadership, storage.* carries backend failures
+    - vendor: message
+      type: string
+      description: human-readable log message text following the module
+      ecs: message
+      status: mapped
+    - vendor: error
+      type: string
+      description: error detail attached as a trailing key=value pair on failure messages
+      ecs: error.message
+      status: partial
+      notes: >
+        one of the arbitrary trailing key/value tokens rather than a schema
+        field; grok must lift it out of the line tail and promote it to
+        error.message to be alertable

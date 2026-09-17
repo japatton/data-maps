@@ -1,0 +1,1702 @@
+id: suricata
+name: Suricata
+vendor: OISF
+versions: Suricata 6.0, 7.0, 8.0
+draft: true
+references:
+- https://docs.suricata.io/en/latest/output/eve/eve-json-format.html
+- https://docs.suricata.io/en/latest/appendix/eve-schema.html
+- >-
+  https://github.com/OISF/suricata/blob/main/doc/userguide/output/eve/eve-json-format.rst
+- https://www.elastic.co/docs/current/en/integrations/suricata
+- >-
+  https://www.elastic.co/guide/en/beats/filebeat/8.19/exported-fields-suricata.html
+- https://github.com/elastic/integrations/tree/main/packages/suricata
+datasets:
+- id: alert
+  name: EVE alert event
+  description: >
+    Signature match records (event_type "alert") from the Suricata detection
+    engine — the primary IDS/IPS feed the CSOC alerts on. Each record carries
+    the rule identity (alert.signature, alert.signature_id, alert.category,
+    alert.severity), the five-tuple of the offending packet, and — when the
+    flow logger is enabled — an embedded flow{} object with the byte/packet
+    counters for the surrounding session.
+  event_categories:
+  - network
+  - malware
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Sensors ship eve.json line-by-line (filebeat/Elastic Agent tail or a
+        Cribl file/TCP-JSON source). Suricata sensors are frequently deployed
+        at enclave boundaries, so a large share of sensors are on this
+        low-side guarded path.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-suricata.eve
+      notes: >
+        The Elastic integration ships ONE data stream (suricata.eve) for every
+        event_type; alert/dns/http/tls/flow all land in logs-suricata.eve and
+        are separated at query time by suricata.eve.event_type. The four
+        datasets in this file are logical views of that single stream, not
+        separate indices.
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Sensors ship eve.json line-by-line (filebeat/Elastic Agent tail or a
+        Cribl file/TCP-JSON source).
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-suricata.eve
+      notes: >
+        The Elastic integration ships ONE data stream (suricata.eve) for every
+        event_type; alert/dns/http/tls/flow all land in logs-suricata.eve and
+        are separated at query time by suricata.eve.event_type. The four
+        datasets in this file are logical views of that single stream, not
+        separate indices.
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: Suricata integration (data stream suricata.eve)
+      notes: >
+        No Cribl pack exists for Suricata; the Elastic integration's default
+        ingest pipeline does the EVE→ECS work. Legacy ArcSight-era collection
+        read eve.json through a SmartConnector that flattened the JSON into
+        CEF, losing the nested alert.metadata and the request/response header
+        arrays — those pipelines are being retired in favour of shipping raw
+        EVE JSON end to end.
+    fields:
+    - vendor: timestamp
+      type: timestamp
+      description: ISO 8601 event time with microseconds and UTC offset
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: event_type
+      type: enum
+      description: EVE record discriminator; "alert" for this dataset
+      ecs: event.dataset
+      status: partial
+      transform: >
+        the integration sets event.dataset to the constant "suricata.eve" for
+        every record, so the discriminator itself is retained at
+        suricata.eve.event_type; alerting rules must filter on the retained
+        copy, not on event.dataset
+    - vendor: flow_id
+      type: long
+      description: 64-bit flow correlation id joining this alert to its flow/http/tls/dns records
+      ecs: null
+      status: unmapped
+      custom: suricata.eve.flow_id
+      notes: >
+        the single most useful pivot in EVE — no ECS equivalent.
+        network.community_id is NOT a substitute: it is a different,
+        hash-based identifier, is off by default in the eve output, and the
+        Elastic ingest pipeline recomputes it from the five-tuple, so a sensor
+        using a non-default community-id seed disagrees with the derived ECS
+        value. flow_id is emitted as a JSON number large enough to lose
+        precision in some consumers; keep it as a keyword.
+    - vendor: src_ip
+      type: ip
+      description: source address of the packet that triggered the signature
+      ecs: source.ip
+      status: mapped
+    - vendor: src_port
+      type: port
+      description: source port (absent for non-port protocols such as ICMP)
+      ecs: source.port
+      status: mapped
+    - vendor: dest_ip
+      type: ip
+      description: destination address of the triggering packet
+      ecs: destination.ip
+      status: mapped
+    - vendor: dest_port
+      type: port
+      description: destination port
+      ecs: destination.port
+      status: mapped
+    - vendor: proto
+      type: enum
+      description: transport protocol name (TCP, UDP, ICMP, ...)
+      ecs: network.transport
+      status: mapped
+    - vendor: app_proto
+      type: enum
+      description: 'application-layer protocol detected by Suricata''s protocol identification'
+      ecs: network.protocol
+      status: partial
+      transform: >
+        Suricata values include "failed" and "unknown" when detection did not
+        conclude; those must be dropped rather than written to
+        network.protocol
+    - vendor: in_iface
+      type: string
+      description: capture interface the packet was seen on
+      ecs: observer.ingress.interface.name
+      status: partial
+      notes: >-
+        stock integration pipeline does not populate
+        observer.ingress.interface.name; needs a custom processor
+    - vendor: alert.signature
+      type: string
+      description: human-readable rule msg text
+      ecs: rule.name
+      status: mapped
+    - vendor: alert.signature_id
+      type: integer
+      description: rule SID
+      ecs: rule.id
+      status: mapped
+      transform: >-
+        numeric in EVE, ECS rule.id is a keyword — convert to string so
+        ET/ETPRO SIDs sort and aggregate correctly
+    - vendor: alert.category
+      type: string
+      description: 'classtype description, e.g. ''A Network Trojan was detected'''
+      ecs: rule.category
+      status: mapped
+    - vendor: alert.rev
+      type: integer
+      description: rule revision number
+      ecs: rule.version
+      status: partial
+      notes: >-
+        not populated by the stock Elastic ingest pipeline; needed to tell
+        which revision of a SID fired after a ruleset update
+    - vendor: alert.gid
+      type: integer
+      description: generator id (1 = rule engine, higher values = decoder/stream/app-layer events)
+      ecs: null
+      status: unmapped
+      custom: suricata.eve.alert.gid
+      notes: >-
+        gid must be read together with signature_id — SID uniqueness is only
+        guaranteed within a gid
+    - vendor: alert.severity
+      type: integer
+      description: rule priority
+      ecs: event.severity
+      status: partial
+      transform: >
+        Suricata severity is INVERTED relative to ECS — 1 is the most severe
+        and 3/4 the least, while ECS event.severity expects higher = worse. A
+        lookup/inversion is required or CSOC severity thresholds will fire
+        backwards.
+    - vendor: alert.action
+      type: enum
+      description: whether the packet was allowed or blocked (only meaningful in IPS mode)
+      ecs: event.action
+      status: mapped
+      transform: >
+        "blocked" is rewritten to "denied" by the integration pipeline;
+        "allowed" passes through. In IDS (non-inline) mode every record reads
+        "allowed" regardless of the rule's action keyword, so this field is
+        NOT evidence that traffic was permitted.
+    - vendor: alert.metadata
+      type: string
+      description: >-
+        key/value arrays from the rule's metadata keyword (created_at,
+        attack_target, mitre_technique_id, malware family, CVE, ...)
+      ecs: null
+      status: unmapped
+      custom: suricata.eve.alert.metadata
+      notes: >
+        nested object of string arrays rather than a scalar — typed "string"
+        here because the vendor-type vocabulary has no object form. Shape
+        varies by ruleset; the ET/ETPRO mitre_technique_id and cve entries are
+        the natural feeders for threat.technique.id and vulnerability.id but
+        no mapping exists today.
+    - vendor: flow.bytes_toserver
+      type: bytes
+      description: bytes client→server on the flow embedded in the alert record
+      ecs: source.bytes
+      status: partial
+      notes: >-
+        present only when the eve alert output has flow metadata enabled;
+        counters are as-of-alert-time, not final flow totals
+    - vendor: payload_printable
+      type: string
+      description: ASCII rendering of the triggering packet payload
+      ecs: null
+      status: unmapped
+      custom: suricata.eve.payload_printable
+      notes: >
+        off by default. Raw attacker-controlled content — if this source is
+        later confirmed to cross the guard, this field is the one most likely
+        to be stripped or length-capped by content inspection.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Keep the core worker group a pass-through — EVE is already
+          LF-terminated NDJSON, so no low-side extraction is warranted, and
+          IDS signature matches are the forensically load-bearing class in
+          this file, so carry _raw end to end rather than dropping it after
+          the parser is proven. Cast flow_id to a string low-side so the
+          64-bit value cannot lose precision in any re-serialization, and
+          attach the in_iface->sensor/site and sensor->owner lookups here
+          while the capture-interface names still have local meaning. Use
+          Persistent Queue backpressure on the Elastic destination, never
+          Block.
+        elastic: >
+          The stock Suricata integration pipeline is the parser; layer one
+          logs-suricata.eve@custom pipeline (branching on
+          suricata.eve.event_type, since all four datasets share the stream)
+          that inverts alert.severity into event.severity through an explicit
+          lookup so CSOC thresholds stop firing backwards, converts
+          alert.signature_id to a keyword rule.id, fills rule.version from
+          alert.rev and observer.ingress.interface.name from in_iface, and
+          discards app_proto values "failed"/"unknown" instead of writing them
+          to network.protocol. Add custom-namespace template mappings for
+          suricata.eve.flow_id as a keyword (it is the cross-dataset pivot and
+          has no ECS home), alert.gid, alert.metadata, and payload_printable,
+          and feed metadata's mitre_technique_id/cve entries into
+          threat.technique.id and vulnerability.id.
+        relay: >
+          Low-side instances cross the guard: this dataset goes hybrid on that
+          path and crosses the thin {_dataId, @timestamp, host, _raw}
+          envelope, because a good Elastic integration already exists.
+          payload_printable and alert.metadata are the content-filter friction
+          — attacker- controlled bytes and unbounded nested string arrays — so
+          length-cap or drop payload_printable and flatten metadata to <=2
+          levels low-side, then validate with C.Schema immediately before the
+          guard destination with a dead-letter route for failures. Treat the
+          crossing as at-most-once and reconcile per-(dataset, hour) counts
+          across the two sides, since alert loss is the loss that matters most
+          here.
+      direct:
+        parse_location: high
+        cribl: >
+          Keep the core worker group a pass-through — EVE is already
+          LF-terminated NDJSON, so no edge extraction is warranted, and IDS
+          signature matches are the forensically load-bearing class in this
+          file, so carry _raw end to end rather than dropping it after the
+          parser is proven. Cast flow_id to a string at the edge worker so the
+          64-bit value cannot lose precision in any re-serialization, and
+          attach the in_iface->sensor/site and sensor->owner lookups here
+          while the capture-interface names still have local meaning. Use
+          Persistent Queue backpressure on the Elastic destination, never
+          Block.
+        elastic: >
+          The stock Suricata integration pipeline is the parser; layer one
+          logs-suricata.eve@custom pipeline (branching on
+          suricata.eve.event_type, since all four datasets share the stream)
+          that inverts alert.severity into event.severity through an explicit
+          lookup so CSOC thresholds stop firing backwards, converts
+          alert.signature_id to a keyword rule.id, fills rule.version from
+          alert.rev and observer.ingress.interface.name from in_iface, and
+          discards app_proto values "failed"/"unknown" instead of writing them
+          to network.protocol. Add custom-namespace template mappings for
+          suricata.eve.flow_id as a keyword (it is the cross-dataset pivot and
+          has no ECS home), alert.gid, alert.metadata, and payload_printable,
+          and feed metadata's mitre_technique_id/cve entries into
+          threat.technique.id and vulnerability.id.
+  - format: other
+    enable: >
+      In suricata.yaml under `outputs:` enable the fast logger: `- fast:
+      {enabled: yes, filename: fast.log, append: yes}`. The file is written to
+      the configured default-log-dir. There is no format string - the line
+      layout is fixed - so the only knobs are the filename and append
+      behaviour. A collector (filebeat/Elastic Agent log input or a Cribl file
+      source) tails fast.log line by line. fast.log and the eve output can run
+      concurrently; pick one as the authoritative alert feed so the same
+      signature match is not counted twice.
+    references:
+    - https://docs.suricata.io/en/suricata-8.0.6/configuration/suricata-yaml.html
+    - https://docs.suricata.io/en/suricata-8.0.6/output/index.html
+    parsing:
+      mechanism: elastic-ingest-pipeline
+      artifact: custom fast.log grok/dissect ingest pipeline (no stock integration)
+      notes: >
+        The stock Suricata Elastic integration reads EVE JSON only, so it
+        cannot parse fast.log; a custom grok/dissect pipeline (or a Cribl
+        regex-extract pipeline low-side) must split the fixed line into
+        timestamp, [gid:sid:rev], message, classification, priority, proto and
+        the two ip:port pairs. Because fast.log carries no flow_id, the
+        cross-dataset correlation the EVE feed provides is simply gone - there
+        is nothing in the line to reconstruct it from - so any deployment
+        considering fast.log should understand it is accepting alert records
+        that cannot be pivoted to the flow, http or tls context.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Unlike the EVE feed, there is no reason to defer parsing: the fast
+          line is a fixed grammar, so extract it to structured fields at the
+          low-side edge worker with a single regex, cast the SID to a keyword
+          rule.id and invert the priority to event.severity there while the
+          record is small. Attach the sensor->owner/site lookup at this hop as
+          on the EVE path. Keep _raw, because a one-line text alert is cheap
+          to carry and is the only forensic copy - fast.log has no richer
+          sibling record to fall back on. Persistent Queue backpressure on the
+          destination, never Block.
+        elastic: >
+          Point the custom fast.log grok pipeline at the low-side-extracted
+          fields (or run the grok here if extraction was deferred): map SID to
+          a keyword rule.id, rev to rule.version, the message to rule.name,
+          the classification text to rule.category, and invert the Priority
+          digit (1 = most severe) into event.severity through the same
+          explicit lookup the EVE alert.severity needs, so CSOC thresholds do
+          not fire backwards. Parse the MM/DD/YY-HH:MM:SS.ffffff timestamp
+          explicitly - it is local time with no timezone, not ISO 8601 - and
+          stamp suricata.eve.alert.gid from the leading gid so a
+          decoder/stream event (gid != 1) is not mistaken for a rule match.
+        relay: >
+          fast.log is the LOW-friction alert crossing: the line is short,
+          ASCII, and the only attacker-influenced token is the signature
+          message, which is a bounded ruleset string rather than raw payload.
+          Length-cap that message defensively and validate the envelope with
+          C.Schema before the guard destination with a low-side dead-letter
+          route. The real caveat to record for the guard owner is not content
+          friction but fidelity: crossing fast.log instead of EVE silently
+          drops flow_id, app_proto and the ATT&CK/CVE metadata, so treat it as
+          an emergency alert-only path, reconcile per-hour alert counts across
+          the two sides, and prefer the EVE crossing whenever the sensor can
+          produce JSON.
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side sensor with no guard, still extract the fixed line
+          at the edge and forward structured NDJSON; there is no benefit to
+          carrying it as opaque text. Choose fast.log OR the eve alert output
+          as the single authoritative alert feed per sensor and disable the
+          other, since both fire on the same signature match.
+        elastic: >
+          Run the custom fast.log grok pipeline: map SID to a keyword rule.id,
+          rev to rule.version, the message to rule.name, the classification
+          text to rule.category, and invert the Priority digit (1 = most
+          severe) into event.severity through an explicit lookup so CSOC
+          thresholds do not fire backwards. Parse the MM/DD/YY-HH:MM:SS.ffffff
+          timestamp explicitly - it is local time with no timezone, not ISO
+          8601 - and stamp suricata.eve.alert.gid from the leading gid so a
+          decoder/stream event (gid != 1) is not mistaken for a rule match.
+          With no boundary the recommendation is blunter: prefer the EVE alert
+          output. fast.log exists here only for sensors that cannot emit JSON,
+          and every EVE-only field (flow_id, app_proto, alert.metadata, the
+          embedded flow counters, payload_printable) is unavailable from it.
+    fields:
+    - vendor: timestamp
+      type: timestamp
+      description: >-
+        fast.log leading field, MM/DD/YY-HH:MM:SS.ffffff local time (e.g.
+        10/05/10-10:08:59.667372).
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        not ISO 8601 and carries no timezone - it is the sensor's local time;
+        it must be parsed with an explicit format and an assumed zone, unlike
+        the EVE timestamp which is already offset-qualified.
+    - vendor: gid
+      type: integer
+      description: >-
+        generator id from the [gid:sid:rev] triple (1 = rule engine, higher =
+        decoder/stream/app-layer).
+      ecs: null
+      status: unmapped
+      custom: suricata.eve.alert.gid
+      notes: >-
+        SID is only unique within a gid; a gid != 1 line is a decoder/stream
+        event, not a ruleset match.
+    - vendor: sid
+      type: integer
+      description: signature id from the [gid:sid:rev] triple.
+      ecs: rule.id
+      status: mapped
+      transform: >-
+        numeric in the line, ECS rule.id is a keyword - convert to string so
+        ET/ETPRO SIDs sort and aggregate correctly.
+    - vendor: rev
+      type: integer
+      description: rule revision from the [gid:sid:rev] triple.
+      ecs: rule.version
+      status: mapped
+      notes: >-
+        available directly in fast.log, whereas the stock EVE ingest pipeline
+        does not populate rule.version from alert.rev.
+    - vendor: signature
+      type: string
+      description: >-
+        human-readable rule message between the [**] delimiters, e.g. 'ET
+        WEB_CLIENT ACTIVEX ...'.
+      ecs: rule.name
+      status: mapped
+    - vendor: classification
+      type: string
+      description: 'classtype description from [Classification: ...], e.g. ''Web Application Attack''.'
+      ecs: rule.category
+      status: mapped
+    - vendor: priority
+      type: integer
+      description: 'rule priority from [Priority: N].'
+      ecs: event.severity
+      status: partial
+      transform: >
+        inverted relative to ECS exactly as EVE alert.severity - 1 is most
+        severe, 3/4 least - so it needs a lookup/inversion or CSOC severity
+        thresholds fire backwards.
+    - vendor: proto
+      type: enum
+      description: transport protocol in braces, e.g. {TCP}, {UDP}, {ICMP}.
+      ecs: network.transport
+      status: mapped
+    - vendor: src_ip
+      type: ip
+      description: 'source address, left of the ''->'' in the ''ip:port -> ip:port'' tail.'
+      ecs: source.ip
+      status: mapped
+    - vendor: src_port
+      type: port
+      description: source port (absent for non-port protocols such as ICMP).
+      ecs: source.port
+      status: mapped
+    - vendor: dest_ip
+      type: ip
+      description: 'destination address, right of the ''->''.'
+      ecs: destination.ip
+      status: mapped
+    - vendor: dest_port
+      type: port
+      description: destination port.
+      ecs: destination.port
+      status: mapped
+  - format: syslog-raw
+    enable: >
+      In suricata.yaml under `outputs:` enable the standalone syslog logger:
+      `- syslog: {enabled: yes, facility: local5, level: Info}`. `facility`
+      selects the syslog facility and `level` the fixed syslog level the
+      alerts are written at (Emergency..Debug); `identity` sets the program
+      name. Suricata writes to the local syslog daemon, which forwards to the
+      collector (a Cribl Syslog source or a syslog-ng/rsyslog relay). Note
+      this is Suricata's own alert-to-syslog module and is deprecated in 8.0 -
+      the recommended path is the eve output, which can itself target syslog
+      while staying EVE JSON.
+    references:
+    - https://docs.suricata.io/en/suricata-8.0.6/output/syslog-alerting-comp.html
+    - https://docs.suricata.io/en/suricata-8.0.6/configuration/suricata-yaml.html
+    - https://docs.suricata.io/en/suricata-8.0.6/upgrade.html
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: Cribl Syslog source + custom fast-line grok pipeline (no stock integration)
+      notes: >
+        No stock Elastic integration or Cribl pack parses this; a Cribl Syslog
+        source (or rsyslog) strips the RFC3164 header, then the same
+        grok/dissect used for fast.log splits the message body into the alert
+        fields. The syslog envelope supplies facility, host and a syslog
+        severity, but that syslog severity is the FIXED configured `level`
+        (e.g. Info) for every alert - it is NOT the per-alert priority - so
+        event.severity must still be derived from the [Priority: N] token in
+        the body, not from the syslog severity code.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Terminate the syslog stream at the low-side edge, extract the fast
+          line from the message body there and promote facility/host from the
+          envelope, exactly as the fast.log path - the fixed grammar means
+          there is no reason to defer it. Cast SID to a keyword rule.id and
+          invert priority low-side, and do NOT let the syslog severity leak
+          into event.severity. Persistent Queue backpressure on the
+          destination.
+        elastic: >
+          Reuse the fast.log grok pipeline on the message body (the tokens are
+          identical): SID to rule.id, rev to rule.version, message to
+          rule.name, classification to rule.category, [Priority: N] inverted
+          to event.severity. From the envelope map the syslog facility to
+          log.syslog.facility.name and the reporting host to
+          observer.hostname, and treat the syslog severity as metadata only.
+          Parse the body timestamp rather than trusting the syslog header
+          time, which is the relay's clock.
+        relay: >
+          This is the historical shape of the guard crossing (alerts as
+          syslog), and it is genuinely low-friction: a short ASCII line whose
+          only attacker-influenced token is the bounded signature message.
+          Length-cap that message and validate the envelope before the guard,
+          dead-letter failures low-side. The fidelity caveat is the same as
+          fast.log - no flow_id, app_proto or metadata cross - so where the
+          sensor can emit JSON, prefer the EVE HTTP crossing and treat the
+          syslog alert path as a compatibility fallback; reconcile per-hour
+          counts since the crossing is at-most-once.
+      direct:
+        parse_location: low
+        cribl: >
+          High-side sensor with no guard: terminate the syslog stream, extract
+          the line and forward structured NDJSON. Run either the syslog output
+          or the eve output as the authoritative alert feed per sensor, not
+          both, and note the module is deprecated - a migration to eve is the
+          forward path.
+        elastic: >
+          Run the fast-line grok on the message body (the tokens match
+          fast.log): SID to rule.id, rev to rule.version, message to
+          rule.name, classification to rule.category, [Priority: N] inverted
+          to event.severity. From the envelope map the syslog facility to
+          log.syslog.facility.name and the reporting host to
+          observer.hostname, and treat the syslog severity as metadata only.
+          Parse the body timestamp rather than the syslog header time, which
+          is the relay's clock. With no boundary there is little reason to
+          choose this deprecated module over the eve output; document it for
+          sensors already wired into an existing syslog collection lane.
+    fields:
+    - vendor: facility
+      type: enum
+      description: >-
+        syslog facility from the envelope, set by the output's `facility`
+        option (default local5).
+      ecs: log.syslog.facility.name
+      status: mapped
+    - vendor: host
+      type: string
+      description: reporting host from the syslog header.
+      ecs: observer.hostname
+      status: partial
+      notes: >-
+        this is the syslog-relay/sensor hostname as the daemon sees it, which
+        may be the relay rather than the sensor if a store-and-forward hop
+        rewrites it.
+    - vendor: severity
+      type: integer
+      description: syslog severity from the envelope, derived from the fixed `level` option.
+      ecs: log.syslog.severity.code
+      status: partial
+      notes: >
+        constant per configuration (the `level` value), NOT the alert
+        priority; keep it as syslog metadata and do not route it to
+        event.severity - the real severity is the [Priority: N] body token.
+    - vendor: timestamp
+      type: timestamp
+      description: fast-line body timestamp, MM/DD/YY-HH:MM:SS.ffffff local time.
+      ecs: '@timestamp'
+      status: partial
+      transform: >-
+        parse the body timestamp (local, no timezone), not the syslog header
+        time which is the relay's clock.
+    - vendor: gid
+      type: integer
+      description: generator id from the [gid:sid:rev] triple in the message body.
+      ecs: null
+      status: unmapped
+      custom: suricata.eve.alert.gid
+    - vendor: sid
+      type: integer
+      description: signature id from the [gid:sid:rev] triple in the message body.
+      ecs: rule.id
+      status: mapped
+      transform: numeric in the line; convert to a keyword rule.id.
+    - vendor: rev
+      type: integer
+      description: rule revision from the [gid:sid:rev] triple.
+      ecs: rule.version
+      status: mapped
+    - vendor: signature
+      type: string
+      description: rule message between the [**] delimiters in the body.
+      ecs: rule.name
+      status: mapped
+    - vendor: classification
+      type: string
+      description: 'classtype text from [Classification: ...] in the body.'
+      ecs: rule.category
+      status: mapped
+    - vendor: priority
+      type: integer
+      description: 'rule priority from [Priority: N] in the body.'
+      ecs: event.severity
+      status: partial
+      transform: >-
+        inverted relative to ECS (1 = most severe); invert by lookup, and use
+        this rather than the syslog severity code.
+    - vendor: proto
+      type: enum
+      description: transport protocol in braces, e.g. {TCP}.
+      ecs: network.transport
+      status: mapped
+    - vendor: src_ip
+      type: ip
+      description: 'source address from the ''ip:port -> ip:port'' tail.'
+      ecs: source.ip
+      status: mapped
+    - vendor: src_port
+      type: port
+      description: source port.
+      ecs: source.port
+      status: mapped
+    - vendor: dest_ip
+      type: ip
+      description: destination address.
+      ecs: destination.ip
+      status: mapped
+    - vendor: dest_port
+      type: port
+      description: destination port.
+      ecs: destination.port
+      status: mapped
+- id: dns
+  name: EVE dns event
+  description: >
+    DNS request and response transactions (event_type "dns") seen by the
+    sensor. The primary hunting feed for C2 beaconing, DGA domains, and DNS
+    tunnelling, and the main way to attribute an internal client to a resolved
+    name when the resolver's own logs are unavailable.
+  event_categories:
+  - dns
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same eve.json stream as the alert dataset. DNS is the highest-volume
+        EVE event_type on most sensors — this is the dataset to sample or drop
+        first if guard throughput becomes the constraint.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-suricata.eve
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Same eve.json stream as the alert dataset.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-suricata.eve
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: Suricata integration (data stream suricata.eve)
+      notes: >
+        Pin the sensors to EVE dns version 2 output. Version 1 emitted one
+        record per answer with flat rrname/rrtype/rdata keys; version 2 emits
+        a single record per transaction with queries[] and answers[] arrays.
+        Mixing both versions across a sensor fleet produces two incompatible
+        document shapes in one data stream.
+    fields:
+    - vendor: timestamp
+      type: timestamp
+      description: ISO 8601 transaction time
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: flow_id
+      type: long
+      description: flow correlation id joining the query and its response
+      ecs: null
+      status: unmapped
+      custom: suricata.eve.flow_id
+    - vendor: src_ip
+      type: ip
+      description: querying client address (or resolver address on responses)
+      ecs: source.ip
+      status: mapped
+    - vendor: src_port
+      type: port
+      description: source port
+      ecs: source.port
+      status: mapped
+    - vendor: dest_ip
+      type: ip
+      description: resolver address
+      ecs: destination.ip
+      status: mapped
+    - vendor: dest_port
+      type: port
+      description: destination port, normally 53
+      ecs: destination.port
+      status: mapped
+    - vendor: proto
+      type: enum
+      description: transport protocol, UDP or TCP
+      ecs: network.transport
+      status: mapped
+    - vendor: dns.type
+      type: enum
+      description: whether the record describes a request or a response
+      ecs: dns.type
+      status: partial
+      transform: >-
+        EVE emits "request"/"response"; ECS dns.type expects "query"/"answer"
+        — a value rewrite is required
+    - vendor: dns.id
+      type: integer
+      description: DNS transaction identifier from the message header
+      ecs: dns.id
+      status: mapped
+      transform: numeric in EVE, keyword in ECS — convert to string
+    - vendor: dns.rrname
+      type: string
+      description: queried domain name (dns.queries[].rrname in v2 output)
+      ecs: dns.question.name
+      status: mapped
+    - vendor: dns.rrtype
+      type: enum
+      description: queried record type (A, AAAA, CNAME, TXT, ...)
+      ecs: dns.question.type
+      status: mapped
+    - vendor: dns.rcode
+      type: enum
+      description: response code string (NOERROR, NXDOMAIN, SERVFAIL, REFUSED)
+      ecs: dns.response_code
+      status: mapped
+    - vendor: dns.answers[].rrname
+      type: string
+      description: name each answer record applies to
+      ecs: dns.answers.name
+      status: mapped
+    - vendor: dns.answers[].rrtype
+      type: enum
+      description: answer record type
+      ecs: dns.answers.type
+      status: mapped
+    - vendor: dns.answers[].rdata
+      type: string
+      description: answer payload — an address for A/AAAA, a name for CNAME/PTR, text for TXT
+      ecs: dns.answers.data
+      status: partial
+      transform: >
+        string-typed even for address records; A/AAAA rdata must additionally
+        be copied to dns.resolved_ip to get the ip-typed lookups CSOC
+        correlation rules use, and the stock pipeline does this only for
+        address record types
+    - vendor: dns.answers[].ttl
+      type: integer
+      description: answer time-to-live in seconds
+      ecs: dns.answers.ttl
+      status: mapped
+    - vendor: dns.flags
+      type: string
+      description: DNS header flags as a hex string, e.g. "8180"
+      ecs: dns.header_flags
+      status: partial
+      transform: >-
+        ECS dns.header_flags is an array of flag names (AA, TC, RD, RA, ...);
+        the hex string must be decoded into that array
+    - vendor: dns.tx_id
+      type: long
+      description: >-
+        per-flow transaction counter distinguishing pipelined queries on one
+        TCP connection
+      ecs: null
+      status: unmapped
+      custom: suricata.eve.dns.tx_id
+    - vendor: dns.version
+      type: integer
+      description: EVE DNS logging format version (1 or 2)
+      ecs: null
+      status: unmapped
+      custom: suricata.eve.dns.version
+      notes: >-
+        keep it — it is the only reliable way to tell which document shape a
+        record uses when a sensor fleet is mid-upgrade
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          No low-side extraction; the real low-side job on this dataset is
+          volume, because it is the highest-volume EVE event_type — put the
+          sampling and drop rules here (suppress response records for
+          known-good internal resolver traffic, sample NOERROR A/AAAA) and
+          make this the first Suricata dataset to drop _raw once the
+          integration parser is proven, since the EVE JSON is self-describing
+          and forensic value is low relative to alert. Route on dns.version
+          low-side so a mid-upgrade sensor fleet's v1 and v2 shapes can be
+          separated or held rather than blended, and keep flow_id as a string.
+          Persistent Queue backpressure on the Elastic destination.
+        elastic: >
+          Extend the shared logs-suricata.eve@custom pipeline with the dns
+          branch: rewrite dns.type "request"/"response" to ECS
+          "query"/"answer", decode the hex dns.flags string into the
+          dns.header_flags name array, convert dns.id to a keyword, and
+          confirm A/AAAA rdata is copied to dns.resolved_ip so the ip-typed
+          correlation rules match. Add custom-namespace template mappings for
+          suricata.eve.dns.tx_id, suricata.eve.dns.version, and
+          suricata.eve.flow_id as a keyword.
+        relay: >
+          Low-side instances cross the guard, and this is the dataset to
+          sample or shed first when guard throughput becomes the constraint;
+          it crosses as the thin envelope like the rest of the file. The
+          content-filter friction is TXT and CNAME rdata plus queried names —
+          unbounded, attacker-chosen, and frequently non-ASCII or
+          base32/base64-looking under tunnelling — so bound string lengths and
+          keep nesting shallow before the guard rather than trusting
+          inspection to pass long answer arrays.
+      direct:
+        parse_location: high
+        cribl: >
+          No edge extraction; the real edge job on this dataset is volume,
+          because it is the highest-volume EVE event_type — put the sampling
+          and drop rules here (suppress response records for known-good
+          internal resolver traffic, sample NOERROR A/AAAA) and make this the
+          first Suricata dataset to drop _raw once the integration parser is
+          proven, since the EVE JSON is self-describing and forensic value is
+          low relative to alert. Route on dns.version at the edge so a
+          mid-upgrade sensor fleet's v1 and v2 shapes can be separated or held
+          rather than blended, and keep flow_id as a string. Persistent Queue
+          backpressure on the Elastic destination.
+        elastic: >
+          Extend the shared logs-suricata.eve@custom pipeline with the dns
+          branch: rewrite dns.type "request"/"response" to ECS
+          "query"/"answer", decode the hex dns.flags string into the
+          dns.header_flags name array, convert dns.id to a keyword, and
+          confirm A/AAAA rdata is copied to dns.resolved_ip so the ip-typed
+          correlation rules match. Add custom-namespace template mappings for
+          suricata.eve.dns.tx_id, suricata.eve.dns.version, and
+          suricata.eve.flow_id as a keyword.
+- id: http
+  name: EVE http event
+  description: >
+    Cleartext HTTP transaction records (event_type "http") — one per
+    request/response pair. Used for URL and user-agent hunting, and to recover
+    the request context behind an http-triggered alert via flow_id.
+  event_categories:
+  - web
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same eve.json stream as the other datasets.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-suricata.eve
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Same eve.json stream as the other datasets.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-suricata.eve
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: Suricata integration (data stream suricata.eve)
+    fields:
+    - vendor: timestamp
+      type: timestamp
+      description: ISO 8601 transaction time
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: flow_id
+      type: long
+      description: flow correlation id joining this transaction to any alert raised on it
+      ecs: null
+      status: unmapped
+      custom: suricata.eve.flow_id
+    - vendor: src_ip
+      type: ip
+      description: client address
+      ecs: source.ip
+      status: mapped
+    - vendor: src_port
+      type: port
+      description: client port
+      ecs: source.port
+      status: mapped
+    - vendor: dest_ip
+      type: ip
+      description: server address
+      ecs: destination.ip
+      status: mapped
+    - vendor: dest_port
+      type: port
+      description: server port
+      ecs: destination.port
+      status: mapped
+    - vendor: proto
+      type: enum
+      description: transport protocol
+      ecs: network.transport
+      status: mapped
+    - vendor: app_proto
+      type: enum
+      description: 'detected application protocol, ''http'' or ''http2'''
+      ecs: network.protocol
+      status: mapped
+    - vendor: http.hostname
+      type: string
+      description: value of the Host header (or the :authority pseudo-header for HTTP/2)
+      ecs: url.domain
+      status: partial
+      notes: >
+        may be an IP literal or carry an explicit ":port" suffix; the port
+        must be stripped before it is written to url.domain, and url.full has
+        to be reassembled from hostname + url since EVE never emits an
+        absolute URL
+    - vendor: http.url
+      type: string
+      description: request target as sent on the request line
+      ecs: url.original
+      status: partial
+      transform: >
+        this is path plus query string, not an absolute URL; split on the
+        first "?" to populate url.path and url.query. Mapping it to url.full
+        without prefixing the scheme and hostname produces unusable values.
+    - vendor: http.http_method
+      type: enum
+      description: request verb (GET, POST, CONNECT, ...)
+      ecs: http.request.method
+      status: mapped
+    - vendor: http.protocol
+      type: string
+      description: request-line protocol version string, e.g. "HTTP/1.1"
+      ecs: http.version
+      status: partial
+      transform: ECS http.version expects the bare version ("1.1"); strip the "HTTP/" prefix
+    - vendor: http.status
+      type: integer
+      description: response status code
+      ecs: http.response.status_code
+      status: mapped
+    - vendor: http.length
+      type: bytes
+      description: length of the response body in bytes
+      ecs: http.response.body.bytes
+      status: partial
+      notes: >-
+        reflects what Suricata actually reassembled — truncated on large or
+        streamed bodies, so it is not a reliable transfer-volume metric
+    - vendor: http.http_user_agent
+      type: string
+      description: User-Agent request header
+      ecs: user_agent.original
+      status: mapped
+    - vendor: http.http_refer
+      type: string
+      description: Referer request header
+      ecs: http.request.referrer
+      status: mapped
+    - vendor: http.http_content_type
+      type: string
+      description: Content-Type of the response
+      ecs: http.response.mime_type
+      status: partial
+      transform: >-
+        includes charset and boundary parameters (e.g. "text/html;
+        charset=UTF-8"); strip the parameters to get a clean MIME type
+    - vendor: http.redirect
+      type: string
+      description: Location header on 3xx responses
+      ecs: null
+      status: unmapped
+      custom: suricata.eve.http.redirect
+      notes: >-
+        high-value for redirect-chain hunting; no ECS field for a response
+        redirect target
+    - vendor: http.request_headers
+      type: string
+      description: >-
+        array of {name, value} objects, emitted only when custom header
+        logging is configured
+      ecs: null
+      status: unmapped
+      custom: suricata.eve.http.request_headers
+      notes: >
+        array of objects rather than a scalar — typed "string" here because
+        the vendor-type vocabulary has no array form. Off by default and
+        expensive, and the shape does not fit any ECS field. If this source is
+        confirmed to cross the guard, arbitrary header content is a
+        content-inspection concern.
+    - vendor: tx_id
+      type: long
+      description: application-layer transaction counter within the flow
+      ecs: null
+      status: unmapped
+      custom: suricata.eve.tx_id
+      notes: >-
+        needed with flow_id to pair a request with the right alert on a
+        keep-alive connection carrying several transactions
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Parsing stays on the Elastic side, but redaction does not: this is
+          cleartext HTTP, so credentials show up in http.url query strings and
+          in the Authorization and Cookie entries of http.request_headers —
+          add a low-side mask/drop rule for those on the sensor-facing route
+          so the secrets never leave the low side, and leave custom header
+          logging off unless a specific hunt needs it. Keep flow_id and tx_id
+          as strings so the request-to-alert pairing survives serialization,
+          and treat this as a mid-value dataset for _raw: drop it after the
+          alert and dns decisions, not before. Persistent Queue backpressure
+          on the Elastic destination.
+        elastic: >
+          Add the http branch to logs-suricata.eve@custom: strip any ":port"
+          suffix from http.hostname before writing url.domain, split http.url
+          on the first "?" into url.path and url.query and reassemble url.full
+          from scheme plus hostname plus target (EVE never emits an absolute
+          URL, so mapping http.url straight to url.full yields unusable
+          values), strip the "HTTP/" prefix for http.version, and strip
+          charset/boundary parameters from the content type before
+          http.response.mime_type. Add custom-namespace mappings for
+          suricata.eve.http.redirect, http.request_headers, tx_id, and flow_id
+          as a keyword, and flag in the dashboards that http.length reflects
+          only what Suricata reassembled, so it must not back a
+          transfer-volume metric.
+        relay: >
+          Low-side instances cross the guard as the thin envelope; the
+          friction here is that URLs, user-agents, referrers and header arrays
+          are wholly attacker-controlled free text with unicode and
+          percent-encoding, and kilobyte-scale values are routine. Bound those
+          string lengths and apply the credential mask BEFORE the guard
+          destination — there is no return channel, so anything the content
+          filter rejects is silently lost rather than retried.
+      direct:
+        parse_location: high
+        cribl: >
+          Parsing stays on the Elastic side, but redaction does not: this is
+          cleartext HTTP, so credentials show up in http.url query strings and
+          in the Authorization and Cookie entries of http.request_headers —
+          add an edge mask/drop rule for those on the sensor-facing route so
+          the secrets never leave the edge, and leave custom header logging
+          off unless a specific hunt needs it. Keep flow_id and tx_id as
+          strings so the request-to-alert pairing survives serialization, and
+          treat this as a mid-value dataset for _raw: drop it after the alert
+          and dns decisions, not before. Persistent Queue backpressure on the
+          Elastic destination.
+        elastic: >
+          Add the http branch to logs-suricata.eve@custom: strip any ":port"
+          suffix from http.hostname before writing url.domain, split http.url
+          on the first "?" into url.path and url.query and reassemble url.full
+          from scheme plus hostname plus target (EVE never emits an absolute
+          URL, so mapping http.url straight to url.full yields unusable
+          values), strip the "HTTP/" prefix for http.version, and strip
+          charset/boundary parameters from the content type before
+          http.response.mime_type. Add custom-namespace mappings for
+          suricata.eve.http.redirect, http.request_headers, tx_id, and flow_id
+          as a keyword, and flag in the dashboards that http.length reflects
+          only what Suricata reassembled, so it must not back a
+          transfer-volume metric.
+  - format: syslog-raw
+    enable: >
+      In suricata.yaml enable the http logger with a custom format: `-
+      http-log: {enabled: yes, filename: http.log, custom: yes, customformat:
+      "%{%D-%H:%M:%S}t.%z %{X-Forwarded-For}i %{User-agent}i %H %m %h %u %s %B
+      %a:%p -> %A:%P"}`. With `custom: no` a fixed default line is written
+      instead. The directive vocabulary is %h (Host header), %H (request
+      protocol), %m (method), %u (URL+query), %s (status), %B (response
+      bytes), %a/%p (client ip/port), %A/%P (server ip/port), %{name}i /
+      %{name}o (request/response header), and %{fmt}t/%z (timestamp). A
+      collector tails http.log; the parsing pipeline MUST be built against the
+      exact customformat deployed, because the field order and presence are
+      operator-defined. Deprecated in 8.0.
+    references:
+    - https://docs.suricata.io/en/suricata-8.0.6/output/custom-http-logging.html
+    - https://docs.suricata.io/en/suricata-8.0.6/upgrade.html
+    parsing:
+      mechanism: elastic-ingest-pipeline
+      artifact: custom http.log grok ingest pipeline, keyed to the deployed customformat
+      notes: >
+        No stock content parses http.log; a custom grok/dissect pipeline must
+        mirror the exact customformat string, since the tokens and their order
+        are whatever the operator configured. The same value-shaping the EVE
+        http branch needs still applies - strip a ':port' suffix from the Host
+        header before url.domain, split the URL on the first '?' into url.path
+        and url.query and reassemble url.full (the directive emits path+query,
+        never an absolute URL), and strip the 'HTTP/' prefix for http.version.
+        http.log has no flow_id/tx_id directive, so unlike the EVE http record
+        it cannot be paired back to the alert that fired on the transaction.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Parse near the source because the grammar is fixed by the deployed
+          customformat: extract the configured tokens at the low-side edge
+          and, critically, apply the credential redaction HERE - http.log can
+          be configured to emit Authorization/Cookie request headers and the
+          URL query string carries secrets in cleartext, so mask or drop those
+          before the record leaves the low side. Keep custom header directives
+          out of the format unless a specific hunt needs them. Persistent
+          Queue backpressure on the destination.
+        elastic: >
+          Run the customformat-specific grok pipeline: %m to
+          http.request.method, %u split into url.path/url.query with url.full
+          reassembled from %h + %u, %h (port-stripped) to url.domain, %H
+          ('HTTP/1.1') stripped to http.version, %s to
+          http.response.status_code, %B to http.response.body.bytes (flag that
+          it reflects only what Suricata reassembled, so it must not back a
+          transfer-volume metric), %{User-agent}i to user_agent.original,
+          %{Referer}i to http.request.referrer and %{X-Forwarded-For}i to
+          network.forwarded_ip. Route any %{name}i/%{name}o header directives
+          to a suricata.http_log.headers custom object.
+        relay: >
+          URLs, user-agents, referrers and any logged header values are wholly
+          attacker-controlled free text with unicode and percent-encoding, and
+          kilobyte-scale values are routine - the same friction as the EVE
+          http crossing. Bound those string lengths and apply the credential
+          mask BEFORE the guard destination; there is no return channel, so
+          anything the content filter rejects is silently lost. Because
+          http.log has no flow_id, an http row that crosses cannot be
+          re-associated with its alert on the high side - prefer the EVE http
+          crossing where that pivot matters.
+      direct:
+        parse_location: low
+        cribl: >
+          High-side sensor with no guard: extract the fixed customformat line
+          at the edge and forward NDJSON, still applying the credential mask
+          since this is cleartext HTTP. Choose http.log or the eve http output
+          as the single authoritative HTTP feed per sensor.
+        elastic: >
+          Run the customformat-keyed grok pipeline: %m to http.request.method,
+          %u split into url.path/url.query with url.full reassembled from %h +
+          %u, %h (port-stripped) to url.domain, %H ('HTTP/1.1') stripped to
+          http.version, %s to http.response.status_code, %B to
+          http.response.body.bytes (flag that it reflects only what Suricata
+          reassembled, so it must not back a transfer-volume metric),
+          %{User-agent}i to user_agent.original, %{Referer}i to
+          http.request.referrer and %{X-Forwarded-For}i to
+          network.forwarded_ip, routing any %{name}i/%{name}o header
+          directives to a suricata.http_log.headers custom object. With no
+          boundary, prefer the eve http output: it adds flow_id/tx_id (the
+          request-to-alert pivot), the full response header set and the
+          redirect target that http.log's directive vocabulary cannot express.
+    fields:
+    - vendor: '%{fmt}t / %z'
+      type: timestamp
+      description: timestamp directive (strftime format plus microsecond precision).
+      ecs: '@timestamp'
+      status: partial
+      transform: >-
+        format is operator-chosen in the customformat; parse against the
+        configured strftime pattern, which is typically local time without an
+        offset.
+    - vendor: '%a'
+      type: ip
+      description: client IP address directive.
+      ecs: source.ip
+      status: mapped
+    - vendor: '%p'
+      type: port
+      description: client port directive.
+      ecs: source.port
+      status: mapped
+    - vendor: '%A'
+      type: ip
+      description: server IP address directive.
+      ecs: destination.ip
+      status: mapped
+    - vendor: '%P'
+      type: port
+      description: server port directive.
+      ecs: destination.port
+      status: mapped
+    - vendor: '%h'
+      type: string
+      description: Host request-header directive (remote hostname), e.g. us.cnn.com.
+      ecs: url.domain
+      status: partial
+      notes: >-
+        may be an IP literal or carry an explicit ':port' suffix; strip the
+        port before url.domain and reassemble url.full from host + URL, since
+        the line never carries an absolute URL.
+    - vendor: '%H'
+      type: string
+      description: request protocol directive, e.g. HTTP/1.1.
+      ecs: http.version
+      status: partial
+      transform: 'ECS http.version expects the bare version (''1.1''); strip the ''HTTP/'' prefix.'
+    - vendor: '%m'
+      type: enum
+      description: request method directive, e.g. GET, POST.
+      ecs: http.request.method
+      status: mapped
+    - vendor: '%u'
+      type: string
+      description: URL directive including query string, e.g. /search?q=suricata.
+      ecs: url.original
+      status: partial
+      transform: >-
+        path+query, not an absolute URL; split on the first '?' into url.path
+        and url.query, and reassemble url.full from scheme + host + this
+        value.
+    - vendor: '%s'
+      type: integer
+      description: response status code directive (renders the bracketed redirect URL for 301/302).
+      ecs: http.response.status_code
+      status: partial
+      notes: >-
+        on 3xx the directive also prints the redirect target in brackets; that
+        inline redirect must be split out rather than parsed as part of the
+        status.
+    - vendor: '%B'
+      type: bytes
+      description: response size in bytes directive.
+      ecs: http.response.body.bytes
+      status: partial
+      notes: >-
+        reflects only what Suricata reassembled - truncated on large or
+        streamed bodies - so it is not a reliable transfer-volume metric.
+    - vendor: '%{User-agent}i'
+      type: string
+      description: User-Agent request-header directive.
+      ecs: user_agent.original
+      status: mapped
+    - vendor: '%{Referer}i'
+      type: string
+      description: Referer request-header directive.
+      ecs: http.request.referrer
+      status: mapped
+    - vendor: '%{X-Forwarded-For}i'
+      type: string
+      description: X-Forwarded-For request-header directive.
+      ecs: network.forwarded_ip
+      status: partial
+      notes: >-
+        a header value that may be a comma-separated proxy chain; take the
+        appropriate hop before writing the ip-typed network.forwarded_ip, and
+        leave it unset if the header is absent.
+    - vendor: '%{name}i / %{name}o'
+      type: string
+      description: >-
+        arbitrary request (i) or response (o) header directive - emits the
+        named header's value.
+      ecs: null
+      status: unmapped
+      custom: suricata.http_log.headers
+      notes: >
+        a general mechanism for logging any header (including
+        Authorization/Cookie), so it is both the credential-exposure risk and
+        a shape that fits no single ECS field; route configured headers into a
+        custom object and keep secret-bearing headers out of the format.
+- id: tls
+  name: EVE tls event
+  description: >
+    TLS handshake metadata (event_type "tls") — SNI, certificate
+    subject/issuer/validity, SHA-1 fingerprint, and JA3/JA3S client and server
+    fingerprints. The main visibility the SOC retains into encrypted sessions
+    where no decryption is performed.
+  event_categories:
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same eve.json stream as the other datasets.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-suricata.eve
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Same eve.json stream as the other datasets.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-suricata.eve
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: Suricata integration (data stream suricata.eve)
+      notes: >
+        Requires tls output "extended: yes" in suricata.yaml for the
+        certificate fields, and ja3.enabled to get the fingerprints — neither
+        is on by default, and both are the reason a sensor's tls records can
+        look empty apart from sni.
+    fields:
+    - vendor: timestamp
+      type: timestamp
+      description: ISO 8601 handshake time
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: flow_id
+      type: long
+      description: flow correlation id joining the handshake to its flow and any alert
+      ecs: null
+      status: unmapped
+      custom: suricata.eve.flow_id
+    - vendor: src_ip
+      type: ip
+      description: client address
+      ecs: source.ip
+      status: mapped
+    - vendor: src_port
+      type: port
+      description: client port
+      ecs: source.port
+      status: mapped
+    - vendor: dest_ip
+      type: ip
+      description: server address
+      ecs: destination.ip
+      status: mapped
+    - vendor: dest_port
+      type: port
+      description: server port
+      ecs: destination.port
+      status: mapped
+    - vendor: proto
+      type: enum
+      description: transport protocol
+      ecs: network.transport
+      status: mapped
+    - vendor: tls.sni
+      type: string
+      description: Server Name Indication sent by the client
+      ecs: tls.client.server_name
+      status: mapped
+    - vendor: tls.version
+      type: enum
+      description: negotiated TLS/SSL version string, e.g. "TLS 1.2"
+      ecs: tls.version
+      status: partial
+      transform: >
+        ECS splits this into tls.version_protocol ("tls") and tls.version
+        ("1.2"); the EVE string carries both and must be parsed. Sensors also
+        emit "UNDETERMINED" on truncated handshakes.
+    - vendor: tls.subject
+      type: string
+      description: server certificate subject distinguished name
+      ecs: tls.server.subject
+      status: partial
+      notes: >-
+        single DN string in OpenSSL one-line form; the per-component ECS x509
+        subject fields (common_name, organization, ...) require parsing it
+    - vendor: tls.issuerdn
+      type: string
+      description: server certificate issuer distinguished name
+      ecs: tls.server.issuer
+      status: mapped
+    - vendor: tls.serial
+      type: string
+      description: server certificate serial number as colon-separated uppercase hex
+      ecs: tls.server.x509.serial_number
+      status: partial
+      transform: >
+        ECS 9.4 requires x509.serial_number (all reuse points, including
+        tls.server) to be base-16 with no colons and uppercase; the EVE value
+        is already uppercase hex but colon-separated, so the colons must be
+        stripped or certificate-serial correlation and threat-intel matches
+        will never hit — the same failure mode as tls.fingerprint
+    - vendor: tls.fingerprint
+      type: string
+      description: SHA-1 fingerprint of the server certificate
+      ecs: tls.server.hash.sha1
+      status: partial
+      transform: >
+        EVE emits colon-separated lowercase hex ("aa:bb:cc:..."); strip the
+        colons or threat-intel indicator matches against tls.server.hash.sha1
+        will never hit
+    - vendor: tls.notbefore
+      type: timestamp
+      description: certificate validity start
+      ecs: tls.server.not_before
+      status: mapped
+    - vendor: tls.notafter
+      type: timestamp
+      description: certificate validity end
+      ecs: tls.server.not_after
+      status: mapped
+    - vendor: tls.ja3.hash
+      type: string
+      description: MD5 JA3 fingerprint of the client hello
+      ecs: tls.client.ja3
+      status: mapped
+    - vendor: tls.ja3s.hash
+      type: string
+      description: MD5 JA3S fingerprint of the server hello
+      ecs: tls.server.ja3s
+      status: mapped
+    - vendor: tls.ja3.string
+      type: string
+      description: raw comma-separated JA3 string the hash is computed from
+      ecs: null
+      status: unmapped
+      custom: suricata.eve.tls.ja3.string
+      notes: >-
+        kept so an analyst can re-derive or fuzzy-match a fingerprint; ECS
+        only defines the hash
+    - vendor: tls.session_resumed
+      type: boolean
+      description: >-
+        true when the handshake resumed a prior session, in which case no
+        certificate fields are present
+      ecs: tls.resumed
+      status: mapped
+      notes: >-
+        explains the large share of tls records with an empty
+        subject/fingerprint — resumed sessions never re-send the certificate
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Pass-through with Persistent Queue backpressure and no low-side
+          extraction; the useful low-side work is hygiene — tag records where
+          tls.session_resumed is true so the large population of
+          certificate-free handshakes can be excluded from
+          certificate-inventory routes instead of looking like parser
+          failures, and keep flow_id as a string for the alert pivot. Treat
+          missing certificate and JA3 fields as a sensor-config defect
+          (extended tls output and ja3.enabled), not a pipeline bug, and
+          surface it from the Cribl side as a per-sensor coverage check rather
+          than repairing it downstream.
+        elastic: >
+          In the tls branch of logs-suricata.eve@custom, strip the colons from
+          tls.serial and tls.fingerprint before they are written to
+          tls.server.x509.serial_number and tls.server.hash.sha1 — ECS
+          requires uppercase colon-free base-16, and without this every
+          certificate-serial correlation and threat-intel indicator match
+          silently fails to hit. Split the EVE version string into
+          tls.version_protocol and tls.version while discarding
+          "UNDETERMINED", parse the one-line subject DN into the per-component
+          x509 subject fields, and add custom-namespace mappings for
+          suricata.eve.tls.ja3.string and suricata.eve.flow_id as a keyword.
+        relay: >
+          Low-side instances cross the guard as the thin envelope; pin the
+          colon-stripping to the Elastic side so the two sides cannot disagree
+          about hash format. The content-filter friction is the certificate
+          subject and issuer DNs — unbounded free text carrying unicode and
+          punctuation from arbitrary CAs — so bound their length low-side and
+          validate with C.Schema before the guard destination.
+      direct:
+        parse_location: high
+        cribl: >
+          Pass-through with Persistent Queue backpressure and no edge
+          extraction; the useful edge work is hygiene — tag records where
+          tls.session_resumed is true so the large population of
+          certificate-free handshakes can be excluded from
+          certificate-inventory routes instead of looking like parser
+          failures, and keep flow_id as a string for the alert pivot. Treat
+          missing certificate and JA3 fields as a sensor-config defect
+          (extended tls output and ja3.enabled), not a pipeline bug, and
+          surface it from the Cribl side as a per-sensor coverage check rather
+          than repairing it downstream.
+        elastic: >
+          In the tls branch of logs-suricata.eve@custom, strip the colons from
+          tls.serial and tls.fingerprint before they are written to
+          tls.server.x509.serial_number and tls.server.hash.sha1 — ECS
+          requires uppercase colon-free base-16, and without this every
+          certificate-serial correlation and threat-intel indicator match
+          silently fails to hit. Split the EVE version string into
+          tls.version_protocol and tls.version while discarding
+          "UNDETERMINED", parse the one-line subject DN into the per-component
+          x509 subject fields, and add custom-namespace mappings for
+          suricata.eve.tls.ja3.string and suricata.eve.flow_id as a keyword.
+  - format: syslog-raw
+    enable: >
+      In suricata.yaml enable the tls logger with a custom format: `- tls-log:
+      {enabled: yes, filename: tls.log, custom: yes, customformat:
+      "%{%D-%H:%M:%S}t.%z %a:%p -> %A:%P %v %n %d %D"}`. The directive
+      vocabulary is %n (client SNI), %v (TLS/SSL version), %d (certificate
+      not-before), %D (certificate not-after), %f (certificate SHA1
+      fingerprint), %s (certificate subject), %i (certificate issuer DN), %E
+      (extended format, which expands the certificate detail), %a/%p and %A/%P
+      (client/server ip and port) and %{fmt}t/%z (timestamp). A collector
+      tails tls.log; as with http.log the pipeline must be keyed to the exact
+      customformat. Certificate directives are populated only when the
+      handshake actually carried a certificate. Deprecated in 8.0.
+    references:
+    - https://docs.suricata.io/en/suricata-8.0.6/output/custom-tls-logging.html
+    - https://docs.suricata.io/en/suricata-8.0.6/upgrade.html
+    parsing:
+      mechanism: elastic-ingest-pipeline
+      artifact: custom tls.log grok ingest pipeline, keyed to the deployed customformat
+      notes: >
+        No stock content parses tls.log; a custom grok/dissect pipeline must
+        mirror the deployed customformat. The value-shaping largely matches
+        the EVE tls branch: split the %v version string ('TLS 1.2') into
+        tls.version_protocol and tls.version, parse the one-line %s subject DN
+        into the per-component x509 subject fields, and normalise the %f SHA1
+        fingerprint to colon-free uppercase base-16 or threat-intel matches
+        against tls.server.hash.sha1 never hit. Unlike the EVE record there is
+        no serial and no JA3 directive to map, and no flow_id to pair the
+        handshake back to an alert.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          The grammar is fixed by the deployed customformat, so extract the
+          tokens at the low-side edge. The useful low-side hygiene is the same
+          as the EVE tls feed: recognise certificate-free handshakes (resumed
+          sessions produce a line with SNI but empty %d/%D/%f/%s/%i) so they
+          are not treated as parser failures, and surface missing certificate
+          directives as a per-sensor coverage check rather than a downstream
+          repair. Persistent Queue backpressure on the destination.
+        elastic: >
+          Run the customformat-keyed grok pipeline: %n to
+          tls.client.server_name, split %v into tls.version_protocol and
+          tls.version (discarding 'UNDETERMINED'), %d to
+          tls.server.not_before, %D to tls.server.not_after, %i to
+          tls.server.issuer, the one-line %s subject DN parsed into
+          tls.server.subject and the x509 subject components, and %f
+          normalised to colon-free uppercase before tls.server.hash.sha1.
+          Accept that serial and JA3/JA3S have no source in this format - if
+          certificate-serial correlation or JA3 hunting matters, tls.log
+          cannot feed it and the eve tls output is required.
+        relay: >
+          The content-filter friction is the certificate subject and issuer
+          DNs - unbounded free text carrying unicode and punctuation from
+          arbitrary CAs - plus the SNI. Bound their lengths low-side and
+          validate with C.Schema before the guard destination, and pin the
+          fingerprint colon-stripping to the high side so the two sides cannot
+          disagree about hash format. As with the other text forms, no flow_id
+          crosses, so a tls.log handshake cannot be re-associated with its
+          alert on the high side; prefer the EVE tls crossing where the
+          serial, JA3 or the alert pivot are needed.
+      direct:
+        parse_location: low
+        cribl: >
+          High-side sensor with no guard: extract the fixed customformat line
+          at the edge and forward NDJSON. Choose tls.log or the eve tls output
+          as the single authoritative TLS feed per sensor.
+        elastic: >
+          Run the customformat-keyed grok pipeline: %n to
+          tls.client.server_name, split %v into tls.version_protocol and
+          tls.version (discarding 'UNDETERMINED'), %d to
+          tls.server.not_before, %D to tls.server.not_after, %i to
+          tls.server.issuer, the one-line %s subject DN parsed into
+          tls.server.subject and the x509 subject components, and %f
+          normalised to colon-free uppercase before tls.server.hash.sha1. With
+          no boundary, prefer the eve tls output: it adds the certificate
+          serial, JA3/JA3S fingerprints, the ja3 string and flow_id, none of
+          which the tls.log directive vocabulary can express.
+    fields:
+    - vendor: '%{fmt}t / %z'
+      type: timestamp
+      description: timestamp directive (strftime format plus microsecond precision).
+      ecs: '@timestamp'
+      status: partial
+      transform: >-
+        parse against the configured strftime pattern, typically local time
+        without an offset.
+    - vendor: '%a'
+      type: ip
+      description: client IP address directive.
+      ecs: source.ip
+      status: mapped
+    - vendor: '%p'
+      type: port
+      description: client port directive.
+      ecs: source.port
+      status: mapped
+    - vendor: '%A'
+      type: ip
+      description: server IP address directive.
+      ecs: destination.ip
+      status: mapped
+    - vendor: '%P'
+      type: port
+      description: server port directive.
+      ecs: destination.port
+      status: mapped
+    - vendor: '%n'
+      type: string
+      description: client SNI (server name indication) directive.
+      ecs: tls.client.server_name
+      status: mapped
+    - vendor: '%v'
+      type: enum
+      description: 'negotiated TLS/SSL version directive, e.g. ''TLS 1.2''.'
+      ecs: tls.version
+      status: partial
+      transform: >-
+        ECS splits this into tls.version_protocol ('tls') and tls.version
+        ('1.2'); the directive carries both in one string and 'UNDETERMINED'
+        on truncated handshakes.
+    - vendor: '%d'
+      type: timestamp
+      description: certificate not-before directive (NOTBEFORE), e.g. 2016-10-27T20:36:00.
+      ecs: tls.server.not_before
+      status: mapped
+    - vendor: '%D'
+      type: timestamp
+      description: certificate not-after directive (NOTAFTER).
+      ecs: tls.server.not_after
+      status: mapped
+    - vendor: '%f'
+      type: string
+      description: certificate SHA1 fingerprint directive.
+      ecs: tls.server.hash.sha1
+      status: partial
+      transform: >-
+        normalise to colon-free uppercase base-16 before tls.server.hash.sha1,
+        or threat-intel indicator matches never hit - the same failure mode as
+        the EVE tls.fingerprint.
+    - vendor: '%s'
+      type: string
+      description: certificate subject directive (subject distinguished name).
+      ecs: tls.server.subject
+      status: partial
+      notes: >-
+        single one-line DN; the per-component ECS x509 subject fields
+        (common_name, organization, ...) require parsing it.
+    - vendor: '%i'
+      type: string
+      description: certificate issuer directive (issuer distinguished name).
+      ecs: tls.server.issuer
+      status: mapped
+    - vendor: '%E'
+      type: string
+      description: >-
+        extended-format directive that expands the logged certificate detail
+        (fingerprint/subject/issuer) in one token.
+      ecs: null
+      status: unmapped
+      custom: suricata.tls_log.extended
+      notes: >
+        a formatting switch rather than a distinct value - it controls how
+        much certificate detail the line carries; parse the expanded fields to
+        their individual tls.server.* targets and keep nothing extra. There is
+        no serial-number or JA3 directive in this vocabulary, so those EVE
+        fields have no tls.log source at all.

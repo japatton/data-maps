@@ -1,0 +1,1051 @@
+id: iis
+name: Microsoft IIS
+vendor: Microsoft
+versions: IIS 8.5, IIS 10.0
+draft: true
+references:
+- https://learn.microsoft.com/en-us/windows/win32/http/w3c-logging
+- >-
+  https://learn.microsoft.com/en-us/windows/win32/http/format-of-the-http-server-api-error-logs
+- https://www.elastic.co/docs/reference/integrations/iis
+- https://github.com/elastic/integrations/tree/main/packages/iis
+datasets:
+- id: access
+  name: W3C access log
+  description: >
+    Per-request records written by IIS in W3C extended log format
+    (%SystemDrive%\inetpub\logs\LogFiles\W3SVC<n>\u_exYYMMDD.log): one
+    space-separated line per HTTP request, UTC-stamped, with a leading #Fields
+    directive naming the columns. The field set is chosen by the site
+    administrator, so the column list varies between sites; the fields below
+    are the IIS default selection plus the byte counters and host/version
+    columns most commonly added. A hyphen is the placeholder for any
+    selected-but-empty field, and unprintable characters are replaced with a
+    plus sign, which matters when parsing attacker-controlled URIs and user
+    agents.
+  event_categories:
+  - web
+  - authentication
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Elastic Agent tails the W3SVC log directory on the web server and
+        ships to Cribl. Public-facing IIS estates are typically the low-side
+        instances, where the relay guidance below applies.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-iis.access
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Elastic Agent tails the W3SVC log directory on the web server and
+        ships to Cribl.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-iis.access
+  formats:
+  - format: other
+    parsing:
+      mechanism: elastic-integration
+      artifact: Elastic IIS integration (access data stream)
+      notes: >
+        The integration's access ingest pipeline carries roughly ten grok
+        variants to cover common #Fields permutations. Because the column list
+        is admin-selectable per site, the site's field set must be
+        standardised (or matched to one of those variants) or a site-specific
+        grok has to be added; this is the main operational risk on this
+        dataset, not the ECS mapping itself.
+    fields:
+    - vendor: date
+      type: string
+      description: UTC date the request completed, always ten characters as YYYY-MM-DD
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        concatenated with the adjacent time column and parsed as UTC to
+        produce @timestamp; neither column is usable on its own
+    - vendor: time
+      type: string
+      description: UTC time the request completed, always eight characters as HH:MM:SS
+      ecs: '@timestamp'
+      status: partial
+      notes: >
+        second-resolution only - sub-second ordering of same-second requests
+        is not recoverable from the log
+    - vendor: s-ip
+      type: ip
+      description: IP address of the IIS server that handled the request
+      ecs: destination.ip
+      status: mapped
+    - vendor: s-port
+      type: port
+      description: TCP port the site was listening on when the request arrived
+      ecs: destination.port
+      status: mapped
+    - vendor: c-ip
+      type: ip
+      description: IP address of the client that made the request
+      ecs: source.ip
+      status: mapped
+    - vendor: cs-method
+      type: string
+      description: HTTP verb requested by the client, e.g. GET or POST
+      ecs: http.request.method
+      status: mapped
+    - vendor: cs-uri-stem
+      type: string
+      description: request target without the query string, e.g. /app/default.aspx
+      ecs: url.original
+      status: partial
+      notes: >
+        the integration sets url.original to the stem alone and derives
+        url.path from it; the query string stays in a separate column, so
+        url.original is not the full request target until a custom pipeline
+        rejoins stem and query
+    - vendor: cs-uri-query
+      type: string
+      description: query string submitted with the request, hyphen when there is none
+      ecs: url.query
+      status: mapped
+      transform: >
+        url-decoded on ingest; the hyphen placeholder must be dropped rather
+        than indexed as a literal query value
+    - vendor: cs-username
+      type: string
+      description: authenticated account that made the request, hyphen for anonymous requests
+      ecs: user.name
+      status: partial
+      transform: >
+        arrives as DOMAIN\user and needs splitting into user.name and
+        user.domain; the hyphen placeholder must be dropped, and on anonymous
+        sites this column is empty for every record, which is why the
+        authentication profile is only partly satisfiable here
+    - vendor: cs(User-Agent)
+      type: string
+      description: User-Agent header sent by the client
+      ecs: user_agent.original
+      status: mapped
+      transform: >
+        IIS replaces spaces and unprintable characters with plus signs, so the
+        value must be un-escaped before user-agent parsing produces sensible
+        browser/OS breakdowns
+    - vendor: cs(Referer)
+      type: string
+      description: Referer header naming the page that linked to the request target
+      ecs: http.request.referrer
+      status: mapped
+      notes: >
+        IIS spells the column cs(Referer) while the HTTP Server API reference
+        spells it cs(Referrer); both appear in the wild and the parser must
+        accept either
+    - vendor: sc-status
+      type: integer
+      description: HTTP status code returned to the client
+      ecs: http.response.status_code
+      status: mapped
+      notes: >
+        the integration derives event.outcome from this column alone (success
+        below 400, failure at 400 and above), so it is the only source of
+        outcome on this dataset
+    - vendor: sc-substatus
+      type: integer
+      description: IIS sub-status refining the HTTP status, e.g. 401.3 for an ACL denial
+      ecs: null
+      status: unmapped
+      custom: iis.access.sub_status
+      notes: >
+        the sub-status is what distinguishes bad-password from
+        account-disabled from ACL failures on a 401; no ECS field carries it
+    - vendor: sc-win32-status
+      type: integer
+      description: Windows (Win32) error code associated with the response
+      ecs: null
+      status: partial
+      custom: iis.access.win32_status
+      transform: >
+        numeric Win32 code needing a lookup table to become a readable failure
+        reason; 0 means success and should not be indexed as an error
+    - vendor: time-taken
+      type: integer
+      description: time the request took end to end, in milliseconds
+      ecs: event.duration
+      status: mapped
+      transform: >
+        multiplied by 1,000,000 to reach ECS nanoseconds; the timer starts at
+        the first received byte and stops at last send completion, so it
+        excludes network transit
+    - vendor: sc-bytes
+      type: bytes
+      description: number of bytes the server sent in the response
+      ecs: http.response.body.bytes
+      status: mapped
+    - vendor: cs-bytes
+      type: bytes
+      description: number of bytes the server received and processed for the request
+      ecs: http.request.body.bytes
+      status: mapped
+    - vendor: s-sitename
+      type: string
+      description: IIS service name and instance number of the site, e.g. W3SVC1
+      ecs: null
+      status: unmapped
+      custom: iis.access.site_name
+      notes: >
+        the only per-site discriminator on a multi-tenant web server; needed
+        for ownership routing and for per-site count reconciliation
+    - vendor: s-computername
+      type: string
+      description: name of the server on which the log entry was generated
+      ecs: host.name
+      status: mapped
+      transform: lowercased on ingest so it joins cleanly against Windows host inventory
+    - vendor: cs-host
+      type: string
+      description: Host header supplied by the client, identifying the requested virtual host
+      ecs: url.domain
+      status: mapped
+      notes: >
+        client-supplied and therefore untrusted; useful for host-header
+        injection and virtual-host enumeration detection
+    - vendor: cs(Cookie)
+      type: string
+      description: content of the cookie sent or received with the request
+      ecs: null
+      status: unmapped
+      custom: iis.access.cookie
+      notes: >
+        off by default and rarely enabled; carries session tokens and PII, so
+        it should be masked or dropped low-side if a site turns it on
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Keep the core worker group a pass-through with the raw W3C line in
+          _raw, but pin each site's #Fields header low-side as a routing tag
+          so the high-side grok variant is selected deterministically rather
+          than by trial, and alert when a site's column order drifts. Mask
+          secrets near the source - cs(Cookie) session material and any tokens
+          or API keys carried in cs-uri-query - and run Persistent Queue
+          backpressure (never Block) on the Elastic destination. This is the
+          highest-volume, lowest-forensic-value dataset in this map, so it is
+          the first place to drop _raw once the integration parser is proven.
+        elastic: >
+          The stock IIS integration access pipeline is the parser; add a
+          logs-iis.access@custom pipeline that recombines cs-uri-stem and
+          cs-uri-query into a complete url.original, since the shipped
+          pipeline sets url.original to the stem alone and the web alerting
+          profile depends on that field. Resolve sc-win32-status through a
+          Win32 error-code lookup into a readable failure reason and derive
+          event.action from the method/status pair instead of leaving it
+          empty, keeping the existing status-driven (<400 success, >=400
+          failure) event.outcome. Declare iis.access.site_name,
+          iis.access.sub_status, iis.access.win32_status and iis.access.cookie
+          explicitly in the custom-namespace index template rather than
+          relying on dynamic mapping.
+        relay: >
+          Low-side instances cross the guard: use the thin-envelope hybrid -
+          {_dataId, @timestamp, host, _raw} as NDJSON, never CEF - and treat
+          cs-uri-stem, cs-uri-query and cs(User-Agent) as the content-filter
+          problem: they are attacker-controlled free text, percent-encoded,
+          potentially non-ASCII, and IIS has already substituted plus signs
+          for unprintable bytes. Cap those three at declared lengths and
+          normalise their encoding low-side so a custom NDJSON (LUA) guard
+          filter can stay simple, since certified JSON validators do not exist
+          the way XML/XSD ones do. Treat the crossing as at-most-once and
+          detect silent drops by reconciling low-side and high-side record
+          counts per (site, hour).
+      direct:
+        parse_location: high
+        cribl: >
+          Keep the core worker group a pass-through with the raw W3C line in
+          _raw, but pin each site's #Fields header at the edge as a routing
+          tag so the grok variant is selected deterministically rather than by
+          trial, and alert when a site's column order drifts. Mask secrets
+          near the source - cs(Cookie) session material and any tokens or API
+          keys carried in cs-uri-query - and run Persistent Queue backpressure
+          (never Block) on the Elastic destination. This is the
+          highest-volume, lowest-forensic-value dataset in this map, so it is
+          the first place to drop _raw once the integration parser is proven.
+        elastic: >
+          The stock IIS integration access pipeline is the parser; add a
+          logs-iis.access@custom pipeline that recombines cs-uri-stem and
+          cs-uri-query into a complete url.original, since the shipped
+          pipeline sets url.original to the stem alone and the web alerting
+          profile depends on that field. Resolve sc-win32-status through a
+          Win32 error-code lookup into a readable failure reason and derive
+          event.action from the method/status pair instead of leaving it
+          empty, keeping the existing status-driven (<400 success, >=400
+          failure) event.outcome. Declare iis.access.site_name,
+          iis.access.sub_status, iis.access.win32_status and iis.access.cookie
+          explicitly in the custom-namespace index template rather than
+          relying on dynamic mapping.
+  - format: csv-file
+    enable: >
+      The native "Microsoft IIS Log File Format". Select it per site (or at
+      the server node) in IIS Manager > Logging by setting Format to "IIS", or
+      set <logFile logFormat="IIS"> on the site in applicationHost.config
+      (appcmd set sites "<site>" -logFile.logFormat:IIS). Unlike W3C the field
+      set is FIXED and cannot be customised: fifteen comma-delimited columns,
+      one line per request, in the order below. There is no #Fields header, so
+      the column order is the only schema, and timestamps are written in the
+      server's LOCAL time zone (not UTC) with a two-digit year for 1999 and
+      earlier and four digits thereafter. The format carries no User-Agent,
+      Referer, Host or Cookie columns at all, so it records less than the W3C
+      selection.
+    references:
+    - >-
+      https://learn.microsoft.com/en-us/previous-versions/iis/6.0-sdk/ms525807(v=vs.90)
+    - >-
+      https://learn.microsoft.com/en-us/iis/configuration/system.applicationhost/sites/site/logfile/
+    parsing:
+      mechanism: elastic-ingest-pipeline
+      artifact: >-
+        logs-iis.access@custom (CSV/grok split of the fixed 15-column native
+        order, then rename-to-ECS)
+      notes: >
+        The stock Elastic IIS integration groks W3C space-delimited lines
+        behind a #Fields header and will not match a comma-delimited native
+        line, so a native feed cannot ride the shipped access pipeline. It
+        needs a custom pipeline whose head is a csv (or positional grok)
+        processor over the fixed field order, followed by rename-to-ECS. The
+        governing trap is the timestamp: the native Date/Time pair is local
+        server time while the integration assumes UTC, so the date parse must
+        apply the source host's zone per site or every record lands skewed by
+        the UTC offset.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          The native format has no #Fields header, so the fixed 15-column
+          comma order IS the schema and a parser cannot recover if a site
+          silently switches format. Pin each site's active log format low-side
+          as a routing tag so the high side never has to sniff comma-native
+          against W3C-space lines, and alert when a site drifts back to W3C or
+          NCSA mid-stream. Mask the Parameters column near source - it carries
+          the query string and script parameters and can hold tokens - keep
+          _raw for reconciliation, and run Persistent Queue backpressure
+          (never Block) on the Elastic destination.
+        elastic: >
+          Parse in a logs-iis.access@custom pipeline whose first processor is
+          a csv/grok split of the fifteen positional columns, then rename to
+          ECS. Convert the local Date/Time pair to UTC using a per-site zone
+          constant carried as an ingest field, since this format unlike W3C
+          logs local time and a naive UTC parse skews every event. Rejoin
+          Target and Parameters into a complete url.original, resolve
+          Win32Status through the same Win32 error-code lookup used on the W3C
+          stream, and derive event.outcome from ServiceStatus (below 400
+          success, 400 and above failure). Declare iis.access.site_name and
+          iis.access.win32_status in the custom-namespace index template.
+        relay: >
+          Low-side instances cross the guard as the same thin-envelope NDJSON
+          the W3C stream uses - {_dataId, @timestamp, host, _raw}, never CEF.
+          The only unbounded, attacker-controlled values are Target and
+          Parameters (the request path and its query), which may be
+          percent-encoded and non-ASCII; cap them at declared lengths and
+          normalise their encoding low-side so a simple custom NDJSON filter
+          suffices. The native format's lack of User-Agent, Referer and Cookie
+          columns makes its crossing surface smaller than W3C. Treat the
+          crossing as at-most-once and reconcile low-side and high-side counts
+          per (site, hour).
+      direct:
+        parse_location: high
+        cribl: >
+          High-side instances need no guard hops: keep the core worker group a
+          pass-through with the raw native line in _raw. If some sites emit
+          native while others emit W3C, tag the format at the edge so the
+          ingest pipeline routes each line to the matching parser rather than
+          guessing from the delimiter.
+        elastic: >
+          Parse in a logs-iis.access@custom pipeline whose first processor is
+          a csv/grok split of the fifteen positional columns, then rename to
+          ECS. Convert the local Date/Time pair to UTC using a per-site zone
+          constant, since this format logs local time and a naive UTC parse
+          skews every event. Rejoin Target and Parameters into a complete
+          url.original, resolve Win32Status through the Win32 error-code
+          lookup, and derive event.outcome from ServiceStatus (below 400
+          success, 400 and above failure). Declare iis.access.site_name and
+          iis.access.win32_status in the custom-namespace index template.
+    fields:
+    - vendor: ClientHost
+      type: ip
+      description: IP address of the client that made the request (first comma-delimited column)
+      ecs: source.ip
+      status: mapped
+    - vendor: UserName
+      type: string
+      description: authenticated account that made the request, hyphen for anonymous requests
+      ecs: user.name
+      status: partial
+      transform: >
+        arrives as DOMAIN\user and needs splitting into user.name and
+        user.domain; the hyphen placeholder must be dropped, and anonymous
+        sites log a hyphen for every record
+    - vendor: Date
+      type: string
+      description: >-
+        date the request completed, in the server's local time zone, MM/DD/YY
+        (two-digit year for 1999 and earlier, four digits thereafter)
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        concatenated with the adjacent Time column and parsed with the source
+        host's local zone applied - this format logs local time, not UTC, so a
+        naive UTC parse skews every event by the offset
+    - vendor: Time
+      type: string
+      description: 'time the request completed, in the server''s local time zone, H:MM:SS'
+      ecs: '@timestamp'
+      status: partial
+      notes: >
+        local time and second-resolution only; combined with the Date column
+        and the per-site zone constant to produce @timestamp
+    - vendor: Service
+      type: string
+      description: IIS service name and instance number that handled the request, e.g. W3SVC2
+      ecs: null
+      status: unmapped
+      custom: iis.access.site_name
+      notes: >
+        the only per-site discriminator on a multi-tenant server; reuses the
+        same custom namespace as the W3C s-sitename column for ownership
+        routing and per-site count reconciliation
+    - vendor: Machine
+      type: string
+      description: name of the server on which the log entry was generated
+      ecs: host.name
+      status: mapped
+      transform: lowercased on ingest so it joins cleanly against Windows host inventory
+    - vendor: ServerIP
+      type: ip
+      description: IP address of the IIS server that handled the request
+      ecs: destination.ip
+      status: mapped
+    - vendor: ProcessingTime
+      type: integer
+      description: elapsed time taken to process the request, in milliseconds
+      ecs: event.duration
+      status: partial
+      transform: >
+        multiplied by 1,000,000 to reach ECS nanoseconds; measures server-side
+        processing and excludes network transit
+    - vendor: BytesRecvd
+      type: bytes
+      description: number of bytes the server received and processed for the request
+      ecs: http.request.body.bytes
+      status: mapped
+    - vendor: BytesSent
+      type: bytes
+      description: number of bytes the server sent in the response
+      ecs: http.response.body.bytes
+      status: mapped
+    - vendor: ServiceStatus
+      type: integer
+      description: HTTP status code returned to the client
+      ecs: http.response.status_code
+      status: mapped
+      notes: >
+        the only outcome source on this format - event.outcome is derived from
+        it alone (success below 400, failure at 400 and above); the native
+        format carries no sub-status column, so 401.x refinements are not
+        distinguishable here as they are on W3C
+    - vendor: Win32Status
+      type: integer
+      description: Windows (Win32) error code associated with the response
+      ecs: null
+      status: partial
+      custom: iis.access.win32_status
+      transform: >
+        numeric Win32 code needing a lookup table to become a readable failure
+        reason; 0 means success and should not be indexed as an error
+    - vendor: Operation
+      type: string
+      description: >-
+        request type, i.e. the HTTP verb such as GET or POST (labelled "target
+        of operation" verb in the native format)
+      ecs: http.request.method
+      status: mapped
+      notes: >
+        for FTP sites this column carries FTP commands (PASS, STOR); on web
+        sites it is the HTTP method
+    - vendor: Target
+      type: string
+      description: target of the operation - the requested URI stem, without the query string
+      ecs: url.path
+      status: mapped
+      notes: >
+        the query string is carried separately in the Parameters column, so
+        url.original is not complete until a custom pipeline rejoins Target
+        and Parameters
+    - vendor: Parameters
+      type: string
+      description: >-
+        parameters passed to the request, i.e. the query string for a script
+        request, hyphen when there are none
+      ecs: url.query
+      status: partial
+      transform: >
+        url-decoded on ingest and the hyphen placeholder dropped rather than
+        indexed; populated only for script/parameterised requests, a hyphen
+        otherwise
+  - format: syslog-raw
+    enable: >
+      The "NCSA Common Log File Format". Select it per site in IIS Manager >
+      Logging by setting Format to "NCSA", or set <logFile logFormat="NCSA">
+      on the site (appcmd set sites "<site>" -logFile.logFormat:NCSA).
+      Available for Web sites only, not FTP. Like the native IIS format the
+      field set is FIXED - seven space-delimited fields, one line per request
+      - but unlike W3C and native it records local time WITH an explicit GMT
+      offset embedded in the bracketed timestamp, so the value resolves to UTC
+      without a per-site zone constant. This is the same line shape as the
+      Apache/NGINX "common" log format. It records the least of any IIS
+      format: no server IP, no bytes received, no time taken, no Win32 status,
+      no sub-status. This is a file-tailed flat-text format rather than a
+      syslog stream; the syslog-raw format value is its settled vocabulary
+      home under the positional-text precedent.
+    references:
+    - >-
+      https://learn.microsoft.com/en-us/previous-versions/iis/6.0-sdk/ms525807(v=vs.90)
+    - >-
+      https://learn.microsoft.com/en-us/iis/configuration/system.applicationhost/sites/site/logfile/
+    parsing:
+      mechanism: elastic-ingest-pipeline
+      artifact: >-
+        logs-iis.access@custom (Common Log Format grok, reusing the
+        Apache/NGINX common-log grammar)
+      notes: >
+        The stock IIS integration will not match an NCSA line either, but
+        because the format is byte-identical in shape to the Apache/NGINX
+        common log, the existing common-log grok grammar parses it directly -
+        no IIS-specific pattern is needed. The bracketed timestamp includes
+        its own +/-zzzz offset, so this stream avoids the local-to-UTC zone
+        problem the native and W3C streams carry.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          NCSA lines are indistinguishable in shape from Apache/NGINX
+          common-log lines, so route them to the existing common-log grok
+          rather than an IIS-specific parser, and pin the format tag low-side
+          so the routing is deterministic. No per-site zone constant is needed
+          because the timestamp already carries its GMT offset. There are no
+          cookie or header columns to mask; the only length concern is the
+          request-line field. Keep _raw for reconciliation and run Persistent
+          Queue backpressure rather than Block on the Elastic destination.
+        elastic: >
+          Parse with a common-log grok in logs-iis.access@custom - the shared
+          Apache/NGINX grammar, not the shipped IIS access pipeline. Split the
+          "METHOD URI HTTP/x.y" request line into http.request.method,
+          url.original and http.version, and parse the bracketed
+          [dd/Mon/yyyy:HH:MM:SS +/-zzzz] timestamp straight to UTC with no
+          zone guess. Derive event.outcome from the status code. Because NCSA
+          omits server IP, bytes received, time taken and Win32 status, those
+          ECS fields simply stay unpopulated on this feed - a deliberately
+          narrower record than W3C or native.
+        relay: >
+          Cross as the same thin-envelope NDJSON as the other IIS streams so
+          one schema faces the content filter. The single unbounded value is
+          the request line (method, URI and protocol as one quoted string),
+          which is attacker-controlled and percent-encoded; cap and normalise
+          it low-side. This is the smallest crossing surface of the three text
+          formats. Treat as at-most-once and reconcile counts per (site,
+          hour).
+      direct:
+        parse_location: high
+        cribl: >
+          High-side instances need no guard hops: pass NCSA lines through the
+          core worker group unparsed with _raw intact, routing them to the
+          common-log grok. Tag the format at the edge if the estate mixes NCSA
+          with W3C or native so each parser sees only its own grammar.
+        elastic: >
+          Parse with a common-log grok in logs-iis.access@custom - the shared
+          Apache/NGINX grammar, not the shipped IIS access pipeline. Split the
+          request line into http.request.method, url.original and
+          http.version, parse the bracketed [dd/Mon/yyyy:HH:MM:SS +/-zzzz]
+          timestamp straight to UTC with no zone guess, and derive
+          event.outcome from the status code. Because NCSA omits server IP,
+          bytes received, time taken and Win32 status, those ECS fields stay
+          unpopulated on this feed.
+    fields:
+    - vendor: remote-host
+      type: ip
+      description: >-
+        IP address (or resolved host name if reverse DNS is on) of the client
+        that made the request - first space-delimited field
+      ecs: source.ip
+      status: mapped
+      notes: >
+        logs a host name instead of an address when HostnameLookups-style
+        resolution is enabled, in which case it will not satisfy an ip-typed
+        field and must fall back to source.address
+    - vendor: remote-logname
+      type: string
+      description: RFC 1413 identd identity of the client, effectively always a hyphen
+      ecs: null
+      status: unmapped
+      custom: iis.access.ident
+      notes: >
+        the second field; identd is not used, so it is a hyphen on every
+        record and should be dropped rather than stored
+    - vendor: user
+      type: string
+      description: authenticated account that made the request, hyphen for anonymous requests
+      ecs: user.name
+      status: partial
+      transform: >
+        arrives as DOMAIN\user and needs splitting into user.name and
+        user.domain; the hyphen placeholder must be dropped
+    - vendor: date-time
+      type: string
+      description: >-
+        request completion time as [dd/Mon/yyyy:HH:MM:SS +/-zzzz], local time
+        with an explicit GMT offset
+      ecs: '@timestamp'
+      status: mapped
+      transform: >
+        parsed straight to UTC because the +/-zzzz offset is part of the
+        value; no per-site zone constant is required, unlike the native and
+        W3C streams
+    - vendor: request
+      type: string
+      description: >-
+        full first line of the request - HTTP method, requested URI with
+        query, and protocol version as one quoted string
+      ecs: url.original
+      status: partial
+      notes: >
+        a composite field that must be split into http.request.method,
+        url.original and http.version, and must tolerate a non-conforming or
+        escaped request line since it is client-supplied
+    - vendor: status
+      type: integer
+      description: HTTP status code returned to the client
+      ecs: http.response.status_code
+      status: mapped
+      notes: >-
+        the only outcome source on this format; event.outcome is derived from
+        it alone (success below 400, failure at 400 and above)
+    - vendor: bytes
+      type: bytes
+      description: number of bytes the server sent in the response body
+      ecs: http.response.body.bytes
+      status: mapped
+      notes: >
+        response bytes only; NCSA logs no bytes-received counter, so
+        http.request.body.bytes cannot be populated from this format
+  - format: jdbc-sql
+    enable: >
+      ODBC logging writes each request as a row to an ODBC data source (SQL
+      Server, Access) instead of to a text file. Install the "ODBC Logging"
+      role feature (Web Server (IIS) > Health and Diagnostics > ODBC Logging),
+      create the target table - %windir%\System32\inetsrv\logtemp.sql builds
+      the default InternetLog table - and a System DSN, then set the site to
+      <logFile logFormat="Custom"
+      customLogPluginClsid="{FF16065B-DE82-11CF-BC0A-00AA006111E0}"> and
+      populate <odbcLogging dataSource tableName userName password>. There is
+      no IIS Manager UI for it; configure via appcmd or
+      applicationHost.config. The column set is fixed at fourteen columns.
+      Enabling ODBC logging disables the HTTP.sys kernel-mode cache, so it
+      carries a real throughput cost on busy sites.
+    references:
+    - https://learn.microsoft.com/en-us/iis/configuration/system.webserver/odbclogging
+    - https://jeffpar.github.io/kbarchive/kb/245/Q245243/
+    - >-
+      https://learn.microsoft.com/en-us/previous-versions/iis/6.0-sdk/ms525807(v=vs.90)
+    parsing:
+      mechanism: elastic-ingest-pipeline
+      artifact: >-
+        logs-iis.access@custom (column rename-to-ECS; collected by an SQL/JDBC
+        input, not a file tail)
+      notes: >
+        This format has no file to tail - the records live as typed rows in
+        the InternetLog table. Collect with a scheduled query (Elastic Agent
+        SQL input, Logstash JDBC, or a Cribl Database Collector) that tracks a
+        high-water mark on LogTime so rows are read once. Because the DB
+        already stores typed columns, no grok is needed; the ingest pipeline
+        is a pure column rename to ECS. LogTime is a DATETIME stored in the
+        server's local zone, so the source zone must be applied on ingest.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          There is no line to tail: collect with a Database Collector polling
+          the InternetLog table, tracking a high-water mark on LogTime so rows
+          are not re-read, and emit one NDJSON object per row across the
+          guard. Because the DB stores typed columns the crossing payload is
+          already structured - no _raw text line to disambiguate. Surface the
+          kernel-cache-disabled throughput cost to the site owner before
+          recommending ODBC on a high-volume site, and mask the Target and
+          Parameters columns if they carry query secrets. Persistent Queue
+          backpressure, never Block.
+        elastic: >
+          Map the table columns to ECS with a rename pipeline: ClientHost to
+          source.ip, ServerIP to destination.ip, Machine to host.name,
+          ProcessingTime milliseconds to event.duration nanoseconds,
+          BytesRecvd to http.request.body.bytes, BytesSent to
+          http.response.body.bytes, ServiceStatus to
+          http.response.status_code, Operation to http.request.method, Target
+          to url.path and Parameters to url.query, with Win32Status resolved
+          through the Win32 lookup into iis.access.win32_status and Service
+          into iis.access.site_name. Apply the source local zone to LogTime on
+          ingest. No integration grok is involved; this is a pure
+          column-rename feed collected over JDBC/SQL rather than a file.
+        relay: >
+          Cross one NDJSON object per row so the ODBC feed presents the same
+          schema as the file-based IIS streams to the content filter. The
+          bounded values to cap are Target and Parameters. Note the log
+          database is itself a low-side asset: run the collector low-side and
+          cross the NDJSON rather than opening a broad DB port across the
+          guard. Reconcile row counts per (site, hour) using LogTime, an
+          at-most-once crossing.
+      direct:
+        parse_location: high
+        cribl: >
+          High-side instances need no guard hops: collect with a Database
+          Collector polling the InternetLog table, tracking a high-water mark
+          on LogTime so rows are not re-read, and emit the structured rows
+          straight into the core worker group. Because the DB stores typed
+          columns the payload is already structured - there is no _raw text
+          line to disambiguate.
+        elastic: >
+          Map the table columns to ECS with a rename pipeline: ClientHost to
+          source.ip, ServerIP to destination.ip, Machine to host.name,
+          ProcessingTime milliseconds to event.duration nanoseconds,
+          BytesRecvd to http.request.body.bytes, BytesSent to
+          http.response.body.bytes, ServiceStatus to
+          http.response.status_code, Operation to http.request.method, Target
+          to url.path and Parameters to url.query, with Win32Status resolved
+          through the Win32 lookup into iis.access.win32_status and Service
+          into iis.access.site_name. Apply the source local zone to LogTime on
+          ingest. Collection is over the Elastic Agent SQL input or Logstash
+          JDBC directly against the database; no integration grok is involved.
+    fields:
+    - vendor: ClientHost
+      type: ip
+      description: IP address of the client that made the request (varchar column)
+      ecs: source.ip
+      status: mapped
+    - vendor: Username
+      type: string
+      description: authenticated account that made the request, hyphen for anonymous requests
+      ecs: user.name
+      status: partial
+      transform: >-
+        arrives as DOMAIN\user and needs splitting into user.name and
+        user.domain; the hyphen placeholder must be dropped
+    - vendor: LogTime
+      type: timestamp
+      description: >-
+        date and time the log entry was created, a DATETIME in the server's
+        local time zone
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        stored as a single local-time DATETIME with no offset, so the source
+        host's zone must be applied on ingest to produce a correct UTC
+        @timestamp
+    - vendor: Service
+      type: string
+      description: IIS service name and instance that handled the request, e.g. W3SVC2
+      ecs: null
+      status: unmapped
+      custom: iis.access.site_name
+      notes: >-
+        per-site discriminator for ownership routing, reusing the W3C
+        s-sitename custom namespace
+    - vendor: Machine
+      type: string
+      description: name of the server on which the log entry was generated
+      ecs: host.name
+      status: mapped
+      transform: lowercased on ingest so it joins cleanly against Windows host inventory
+    - vendor: ServerIP
+      type: ip
+      description: IP address of the IIS server that handled the request
+      ecs: destination.ip
+      status: mapped
+    - vendor: ProcessingTime
+      type: integer
+      description: elapsed processing time for the request, in milliseconds
+      ecs: event.duration
+      status: partial
+      transform: >-
+        multiplied by 1,000,000 to reach ECS nanoseconds; server-side
+        processing only, excludes network transit
+    - vendor: BytesRecvd
+      type: bytes
+      description: number of bytes the server received and processed for the request
+      ecs: http.request.body.bytes
+      status: mapped
+    - vendor: BytesSent
+      type: bytes
+      description: number of bytes the server sent in the response
+      ecs: http.response.body.bytes
+      status: mapped
+    - vendor: ServiceStatus
+      type: integer
+      description: HTTP status code returned to the client
+      ecs: http.response.status_code
+      status: mapped
+      notes: >-
+        the only outcome source on this format; event.outcome is derived from
+        it alone (success below 400, failure at 400 and above)
+    - vendor: Win32Status
+      type: integer
+      description: Windows (Win32) error code associated with the response
+      ecs: null
+      status: partial
+      custom: iis.access.win32_status
+      transform: >-
+        numeric Win32 code needing a lookup table to become a readable failure
+        reason; 0 means success and should not be indexed as an error
+    - vendor: Operation
+      type: string
+      description: request type carried out, i.e. the HTTP verb such as GET or POST
+      ecs: http.request.method
+      status: mapped
+    - vendor: Target
+      type: string
+      description: target of the operation - the requested URI stem, without the query string
+      ecs: url.path
+      status: mapped
+      notes: >-
+        the query lives in the Parameters column, so url.original is not
+        complete until a pipeline rejoins Target and Parameters
+    - vendor: Parameters
+      type: string
+      description: >-
+        parameters passed to the request, i.e. the query string for a script
+        request, hyphen when there are none
+      ecs: url.query
+      status: partial
+      transform: >-
+        url-decoded on ingest and the hyphen placeholder dropped; populated
+        only for parameterised requests
+- id: error
+  name: HTTPERR error log
+  description: >
+    HTTP.sys (HTTP Server API) error log,
+    %SystemRoot%\System32\LogFiles\HTTPERR\httperr*.log: one space-separated
+    line per connection or request that HTTP.sys terminated before or instead
+    of handing it to a worker process. Unlike the access log this file has a
+    fixed field order and no column headings, and it records the failures the
+    access log never sees - connection limits, idle and minimum-throughput
+    timer expiries, malformed requests, unresolvable host headers, and stopped
+    or unavailable application pools. Low volume, high signal.
+  event_categories:
+  - web
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same collection path as the access log - Elastic Agent tails the
+        HTTPERR directory on the web server and ships to Cribl.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-iis.error
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Same collection path as the access log - Elastic Agent tails the
+        HTTPERR directory on the web server and ships to Cribl.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-iis.error
+  formats:
+  - format: other
+    parsing:
+      mechanism: elastic-integration
+      artifact: Elastic IIS integration (error data stream)
+      notes: >
+        The error ingest pipeline groks the fixed HTTPERR field order into
+        source/destination address pairs, http.*, and the iis.error.*
+        namespace. Field order is stable across IIS versions, so this dataset
+        does not carry the access log's field-set variability risk.
+    fields:
+    - vendor: date
+      type: string
+      description: UTC date the error was recorded, always ten characters as YYYY-MM-DD
+      ecs: '@timestamp'
+      status: partial
+      transform: combined with the adjacent time column and parsed as UTC to produce @timestamp
+    - vendor: time
+      type: string
+      description: UTC time the error was recorded, always eight characters as HH:MM:SS
+      ecs: '@timestamp'
+      status: partial
+      notes: second resolution, same limitation as the access log
+    - vendor: c-ip
+      type: ip
+      description: IP address of the affected client, IPv4 or IPv6 with ScopeId
+      ecs: source.ip
+      status: mapped
+    - vendor: c-port
+      type: port
+      description: source port of the affected client connection
+      ecs: source.port
+      status: mapped
+    - vendor: s-ip
+      type: ip
+      description: IP address of the affected server, IPv4 or IPv6 with ScopeId
+      ecs: destination.ip
+      status: mapped
+    - vendor: s-port
+      type: port
+      description: port on the server the affected connection targeted
+      ecs: destination.port
+      status: mapped
+    - vendor: cs-version
+      type: string
+      description: HTTP protocol version the client used, e.g. HTTP/1.1
+      ecs: http.version
+      status: mapped
+      transform: >
+        strip the HTTP/ prefix; a hyphen appears when the connection was never
+        parsed far enough to determine a version, and a major or minor number
+        of 10 or above is logged as HTTP/?.?
+    - vendor: cs-method
+      type: string
+      description: verb from the last request parsed on the connection
+      ecs: http.request.method
+      status: mapped
+      notes: >
+        unknown verbs are logged as sent and truncated at 255 bytes, and a
+        hyphen appears when no verb was parsed - do not assume this is a valid
+        HTTP method
+    - vendor: cs-uri
+      type: string
+      description: requested URL and its query joined by a question mark as one field
+      ecs: url.original
+      status: partial
+      notes: >
+        truncated at 4096 bytes, and copied byte-for-byte with no Unicode
+        conversion when HTTP.sys could not cook the URL, so it may contain
+        arbitrary encodings; url.query and url.path are not populated unless a
+        custom pipeline splits it
+    - vendor: sc-status
+      type: integer
+      description: protocol status returned for the request, never above 999
+      ecs: http.response.status_code
+      status: mapped
+      transform: >
+        hyphen when no response status was reached; every record in this
+        stream is a failure regardless of whether a status was emitted, so
+        event.outcome must not be derived from this column alone
+    - vendor: s-siteid
+      type: string
+      description: site identifier field, reserved and always logged as a hyphen
+      ecs: null
+      status: unmapped
+      custom: iis.error.site_id
+      notes: >
+        not used by current HTTP Server API versions - always a hyphen
+        placeholder; carried only so the positional parse stays aligned, and
+        site attribution has to come from the queue name instead
+    - vendor: s-reason
+      type: string
+      description: >-
+        string identifying the kind of error, e.g. ConnLimit, Hostname,
+        Timer_MinBytesPerSecond, Version_N/S
+      ecs: event.reason
+      status: partial
+      notes: >
+        never empty and the actual failure classifier for this dataset, but
+        the stock integration writes it only to iis.error.reason_phrase; a
+        custom pipeline should copy it to event.reason and drive event.action
+        from a phrase lookup
+    - vendor: s-queuename
+      type: string
+      description: name of the application-pool request queue the connection was destined for
+      ecs: null
+      status: unmapped
+      custom: iis.error.queue_name
+      notes: >
+        the only per-application discriminator in the record and the join key
+        back to site ownership, since s-siteid is always empty
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Pass HTTPERR lines through the core worker group unparsed with _raw
+          intact - this is the low-volume, high-signal half of the IIS estate,
+          so keep raw here well after it has been dropped on the access
+          stream. Attach app-pool and host ownership context low-side, where
+          the queue-name-to-owner lookup is cheapest, and use Persistent Queue
+          backpressure rather than Block on the Elastic destination.
+        elastic: >
+          Parse with the integration's error pipeline into logs-iis.error,
+          then add a logs-iis.error@custom pipeline that copies the reason
+          phrase into event.reason and derives event.action from a
+          reason-phrase lookup (ConnLimit, Hostname, Timer_MinBytesPerSecond,
+          Timer_ConnectionIdle, Version_N/S, BadRequest), because the reason
+          phrase and not the status code is the real failure classifier on
+          this stream. Handle the hyphen placeholders explicitly - protocol
+          version, verb, URI and status are all absent on connection-level
+          failures - by nulling them instead of indexing a literal hyphen, and
+          set event.outcome to failure for every record in the stream. Declare
+          iis.error.reason_phrase, iis.error.queue_name and iis.error.site_id
+          as keyword in the custom-namespace index template.
+        relay: >
+          Low-side instances cross the guard: ship the same thin-envelope
+          NDJSON as the access stream so both IIS datasets present one schema
+          to the filter. The one unbounded value here is the cooked URL plus
+          query joined into a single field, truncated at 4096 bytes and copied
+          verbatim without Unicode conversion whenever HTTP.sys could not
+          parse it - bound and normalise it low-side, since malformed requests
+          are exactly the traffic that produces these records. Volume is low
+          enough that at-most-once loss is detectable with per-hour count
+          reconciliation.
+      direct:
+        parse_location: high
+        cribl: >
+          Pass HTTPERR lines through the core worker group unparsed with _raw
+          intact - this is the low-volume, high-signal half of the IIS estate,
+          so keep raw here well after it has been dropped on the access
+          stream. Attach app-pool and host ownership context at the edge,
+          where the queue-name-to-owner lookup is cheapest, and use Persistent
+          Queue backpressure rather than Block on the Elastic destination.
+        elastic: >
+          Parse with the integration's error pipeline into logs-iis.error,
+          then add a logs-iis.error@custom pipeline that copies the reason
+          phrase into event.reason and derives event.action from a
+          reason-phrase lookup (ConnLimit, Hostname, Timer_MinBytesPerSecond,
+          Timer_ConnectionIdle, Version_N/S, BadRequest), because the reason
+          phrase and not the status code is the real failure classifier on
+          this stream. Handle the hyphen placeholders explicitly - protocol
+          version, verb, URI and status are all absent on connection-level
+          failures - by nulling them instead of indexing a literal hyphen, and
+          set event.outcome to failure for every record in the stream. Declare
+          iis.error.reason_phrase, iis.error.queue_name and iis.error.site_id
+          as keyword in the custom-namespace index template.

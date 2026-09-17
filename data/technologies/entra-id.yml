@@ -1,0 +1,2699 @@
+id: entra-id
+name: Entra ID (Azure AD Government)
+vendor: Microsoft
+versions: >-
+  Microsoft Graph v1.0 schema; Azure Monitor diagnostic settings, US
+  Government L4 (GCC High) and L5 (DoD) tenants
+draft: true
+references:
+- >-
+  https://learn.microsoft.com/en-us/entra/identity/monitoring-health/concept-activity-log-schemas
+- >-
+  https://learn.microsoft.com/en-us/entra/identity/monitoring-health/howto-stream-logs-to-event-hub
+- >-
+  https://learn.microsoft.com/en-us/azure/azure-monitor/reference/tables/signinlogs
+- https://learn.microsoft.com/en-us/azure/azure-monitor/reference/tables/auditlogs
+- https://learn.microsoft.com/en-us/graph/api/resources/signin
+- https://learn.microsoft.com/en-us/graph/api/resources/directoryaudit
+- https://learn.microsoft.com/en-us/graph/api/resources/riskdetection
+- https://learn.microsoft.com/en-us/graph/api/resources/provisioningobjectsummary
+- https://learn.microsoft.com/en-us/graph/deployments
+- https://www.elastic.co/docs/reference/integrations/azure
+- >-
+  https://github.com/elastic/integrations/tree/main/packages/azure/data_stream/signinlogs
+- >-
+  https://github.com/elastic/integrations/tree/main/packages/azure/data_stream/auditlogs
+datasets:
+- id: signin
+  name: Sign-in logs
+  description: >
+    Every authentication the tenant evaluates, emitted as JSON records by the
+    Entra ID diagnostic setting. Four separate diagnostic categories share one
+    schema and are distinguished only by the record's `category` value:
+    SignInLogs (interactive user sign-ins), NonInteractiveUser SignInLogs,
+    ServicePrincipalSignInLogs and ManagedIdentitySignInLogs. Microsoft warns
+    that the non-interactive and service-principal categories run 5-10x the
+    volume of the interactive one, so enabling all four without volume
+    planning is the single biggest ingest risk on this technology. In an Azure
+    Government tenant the records land in an Event Hubs namespace on the
+    usgovcloudapi.net suffix, and any collector must be pointed at the US
+    Government authority host (login.microsoftonline.us) rather than the
+    commercial default.
+  event_categories:
+  - authentication
+  - iam
+  route:
+    guarded:
+    - hop: other
+      name: Azure Government Event Hubs namespace
+      notes: >
+        Entra ID diagnostic settings push the records to an event hub in the
+        tenant's own Azure Government subscription
+        (<namespace>.servicebus.usgovcloudapi.net). This is a push from a SaaS
+        control plane we do not own - there is no on-prem collector in front
+        of it, and retention on the hub (1-7 days) is the only replay window
+        if the downstream consumer stalls.
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Cribl's Azure Event Hubs source consumes the hub with its own consumer
+        group and checkpoint store. The analysis enclave cannot reach the
+        Government cloud directly, so on the guarded path the collector runs
+        low-side.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-azure.signinlogs
+    direct:
+    - hop: other
+      name: Azure Government Event Hubs namespace
+      notes: >
+        Entra ID diagnostic settings push the records to an event hub in the
+        tenant's own Azure Government subscription
+        (<namespace>.servicebus.usgovcloudapi.net). This is a push from a SaaS
+        control plane we do not own - there is no on-prem collector in front
+        of it, and retention on the hub (1-7 days) is the only replay window
+        if the downstream consumer stalls.
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Cribl's Azure Event Hubs source consumes the hub with its own consumer
+        group and checkpoint store.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-azure.signinlogs
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: Azure Logs integration (azure.signinlogs data stream)
+      notes: >
+        The stock integration's ingest pipeline handles the envelope and the
+        ECS basics (source.ip with geo/ASN enrichment, user.name/user.id,
+        event.outcome from the status error code) but leaves the great
+        majority of the record under azure.signinlogs.properties.* in
+        snake_case. Non-public clouds need resource_manager_endpoint set to
+        https://management.usgovcloudapi.net/ and authority_host set to
+        https://login.microsoftonline.us; the commercial defaults silently
+        fail to authenticate against a Government tenant.
+    fields:
+    - vendor: category
+      type: enum
+      description: >-
+        diagnostic log category that produced the record (SignInLogs,
+        NonInteractiveUserSignInLogs, ServicePrincipalSignInLogs,
+        ManagedIdentitySignInLogs)
+      ecs: null
+      status: unmapped
+      custom: azure.signinlogs.category
+      notes: >
+        the only field that separates interactive from non-interactive and
+        service-principal sign-ins; drives volume routing and most CSOC
+        filters, so it must survive into the index rather than being collapsed
+        into the data stream name
+    - vendor: operationName
+      type: string
+      description: name of the operation that produced the record, e.g. "Sign-in activity"
+      ecs: event.action
+      status: mapped
+      notes: >-
+        nearly constant per category; useful as event.action but carries
+        little discriminating value on its own
+    - vendor: properties.id
+      type: string
+      description: GUID uniquely identifying the sign-in activity
+      ecs: event.id
+      status: mapped
+    - vendor: properties.createdDateTime
+      type: timestamp
+      description: UTC date and time the sign-in was initiated (ISO 8601)
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: properties.userPrincipalName
+      type: string
+      description: UPN of the user who signed in
+      ecs: user.name
+      status: mapped
+      transform: >
+        the integration pipeline also derives user.email from this value when
+        it contains an "@"; note that for the ServicePrincipal and
+        ManagedIdentity categories this field is empty and the actor is only
+        in servicePrincipalName/servicePrincipalId
+    - vendor: properties.userDisplayName
+      type: string
+      description: display name of the user who signed in
+      ecs: user.full_name
+      status: mapped
+    - vendor: properties.userId
+      type: string
+      description: object ID (GUID) of the user in the directory
+      ecs: user.id
+      status: mapped
+    - vendor: properties.appDisplayName
+      type: string
+      description: >-
+        display name of the client application in the request, as shown in the
+        Entra admin center (Azure Portal, Outlook Mobile, a first-party or
+        registered app)
+      ecs: null
+      status: unmapped
+      custom: azure.signinlogs.properties.app_display_name
+      notes: >
+        the client the sign-in came through, not the application signed into -
+        the signed-into resource is properties.resourceDisplayName. It rests
+        in the custom namespace because service.name, the ECS field that would
+        carry a client application name, is taken by servicePrincipalName in
+        the stock pipeline and there means the calling service principal
+    - vendor: properties.resourceDisplayName
+      type: string
+      description: name of the resource the user signed into
+      ecs: service.target.name
+      status: partial
+      notes: >
+        the application authenticated to (Office 365 Exchange Online,
+        Microsoft Graph), distinct from the client application in
+        properties.appDisplayName. The stock integration leaves it at
+        azure.signinlogs.properties.resource_display_name, so reaching ECS
+        service.target.name needs an explicit copy in a @custom pipeline
+    - vendor: properties.resourceId
+      type: string
+      description: GUID of the resource the user signed into
+      ecs: null
+      status: partial
+      custom: azure.signinlogs.properties.resource_id
+      notes: >-
+        the stable identifier behind resourceDisplayName and the join key when
+        a resource is renamed; the readable target name carries the ECS
+        mapping on service.target.name. service.target.id is the field it
+        could plausibly occupy and is deliberately declined: ECS defines it as
+        the identifier of a RUNNING service instance, while this GUID
+        identifies a directory application - the same distinction that keeps a
+        service-account SID off service.id in the active-directory map.
+    - vendor: properties.ipAddress
+      type: ip
+      description: IP address of the client the sign-in came from
+      ecs: source.ip
+      status: mapped
+      transform: >
+        the integration converts to source.ip and copies to source.address and
+        client.ip, then runs geoip/ASN enrichment; records where the value is
+        not a parseable address (some pass-through and proxy cases) fall back
+        to source.address only
+    - vendor: properties.clientAppUsed
+      type: enum
+      description: >-
+        legacy client used for the sign-in (Browser, Exchange ActiveSync,
+        Modern clients, IMAP, MAPI, SMTP, POP)
+      ecs: null
+      status: unmapped
+      custom: azure.signinlogs.properties.client_app_used
+      notes: >
+        the legacy-authentication detector - IMAP/POP/SMTP/MAPI values are the
+        classic basic-auth attack surface; no ECS equivalent, and it must not
+        be conflated with user_agent.*
+    - vendor: properties.userAgent
+      type: string
+      description: user agent string reported by the signing-in client
+      ecs: user_agent.original
+      status: mapped
+      notes: >-
+        absent on non-browser and service-principal sign-ins; unbounded free
+        text, so it is the length-cap candidate on this dataset
+    - vendor: properties.conditionalAccessStatus
+      type: enum
+      description: >-
+        outcome of Conditional Access evaluation for the sign-in (success,
+        failure, notApplied)
+      ecs: null
+      status: unmapped
+      custom: azure.signinlogs.properties.conditional_access_status
+      notes: >
+        deliberately not mapped to event.outcome - a sign-in can succeed with
+        conditionalAccessStatus notApplied, and overloading event.outcome
+        would make CA-bypass hunting impossible
+    - vendor: properties.appliedConditionalAccessPolicies
+      type: string
+      description: >-
+        array of the Conditional Access policies evaluated for the sign-in,
+        each with id, displayName, enforcedGrantControls,
+        enforcedSessionControls and result
+      ecs: null
+      status: unmapped
+      custom: azure.signinlogs.properties.applied_conditional_access_policies
+      notes: >
+        despite the name it lists policies that were NOT applied as well, with
+        a per-policy result (success, failure, notApplied, notEnabled,
+        unknown). Not mapped to rule.name/rule.id even though each entry's
+        displayName and id do describe one object: ECS rule.* is a single
+        object per event and this is an unbounded array, so collapsing it
+        would lose exactly the per-policy result the CSOC queries on
+    - vendor: properties.authenticationRequirement
+      type: enum
+      description: >-
+        highest level of authentication required across all steps for the
+        sign-in to succeed (singleFactorAuthentication,
+        multiFactorAuthentication)
+      ecs: null
+      status: unmapped
+      custom: azure.signinlogs.properties.authentication_requirement
+      notes: >-
+        the MFA-satisfied indicator; paired with authenticationDetails for
+        which method actually satisfied it
+    - vendor: properties.riskLevelDuringSignIn
+      type: enum
+      description: >-
+        Identity Protection risk level evaluated at sign-in time (none, low,
+        medium, high, hidden)
+      ecs: null
+      status: unmapped
+      custom: azure.signinlogs.properties.risk_level_during_signin
+      notes: >
+        returns the literal string "hidden" for tenants without Entra ID P2,
+        so a naive severity mapping produces a bogus level for every record in
+        an unlicensed tenant; kept as a string rather than forced onto the
+        numeric event.severity scale for that reason
+    - vendor: properties.riskEventTypes_v2
+      type: string
+      description: >-
+        array of risk detection types associated with the sign-in
+        (unlikelyTravel, anonymizedIPAddress, maliciousIPAddress,
+        unfamiliarFeatures, leakedCredentials, passwordSpray, ...)
+      ecs: null
+      status: unmapped
+      custom: azure.signinlogs.properties.risk_event_types_v2
+      notes: >
+        supersedes the deprecated riskEventTypes field, which is still present
+        in the record and must not be used; not a threat.* field - these are
+        Microsoft detection type names, not TI indicators
+    - vendor: properties.status.errorCode
+      type: integer
+      description: five/six-digit AADSTS error code for the sign-in, 0 on success
+      ecs: event.outcome
+      status: mapped
+      transform: >
+        0 becomes success and any non-zero value becomes failure; this is the
+        only reliable outcome source on the dataset. The code itself (50126
+        bad password, 50053 smart lockout, 50076/50079 MFA required, 53003
+        blocked by CA) should also be preserved and resolved through a lookup
+        table rather than discarded
+    - vendor: properties.status.failureReason
+      type: string
+      description: human-readable reason for the sign-in failure
+      ecs: error.message
+      status: mapped
+      notes: >
+        free text, localized, and phrased inconsistently across error classes
+        - useful for analyst display, unsafe as an alerting key; alert on the
+        numeric error code instead
+    - vendor: properties.deviceDetail.deviceId
+      type: string
+      description: >-
+        Entra device object ID of the device the sign-in came from, empty for
+        unregistered devices
+      ecs: device.id
+      status: partial
+      notes: >
+        the stock integration leaves this at
+        azure.signinlogs.properties.device_detail.device_id, so reaching ECS
+        device.id needs an explicit copy in a @custom pipeline; the value is
+        empty for any device not joined or registered to the tenant, which is
+        most of the interesting sign-ins
+    - vendor: properties.location.countryOrRegion
+      type: string
+      description: two-letter country code the sign-in was geolocated to by Microsoft
+      ecs: source.geo.country_iso_code
+      status: partial
+      notes: >
+        Microsoft's own geolocation of the client IP, which will disagree with
+        the integration's geoip enrichment of source.ip; decide which one owns
+        source.geo.* rather than letting both write it
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Keep the worker group a pass-through and let the integration
+          pipeline parse, but own the volume problem here: split the four
+          diagnostic categories into separate routes so
+          ManagedIdentitySignInLogs and NonInteractiveUserSignInLogs can be
+          sampled, aggregated or dropped independently of interactive sign-ins
+          without touching the tenant diagnostic setting. Run the Event Hubs
+          source with a dedicated consumer group and a durable checkpoint
+          store, and use Persistent Queue backpressure on the Elastic
+          destination - the hub's 1-7 day retention is the only replay window
+          and a blocked pipeline burns it.
+        elastic: >
+          Point the Azure Logs integration at the Government endpoints
+          (resource_manager_endpoint management.usgovcloudapi.net,
+          authority_host login.microsoftonline.us) and layer a
+          logs-azure.signinlogs@custom pipeline for the gaps the stock
+          pipeline leaves: copy deviceDetail.deviceId to device.id, copy
+          resourceDisplayName to service.target.name so the signed-into
+          application has an ECS home, promote the sign-in status error code
+          into error.code alongside the derived event.outcome, and resolve the
+          five/six-digit code to a readable reason through an enrich policy so
+          failure triage does not require the AADSTS lookup site. Add explicit
+          custom-namespace index-template mappings for client_app_used,
+          conditional_access_status, authentication_requirement,
+          risk_level_during_signin, risk_event_types_v2 and resource_id as
+          keyword, and map applied_conditional_access_policies as nested
+          rather than flattened if the CSOC needs to query policy name and
+          result together.
+        relay: >
+          Do not try to ship this record shape as-is across the guard:
+          deviceDetail, location, status and the
+          appliedConditionalAccessPolicies array push the JSON well past the
+          two-level nesting the crossing doctrine allows, so flatten low-side
+          to a thin envelope (_dataId, @timestamp, host, _raw) and move to
+          hybrid, or flatten the arrays into bounded scalar keys. The feed is
+          already JSON, so nothing CEF-shaped is involved and the ArcSight CEF
+          connector path is explicitly not the target. Content-filter friction
+          is the free-text user agent and the failure-reason string; cap both
+          and drop _raw on the non-interactive categories first, keeping it
+          for interactive sign-ins where forensic value is highest.
+      direct:
+        parse_location: high
+        cribl: >
+          Keep the worker group a pass-through and let the integration
+          pipeline parse, but own the volume problem here: split the four
+          diagnostic categories into separate routes so
+          ManagedIdentitySignInLogs and NonInteractiveUserSignInLogs can be
+          sampled, aggregated or dropped independently of interactive sign-ins
+          without touching the tenant diagnostic setting. Run the Event Hubs
+          source with a dedicated consumer group and a durable checkpoint
+          store, and use Persistent Queue backpressure on the Elastic
+          destination - the hub's 1-7 day retention is the only replay window
+          and a blocked pipeline burns it.
+        elastic: >
+          Point the Azure Logs integration at the Government endpoints
+          (resource_manager_endpoint management.usgovcloudapi.net,
+          authority_host login.microsoftonline.us) and layer a
+          logs-azure.signinlogs@custom pipeline for the gaps the stock
+          pipeline leaves: copy deviceDetail.deviceId to device.id, copy
+          resourceDisplayName to service.target.name so the signed-into
+          application has an ECS home, promote the sign-in status error code
+          into error.code alongside the derived event.outcome, and resolve the
+          five/six-digit code to a readable reason through an enrich policy so
+          failure triage does not require the AADSTS lookup site. Add explicit
+          custom-namespace index-template mappings for client_app_used,
+          conditional_access_status, authentication_requirement,
+          risk_level_during_signin, risk_event_types_v2 and resource_id as
+          keyword, and map applied_conditional_access_policies as nested
+          rather than flattened if the CSOC needs to query policy name and
+          result together.
+  - format: api-pull
+    enable: >
+      Add a Log Analytics workspace as a destination on the same tenant
+      diagnostic setting that already streams to Event Hubs (Entra admin
+      center > Identity > Monitoring & health > Diagnostic settings > Edit, or
+      a Microsoft.aadiam/diagnosticSettings resource with a workspaceId) and
+      check the SignInLogs, NonInteractiveUserSignInLogs,
+      ServicePrincipalSignInLogs and ManagedIdentitySignInLogs categories -
+      one setting may target a workspace and an event hub at once, so this is
+      an added destination, not a replacement. Each of the four categories
+      lands in its OWN table: interactive user sign-ins in SigninLogs, and the
+      other three in AADNonInteractiveUserSignInLogs,
+      AADServicePrincipalSignInLogs and AADManagedIdentitySignInLogs, which
+      carry substantially the same columns (with several typed as JSON strings
+      rather than dynamic, and a coarser Success/Failure ResultType on the
+      service-principal and managed-identity tables). The field table below
+      documents SigninLogs; the sibling tables mirror it. Retrieve by querying
+      the Azure Monitor Log Analytics Query API over HTTPS with an Entra
+      service principal granted Log Analytics Reader on the workspace: POST
+      https://api.loganalytics.us/v1/workspaces/{workspaceId}/query (the
+      Government query host - api.loganalytics.io is the commercial host and
+      will not resolve the Gov workspace), authenticating the token against
+      the Gov authority login.microsoftonline.us. A collection query must name
+      ALL FOUR tables or it silently drops the non-interactive,
+      service-principal and managed-identity volume - either a union such as
+      `union SigninLogs, AADNonInteractiveUserSignInLogs,
+      AADServicePrincipalSignInLogs, AADManagedIdentitySignInLogs | where
+      TimeGenerated > ago(5m)`, or four per-table scheduled queries whose
+      windows are managed independently (the recommended shape, since it lets
+      the high-volume sibling tables be sampled without touching the
+      interactive query). Because this is a poll, the collector owns the query
+      window and de-duplicates on Id; there is no checkpointed stream and no
+      1-7 day hub-retention replay bound - the workspace's own retention is
+      the replay window.
+    references:
+    - >-
+      https://learn.microsoft.com/en-us/azure/azure-monitor/reference/tables/signinlogs
+    - >-
+      https://learn.microsoft.com/en-us/azure/azure-monitor/reference/tables/aadnoninteractiveusersigninlogs
+    - >-
+      https://learn.microsoft.com/en-us/azure/azure-monitor/reference/tables/aadserviceprincipalsigninlogs
+    - >-
+      https://learn.microsoft.com/en-us/azure/azure-monitor/reference/tables/aadmanagedidentitysigninlogs
+    - >-
+      https://learn.microsoft.com/en-us/entra/identity/monitoring-health/howto-integrate-activity-logs-with-azure-monitor-logs
+    - https://learn.microsoft.com/en-us/azure/azure-monitor/logs/api/overview
+    - https://learn.microsoft.com/en-us/azure/azure-monitor/logs/api/request-format
+    - https://learn.microsoft.com/en-us/graph/api/resources/signin
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        Cribl REST Collector against the Log Analytics Query API, feeding a
+        column-rename pipeline into logs-azure.signinlogs
+      notes: >
+        There is no stock Elastic integration that runs KQL against a
+        workspace - the Azure Logs integration is Event Hubs-only - so the
+        realistic path is a Cribl REST Collector that pages the Query API
+        response (a columns/rows table, not one object per row) into events,
+        then a pipeline that renames the PascalCase columns back to the
+        resource-log properties the stock azure.signinlogs pipeline expects
+        (UserPrincipalName -> properties.userPrincipalName, IPAddress ->
+        properties.ipAddress, ResultType -> properties.status.errorCode,
+        ConditionalAccessStatus -> properties.conditionalAccessStatus) before
+        handing off. Two reshape traps drive that pipeline: the four sign-in
+        categories are split across four sibling tables (SigninLogs plus
+        AADNonInteractiveUserSignInLogs, AADServicePrincipalSignInLogs,
+        AADManagedIdentitySignInLogs), so the collector must query all four
+        and tag each event with its source table to reproduce the routing the
+        Event Hub feed drives off the `category` field - each table also
+        carries a constant Category column, but the source table is the
+        reliable discriminator; and in SigninLogs DeviceDetail, Location and
+        Status arrive as parsed dynamic columns, so unlike the hub feed they
+        need no JSON-decode step (the sibling tables type several of these as
+        JSON strings that DO need decoding), while Status still carries the
+        same errorCode/failureReason pair that ResultType and
+        ResultDescription duplicate as flat columns.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Treat the workspace pull as a topology alternative to the Event Hubs
+          source, not a second copy to merge - a tenant that streams to the
+          hub AND pulls from the workspace will double every sign-in, so pick
+          one authoritative transport per instance and reconcile the other as
+          a metric. If the pull is chosen, run the REST Collector on the
+          low-side worker group with egress to api.loganalytics.us, key the
+          scheduled query window on TimeGenerated with a deliberate overlap,
+          and de-duplicate on Id across windows - the poll is at-least-once by
+          window and re-emits boundary records. Own the volume problem in the
+          KQL itself: the non-interactive, service-principal and
+          managed-identity sign-ins are 5-10x the interactive volume and live
+          in their own sibling tables (AADNonInteractiveUserSignInLogs,
+          AADServicePrincipalSignInLogs, AADManagedIdentitySignInLogs), so
+          sample or drop them by scoping or slowing those per-table scheduled
+          queries independently of the SigninLogs interactive query rather
+          than downstream, so the noise never leaves Azure or counts against
+          egress. Back the Elastic destination with Persistent Queue and cap
+          or drop UserAgent low-side on the non-interactive tables first.
+        elastic: >
+          Once the columns are renamed to the resource-log schema the same
+          logs-azure.signinlogs@custom fixes apply, plus the ones this reshape
+          makes cheaper. ResultType is the flat AADSTS error code (0 =
+          success) rather than a nested status object, so event.outcome
+          derivation and error.code promotion are a direct column read;
+          resolve the code to a readable reason through an enrich policy
+          exactly as on the json feed. DeviceDetail is a parsed dynamic here,
+          so copying its deviceId to device.id no longer needs a decode step;
+          the copy of ResourceDisplayName to service.target.name, which gives
+          the signed-into application its ECS home, is owed here exactly as on
+          the hub feed. Take the reshape's genuine additions:
+          AutonomousSystemNumber gives source.as.number the hub feed never
+          carried (cast the string to a long), and LocationDetails promotes
+          city/state/country the envelope buried - decide whether it or the
+          geoip enrichment of source.ip owns source.geo.*. Map
+          client_app_used, conditional_access_status,
+          authentication_requirement, risk_level_during_signin,
+          risk_level_aggregated, risk_event_types_v2 and resource_id as
+          keyword in the custom namespace. The one column trap: TenantId in
+          this table is the Log Analytics workspace GUID, not the Entra tenant
+          - use AADTenantId for the tenant and never feed TenantId to any
+          organization field.
+        relay: >
+          The crossing shape is unchanged in spirit from the json feed:
+          DeviceDetail, LocationDetails, Status and the
+          AppliedConditionalAccessPolicies list push the record past the
+          two-level nesting the crossing doctrine allows, so flatten low-side
+          to a thin envelope (_dataId, @timestamp, host, _raw) and move to
+          hybrid, or flatten the dynamics into bounded scalar keys. The
+          reshape helps at the margin - UserPrincipalName, IPAddress, Location
+          and AutonomousSystemNumber are already flat scalar columns rather
+          than values dug out of a properties path - so the allow-listed
+          record that crosses is a little smaller. Content-filter friction is
+          the free-text UserAgent and ResultDescription; cap both and drop
+          _raw on the non-interactive rows first, keeping it for interactive
+          sign-ins where forensic value is highest. De-duplicate and reconcile
+          low-side and high-side counts per (dataset, hour) on Id, the
+          per-record key the workspace provides.
+      direct:
+        parse_location: high
+        cribl: >
+          For a high-side instance with no guard the choice between the
+          workspace pull and the Event Hubs stream is operational: the pull
+          needs a service principal, scheduled KQL queries, and window/dedup
+          management but lets the 5-10x non-interactive volume be sampled or
+          dropped before it is ever collected - simply by scoping or omitting
+          the sibling-table queries - where the stream is already deployed and
+          self-checkpointing. If the pull is used, run the REST Collector with
+          per-table selection of the sign-in tables, light shaping, and
+          Persistent Queue on the Elastic destination.
+        elastic: >
+          Rename the SigninLogs columns to the resource-log schema, run the
+          stock azure.signinlogs pipeline, and layer the
+          logs-azure.signinlogs@custom fixes: copy DeviceDetail.deviceId to
+          device.id (a parsed dynamic here, so no decode step), copy
+          ResourceDisplayName to service.target.name so the signed-into
+          application has an ECS home, read event.outcome and error.code
+          straight off the flat ResultType column, and resolve the AADSTS code
+          to a readable reason through an enrich policy. Take the reshape's
+          genuine additions - source.as.number from AutonomousSystemNumber
+          (cast the string to a long) and the promoted city/state/country from
+          LocationDetails - rather than re-deriving them from the nested
+          properties the envelope forces you to parse, and map
+          client_app_used, conditional_access_status,
+          authentication_requirement, risk_level_during_signin,
+          risk_level_aggregated, risk_event_types_v2 and resource_id as
+          keyword in the custom namespace. TenantId here is the Log Analytics
+          workspace GUID - use AADTenantId for the Entra tenant.
+    fields:
+    - vendor: CreatedDateTime
+      type: datetime
+      description: date and time the sign-in was initiated, in UTC
+      ecs: '@timestamp'
+      status: mapped
+      notes: >-
+        the workspace column equivalent of the envelope's
+        properties.createdDateTime; the sign-in time, not the workspace ingest
+        time
+    - vendor: TimeGenerated
+      type: datetime
+      description: date and time the record was created in the workspace
+      ecs: event.ingested
+      status: mapped
+      notes: >
+        the reshape recovers an ingest timestamp the Event Hub envelope does
+        not carry - the difference between this and CreatedDateTime is the
+        true collection lag, which the hub feed could only estimate against
+        enqueue time
+    - vendor: Id
+      type: string
+      description: identifier representing the sign-in activity
+      ecs: event.id
+      status: mapped
+      notes: >-
+        the column form of the envelope's properties.id; the per-record
+        de-duplication key across overlapping poll windows and the
+        reconciliation key across the guard
+    - vendor: OperationName
+      type: string
+      description: name of the operation that produced the record, e.g. "Sign-in activity"
+      ecs: event.action
+      status: mapped
+      notes: >-
+        nearly constant per sign-in category, so it carries little
+        discriminating value on its own
+    - vendor: IsInteractive
+      type: bool
+      description: >-
+        whether the sign-in was interactive (a user supplied an authentication
+        factor) or non-interactive (a token or code was used on the user's
+        behalf)
+      ecs: null
+      status: unmapped
+      custom: azure.signinlogs.is_interactive
+      notes: >
+        distinguishes interactive from non-interactive user sign-ins. In this
+        format the coarse category split is by TABLE - SigninLogs holds the
+        interactive user sign-ins, and the non-interactive, service-principal
+        and managed-identity sign-ins are in their own sibling tables - so
+        this boolean refines the interactive-vs-not distinction within the
+        user sign-in surface rather than carrying the whole routing signal the
+        Event Hub feed reads from `category`
+    - vendor: UserPrincipalName
+      type: string
+      description: UPN of the user who signed in
+      ecs: user.name
+      status: mapped
+      transform: >
+        the pipeline also derives user.email from this when it contains an
+        "@"; empty on the ServicePrincipal and ManagedIdentity rows, where the
+        actor is only in ServicePrincipalName/ServicePrincipalId
+    - vendor: UserDisplayName
+      type: string
+      description: display name of the user who signed in
+      ecs: user.full_name
+      status: mapped
+    - vendor: UserId
+      type: string
+      description: object ID (GUID) of the user in the directory
+      ecs: user.id
+      status: mapped
+    - vendor: UserType
+      type: string
+      description: whether the user is a member or a guest in the tenant (member, guest)
+      ecs: null
+      status: unmapped
+      custom: azure.signinlogs.properties.user_type
+      notes: >-
+        promoted to a first-class column in this format; the cheapest
+        guest-account discriminator, absent as a distinct field on the Event
+        Hub envelope
+    - vendor: AppDisplayName
+      type: string
+      description: >-
+        display name of the client application in the request, as shown in the
+        portal (Azure Portal, Outlook Mobile, a registered app)
+      ecs: null
+      status: unmapped
+      custom: azure.signinlogs.properties.app_display_name
+      notes: >
+        the client the sign-in came through, not the application signed into -
+        the signed-into resource is ResourceDisplayName. It rests in the
+        custom namespace because service.name, the ECS field that would carry
+        a client application name, is taken by ServicePrincipalName once the
+        columns are renamed and there means the calling service principal
+    - vendor: ResourceDisplayName
+      type: string
+      description: name of the resource the user signed in to
+      ecs: service.target.name
+      status: partial
+      notes: >
+        the application authenticated to (Office 365 Exchange Online,
+        Microsoft Graph), distinct from the client application in
+        AppDisplayName. The stock pipeline leaves the renamed column at
+        azure.signinlogs.properties.resource_display_name, so reaching ECS
+        service.target.name needs the same explicit @custom copy as the hub
+        feed
+    - vendor: ResourceIdentity
+      type: string
+      description: identifier of the resource the user signed in to
+      ecs: null
+      status: partial
+      custom: azure.signinlogs.properties.resource_id
+      notes: >-
+        the stable identifier behind ResourceDisplayName, which carries the
+        ECS mapping on service.target.name; the table documents a ResourceId
+        column with the same meaning, so take one and keep the collector
+        consistent rather than writing both. service.target.id is the field it
+        could plausibly occupy and is deliberately declined: ECS defines it as
+        the identifier of a RUNNING service instance, while this GUID
+        identifies a directory application - the same distinction that keeps a
+        service-account SID off service.id in the active-directory map.
+    - vendor: IPAddress
+      type: string
+      description: IP address of the client from where the sign-in occurred
+      ecs: source.ip
+      status: mapped
+      transform: >
+        the pipeline converts to source.ip, copies to source.address and
+        client.ip, then runs geoip/ASN enrichment; rows where the value is not
+        a parseable address (some pass-through and proxy cases) fall back to
+        source.address only
+    - vendor: AutonomousSystemNumber
+      type: string
+      description: Autonomous System Number (ASN) of the network the sign-in came from
+      ecs: source.as.number
+      status: partial
+      transform: >
+        a genuine reshape addition - the Event Hub envelope carries no ASN,
+        and Microsoft resolves it here so the geoip pipeline does not have to.
+        Emitted as a string; cast to the long ECS source.as.number expects
+    - vendor: ClientAppUsed
+      type: string
+      description: >-
+        legacy client used for the sign-in (Browser, Exchange ActiveSync,
+        Modern clients, IMAP, MAPI, SMTP, POP)
+      ecs: null
+      status: unmapped
+      custom: azure.signinlogs.properties.client_app_used
+      notes: >-
+        the legacy-authentication detector - IMAP/POP/SMTP/MAPI are the
+        classic basic-auth attack surface; no ECS equivalent and it must not
+        be conflated with user_agent.*
+    - vendor: UserAgent
+      type: string
+      description: user agent string reported by the signing-in client
+      ecs: user_agent.original
+      status: mapped
+      notes: >-
+        absent on non-browser and service-principal rows; unbounded free text,
+        so it is the length-cap candidate on this dataset
+    - vendor: ConditionalAccessStatus
+      type: string
+      description: >-
+        outcome of Conditional Access evaluation for the sign-in (success,
+        failure, notApplied)
+      ecs: null
+      status: unmapped
+      custom: azure.signinlogs.properties.conditional_access_status
+      notes: >-
+        deliberately not mapped to event.outcome - a sign-in can succeed with
+        a notApplied CA status, and overloading event.outcome would make
+        CA-bypass hunting impossible
+    - vendor: ConditionalAccessPolicies
+      type: dynamic
+      description: >-
+        list of Conditional Access policies triggered by the sign-in, each
+        with id, displayName, enforcedGrantControls, enforcedSessionControls
+        and result
+      ecs: null
+      status: unmapped
+      custom: azure.signinlogs.properties.applied_conditional_access_policies
+      transform: >
+        this format delivers the policy list as a parsed dynamic column, so no
+        JSON-decode step is needed - the same data the Event Hub feed carries
+        under properties.appliedConditionalAccessPolicies. Despite the name it
+        lists policies that were NOT applied as well, with a per-policy result
+        (success, failure, notApplied, notEnabled, unknown). Not collapsed to
+        a single rule.* object: it is an unbounded array and collapsing it
+        would lose exactly the per-policy result the CSOC queries on. Note the
+        sibling AppliedConditionalAccessPolicies column is a JSON string
+        rather than a dynamic
+    - vendor: AuthenticationRequirement
+      type: string
+      description: >-
+        highest level of authentication required across all steps for the
+        sign-in to succeed (singleFactorAuthentication,
+        multiFactorAuthentication)
+      ecs: null
+      status: unmapped
+      custom: azure.signinlogs.properties.authentication_requirement
+      notes: >-
+        the MFA-satisfied indicator, paired with AuthenticationDetails for
+        which method actually satisfied it
+    - vendor: RiskLevelDuringSignIn
+      type: string
+      description: >-
+        Identity Protection risk level evaluated at sign-in time (none, low,
+        medium, high, hidden)
+      ecs: null
+      status: unmapped
+      custom: azure.signinlogs.properties.risk_level_during_signin
+      notes: >
+        returns the literal string "hidden" for tenants without Entra ID P2,
+        so a naive severity mapping produces a bogus level for every row in an
+        unlicensed tenant; kept a string rather than forced onto the numeric
+        event.severity scale for that reason
+    - vendor: RiskLevelAggregated
+      type: string
+      description: >-
+        aggregated Identity Protection risk level for the sign-in (none, low,
+        medium, high, hidden)
+      ecs: null
+      status: unmapped
+      custom: azure.signinlogs.properties.risk_level_aggregated
+      notes: >-
+        a first-class column in this format that the json envelope does not
+        surface; the same "hidden means unlicensed" P2 caveat as
+        RiskLevelDuringSignIn applies
+    - vendor: RiskEventTypes_V2
+      type: string
+      description: >-
+        list of risk detection types associated with the sign-in
+        (unlikelyTravel, anonymizedIPAddress, maliciousIPAddress,
+        unfamiliarFeatures, leakedCredentials, ...)
+      ecs: null
+      status: unmapped
+      custom: azure.signinlogs.properties.risk_event_types_v2
+      notes: >-
+        supersedes the deprecated RiskEventTypes column, which is still
+        present and must not be used; not a threat.* field - these are
+        Microsoft detection type names, not TI indicators
+    - vendor: ResultType
+      type: string
+      description: 5-6 digit AADSTS error code generated during the sign-in, 0 on success
+      ecs: event.outcome
+      status: partial
+      transform: >
+        the reshape flattens the envelope's properties.status.errorCode into a
+        top-level column: 0 becomes success and any non-zero value becomes
+        failure. The code itself (50126 bad password, 50053 smart lockout,
+        50076/50079 MFA required, 53003 blocked by CA) should be preserved and
+        resolved through a lookup rather than discarded - it is a direct
+        column read here where the hub feed had to reach into a nested status
+        object
+    - vendor: ResultDescription
+      type: string
+      description: error message or reason for failure for the sign-in
+      ecs: error.message
+      status: mapped
+      notes: >
+        the flat-column form of the envelope's
+        properties.status.failureReason; free text, localized and phrased
+        inconsistently across error classes - useful for analyst display,
+        unsafe as an alerting key. Alert on ResultType instead
+    - vendor: Status
+      type: dynamic
+      description: sign-in status object carrying the error code and description in case of failure
+      ecs: null
+      status: unmapped
+      custom: azure.signinlogs.properties.status
+      notes: >
+        the parsed dynamic form of the status object; its errorCode and
+        failureReason duplicate the flat ResultType and ResultDescription
+        columns, so take the outcome from ResultType and keep this as the
+        structured record rather than deriving outcome twice
+    - vendor: DeviceDetail
+      type: dynamic
+      description: >-
+        device information for the sign-in, including deviceId,
+        operatingSystem, browser, isManaged and isCompliant
+      ecs: device.id
+      status: partial
+      transform: >
+        a parsed dynamic column in this format, so reaching device.id is a
+        copy of DeviceDetail.deviceId with no decode step - cheaper than the
+        hub feed, where the stock integration leaves it at
+        properties.device_detail.device_id. Empty for any device not joined or
+        registered to the tenant, which is most of the interesting sign-ins
+    - vendor: Location
+      type: string
+      description: two-letter country code the sign-in was geolocated to by Microsoft
+      ecs: source.geo.country_iso_code
+      status: partial
+      notes: >
+        Microsoft's own geolocation of the client IP, which disagrees with the
+        integration's geoip enrichment of source.ip; decide which one owns
+        source.geo.* rather than letting both write it
+    - vendor: LocationDetails
+      type: dynamic
+      description: city, state, country/region and latitude/longitude the sign-in came from
+      ecs: source.geo.city_name
+      status: partial
+      transform: >
+        the reshape promotes the full geo breakdown the envelope buries;
+        extract .city to source.geo.city_name and .state to
+        source.geo.region_name, subject to the same Microsoft-vs-geoip
+        ownership decision as Location
+    - vendor: ServicePrincipalName
+      type: string
+      description: >-
+        application name used for sign-in, populated on service-principal and
+        managed-identity sign-ins
+      ecs: null
+      status: unmapped
+      custom: azure.signinlogs.properties.service_principal_name
+      notes: >-
+        the actor on the ServicePrincipal and ManagedIdentity categories,
+        where UserPrincipalName is empty; it names the signing-in principal,
+        which is what service.name carries once the stock pipeline reads this
+        column - the application signed into is ResourceDisplayName, on
+        service.target.name
+    - vendor: ServicePrincipalId
+      type: string
+      description: >-
+        application identifier used for sign-in, populated on
+        service-principal and managed-identity sign-ins
+      ecs: null
+      status: unmapped
+      custom: azure.signinlogs.properties.service_principal_id
+      notes: >-
+        the identifier of the signing-in service principal, populated on the
+        AADServicePrincipalSignInLogs and AADManagedIdentitySignInLogs tables;
+        the source table (not this field) is the discriminator that separates
+        those sign-ins from interactive user sign-ins, though each table also
+        carries a constant Category column
+    - vendor: CorrelationId
+      type: string
+      description: >-
+        identifier sent from the client when the sign-in was initiated, shared
+        across the sign-in's related records
+      ecs: null
+      status: unmapped
+      custom: azure.signinlogs.properties.correlation_id
+      notes: >-
+        the join key back to the Identity Protection risk detections and to
+        the audit log; kept custom rather than mapped to trace.id, which
+        models distributed tracing spans
+    - vendor: AADTenantId
+      type: string
+      description: the Entra ID tenant the sign-in occurred in
+      ecs: null
+      status: unmapped
+      custom: azure.tenant_id
+      notes: >
+        use this for the Entra tenant, NOT the TenantId column - TenantId in
+        this table is the Log Analytics workspace GUID the record was stored
+        in, a reshape trap that must not be fed to any organization/tenant
+        field
+- id: audit
+  name: Audit logs (directory changes)
+  description: >
+    The directory change record: who created, modified or deleted which user,
+    group, role assignment, application, service principal or policy. One
+    diagnostic category (AuditLogs) covering every service that writes to the
+    directory - Core Directory, self-service password management, Privileged
+    Identity Management, B2C and the application management surfaces. This is
+    the dataset that answers privilege escalation and persistence questions
+    (role assignments, credential additions to service principals, CA policy
+    edits), and its targetResources.modifiedProperties array is the
+    before/after evidence that makes those answers stand up.
+  event_categories:
+  - iam
+  - configuration
+  route:
+    guarded:
+    - hop: other
+      name: Azure Government Event Hubs namespace
+      notes: >
+        same diagnostic setting and event hub as the sign-in categories; audit
+        volume is orders of magnitude lower, so this dataset is never the
+        reason the hub backs up.
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Consumed from the same Event Hubs source and split by the record's
+        category value; the modifiedProperties payload is the first thing the
+        guard owner will want bounded.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-azure.auditlogs
+    direct:
+    - hop: other
+      name: Azure Government Event Hubs namespace
+      notes: >
+        same diagnostic setting and event hub as the sign-in categories; audit
+        volume is orders of magnitude lower, so this dataset is never the
+        reason the hub backs up.
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Consumed from the same Event Hubs source and split by the record's
+        category value.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-azure.auditlogs
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: Azure Logs integration (azure.auditlogs data stream)
+      notes: >
+        The stock pipeline maps the initiating user and caller IP and derives
+        event.outcome from properties.result, but leaves targetResources and
+        modifiedProperties as nested objects under
+        azure.auditlogs.properties.*. App-initiated changes populate
+        initiatedBy.app instead of initiatedBy.user, and the pipeline does not
+        coalesce the two - a dashboard keyed on user.name silently loses every
+        service-principal-driven change.
+    fields:
+    - vendor: category
+      type: enum
+      description: diagnostic log category, currently always AuditLogs for this feed
+      ecs: null
+      status: unmapped
+      custom: azure.auditlogs.category
+    - vendor: operationName
+      type: string
+      description: name of the operation, carrying the same value as properties.activityDisplayName
+      ecs: null
+      status: unmapped
+      custom: azure.auditlogs.operation_name
+      notes: >
+        the stock Elastic pipeline copies this field to event.action; it
+        duplicates properties.activityDisplayName, so pick one source of truth
+        for event.action and keep the other as a custom field rather than
+        writing both
+    - vendor: properties.activityDisplayName
+      type: string
+      description: >-
+        name of the activity performed, e.g. "Add member to role", "Update
+        user", "Add service principal credentials"
+      ecs: event.action
+      status: mapped
+      notes: >-
+        the analyst-facing name of the change and the natural event.action for
+        this dataset
+    - vendor: properties.category
+      type: enum
+      description: >-
+        resource category the activity targeted (UserManagement,
+        GroupManagement, RoleManagement, ApplicationManagement,
+        DirectoryManagement, Policy, ...)
+      ecs: null
+      status: unmapped
+      custom: azure.auditlogs.properties.category
+      notes: >-
+        the coarse change-type facet every audit dashboard pivots on; distinct
+        from the record's top-level category
+    - vendor: properties.loggedByService
+      type: string
+      description: >-
+        service that recorded the activity (Core Directory, Self-service
+        Password Management, PIM, B2C, Invited Users, MIM Service)
+      ecs: event.provider
+      status: mapped
+    - vendor: properties.result
+      type: enum
+      description: result of the activity (success, failure, timeout, unknownFutureValue)
+      ecs: event.outcome
+      status: partial
+      transform: >
+        success and failure map directly; timeout and unknownFutureValue have
+        no ECS equivalent and must be mapped to unknown rather than being
+        copied verbatim or folded into failure, which would overcount denied
+        changes
+    - vendor: properties.resultReason
+      type: string
+      description: description of the cause of a failure or timeout result
+      ecs: event.reason
+      status: mapped
+      notes: empty on successful activities
+    - vendor: properties.initiatedBy.user.userPrincipalName
+      type: string
+      description: UPN of the user who initiated the change
+      ecs: user.name
+      status: partial
+      notes: >
+        empty whenever the change was made by an application or service
+        principal, in which case only initiatedBy.app is populated; the stock
+        pipeline does not coalesce the two, so user.name is null for a
+        meaningful share of records
+    - vendor: properties.initiatedBy.user.id
+      type: string
+      description: object ID (GUID) of the initiating user
+      ecs: user.id
+      status: mapped
+    - vendor: properties.initiatedBy.user.ipAddress
+      type: ip
+      description: IP address of the OAuth client that initiated the activity
+      ecs: source.ip
+      status: partial
+      notes: >
+        documented as the peer directly connected to the service endpoint, so
+        behind a proxy or a first-party service it is a Microsoft address
+        rather than the analyst's client; frequently absent entirely on
+        app-initiated changes
+    - vendor: properties.initiatedBy.app.displayName
+      type: string
+      description: display name of the application or service principal that initiated the change
+      ecs: null
+      status: unmapped
+      custom: azure.auditlogs.properties.initiated_by.app.display_name
+      notes: >-
+        the actor for automation-driven directory changes; must be coalesced
+        with the user actor for any "who changed this" query to be complete
+    - vendor: properties.initiatedBy.app.servicePrincipalId
+      type: string
+      description: object ID of the service principal that initiated the change
+      ecs: null
+      status: unmapped
+      custom: azure.auditlogs.properties.initiated_by.app.service_principal_id
+    - vendor: properties.targetResources[].type
+      type: enum
+      description: >-
+        type of the object the change was applied to (User, Device, Group,
+        Application, ServicePrincipal, Policy, Role, Directory, Other)
+      ecs: null
+      status: unmapped
+      custom: azure.auditlogs.properties.target_resources.type
+      notes: >-
+        gates every other targetResources mapping - the same array positions
+        mean different things depending on this value
+    - vendor: properties.targetResources[].userPrincipalName
+      type: string
+      description: UPN of the target object when the target is a user
+      ecs: user.target.name
+      status: partial
+      notes: >
+        only valid when the entry's type is User; targetResources is an array
+        and a single activity can touch several objects, so the mapping must
+        pick the User-typed entry rather than the first one
+    - vendor: properties.targetResources[].id
+      type: string
+      description: object ID (GUID) of the target of the change
+      ecs: user.target.id
+      status: partial
+      notes: >-
+        same type-conditional caveat as the target UPN; for Group, Application
+        and Policy targets this is not a user id and must not be written to
+        user.target.id
+    - vendor: properties.targetResources[].displayName
+      type: string
+      description: display name of the changed object
+      ecs: null
+      status: unmapped
+      custom: azure.auditlogs.properties.target_resources.display_name
+    - vendor: properties.targetResources[].modifiedProperties
+      type: string
+      description: array of the attributes changed, each with displayName, oldValue and newValue
+      ecs: null
+      status: unmapped
+      custom: azure.auditlogs.properties.target_resources.modified_properties
+      notes: >
+        the before/after evidence for role assignments, credential additions
+        and policy edits. oldValue and newValue are JSON-encoded strings
+        inside a JSON document, unbounded in length, and can carry directory
+        attribute contents and credential metadata - the highest-value and
+        highest-risk payload on this technology
+    - vendor: properties.additionalDetails
+      type: string
+      description: >-
+        array of key/value pairs with extra context for the activity, commonly
+        including User-Agent
+      ecs: null
+      status: unmapped
+      custom: azure.auditlogs.properties.additional_details
+      transform: >
+        the array carries the client User-Agent under a key/value pair rather
+        than a named field; extract it into user_agent.original instead of
+        leaving it buried in a generic key/value list
+    - vendor: properties.id
+      type: string
+      description: GUID uniquely identifying the audit activity
+      ecs: event.id
+      status: mapped
+    - vendor: properties.activityDateTime
+      type: timestamp
+      description: UTC date and time the activity was performed (ISO 8601)
+      ecs: '@timestamp'
+      status: mapped
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Pass through unparsed and keep _raw end-to-end: this is low-volume,
+          individually significant, forensically load-bearing evidence and the
+          last dataset on this technology to economize on. Use the same Event
+          Hubs consumer group and checkpoint store as the sign-in route with
+          Persistent Queue backpressure on the Elastic destination, and route
+          by the record's category value so audit records are never sampled by
+          a volume rule written for non-interactive sign-ins.
+        elastic: >
+          Let the azure.auditlogs pipeline parse and add a
+          logs-azure.auditlogs@custom pipeline for the three gaps this map
+          records: coalesce initiatedBy.user and initiatedBy.app into one
+          actor so user.name is populated for service-principal-driven changes
+          (or a parallel actor field the dashboards read), map the first
+          targetResources entry to user.target.name/user.target.id only when
+          its type is User, and normalize properties.result - success and
+          failure map cleanly, but timeout and unknownFutureValue must become
+          unknown rather than silently counting as failures. Map
+          targetResources as nested (not flattened) so type, displayName and
+          modifiedProperties stay correlated within one entry, and give
+          modified_properties.old_value/new_value keyword mappings with
+          ignore_above so the JSON-encoded blobs stay queryable without
+          blowing up the index.
+        relay: >
+          On the guarded crossing, the friction is
+          targetResources[].modifiedProperties: unbounded, JSON-encoded
+          oldValue/newValue strings that can carry directory attribute
+          contents, certificate material and service-principal credential
+          metadata. Bound and allow-list those keys low-side before the
+          crossing rather than asking a custom NDJSON content filter to reason
+          about nested arrays, and keep the envelope keys identical to every
+          other dataset. Nothing CEF-shaped is involved - the feed is already
+          JSON - and with an at-most-once crossing, reconcile low-side and
+          high-side counts per (dataset, hour), which matters more here than
+          on sign-ins because a dropped role-assignment record is not
+          recoverable from volume.
+      direct:
+        parse_location: high
+        cribl: >
+          Pass through unparsed and keep _raw end-to-end: this is low-volume,
+          individually significant, forensically load-bearing evidence and the
+          last dataset on this technology to economize on. Use the same Event
+          Hubs consumer group and checkpoint store as the sign-in route with
+          Persistent Queue backpressure on the Elastic destination, and route
+          by the record's category value so audit records are never sampled by
+          a volume rule written for non-interactive sign-ins.
+        elastic: >
+          Let the azure.auditlogs pipeline parse and add a
+          logs-azure.auditlogs@custom pipeline for the three gaps this map
+          records: coalesce initiatedBy.user and initiatedBy.app into one
+          actor so user.name is populated for service-principal-driven changes
+          (or a parallel actor field the dashboards read), map the first
+          targetResources entry to user.target.name/user.target.id only when
+          its type is User, and normalize properties.result - success and
+          failure map cleanly, but timeout and unknownFutureValue must become
+          unknown rather than silently counting as failures. Map
+          targetResources as nested (not flattened) so type, displayName and
+          modifiedProperties stay correlated within one entry, and give
+          modified_properties.old_value/new_value keyword mappings with
+          ignore_above so the JSON-encoded blobs stay queryable without
+          blowing up the index.
+  - format: api-pull
+    enable: >
+      Check the AuditLogs category on the same tenant diagnostic setting that
+      targets the Log Analytics workspace (an added workspace destination
+      alongside the existing event hub, not a replacement). The records land
+      in the AuditLogs table, auto-created on first write. Retrieve them from
+      the Azure Monitor Log Analytics Query API over HTTPS with a service
+      principal granted Log Analytics Reader on the workspace: POST
+      https://api.loganalytics.us/v1/workspaces/{workspaceId}/query with a KQL
+      body such as `AuditLogs | where TimeGenerated > ago(15m)`, using the Gov
+      query host api.loganalytics.us and the Gov authority
+      login.microsoftonline.us. Audit volume is orders of magnitude below the
+      sign-in categories, so the query window can be wide; de-duplicate on Id
+      and let the workspace retention be the replay bound.
+    references:
+    - https://learn.microsoft.com/en-us/azure/azure-monitor/reference/tables/auditlogs
+    - >-
+      https://learn.microsoft.com/en-us/entra/identity/monitoring-health/howto-integrate-activity-logs-with-azure-monitor-logs
+    - https://learn.microsoft.com/en-us/azure/azure-monitor/logs/api/overview
+    - https://learn.microsoft.com/en-us/graph/api/resources/directoryaudit
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        Cribl REST Collector against the Log Analytics Query API, feeding a
+        column-rename pipeline into logs-azure.auditlogs
+      notes: >
+        Same REST-Collector-plus-column-rename path as the sign-in pull; the
+        Azure Logs integration is Event Hubs-only, so a pipeline renames the
+        PascalCase columns back to the resource-log properties the stock
+        azure.auditlogs pipeline expects (ActivityDisplayName ->
+        properties.activityDisplayName, Result -> properties.result,
+        InitiatedBy -> properties.initiatedBy, TargetResources ->
+        properties.targetResources). The reshape's advantage here is that
+        InitiatedBy, TargetResources and AdditionalDetails arrive as parsed
+        dynamic columns, so the nested actor and target objects are
+        addressable without the decode step the hub feed needs - but the
+        oldValue/newValue inside TargetResources[].modifiedProperties are
+        still JSON-encoded strings, and the initiatedBy.user / initiatedBy.app
+        coalescing gap is unchanged: an app-initiated change still leaves
+        user.name null unless the pipeline coalesces the two.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Pass through unparsed and keep _raw end-to-end: this is low-volume,
+          individually significant, forensically load-bearing evidence and the
+          last dataset on the technology to economize on. Treat the workspace
+          pull as a transport alternative to the event hub, not a second copy
+          - a tenant doing both will double every directory change, so pick
+          one authoritative source per instance. Run the REST Collector on the
+          low-side worker group with egress to api.loganalytics.us, key the
+          window on TimeGenerated with overlap, de-duplicate on Id, and keep
+          Persistent Queue backpressure on the Elastic destination.
+        elastic: >
+          Let the azure.auditlogs pipeline parse the renamed columns and add a
+          logs-azure.auditlogs@custom pipeline for the three gaps this reshape
+          still leaves: coalesce InitiatedBy.user and InitiatedBy.app into one
+          actor so user.name is populated for service-principal-driven
+          changes, map the User-typed entry of TargetResources to
+          user.target.name/user.target.id only when its type is User, and
+          normalize Result - success and failure map cleanly, but timeout and
+          unknownFutureValue must become unknown rather than counting as
+          failures. Because InitiatedBy and TargetResources are parsed
+          dynamics here, those extractions are column reads rather than JSON
+          decodes. Give modified_properties.old_value/new_value keyword
+          mappings with ignore_above so the JSON-encoded blobs stay queryable
+          without blowing up the index, and use AADOperationType
+          (Add/Update/Delete/Other), a coarse CRUD facet this format promotes
+          to a column, to pre-bucket changes the envelope offered no
+          equivalent for.
+        relay: >
+          On the guarded crossing the friction is
+          TargetResources[].modifiedProperties: unbounded, JSON-encoded
+          oldValue/newValue strings that can carry directory attribute
+          contents, certificate material and service-principal credential
+          metadata - and still JSON-encoded strings even though the enclosing
+          TargetResources is a parsed dynamic in this format. Bound and
+          allow-list those keys low-side before the crossing rather than
+          asking a custom NDJSON content filter to reason about nested arrays,
+          and keep the envelope keys identical to every other dataset. With an
+          at-most-once crossing, reconcile low-side and high-side counts per
+          (dataset, hour) on Id - which matters more here than on sign-ins,
+          because a dropped role-assignment record is not recoverable from
+          volume.
+      direct:
+        parse_location: high
+        cribl: >
+          High side with no guard: the choice between the workspace pull and
+          the event hub is operational, and for this low-volume dataset the
+          pull's wide query window and stable per-record Id are the draw. Run
+          the REST Collector with light shaping, de-duplicate on Id, and pass
+          through with _raw intact.
+        elastic: >
+          Let the azure.auditlogs pipeline parse the renamed columns and add a
+          logs-azure.auditlogs@custom pipeline for the gaps this reshape
+          leaves: coalesce InitiatedBy.user and InitiatedBy.app into one actor
+          so user.name is populated for service-principal-driven changes, map
+          the User-typed entry of TargetResources to
+          user.target.name/user.target.id only when its type is User, and
+          normalize Result - success and failure map cleanly, but timeout and
+          unknownFutureValue must become unknown rather than counting as
+          failures. Because InitiatedBy and TargetResources are parsed
+          dynamics here, those extractions are column reads rather than JSON
+          decodes; give modified_properties.old_value/new_value keyword
+          mappings with ignore_above so the JSON-encoded blobs stay queryable,
+          and use the promoted AADOperationType (Add/Update/Delete/Other)
+          column to pre-bucket changes the envelope offered no equivalent for.
+    fields:
+    - vendor: ActivityDateTime
+      type: datetime
+      description: date and time the activity was performed, in UTC
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: TimeGenerated
+      type: datetime
+      description: date and time the record was created in the workspace
+      ecs: event.ingested
+      status: mapped
+      notes: >-
+        the collection lag against ActivityDateTime, which the Event Hub
+        envelope could only estimate
+    - vendor: Id
+      type: string
+      description: GUID that uniquely identifies the activity
+      ecs: event.id
+      status: mapped
+      notes: the per-record de-duplication and cross-guard reconciliation key
+    - vendor: ActivityDisplayName
+      type: string
+      description: >-
+        name of the activity performed, e.g. "Add member to role", "Update
+        user", "Add service principal credentials"
+      ecs: event.action
+      status: mapped
+      notes: >-
+        the analyst-facing name of the change and the natural event.action for
+        this dataset
+    - vendor: OperationName
+      type: string
+      description: name of the operation, carrying the same value as ActivityDisplayName
+      ecs: null
+      status: unmapped
+      custom: azure.auditlogs.operation_name
+      notes: >
+        the stock pipeline copies this to event.action; it duplicates
+        ActivityDisplayName, so pick one source of truth for event.action and
+        keep the other custom rather than writing both
+    - vendor: AADOperationType
+      type: string
+      description: coarse type of the operation (Add, Update, Delete, Other)
+      ecs: null
+      status: unmapped
+      custom: azure.auditlogs.aad_operation_type
+      notes: >-
+        a first-class column this format promotes that the Event Hub envelope
+        has no equivalent for; the cheapest CRUD facet to pre-bucket directory
+        changes without parsing ActivityDisplayName
+    - vendor: Category
+      type: string
+      description: category of the record, "Audit" being the only supported value in this table
+      ecs: null
+      status: unmapped
+      custom: azure.auditlogs.category
+      notes: >-
+        a reshape difference - the Event Hub feed's top-level category is
+        "AuditLogs" and drives routing, whereas the workspace Category column
+        is the constant "Audit"; the diagnostic category is instead encoded in
+        the table name
+    - vendor: LoggedByService
+      type: string
+      description: >-
+        service that recorded the activity (Core Directory, Self-service
+        Password Management, PIM, B2C, Invited Users, MIM Service)
+      ecs: event.provider
+      status: mapped
+    - vendor: Result
+      type: string
+      description: result of the activity (success, failure, timeout, unknownFutureValue)
+      ecs: event.outcome
+      status: partial
+      transform: >
+        success and failure map directly; timeout and unknownFutureValue have
+        no ECS equivalent and must be mapped to unknown rather than folded
+        into failure, which would overcount denied changes. Distinct from the
+        coarser ResultType column, which carries only Success/Failure
+    - vendor: ResultReason
+      type: string
+      description: cause of a failure or timeout result
+      ecs: event.reason
+      status: mapped
+      notes: empty on successful activities
+    - vendor: ResultType
+      type: string
+      description: coarse result of the operation (Success, Failure)
+      ecs: null
+      status: unmapped
+      custom: azure.auditlogs.result_type
+      notes: >-
+        a two-value duplicate of the richer Result column; kept custom so it
+        is not mistaken for the timeout/unknownFutureValue-aware Result that
+        feeds event.outcome
+    - vendor: InitiatedBy.user.userPrincipalName
+      type: dynamic
+      description: UPN of the user who initiated the change, inside the parsed InitiatedBy dynamic
+      ecs: user.name
+      status: partial
+      notes: >
+        empty whenever an application or service principal made the change, in
+        which case only InitiatedBy.app is populated; the stock pipeline does
+        not coalesce the two, so user.name is null for a meaningful share of
+        records. Addressable as a dynamic sub-field here, no decode needed
+    - vendor: InitiatedBy.user.id
+      type: dynamic
+      description: object ID (GUID) of the initiating user
+      ecs: user.id
+      status: mapped
+    - vendor: InitiatedBy.user.ipAddress
+      type: dynamic
+      description: IP address of the OAuth client that initiated the activity
+      ecs: source.ip
+      status: partial
+      notes: >
+        documented as the peer directly connected to the service endpoint, so
+        behind a proxy or a first-party service it is a Microsoft address
+        rather than the analyst's client; frequently absent on app-initiated
+        changes
+    - vendor: InitiatedBy.app.displayName
+      type: dynamic
+      description: display name of the application or service principal that initiated the change
+      ecs: null
+      status: unmapped
+      custom: azure.auditlogs.properties.initiated_by.app.display_name
+      notes: >-
+        the actor for automation-driven directory changes; must be coalesced
+        with the user actor for any "who changed this" query to be complete
+    - vendor: InitiatedBy.app.servicePrincipalId
+      type: dynamic
+      description: object ID of the service principal that initiated the change
+      ecs: null
+      status: unmapped
+      custom: azure.auditlogs.properties.initiated_by.app.service_principal_id
+    - vendor: TargetResources[].type
+      type: dynamic
+      description: >-
+        type of the object the change was applied to (User, Device, Group,
+        Application, ServicePrincipal, Policy, Role, Directory, Other)
+      ecs: null
+      status: unmapped
+      custom: azure.auditlogs.properties.target_resources.type
+      notes: >-
+        gates every other TargetResources mapping - the same array positions
+        mean different things depending on this value
+    - vendor: TargetResources[].userPrincipalName
+      type: dynamic
+      description: UPN of the target object when the target is a user
+      ecs: user.target.name
+      status: partial
+      notes: >-
+        only valid when the entry's type is User; TargetResources is an array
+        and one activity can touch several objects, so the mapping must pick
+        the User-typed entry rather than the first
+    - vendor: TargetResources[].id
+      type: dynamic
+      description: object ID (GUID) of the target of the change
+      ecs: user.target.id
+      status: partial
+      notes: >-
+        same type-conditional caveat as the target UPN; for Group, Application
+        and Policy targets this is not a user id and must not be written to
+        user.target.id
+    - vendor: TargetResources[].displayName
+      type: dynamic
+      description: display name of the changed object
+      ecs: null
+      status: unmapped
+      custom: azure.auditlogs.properties.target_resources.display_name
+    - vendor: TargetResources[].modifiedProperties
+      type: dynamic
+      description: array of the attributes changed, each with displayName, oldValue and newValue
+      ecs: null
+      status: unmapped
+      custom: azure.auditlogs.properties.target_resources.modified_properties
+      notes: >
+        the before/after evidence for role assignments, credential additions
+        and policy edits. Although the enclosing TargetResources is a parsed
+        dynamic in this format, oldValue and newValue are still JSON-encoded
+        strings, unbounded in length, and can carry directory attribute
+        contents and credential metadata - the highest-value and highest-risk
+        payload on this technology and the one to bound before any crossing
+    - vendor: AdditionalDetails
+      type: dynamic
+      description: >-
+        array of key/value pairs with extra context for the activity, commonly
+        including User-Agent
+      ecs: null
+      status: unmapped
+      custom: azure.auditlogs.properties.additional_details
+      transform: >-
+        the array carries the client User-Agent as a key/value pair rather
+        than a named field; extract it into user_agent.original instead of
+        leaving it buried
+    - vendor: Identity
+      type: string
+      description: >-
+        identity from the token presented when the request was made - a user
+        account, system account or service principal
+      ecs: null
+      status: unmapped
+      custom: azure.auditlogs.identity
+      notes: >-
+        a display-string column this format surfaces; overlaps InitiatedBy but
+        is a flattened single value, useful only when the structured
+        InitiatedBy dynamic is absent
+    - vendor: Location
+      type: string
+      description: location of the datacenter that processed the activity
+      ecs: null
+      status: unmapped
+      custom: azure.auditlogs.datacenter_location
+      notes: >-
+        the processing datacenter, NOT the client's location - must not be
+        mapped to source.geo.* the way the sign-in Location column is
+    - vendor: AADTenantId
+      type: string
+      description: the Entra ID tenant the activity occurred in
+      ecs: null
+      status: unmapped
+      custom: azure.tenant_id
+      notes: >-
+        use this for the Entra tenant, not the TenantId column, which is the
+        Log Analytics workspace GUID
+- id: identity-protection
+  name: Identity Protection risk detections
+  description: >
+    Microsoft Entra ID Protection risk detections - leaked credentials,
+    password spray, unfamiliar sign-in properties, anonymized/malicious IP,
+    unlikely travel, anomalous token - streamed through the RiskyUsers and
+    UserRiskEvents diagnostic categories. Requires Entra ID P2; without it the
+    risk fields on every other dataset return the literal string "hidden".
+    Where the Government tenant has not enabled diagnostic streaming for these
+    categories, the same records are available by polling the Microsoft Graph
+    riskDetection endpoint at graph.microsoft.us (GCC High) or
+    dod-graph.microsoft.us (DoD), which changes the source format to api-pull
+    but not the field shape.
+  event_categories:
+  - authentication
+  - iam
+  route:
+    guarded:
+    - hop: other
+      name: Azure Government Event Hubs namespace
+      notes: >
+        RiskyUsers and UserRiskEvents categories on the same diagnostic
+        setting. Very low volume compared with the sign-in categories, but
+        latency-skewed: offline detections arrive hours to days after the
+        activity they describe.
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same Event Hubs source, split by category.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-azure.identity_protection
+    direct:
+    - hop: other
+      name: Azure Government Event Hubs namespace
+      notes: >
+        RiskyUsers and UserRiskEvents categories on the same diagnostic
+        setting. Very low volume compared with the sign-in categories, but
+        latency-skewed: offline detections arrive hours to days after the
+        activity they describe.
+    - hop: cribl
+      location: edge worker group
+      notes: Same Event Hubs source, split by category.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-azure.identity_protection
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: Azure Logs integration (azure.identity_protection data stream)
+      notes: >
+        The integration parses the envelope and geo-enriches the IP but keeps
+        the detection semantics under azure.identity_protection.properties.*.
+        Note the additionalInfo field arrives as a JSON-encoded string, not an
+        object, so it survives parsing intact and is never expanded by the
+        stock pipeline.
+    fields:
+    - vendor: category
+      type: enum
+      description: diagnostic log category (UserRiskEvents or RiskyUsers)
+      ecs: null
+      status: unmapped
+      custom: azure.identity_protection.category
+    - vendor: properties.id
+      type: string
+      description: unique ID of the risk detection
+      ecs: event.id
+      status: mapped
+    - vendor: properties.riskEventType
+      type: enum
+      description: >-
+        type of risk detected (leakedCredentials, passwordSpray,
+        unfamiliarFeatures, anonymizedIPAddress, maliciousIPAddress,
+        unlikelyTravel, anomalousToken, suspiciousBrowser, newCountry, ...)
+      ecs: null
+      status: unmapped
+      custom: azure.identity_protection.properties.risk_event_type
+      notes: >
+        the detection identity and the field every alert keys on. Not mapped
+        to rule.name: there is no sibling detection id, and rule.* implies a
+        rule object the tenant owns and can enumerate, which these
+        Microsoft-internal detections are not. Premium detections collapse to
+        the value "generic" in the API, which limits how specific an alert on
+        this field can be
+    - vendor: properties.riskLevel
+      type: enum
+      description: level of the detected risk (low, medium, high, hidden, none, unknownFutureValue)
+      ecs: event.severity
+      status: partial
+      transform: >
+        needs a lookup to the numeric ECS event.severity scale; hidden and
+        none are not severities and must be excluded from the mapping rather
+        than defaulted to zero, or an unlicensed tenant produces a wall of
+        severity-0 detections
+    - vendor: properties.riskState
+      type: enum
+      description: >-
+        current state of the risk (none, confirmedSafe, remediated, dismissed,
+        atRisk, confirmedCompromised)
+      ecs: null
+      status: unmapped
+      custom: azure.identity_protection.properties.risk_state
+      notes: >
+        mutable - the same detection id is re-emitted as an analyst or
+        automated remediation moves it through states, so the index will hold
+        several records per detection and dashboards must deduplicate on the
+        detection id
+    - vendor: properties.riskDetail
+      type: enum
+      description: >-
+        reason behind the current risk state (none, adminConfirmedSigninSafe,
+        userPassedMFADrivenByRiskBasedPolicy, adminDismissedAllRiskForUser,
+        adminConfirmedSigninCompromised, ...)
+      ecs: null
+      status: unmapped
+      custom: azure.identity_protection.properties.risk_detail
+    - vendor: properties.detectionTimingType
+      type: enum
+      description: timing of the detection (notDefined, realtime, nearRealtime, offline)
+      ecs: null
+      status: unmapped
+      custom: azure.identity_protection.properties.detection_timing_type
+      notes: >-
+        the field that explains why a detection's timestamp can trail the
+        activity by hours or days; required context for any time-based
+        correlation with sign-in logs
+    - vendor: properties.activity
+      type: enum
+      description: activity type the detected risk is linked to (signin, user)
+      ecs: null
+      status: unmapped
+      custom: azure.identity_protection.properties.activity
+    - vendor: properties.userPrincipalName
+      type: string
+      description: UPN of the user the risk was detected for
+      ecs: user.name
+      status: mapped
+    - vendor: properties.userId
+      type: string
+      description: object ID (GUID) of the user the risk was detected for
+      ecs: user.id
+      status: mapped
+    - vendor: properties.userDisplayName
+      type: string
+      description: display name of the user the risk was detected for
+      ecs: user.full_name
+      status: mapped
+    - vendor: properties.ipAddress
+      type: ip
+      description: IP address of the client the risk occurred from
+      ecs: source.ip
+      status: mapped
+    - vendor: properties.activityDateTime
+      type: timestamp
+      description: UTC date and time the risky activity occurred (ISO 8601)
+      ecs: '@timestamp'
+      status: mapped
+      notes: >-
+        use this rather than detectedDateTime as the event time, or offline
+        detections misplace the activity on the timeline
+    - vendor: properties.detectedDateTime
+      type: timestamp
+      description: UTC date and time the risk was detected (ISO 8601)
+      ecs: null
+      status: unmapped
+      custom: azure.identity_protection.properties.detected_datetime
+      notes: >-
+        kept alongside @timestamp so the detection lag on offline detections
+        is measurable rather than invisible
+    - vendor: properties.correlationId
+      type: string
+      description: >-
+        correlation ID of the sign-in associated with the detection, null when
+        the detection is not tied to a sign-in
+      ecs: null
+      status: unmapped
+      custom: azure.identity_protection.properties.correlation_id
+      notes: >-
+        the join key back to the sign-in dataset; Microsoft warns correlation
+        IDs are not a guaranteed join across services, so treat matches as
+        strong hints
+    - vendor: properties.additionalInfo
+      type: string
+      description: >-
+        JSON-encoded string of extra detection detail, with possible keys
+        userAgent, clientIp, riskReasons, alertUrl, relatedLocation,
+        requestId, malwareName
+      ecs: null
+      status: unmapped
+      custom: azure.identity_protection.properties.additional_info
+      transform: >
+        arrives as an escaped JSON string rather than an object and is never
+        expanded by the stock pipeline; decode it and lift userAgent to
+        user_agent.original and clientIp to a related IP before the detail is
+        usable in a query
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Pass through with no low-side extraction - the volume does not
+          justify a pipeline and the detection payload is small. Keep
+          Persistent Queue backpressure on the Elastic destination and retain
+          _raw: these records are individually significant and the
+          additionalInfo blob is the only place several detection details
+          exist.
+        elastic: >
+          Parse with the azure.identity_protection pipeline and add a
+          logs-azure.identity_protection@custom pipeline that decodes the
+          JSON-encoded additionalInfo string into real fields (userAgent,
+          clientIp, riskReasons, alertUrl) instead of leaving it as an opaque
+          blob, and that sets @timestamp from activityDateTime while keeping
+          detectedDateTime as a separate field so offline-detection lag is
+          visible rather than silently backdating the record. Map
+          risk_event_type, risk_level, risk_state, risk_detail and
+          detection_timing_type as keyword in the custom namespace, and guard
+          any severity derivation against the "hidden" and "none" values a
+          non-P2 or unenrolled tenant returns.
+        relay: >
+          Nothing here strains a guard: the records are small, flat and
+          already JSON. Carry the same envelope keys as the other Entra
+          datasets, and treat additionalInfo as the one unbounded free-text
+          field to cap - it embeds a user agent string and arbitrary detection
+          detail inside a quoted JSON string, which is exactly the shape a
+          simple custom NDJSON content filter handles worst.
+      direct:
+        parse_location: high
+        cribl: >
+          Pass through with no low-side extraction - the volume does not
+          justify a pipeline and the detection payload is small. Keep
+          Persistent Queue backpressure on the Elastic destination and retain
+          _raw: these records are individually significant and the
+          additionalInfo blob is the only place several detection details
+          exist.
+        elastic: >
+          Parse with the azure.identity_protection pipeline and add a
+          logs-azure.identity_protection@custom pipeline that decodes the
+          JSON-encoded additionalInfo string into real fields (userAgent,
+          clientIp, riskReasons, alertUrl) instead of leaving it as an opaque
+          blob, and that sets @timestamp from activityDateTime while keeping
+          detectedDateTime as a separate field so offline-detection lag is
+          visible rather than silently backdating the record. Map
+          risk_event_type, risk_level, risk_state, risk_detail and
+          detection_timing_type as keyword in the custom namespace, and guard
+          any severity derivation against the "hidden" and "none" values a
+          non-P2 or unenrolled tenant returns.
+  - format: api-pull
+    enable: >
+      Check the UserRiskEvents and RiskyUsers categories on the workspace
+      destination of the tenant diagnostic setting (both require Entra ID P2).
+      UserRiskEvents lands the individual risk detections in the
+      AADUserRiskEvents table - the featured pull here - while RiskyUsers
+      lands the per-user risk-state summary in the sibling AADRiskyUsers
+      table. Retrieve the detections from the Azure Monitor Log Analytics
+      Query API over HTTPS with a service principal granted Log Analytics
+      Reader: POST
+      https://api.loganalytics.us/v1/workspaces/{workspaceId}/query with a KQL
+      body such as `AADUserRiskEvents | where TimeGenerated > ago(1h)`, using
+      the Gov query host api.loganalytics.us and the Gov authority
+      login.microsoftonline.us. Where the tenant has not enabled diagnostic
+      streaming for these categories at all, the same detections are available
+      by polling the Microsoft Graph identityProtection/riskDetections
+      endpoint at graph.microsoft.us (GCC High) or dod-graph.microsoft.us
+      (DoD), which is the second api-pull path - closer to the Event Hub
+      camelCase shape than to these PascalCase columns. Volume is low but
+      latency-skewed: offline detections arrive hours to days after the
+      activity they describe, so the query window and de-duplication on Id
+      must tolerate late records.
+    references:
+    - >-
+      https://learn.microsoft.com/en-us/azure/azure-monitor/reference/tables/aaduserriskevents
+    - >-
+      https://learn.microsoft.com/en-us/azure/azure-monitor/reference/tables/aadriskyusers
+    - https://learn.microsoft.com/en-us/graph/api/resources/riskdetection
+    - https://learn.microsoft.com/en-us/azure/azure-monitor/logs/api/overview
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        Cribl REST Collector against the Log Analytics Query API, feeding a
+        column-rename pipeline into logs-azure.identity_protection
+      notes: >
+        Same REST-Collector-plus-column-rename path; the pipeline renames the
+        PascalCase columns back to the resource-log properties the stock
+        azure.identity_protection pipeline expects (RiskEventType ->
+        properties.riskEventType, RiskLevel -> properties.riskLevel, RiskState
+        -> properties.riskState). The reshape's one concrete win is that
+        AdditionalInfo arrives as a parsed dynamic column here, where the
+        Event Hub feed carries it as an escaped JSON string the stock pipeline
+        never expands - so userAgent, clientIp and riskReasons are addressable
+        sub-fields without a decode step. RiskState is mutable: the same Id is
+        re-emitted as a detection moves through states, so the pull must
+        upsert on Id rather than treat every row as a new event, and
+        LastUpdatedDateTime (a column this format adds) tells the collector
+        which copy is current.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Pass through with no low-side extraction - the volume does not
+          justify a pipeline and the detection payload is small. Treat the
+          workspace pull as a transport alternative to the event hub, key the
+          scheduled window on TimeGenerated with generous overlap because
+          offline detections land late, and upsert on Id rather than
+          de-duplicating blindly, since a re-emitted row is a state change on
+          an existing detection, not a duplicate. Keep Persistent Queue
+          backpressure on the Elastic destination and retain _raw: these
+          records are individually significant and the AdditionalInfo dynamic
+          is the only place several detection details exist.
+        elastic: >
+          Parse with the azure.identity_protection pipeline and add a
+          logs-azure.identity_protection@custom pipeline that lifts the parsed
+          AdditionalInfo sub-fields (userAgent to user_agent.original,
+          clientIp to a related.ip, riskReasons and alertUrl to custom
+          keywords) - no JSON-decode step is needed on this format - and that
+          sets @timestamp from ActivityDateTime while keeping DetectedDateTime
+          and LastUpdatedDateTime as separate fields so offline-detection lag
+          and state churn stay visible rather than silently backdating the
+          record. Map risk_event_type, risk_state, risk_detail and
+          detection_timing_type as keyword in the custom namespace, map
+          RiskLevel to event.severity through a lookup that EXCLUDES the
+          hidden and none values a non-P2 or unenrolled tenant returns, and
+          dedupe dashboards on Id since RiskState is mutable.
+        relay: >
+          Nothing here strains a guard: the records are small, flat and
+          already structured. Carry the same envelope keys as the other Entra
+          datasets, and treat AdditionalInfo as the one field to cap - even as
+          a parsed dynamic it embeds a user agent string and arbitrary
+          detection detail, the shape a simple custom NDJSON content filter
+          handles worst. Because RiskState is mutable and the same Id crosses
+          several times, reconcile on Id per (dataset, hour) understanding
+          that a re-crossed record is an update, not a loss.
+      direct:
+        parse_location: high
+        cribl: >
+          High side with no guard: run the REST Collector against
+          AADUserRiskEvents with a generous overlapping window for late
+          offline detections, upsert on Id, and pass through with light
+          shaping. If diagnostic streaming is not enabled for these
+          categories, the Graph riskDetections pull at graph.microsoft.us is
+          the fallback source with the same field semantics in a camelCase
+          shape.
+        elastic: >
+          Parse with the azure.identity_protection pipeline and add a
+          logs-azure.identity_protection@custom pipeline that lifts the parsed
+          AdditionalInfo sub-fields (userAgent to user_agent.original,
+          clientIp to a related.ip, riskReasons and alertUrl to custom
+          keywords) with no JSON-decode step, and that keeps ActivityDateTime
+          as @timestamp with DetectedDateTime and LastUpdatedDateTime
+          alongside so offline-detection lag and state churn stay visible. Map
+          risk_event_type, risk_state, risk_detail and detection_timing_type
+          as keyword in the custom namespace, map RiskLevel to event.severity
+          through a lookup that excludes the hidden and none values a non-P2
+          or unenrolled tenant returns, and dedupe dashboards on Id since
+          RiskState is mutable.
+    fields:
+    - vendor: ActivityDateTime
+      type: datetime
+      description: date and time the risky activity occurred, in UTC
+      ecs: '@timestamp'
+      status: mapped
+      notes: >-
+        use this rather than DetectedDateTime as the event time, or offline
+        detections misplace the activity on the timeline
+    - vendor: DetectedDateTime
+      type: datetime
+      description: date and time the risk was detected, in UTC
+      ecs: null
+      status: unmapped
+      custom: azure.identity_protection.properties.detected_datetime
+      notes: >-
+        kept alongside @timestamp so the detection lag on offline detections
+        is measurable rather than invisible
+    - vendor: LastUpdatedDateTime
+      type: datetime
+      description: date and time the risk detection was last updated, in UTC
+      ecs: null
+      status: unmapped
+      custom: azure.identity_protection.properties.last_updated_datetime
+      notes: >-
+        a column this format adds; because RiskState is mutable it is the
+        field the collector uses to tell the current copy of a detection from
+        a superseded one
+    - vendor: TimeGenerated
+      type: datetime
+      description: date and time the record was created in the workspace
+      ecs: event.ingested
+      status: mapped
+    - vendor: Id
+      type: string
+      description: unique ID of the risk event
+      ecs: event.id
+      status: mapped
+      notes: >
+        stable across the re-emissions of one detection as its RiskState
+        changes, so it is an upsert key, not a uniqueness guarantee per row -
+        dashboards must dedupe on it
+    - vendor: OperationName
+      type: string
+      description: name of the operation that produced the record
+      ecs: event.action
+      status: mapped
+      notes: >-
+        effectively constant across the dataset; carries little discriminating
+        value on its own
+    - vendor: RiskEventType
+      type: string
+      description: >-
+        type of risk detected (leakedCredentials, passwordSpray,
+        unfamiliarFeatures, anonymizedIPAddress, maliciousIPAddress,
+        unlikelyTravel, anomalousToken, ...)
+      ecs: null
+      status: unmapped
+      custom: azure.identity_protection.properties.risk_event_type
+      notes: >
+        the detection identity and the field every alert keys on. Not mapped
+        to rule.name: rule.* implies a rule object the tenant owns and can
+        enumerate, which these Microsoft-internal detections are not. Premium
+        detections collapse to the value "generic" in the pull, limiting how
+        specific an alert on this field can be
+    - vendor: RiskLevel
+      type: string
+      description: level of the detected risk (low, medium, high, hidden, none, unknownFutureValue)
+      ecs: event.severity
+      status: partial
+      transform: >
+        needs a lookup to the numeric ECS event.severity scale; hidden and
+        none are not severities and must be excluded rather than defaulted to
+        zero, or an unlicensed tenant produces a wall of severity-0 detections
+    - vendor: RiskState
+      type: string
+      description: >-
+        current state of the risk (none, confirmedSafe, remediated, dismissed,
+        atRisk, confirmedCompromised, unknownFutureValue)
+      ecs: null
+      status: unmapped
+      custom: azure.identity_protection.properties.risk_state
+      notes: >
+        mutable - the same Id is re-emitted as an analyst or automated
+        remediation moves it through states, so the index holds several rows
+        per detection and dashboards must deduplicate on Id
+    - vendor: RiskDetail
+      type: string
+      description: >-
+        reason behind the current risk state (none, adminConfirmedSigninSafe,
+        userPassedMFADrivenByRiskBasedPolicy, adminDismissedAllRiskForUser,
+        adminConfirmedSigninCompromised, hidden, ...)
+      ecs: null
+      status: unmapped
+      custom: azure.identity_protection.properties.risk_detail
+    - vendor: DetectionTimingType
+      type: string
+      description: >-
+        timing of the detection (notDefined, realtime, nearRealtime, offline,
+        unknownFutureValue)
+      ecs: null
+      status: unmapped
+      custom: azure.identity_protection.properties.detection_timing_type
+      notes: >-
+        explains why a detection's timestamp can trail the activity by hours
+        or days; required context for any time-based correlation with the
+        sign-in dataset
+    - vendor: Activity
+      type: string
+      description: activity type the detected risk is linked to (signin, user, unknownFutureValue)
+      ecs: null
+      status: unmapped
+      custom: azure.identity_protection.properties.activity
+    - vendor: UserPrincipalName
+      type: string
+      description: UPN of the user the risk was detected for
+      ecs: user.name
+      status: mapped
+    - vendor: UserId
+      type: string
+      description: object ID (GUID) of the user the risk was detected for
+      ecs: user.id
+      status: mapped
+    - vendor: UserDisplayName
+      type: string
+      description: display name of the user the risk was detected for
+      ecs: user.full_name
+      status: mapped
+      notes: >-
+        the published table reference mislabels this column's description as
+        the UPN, but it carries the display name as the Graph
+        riskDetection.userDisplayName does
+    - vendor: IpAddress
+      type: string
+      description: IP address of the client the risk occurred from
+      ecs: source.ip
+      status: mapped
+    - vendor: Location
+      type: dynamic
+      description: >-
+        location of the sign-in the risk is linked to (city, state,
+        countryOrRegion, geoCoordinates)
+      ecs: source.geo.country_iso_code
+      status: partial
+      transform: >-
+        a parsed dynamic in this format; extract .countryOrRegion to
+        source.geo.country_iso_code and .city to source.geo.city_name, subject
+        to the Microsoft-vs-geoip ownership decision on source.geo.*
+    - vendor: Source
+      type: string
+      description: source of the risk detection (for example activeDirectory)
+      ecs: null
+      status: unmapped
+      custom: azure.identity_protection.properties.source
+    - vendor: CorrelationId
+      type: string
+      description: >-
+        correlation ID of the sign-in associated with the detection, null when
+        the detection is not tied to a sign-in
+      ecs: null
+      status: unmapped
+      custom: azure.identity_protection.properties.correlation_id
+      notes: >-
+        a join key back to the sign-in dataset; Microsoft warns correlation
+        IDs are not a guaranteed cross-service join, so treat matches as
+        strong hints
+    - vendor: RequestId
+      type: string
+      description: >-
+        request ID of the sign-in associated with the detection, null when not
+        tied to a sign-in
+      ecs: null
+      status: unmapped
+      custom: azure.identity_protection.properties.request_id
+      notes: >-
+        a second, finer sign-in join key this format surfaces as its own
+        column - it ties a detection to a single sign-in request where
+        CorrelationId groups a whole sign-in sequence
+    - vendor: TokenIssuerType
+      type: string
+      description: >-
+        type of token issuer for the detected sign-in risk (AzureAD,
+        ADFederationServices, UnknownFutureValue)
+      ecs: null
+      status: unmapped
+      custom: azure.identity_protection.properties.token_issuer_type
+    - vendor: AdditionalInfo
+      type: dynamic
+      description: >-
+        extra detection detail with possible keys userAgent, clientIp,
+        riskReasons, alertUrl, relatedLocation, requestId, malwareName
+      ecs: null
+      status: unmapped
+      custom: azure.identity_protection.properties.additional_info
+      transform: >
+        the reshape delivers this as a parsed dynamic column, where the Event
+        Hub feed carries it as an escaped JSON string the stock pipeline never
+        expands - so userAgent lifts to user_agent.original and clientIp to a
+        related.ip with no decode step, the one concrete parsing win of this
+        format on the dataset
+- id: provisioning
+  name: Provisioning logs
+  description: >
+    Thin starter - records of the Entra provisioning service creating,
+    updating, disabling and deleting identities in target systems (SCIM
+    applications, on-premises AD via Entra Connect provisioning, HR-driven
+    inbound provisioning). Operationally noisy and mostly non-security, but it
+    is the authoritative record of automated account lifecycle, which matters
+    when an account appears in a target system without a matching directory
+    change in the audit log.
+  event_categories:
+  - iam
+  - configuration
+  route:
+    guarded:
+    - hop: other
+      name: Azure Government Event Hubs namespace
+      notes: ProvisioningLogs category on the same tenant diagnostic setting.
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same Event Hubs source, split by category.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-azure.provisioning
+    direct:
+    - hop: other
+      name: Azure Government Event Hubs namespace
+      notes: ProvisioningLogs category on the same tenant diagnostic setting.
+    - hop: cribl
+      location: edge worker group
+      notes: Same Event Hubs source, split by category.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-azure.provisioning
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: Azure Logs integration (azure.provisioning data stream)
+      notes: >
+        The integration flattens the Graph provisioningObjectSummary shape
+        into azure.provisioning.properties.* and keeps modifiedProperties and
+        the per-step details as flattened objects. Vendor names below follow
+        the Graph resource; the integration exposes them snake_cased.
+    fields:
+    - vendor: category
+      type: enum
+      description: diagnostic log category, ProvisioningLogs for this feed
+      ecs: null
+      status: unmapped
+      custom: azure.provisioning.category
+    - vendor: properties.action
+      type: enum
+      description: >-
+        provisioning action performed on the identity (Create, Update, Delete,
+        Disable, StagedDelete, Other)
+      ecs: event.action
+      status: mapped
+    - vendor: properties.provisioningStatusInfo.status
+      type: enum
+      description: outcome of the provisioning operation (success, failure, skipped, warning)
+      ecs: event.outcome
+      status: partial
+      transform: >
+        success and failure map directly; skipped and warning have no ECS
+        equivalent and must become unknown - skipped in particular is the most
+        common value in a steady-state tenant and counting it as a failure
+        would make the dataset unreadable
+    - vendor: properties.provisioningStatusInfo.errorInformation.errorCode
+      type: string
+      description: error code for a failed provisioning operation
+      ecs: error.code
+      status: mapped
+    - vendor: properties.provisioningStatusInfo.errorInformation.reason
+      type: string
+      description: description of why the provisioning operation failed
+      ecs: error.message
+      status: mapped
+    - vendor: properties.sourceIdentity.displayName
+      type: string
+      description: display name of the identity in the source system
+      ecs: user.full_name
+      status: partial
+      notes: >
+        Microsoft defines this as the display name of the identity, so it
+        belongs in user.full_name beside the sign-in dataset's userDisplayName
+        rather than in user.name, which ECS reserves for a short name or
+        login. The provisioned identity is not always a user - group and
+        service principal provisioning use the same record shape - so the
+        mapping must be gated on the identityType field rather than applied
+        blindly, and the value is an empty string on cycles where the source
+        object carries no display name. A login-shaped value exists only when
+        the sourceIdentity.details property bag carries a UPN, which the stock
+        pipeline surfaces as source_identity.details.user_principal_name;
+        derive user.name from that and leave it null otherwise
+    - vendor: properties.sourceIdentity.id
+      type: string
+      description: identifier that uniquely identifies the identity in the source system
+      ecs: user.id
+      status: partial
+      notes: >-
+        the joinable half of the source identity - Microsoft defines it as the
+        value that uniquely identifies the identity, where displayName is only
+        a label, so this is what an account trace from the directory to the
+        target system keys on; carries the same identityType gate as the
+        display name
+    - vendor: properties.sourceIdentity.identityType
+      type: enum
+      description: type of the source identity (User, Group, Other)
+      ecs: null
+      status: unmapped
+      custom: azure.provisioning.properties.source_identity.identity_type
+      notes: >-
+        the gate on both source identity mappings: only a user identity's
+        displayName and id may be written to user.full_name and user.id
+    - vendor: properties.targetIdentity.displayName
+      type: string
+      description: display name of the corresponding identity in the target system
+      ecs: user.target.full_name
+      status: partial
+      notes: >-
+        a display name on the target side of the same provisionedIdentity
+        shape, so it lands in user.target.full_name rather than
+        user.target.name; same identityType gating as the source identity, and
+        empty when the provisioning cycle failed before the target object was
+        created
+    - vendor: properties.targetIdentity.id
+      type: string
+      description: identifier that uniquely identifies the identity in the target system
+      ecs: user.target.id
+      status: partial
+      notes: >-
+        the joinable half of the target identity and the value that ties a
+        provisioned account back to its directory object; same identityType
+        gate as the target display name, and an empty string when the cycle
+        failed before the target object was created
+    - vendor: properties.targetSystem.displayName
+      type: string
+      description: display name of the system the identity was provisioned into
+      ecs: service.name
+      status: partial
+      notes: >-
+        the downstream application or directory, not an Entra service; mapped
+        to service.name for traceability but it is a target rather than the
+        service emitting the event
+    - vendor: properties.jobId
+      type: string
+      description: identifier of the provisioning job the record belongs to
+      ecs: null
+      status: unmapped
+      custom: azure.provisioning.properties.job_id
+    - vendor: properties.changeId
+      type: string
+      description: unique identifier of the change record
+      ecs: event.id
+      status: mapped
+    - vendor: properties.modifiedProperties
+      type: string
+      description: >-
+        array of attributes changed on the target identity, each with
+        displayName, oldValue and newValue
+      ecs: null
+      status: unmapped
+      custom: azure.provisioning.properties.modified_properties
+      notes: >-
+        same unbounded JSON-encoded before/after shape as the audit log's
+        modifiedProperties, carrying attribute values synchronized to the
+        target system
+    - vendor: properties.activityDateTime
+      type: timestamp
+      description: UTC date and time the provisioning activity occurred (ISO 8601)
+      ecs: '@timestamp'
+      status: mapped
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Pass through unparsed with Persistent Queue backpressure. This is
+          the first Entra dataset to shape for volume after the
+          non-interactive sign-in categories: filter to the actions that
+          change account state (Create, Delete, Disable, Update) and drop the
+          skipped-cycle records that dominate the category, and drop _raw here
+          first once the parser is proven.
+        elastic: >
+          Parse with the azure.provisioning pipeline and add a
+          logs-azure.provisioning@custom pipeline that normalizes the
+          four-value provisioning status - success and failure map to
+          event.outcome, while skipped and warning must become unknown rather
+          than failure - and that promotes the error information code and
+          reason into error.code and error.message so failed provisioning
+          cycles are alertable without reading the nested object. Map the
+          source/target identity and system names as keyword in the custom
+          namespace so an account can be traced from the directory to the
+          downstream system in one query.
+        relay: >
+          Low volume and modest record size, so the crossing is
+          straightforward; carry the same envelope keys as the other Entra
+          datasets. The one thing to bound is modifiedProperties, which
+          mirrors the audit log's before/after payload and can carry attribute
+          values synchronized to the target system.
+      direct:
+        parse_location: high
+        cribl: >
+          Pass through unparsed with Persistent Queue backpressure. This is
+          the first Entra dataset to shape for volume after the
+          non-interactive sign-in categories: filter to the actions that
+          change account state (Create, Delete, Disable, Update) and drop the
+          skipped-cycle records that dominate the category, and drop _raw here
+          first once the parser is proven.
+        elastic: >
+          Parse with the azure.provisioning pipeline and add a
+          logs-azure.provisioning@custom pipeline that normalizes the
+          four-value provisioning status - success and failure map to
+          event.outcome, while skipped and warning must become unknown rather
+          than failure - and that promotes the error information code and
+          reason into error.code and error.message so failed provisioning
+          cycles are alertable without reading the nested object. Map the
+          source/target identity and system names as keyword in the custom
+          namespace so an account can be traced from the directory to the
+          downstream system in one query.
+  - format: api-pull
+    enable: >
+      Check the ProvisioningLogs category on the workspace destination of the
+      tenant diagnostic setting; the records land in the AADProvisioningLogs
+      table. Retrieve them from the Azure Monitor Log Analytics Query API over
+      HTTPS with a service principal granted Log Analytics Reader: POST
+      https://api.loganalytics.us/v1/workspaces/{workspaceId}/query with a KQL
+      body such as `AADProvisioningLogs | where TimeGenerated > ago(15m)`,
+      using the Gov query host api.loganalytics.us and the Gov authority
+      login.microsoftonline.us. Because the skipped-cycle records dominate
+      this category, the reduction case is strongest here - filter to
+      state-changing actions in the KQL. The same records are alternatively
+      available from the Microsoft Graph auditLogs/provisioning endpoint at
+      graph.microsoft.us (GCC High) or dod-graph.microsoft.us (DoD), the
+      second api-pull path, whose provisioningObjectSummary shape keeps the
+      nested objects this table flattens into JSON-string columns.
+    references:
+    - >-
+      https://learn.microsoft.com/en-us/azure/azure-monitor/reference/tables/aadprovisioninglogs
+    - https://learn.microsoft.com/en-us/graph/api/resources/provisioningobjectsummary
+    - https://learn.microsoft.com/en-us/azure/azure-monitor/logs/api/overview
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        Cribl REST Collector against the Log Analytics Query API, feeding a
+        column-rename pipeline into logs-azure.provisioning
+      notes: >
+        Same REST-Collector-plus-column-rename path into the stock
+        azure.provisioning data stream. This table has a reshape trap the
+        other three do not: SourceIdentity, TargetIdentity, TargetSystem,
+        ProvisioningStatusInfo, ModifiedProperties, ServicePrincipal,
+        ProvisioningSteps and InitiatedBy are typed `string` and carry
+        JSON-encoded objects, NOT parsed dynamic columns - so unlike the
+        SigninLogs/AuditLogs pulls, this format needs a JSON-decode step on
+        each of them before their sub-fields are addressable. The reshape's
+        compensating win is that the provisioningStatusInfo nesting the Event
+        Hub feed buries is also promoted to three flat columns - ResultType
+        (Success/Failure/Skipped), ResultSignature (error code) and
+        ResultDescription (error message) - so the outcome and error can be
+        read without decoding ProvisioningStatusInfo at all.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Shape this at the pull, since it is the first Entra dataset to
+          economize on after the non-interactive sign-ins: build the scheduled
+          KQL to keep the state-changing actions (Create, Delete, Disable,
+          Update) and drop the skipped-cycle records that dominate the
+          category, so the noise never leaves Azure. Treat the workspace pull
+          as a transport alternative to the event hub, de-duplicate on
+          ChangeId across overlapping windows, back the Elastic destination
+          with Persistent Queue, and drop _raw here first once the parser is
+          proven.
+        elastic: >
+          Parse with the azure.provisioning pipeline and add a
+          logs-azure.provisioning@custom pipeline that reads the outcome and
+          error from the promoted flat columns - ResultType to event.outcome
+          (success and failure map, skipped becomes unknown), ResultSignature
+          to error.code, ResultDescription to error.message - rather than
+          decoding ProvisioningStatusInfo. Because SourceIdentity,
+          TargetIdentity and TargetSystem are JSON strings here, decode them
+          before gating the identity mappings on identityType:
+          SourceIdentity.displayName to user.full_name and SourceIdentity.id
+          to user.id, TargetIdentity.displayName to user.target.full_name and
+          TargetIdentity.id to user.target.id, all only when the identity is a
+          User. The display names are labels and the ids are the joinable
+          halves, so neither belongs in user.name or user.target.name, which
+          ECS reserves for a short name or login - leave those null unless the
+          decoded .details property bag carries a UPN.
+          TargetSystem.displayName goes to service.name as the downstream
+          system. Map the source/target identity and system names as keyword
+          in the custom namespace so an account can be traced from the
+          directory to the downstream system in one query.
+        relay: >
+          Low volume and modest record size once the skipped cycles are
+          filtered, so the crossing is straightforward; carry the same
+          envelope keys as the other Entra datasets. The one thing to bound is
+          ModifiedProperties, which mirrors the audit log's before/after
+          payload and can carry attribute values synchronized to the target
+          system - and here it is a JSON-encoded string column, so
+          decode-and-allow-list it low-side before the guard rather than
+          asking the content filter to reason about it. Reconcile on ChangeId
+          per (dataset, hour).
+      direct:
+        parse_location: high
+        cribl: >
+          High side with no guard: the pull's value for this category is that
+          the skipped-cycle volume filter lives in the KQL itself, so the
+          noise is dropped before collection. Run the REST Collector with that
+          filter, de-duplicate on ChangeId, and pass through with light
+          shaping.
+        elastic: >
+          Parse with the azure.provisioning pipeline and add a
+          logs-azure.provisioning@custom pipeline that reads outcome and error
+          from the promoted flat columns - ResultType to event.outcome
+          (success and failure map, skipped becomes unknown), ResultSignature
+          to error.code, ResultDescription to error.message - rather than
+          decoding ProvisioningStatusInfo. Because SourceIdentity,
+          TargetIdentity and TargetSystem are JSON strings here, decode them
+          before gating the identity mappings on identityType:
+          SourceIdentity.displayName to user.full_name and SourceIdentity.id
+          to user.id, TargetIdentity.displayName to user.target.full_name and
+          TargetIdentity.id to user.target.id, all only when the identity is a
+          User. The display names are labels and the ids are the joinable
+          halves, so neither belongs in user.name or user.target.name, which
+          ECS reserves for a short name or login - leave those null unless the
+          decoded .details property bag carries a UPN.
+          TargetSystem.displayName goes to service.name as the downstream
+          system. Map the source/target identity and system names as keyword
+          in the custom namespace so an account can be traced from the
+          directory to the downstream system in one query.
+    fields:
+    - vendor: TimeGenerated
+      type: datetime
+      description: date and time of the provisioning event, in UTC
+      ecs: '@timestamp'
+      status: mapped
+      notes: >-
+        this table carries no separate activity-time column, so TimeGenerated
+        is both the event time and the ingest time - a reshape difference from
+        the sign-in and audit tables, which keep the two apart
+    - vendor: ChangeId
+      type: string
+      description: unique ID of this change in this cycle
+      ecs: event.id
+      status: mapped
+      notes: >-
+        the per-record de-duplication and cross-guard reconciliation key, the
+        column form of the envelope's properties.changeId
+    - vendor: Id
+      type: string
+      description: unique ID for the activity
+      ecs: null
+      status: unmapped
+      custom: azure.provisioning.activity_id
+      notes: distinct from ChangeId; kept custom so the de-duplication key stays unambiguous
+    - vendor: CycleId
+      type: string
+      description: unique ID per job iteration
+      ecs: null
+      status: unmapped
+      custom: azure.provisioning.properties.cycle_id
+      notes: >-
+        a column this format surfaces that groups every change made in one
+        provisioning cycle; the natural key for "what did this sync run touch"
+    - vendor: JobId
+      type: string
+      description: unique ID for the whole provisioning job
+      ecs: null
+      status: unmapped
+      custom: azure.provisioning.properties.job_id
+    - vendor: CorrelationId
+      type: string
+      description: ID to provide a provisioning trail across records
+      ecs: null
+      status: unmapped
+      custom: azure.provisioning.properties.correlation_id
+    - vendor: ProvisioningAction
+      type: string
+      description: >-
+        provisioning action performed on the identity (Create, Update, Delete,
+        Disable, StagedDelete, Other)
+      ecs: event.action
+      status: mapped
+    - vendor: OperationName
+      type: string
+      description: name of the operation, duplicating ProvisioningAction
+      ecs: null
+      status: unmapped
+      custom: azure.provisioning.operation_name
+      notes: >-
+        pick one of this and ProvisioningAction as event.action and keep the
+        other custom rather than writing both
+    - vendor: Category
+      type: string
+      description: category of the event
+      ecs: null
+      status: unmapped
+      custom: azure.provisioning.category
+    - vendor: ResultType
+      type: string
+      description: result of the provisioning operation (Success, Failure, Skipped)
+      ecs: event.outcome
+      status: partial
+      transform: >
+        a flat column this format promotes out of the nested
+        provisioningStatusInfo the Event Hub feed buries - success and failure
+        map directly, but skipped has no ECS equivalent and must become
+        unknown. Skipped is the most common value in a steady-state tenant, so
+        counting it as failure makes the dataset unreadable
+    - vendor: ResultSignature
+      type: string
+      description: error code, if any, for the provisioning operation
+      ecs: error.code
+      status: mapped
+      notes: >-
+        the flat-column form of
+        provisioningStatusInfo.errorInformation.errorCode; empty on successful
+        and skipped cycles
+    - vendor: ResultDescription
+      type: string
+      description: error description for the provisioning operation, when available
+      ecs: error.message
+      status: mapped
+      notes: the flat-column form of provisioningStatusInfo.errorInformation.reason
+    - vendor: ProvisioningStatusInfo
+      type: string
+      description: >-
+        JSON-encoded details of provisioning status, including the status
+        value and errorInformation object
+      ecs: null
+      status: unmapped
+      custom: azure.provisioning.properties.provisioning_status_info
+      notes: >
+        a JSON-encoded string column, NOT a parsed dynamic - it duplicates the
+        promoted ResultType/ResultSignature/ResultDescription columns and adds
+        the warning-level detail they omit, so decode it only when that extra
+        detail is needed and take the common case from the flat columns
+    - vendor: SourceIdentity
+      type: string
+      description: >-
+        JSON-encoded details of the source object being provisioned, including
+        displayName, id and identityType
+      ecs: user.full_name
+      status: partial
+      transform: >
+        a JSON-encoded string column that needs decoding before use.
+        .displayName is a display name, so it goes to user.full_name - not
+        user.name, which ECS reserves for a short name or login - and .id, the
+        value Microsoft defines as uniquely identifying the identity, goes to
+        user.id as the joinable half. Write both only when .identityType is
+        User: group and service-principal provisioning share this record
+        shape, so an unconditional mapping mislabels non-user identities.
+        user.name has no source on this column unless the decoded .details
+        property bag carries a UPN
+    - vendor: TargetIdentity
+      type: string
+      description: >-
+        JSON-encoded details of the target object being provisioned, including
+        displayName, id and identityType
+      ecs: user.target.full_name
+      status: partial
+      transform: >-
+        same decode-then-gate-on-identityType handling as SourceIdentity, on
+        the target side: .displayName to user.target.full_name and .id to
+        user.target.id. Both are empty when the cycle failed before the target
+        object was created
+    - vendor: TargetSystem
+      type: string
+      description: >-
+        JSON-encoded details of the target system of the object being
+        provisioned, including displayName
+      ecs: service.name
+      status: partial
+      transform: >
+        decode and map .displayName to service.name; it is the downstream
+        application or directory, not an Entra service - mapped for
+        traceability with the caveat that it is a target rather than the
+        service emitting the event
+    - vendor: ServicePrincipal
+      type: string
+      description: >-
+        JSON-encoded representation of the service principal used for
+        provisioning, including id and displayName
+      ecs: null
+      status: unmapped
+      custom: azure.provisioning.properties.service_principal
+      notes: >-
+        a column this format surfaces that identifies the provisioning
+        connector's own principal; a JSON-encoded string needing decode
+    - vendor: InitiatedBy
+      type: string
+      description: JSON-encoded details of who or what initiated the provisioning
+      ecs: null
+      status: unmapped
+      custom: azure.provisioning.properties.initiated_by
+      notes: >-
+        a JSON-encoded string column this format surfaces; the provisioning
+        service is usually the initiator, so it is rarely a human actor and is
+        not coalesced into user.name
+    - vendor: ModifiedProperties
+      type: string
+      description: >-
+        JSON-encoded details of each property modified on the target identity
+        in this provisioning action, each with displayName, oldValue and
+        newValue
+      ecs: null
+      status: unmapped
+      custom: azure.provisioning.properties.modified_properties
+      notes: >-
+        the same unbounded before/after shape as the audit log's
+        modifiedProperties, carrying attribute values synchronized to the
+        target system; a JSON-encoded string, so decode and bound it before
+        any crossing
+    - vendor: ProvisioningSteps
+      type: string
+      description: >-
+        JSON-encoded details of each step in the provisioning action (import,
+        matching, determine-if-in-scope, provisioning, export), each with
+        name, status and details
+      ecs: null
+      status: unmapped
+      custom: azure.provisioning.properties.provisioning_steps
+      notes: >-
+        a per-step breakdown this format surfaces; the step-level status is
+        where a Skipped or Failed cycle's actual cause is recorded, so it is
+        the field to decode when triaging a failed provisioning run
+    - vendor: AADTenantId
+      type: string
+      description: the Entra ID tenant the provisioning occurred in
+      ecs: null
+      status: unmapped
+      custom: azure.tenant_id
+      notes: >-
+        use this for the Entra tenant, not the TenantId column, which is the
+        Log Analytics workspace GUID

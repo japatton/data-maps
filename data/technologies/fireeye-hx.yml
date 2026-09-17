@@ -1,0 +1,804 @@
+id: fireeye-hx
+name: FireEye HX (Trellix Endpoint Security)
+vendor: Trellix (formerly FireEye)
+versions: HX Series 4.x/5.x (FireEye); Trellix Endpoint Security (HX)
+draft: true
+references:
+- https://docs.trellix.com/
+datasets:
+- id: hx-alert
+  name: HX endpoint detection alert (CEF)
+  description: >
+    Real-time detections for enrolled endpoints — IOC hits, Exploit Guard
+    behavioral detections, and malware-protection events — emitted by the HX
+    controller (agents report to the controller; endpoints never send
+    directly). Portrayed as CEF over syslog from the controller's notification
+    settings; the transport is the top verify-in-tool item for this map —
+    confirm the format and whether the feed leaves the HX controller directly
+    or rides the CM notification rollup.
+  event_categories:
+  - malware
+  - process
+  - file
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Receives CEF over TCP syslog from the HX controller. Process command
+        lines and file paths are the free-text fields a content-inspection
+        policy will reject or truncate.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-fireeye_hx.alert
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Receives CEF over TCP syslog from the HX controller.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-fireeye_hx.alert
+  formats:
+  - format: syslog-cef
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom HX CEF pipeline
+      notes: >
+        No Elastic integration exists for HX and no vendor Cribl pack covers
+        it, so the CEF header + extension parse is a hand-built Cribl
+        pipeline. The extension uses ArcSight-style cs*/cn* custom slots named
+        at runtime by their paired Label keys — resolve by Label value, never
+        by slot number, and confirm the deployed template's slot assignments
+        in-tool before pinning any mapping.
+    fields:
+    - vendor: 'CEF header: Name (field 6)'
+      type: enum
+      description: detection type — IOC hit, Exploit Guard detection, malware protection event
+      ecs: event.action
+      status: mapped
+    - vendor: 'CEF header: Severity (field 7)'
+      type: integer
+      description: alert severity on the CEF 0-10 integer scale
+      ecs: event.severity
+      status: partial
+      transform: >-
+        normalize the 0-10 integer onto the platform-wide severity convention
+        rather than copying the raw value through
+    - vendor: rt
+      type: timestamp
+      description: CEF receipt time — when the controller registered the detection
+      ecs: '@timestamp'
+      status: partial
+      transform: >-
+        parse with an explicit UTC assumption, since the controller clock and
+        syslog envelope can disagree
+    - vendor: dvchost
+      type: string
+      description: hostname of the emitting HX controller
+      ecs: observer.hostname
+      status: mapped
+    - vendor: dhost
+      type: string
+      description: hostname of the enrolled endpoint the detection fired on
+      ecs: host.name
+      status: mapped
+      notes: >-
+        the alert describes this asset — the endpoint, not the controller,
+        belongs in host.*
+    - vendor: dst
+      type: ip
+      description: reported address of the enrolled endpoint
+      ecs: host.ip
+      status: partial
+      notes: confirm against the CEF template whether the agent address arrives as dst or src
+    - vendor: duser
+      type: string
+      description: user logged on at detection time
+      ecs: user.name
+      status: partial
+      notes: >-
+        domain-qualified values (DOMAIN\\user) need splitting into user.domain
+        and user.name low-side
+    - vendor: fname
+      type: string
+      description: filename involved in the detection
+      ecs: file.name
+      status: mapped
+    - vendor: filePath
+      type: string
+      description: full path of the file involved in the detection
+      ecs: file.path
+      status: mapped
+    - vendor: fileHash
+      type: string
+      description: hash of the file involved in the detection
+      ecs: file.hash.md5
+      status: partial
+      notes: >-
+        confirm which hash algorithm the deployed template emits before
+        pinning the mapping
+    - vendor: deviceProcessName
+      type: string
+      description: process involved in behavioral/exploit detections
+      ecs: process.name
+      status: partial
+      notes: >-
+        present on Exploit Guard detections; confirm the key name against the
+        deployed template
+    - vendor: cs1 (label-resolved indicator name)
+      type: string
+      description: >-
+        IOC/indicator or detection rule name, carried in an ArcSight custom
+        slot named by its paired Label
+      ecs: rule.name
+      status: partial
+      notes: >-
+        resolve by Label value, never slot number; confirm the deployed
+        template's slot and label in-tool
+    - vendor: externalId
+      type: long
+      description: controller-assigned alert identifier
+      ecs: event.id
+      status: partial
+      notes: confirm presence on the deployed template
+    - vendor: act
+      type: enum
+      description: action taken — alerted, or blocked where Exploit Guard prevention applies
+      ecs: event.type
+      status: partial
+      transform: >
+        lookup to the ECS event.type vocabulary (allowed / denied) retaining
+        the raw value; alerted means detection-only and the activity proceeded
+        on the endpoint — confirm the deployed value set in-tool
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Build the CEF header and extension parse here and emit ECS-shaped
+          JSON, resolving every custom slot by its paired Label value. dhost
+          names the enrolled endpoint the detection fired on, so it maps into
+          host.* — the alert describes that asset, and host.name is the pivot
+          every downstream consumer needs. Split domain-qualified usernames
+          into user.domain and user.name, run the severity normalization onto
+          the platform-wide convention, and translate the alerted/blocked
+          action through a lookup to event.type while retaining the raw value.
+          Cap process command lines and file paths to declared lengths, then
+          validate against a Schema Library schema (C.Schema(...).validate)
+          with a dead-letter route immediately before the guard destination
+          and Persistent Queue backpressure rather than Block; keep _raw while
+          the hand-built parser is unproven.
+        elastic: >
+          Stand up a custom ingest pipeline and index template for
+          logs-fireeye_hx.alert that accepts the pre-shaped documents, with
+          custom-namespace keyword mappings under fireeye.hx.*. Assert in the
+          template that host.name is populated on every document — an endpoint
+          detection that cannot say which endpoint is operationally useless —
+          and that event.severity arrives as the normalized numeric value.
+        relay: >
+          Full ECS-shaped JSON crosses, converted from CEF on the low side.
+          The flashpoints are process command lines and file paths —
+          user-influenced, long, and occasionally carrying encoded payloads —
+          so enforce declared length caps and character normalization on them
+          before the guard destination. Treat the crossing as at-most-once
+          with no return channel and detect silent drops by reconciling
+          low-side and high-side counts per (dataset, hour).
+      direct:
+        parse_location: low
+        cribl: >
+          Build the CEF header and extension parse here and emit ECS-shaped
+          JSON, resolving every custom slot by its paired Label value. dhost
+          names the enrolled endpoint the detection fired on, so it maps into
+          host.* — the alert describes that asset, and host.name is the pivot
+          every downstream consumer needs. Split domain-qualified usernames
+          into user.domain and user.name, run the severity normalization onto
+          the platform-wide convention, and translate the alerted/blocked
+          action through a lookup to event.type while retaining the raw value.
+          With no boundary the length caps and dead-letter discipline the
+          crossing forces are unnecessary; keep _raw while the hand-built
+          parser is unproven.
+        elastic: >
+          Stand up a custom ingest pipeline and index template for
+          logs-fireeye_hx.alert that accepts the pre-shaped documents, with
+          custom-namespace keyword mappings under fireeye.hx.*. Assert in the
+          template that host.name is populated on every document — an endpoint
+          detection that cannot say which endpoint is operationally useless —
+          and that event.severity arrives as the normalized numeric value.
+  - format: api-pull
+    enable: >
+      Enable a service account with at least the api_analyst role on the HX
+      controller, then GET https://<controller>/hx/api/v3/token with HTTP
+      Basic credentials to obtain an API token and read it from the
+      X-FeApi-Token response header. Poll GET /hx/api/v3/alerts on that same
+      base path, carrying the token in the X-FeApi-Token request header,
+      paginating with the offset/limit query parameters and check-pointing on
+      the event_at timestamp (or the monotonic _id) so each poll pulls only
+      alerts newer than the last. Filter server-side by source (IOC, MAL,
+      EXD/PROCGUARD, AMSI) or by has_share_mode / resolution as needed. Host
+      identity beyond the embedded agent._id is retrieved by joining GET
+      /hx/api/v3/hosts/<agent_id>, and the acquisition/triage artifacts a
+      responder pivots to live under /hx/api/v3/acqs. The token is
+      short-lived, so the collector must re-authenticate on a 401 rather than
+      pinning one token for the life of the job.
+    references:
+    - https://xsoar.pan.dev/docs/reference/integrations/fire-eye-hx-v2
+    - https://github.com/fireeye/HXTool/blob/master/hxtool_api.py
+    - >-
+      https://docs.stellarcyber.ai/prod-docs/5.3.x/Configure/Connectors/Fireeye-HX-Connectors.htm
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom HX REST alert pipeline (token auth + event_values flatten)
+      notes: >
+        No Elastic integration or vendor Cribl pack exists for HX, so this is
+        a hand-built pipeline fed by a Cribl REST Collector: authenticate,
+        page the alerts resource, then flatten the record. The hard part is
+        event_values — its keys are slash-delimited and namespaced by
+        event_type (processEvent/processCmdLine, fileWriteEvent/fullPath,
+        regKeyEvent/path, dnsLookupEvent/hostname), so the flatten must branch
+        on event_type and resolve keys by name, never by position, and
+        tolerate the absence of any given key. source names the detecting
+        engine (IOC vs malware vs exploit/PROCGUARD) and decides which
+        event_values branch and which of indicator/condition are populated.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Run the REST Collector against the low-side controller and shape to
+          ECS here so only a flat ECS document crosses the guard. Resolve the
+          agent into host.* (hostname -> host.name, primary_ip_address ->
+          host.ip, agent._id -> host.id) — the alert describes the endpoint
+          the detection fired on, so host.name is the pivot every downstream
+          consumer needs — and branch the event_values flatten on event_type,
+          mapping processEvent/* into process.*, fileWriteEvent/* into file.*,
+          regKeyEvent/path into registry.path and dnsLookupEvent/hostname into
+          dns.question.name. Translate resolution (ALERT / BLOCK /
+          PARTIAL_BLOCK) through a lookup to event.type while retaining the
+          raw value, run the platform-wide severity normalization, and split
+          any domain-qualified user into user.domain and user.name. Cap
+          processEvent/processCmdLine, fileWriteEvent/fullPath and the
+          free/binary fileWriteEvent/textAtLowestOffset to declared lengths,
+          validate against a Schema Library schema (C.Schema(...).validate)
+          with a dead-letter route immediately before the guard destination,
+          and use Persistent Queue backpressure rather than Block. Key on _id
+          so this pull is deduplicated against the CEF feed when both collect
+          the same controller.
+        elastic: >
+          Stand up a custom ingest pipeline and index template for
+          logs-fireeye_hx.alert that accepts the pre-shaped documents, with
+          custom-namespace keyword mappings under fireeye.hx.* for the fields
+          that have no ECS home (alert_source, subtype, matched_source_alerts,
+          containment_state). Assert in the template that host.name is
+          populated on every document — an endpoint detection that cannot say
+          which endpoint is operationally useless — and that event.severity
+          arrives as the normalized numeric value. Populate file.hash.md5 /
+          process.hash.md5 from the md5values and event_values md5 keys so
+          detections join the same threat-intel enrichment as the CEF feed.
+        relay: >
+          Full ECS-shaped JSON crosses, converted from the API record on the
+          low side, never the raw event_values nesting. The flashpoints are
+          the same user-influenced free text the CEF feed carries — process
+          command lines, full file paths, and the fileWriteEvent
+          textAtLowestOffset blob, which can hold encoded payload bytes — so
+          enforce declared length caps and character normalization on them
+          before the guard destination. Treat the crossing as at-most-once
+          with no return channel and detect silent drops by reconciling
+          low-side and high-side counts per (dataset, hour) on _id.
+      direct:
+        parse_location: low
+        cribl: >
+          Run the REST Collector against the high-side controller and shape to
+          ECS: authenticate, page the alerts resource, resolve the agent into
+          host.* (hostname -> host.name, primary_ip_address -> host.ip,
+          agent._id -> host.id), and branch the event_values flatten on
+          event_type, mapping processEvent/* into process.*, fileWriteEvent/*
+          into file.*, regKeyEvent/path into registry.path and
+          dnsLookupEvent/hostname into dns.question.name. Translate resolution
+          (ALERT / BLOCK / PARTIAL_BLOCK) through a lookup to event.type while
+          retaining the raw value, run the platform-wide severity
+          normalization, and split any domain-qualified user into user.domain
+          and user.name. With no boundary the length-capping and dead-letter
+          discipline are unnecessary. The decision that matters here is
+          deduplication against the CEF feed if both are collected for the
+          same controller — key on _id so a pulled alert and the CEF
+          notification for the same detection are recognized as one event
+          rather than double-counted.
+        elastic: >
+          Stand up a custom ingest pipeline and index template for
+          logs-fireeye_hx.alert that accepts the pre-shaped documents, with
+          custom-namespace keyword mappings under fireeye.hx.* for the fields
+          that have no ECS home (alert_source, subtype, matched_source_alerts,
+          containment_state). Assert in the template that host.name is
+          populated on every document — an endpoint detection that cannot say
+          which endpoint is operationally useless — and that event.severity
+          arrives as the normalized numeric value, and populate file.hash.md5
+          / process.hash.md5 from the md5values and event_values md5 keys.
+          With no boundary, retain the full event_values detail and
+          matched_source_alerts correlation for hunting rather than capping
+          them, and treat the API pull as complementary to the CEF
+          notification: the API record carries the correlated source alerts,
+          the containment state, and the acquisition pivots that the CEF
+          extension does not.
+    fields:
+    - vendor: _id
+      type: string
+      description: controller-assigned alert identifier
+      ecs: event.id
+      status: mapped
+    - vendor: event_at
+      type: timestamp
+      description: time the underlying endpoint event occurred
+      ecs: '@timestamp'
+      status: partial
+      transform: >-
+        parse with an explicit UTC assumption; distinct from matched_at (when
+        the controller matched it) and reported_at (when the agent reported
+        it)
+    - vendor: matched_at
+      type: timestamp
+      description: time the controller matched the event against a condition
+      ecs: null
+      status: unmapped
+      custom: fireeye.hx.matched_at
+      notes: >-
+        kept alongside the event time; the detection-latency delta between
+        event_at and matched_at is operationally useful
+    - vendor: reported_at
+      type: timestamp
+      description: time the agent reported the event to the controller
+      ecs: null
+      status: unmapped
+      custom: fireeye.hx.reported_at
+    - vendor: source
+      type: enum
+      description: >-
+        detecting engine — IOC, MAL (malware protection), EXD/PROCGUARD
+        (exploit guard), AMSI
+      ecs: null
+      status: unmapped
+      custom: fireeye.hx.alert_source
+      notes: >-
+        decides which event_values branch and which of indicator/condition are
+        populated; retain it as the routing discriminator
+    - vendor: resolution
+      type: enum
+      description: disposition — ALERT (detection-only), BLOCK, PARTIAL_BLOCK
+      ecs: event.type
+      status: partial
+      transform: >
+        lookup to the ECS event.type vocabulary (allowed / denied) retaining
+        the raw value; ALERT means detection-only and the activity proceeded
+        on the endpoint, BLOCK means prevention applied
+    - vendor: event_type
+      type: enum
+      description: >-
+        matched OS event class — processEvent, fileWriteEvent, regKeyEvent,
+        dnsLookupEvent, imageLoadEvent, urlMonitorEvent
+      ecs: event.action
+      status: partial
+      transform: >-
+        normalize the HX event-type taxonomy into a bounded event.action set;
+        it selects the slash-key namespace inside event_values
+    - vendor: subtype
+      type: string
+      description: additional classification of the alert
+      ecs: null
+      status: unmapped
+      custom: fireeye.hx.subtype
+    - vendor: matched_source_alerts
+      type: array
+      description: identifiers of the correlated source alerts that rolled up into this alert
+      ecs: null
+      status: unmapped
+      custom: fireeye.hx.matched_source_alerts
+      notes: >-
+        the correlation the API exposes and the CEF notification does not;
+        keep for cross-alert pivoting
+    - vendor: is_false_positive
+      type: boolean
+      description: whether the alert has been marked a false positive
+      ecs: null
+      status: unmapped
+      custom: fireeye.hx.is_false_positive
+    - vendor: url
+      type: string
+      description: API self-link to the alert resource
+      ecs: event.reference
+      status: partial
+      notes: >-
+        an API href rather than a UI deep link; confirm it resolves for the
+        analyst pivot before relying on it
+    - vendor: indicator.name
+      type: string
+      description: name of the IOC/indicator that fired, on IOC-source alerts
+      ecs: rule.name
+      status: partial
+      notes: >-
+        present on source=IOC alerts; absent on malware/exploit engine alerts,
+        so detections must tolerate its absence
+    - vendor: condition._id
+      type: string
+      description: identifier of the IOC condition that matched
+      ecs: rule.id
+      status: partial
+      notes: >-
+        the machine identity of the matched condition; pairs with
+        indicator.name on IOC alerts
+    - vendor: md5values
+      type: string
+      description: MD5 hash(es) associated with the alert, on malware-protection alerts
+      ecs: file.hash.md5
+      status: partial
+      notes: >-
+        confirm cardinality — some trains emit an array; take the primary
+        object hash before pinning the mapping
+    - vendor: agent._id
+      type: string
+      description: GUID of the HX agent on the enrolled endpoint the detection fired on
+      ecs: host.id
+      status: partial
+      notes: >-
+        the durable endpoint identity; join GET /hx/api/v3/hosts/<agent_id>
+        for the rest of host.*
+    - vendor: agent.containment_state
+      type: enum
+      description: >-
+        containment status of the endpoint at alert time (normal, contain,
+        containing, contained)
+      ecs: null
+      status: unmapped
+      custom: fireeye.hx.containment_state
+    - vendor: hostname
+      type: string
+      description: hostname of the enrolled endpoint (from the joined host record)
+      ecs: host.name
+      status: mapped
+      notes: >-
+        the alert describes this asset — the endpoint, not the controller,
+        belongs in host.*
+    - vendor: domain
+      type: string
+      description: domain the endpoint is joined to (from the joined host record)
+      ecs: host.domain
+      status: partial
+      notes: >-
+        confirm this is the AD/DNS domain rather than a workgroup label before
+        joining on it
+    - vendor: primary_ip_address
+      type: ip
+      description: reported address of the enrolled endpoint (from the joined host record)
+      ecs: host.ip
+      status: mapped
+    - vendor: agent_version
+      type: string
+      description: HX agent build running on the endpoint (from the joined host record)
+      ecs: agent.version
+      status: mapped
+    - vendor: os.product_name
+      type: string
+      description: operating system product name of the endpoint (from the joined host record)
+      ecs: host.os.name
+      status: mapped
+    - vendor: os.platform
+      type: string
+      description: >-
+        OS platform family of the endpoint — win, osx, linux (from the joined
+        host record)
+      ecs: host.os.platform
+      status: partial
+      notes: vendor tokens; normalize to the ECS host.os.platform convention
+    - vendor: event_values "processEvent/processPath"
+      type: string
+      description: image path of the process on a processEvent alert
+      ecs: process.executable
+      status: partial
+      notes: >-
+        event_values keys are slash-delimited and namespaced by event_type;
+        resolve by key name, never position
+    - vendor: event_values "processEvent/processCmdLine"
+      type: string
+      description: full command line of the process on a processEvent alert
+      ecs: process.command_line
+      status: partial
+      notes: >-
+        user-influenced free text and a guard-crossing flashpoint — cap to a
+        declared length low-side
+    - vendor: event_values "processEvent/md5"
+      type: string
+      description: MD5 hash of the process image on a processEvent alert
+      ecs: process.hash.md5
+      status: partial
+    - vendor: event_values "processEvent/parentPid"
+      type: integer
+      description: PID of the parent process on a processEvent alert
+      ecs: process.parent.pid
+      status: partial
+    - vendor: event_values "processEvent/parentProcess"
+      type: string
+      description: name of the parent process on a processEvent alert
+      ecs: process.parent.name
+      status: partial
+    - vendor: event_values "fileWriteEvent/fileName"
+      type: string
+      description: name of the written file on a fileWriteEvent alert
+      ecs: file.name
+      status: partial
+    - vendor: event_values "fileWriteEvent/fullPath"
+      type: string
+      description: full path of the written file on a fileWriteEvent alert
+      ecs: file.path
+      status: partial
+      notes: user-influenced free text; cap to a declared length before the guard
+    - vendor: event_values "fileWriteEvent/md5"
+      type: string
+      description: MD5 hash of the written file on a fileWriteEvent alert
+      ecs: file.hash.md5
+      status: partial
+    - vendor: event_values "fileWriteEvent/textAtLowestOffset"
+      type: string
+      description: bytes captured at the lowest file offset on a fileWriteEvent alert
+      ecs: null
+      status: unmapped
+      custom: fireeye.hx.file_text_at_lowest_offset
+      notes: >-
+        can carry encoded/binary payload bytes — the highest-risk field for
+        guard content inspection; cap or strip low-side
+    - vendor: event_values "regKeyEvent/path"
+      type: string
+      description: registry key path on a regKeyEvent alert
+      ecs: registry.path
+      status: partial
+    - vendor: event_values "dnsLookupEvent/hostname"
+      type: string
+      description: queried DNS name on a dnsLookupEvent alert
+      ecs: dns.question.name
+      status: partial
+    - vendor: event_values "urlMonitorEvent/requestUrl"
+      type: string
+      description: requested URL on a urlMonitorEvent alert
+      ecs: url.original
+      status: partial
+      notes: >-
+        confirm the exact key against the deployed train; url monitoring keys
+        vary by agent module version
+  - format: json
+    enable: >
+      On the HX controller open Settings > Notifications, enable an rsyslog
+      notification, and set the Format drop-down to JSON instead of CEF. The
+      same rsyslog Server IP / Port / Protocol (TCP) delivery as the CEF feed
+      applies — only the on-wire rendering changes — so the endpoint
+      detections leave the controller as one JSON object per notification on
+      the existing syslog path rather than a CEF line. This is the push
+      counterpart to the pull API: the same alert record, delivered over
+      syslog rather than polled over HTTPS.
+    references:
+    - https://axoflow.com/docs/axoflow/data-sources/appliances/trellix/hx/
+    - >-
+      https://docs.cloud.google.com/chronicle/docs/ingestion/default-parsers/fireeye-hx
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom HX JSON notification pipeline (syslog-envelope strip + Extract JSON)
+      notes: >
+        Strip the syslog envelope, Extract JSON, then flatten the alert object
+        into ECS with the same event_type-branched event_values handling the
+        api-pull entry documents — the JSON notification serializes the same
+        HX alert record, so the mapping table is shared and only the transport
+        differs. A public field reference for the push-JSON envelope
+        specifically is not published; capture sample notifications from the
+        deployed controller to pin the exact envelope keys before finalizing
+        extraction, and reuse the api-pull field mappings for the alert-record
+        body.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Receive the JSON over TCP syslog on the same edge worker group as
+          the CEF feed, Extract JSON, and reshape to ECS with the api-pull
+          mapping — resolve the agent into host.*, branch the event_values
+          flatten on event_type, translate resolution to event.type retaining
+          the raw value, and run the severity normalization. Because a
+          truncated JSON object yields nothing on the high side (unlike a cut
+          CEF line, which is partially recoverable), enforce a hard maximum
+          record size and dead-letter oversize records low-side rather than
+          letting the content filter trim them; cap the same command-line /
+          path / textAtLowestOffset free text, then Schema-Library-validate
+          with a dead-letter route and Persistent Queue backpressure ahead of
+          the guard destination.
+        elastic: >
+          The same custom logs-fireeye_hx.alert ingest pipeline and index
+          template the api-pull entry describes consumes these documents —
+          they are the same ECS shape reached over a different transport, so
+          there is no second pipeline. Key on the alert _id so a JSON
+          notification and an API pull for the same detection deduplicate
+          rather than double-count.
+        relay: >
+          Full ECS-shaped JSON crosses, converted from the notification on the
+          low side. The content-inspection flashpoints are identical to the
+          api-pull feed — process command lines, full file paths, and the
+          textAtLowestOffset blob — so cap and normalize them before the guard
+          destination, and enforce the hard size cap so a cut JSON record is
+          dead-lettered rather than silently emptied. Treat the crossing as
+          at-most-once and reconcile low- and high-side counts per (dataset,
+          hour) on _id.
+      direct:
+        parse_location: low
+        cribl: >
+          Receive the JSON over TCP syslog on the high-side edge worker group,
+          Extract JSON, and reshape to ECS with the shared api-pull mapping —
+          resolve the agent into host.*, branch the event_values flatten on
+          event_type, translate resolution to event.type retaining the raw
+          value, and run the severity normalization. With no boundary the hard
+          size cap and dead-letter discipline are unnecessary. Dedupe against
+          the CEF notification on _id if both formats are enabled on the same
+          controller — emitting CEF and JSON simultaneously doubles the syslog
+          volume for no gain.
+        elastic: >
+          The same custom logs-fireeye_hx.alert ingest pipeline and index
+          template the api-pull entry describes consumes these documents —
+          they are the same ECS shape reached over a different transport, so
+          there is no second pipeline. With no boundary, retain the full
+          event_values detail rather than capping it, and prefer this push
+          path over the api-pull collector when the existing syslog transport
+          is already trusted end-to-end, since it needs no outbound API
+          credential from the enclave.
+    fields_omitted: >
+      The notification body is the same HX alert record the api-pull entry
+      inventories, including the event_type-branched event_values tree, so
+      that mapping table is shared rather than repeated here. The only part
+      unique to this entry is the push-JSON envelope wrapped around the
+      record, and FireEye publishes no field reference for it.
+    fields: []
+- id: hx-audit
+  name: HX controller audit (CEF)
+  description: >
+    Console and system audit from the HX controller — admin logins, policy and
+    host-set changes, and containment actions. Portrayed on the same
+    CEF-over-syslog transport as the alert feed; confirm the format in-tool.
+  event_categories:
+  - authentication
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Small feed with minimal free text.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-fireeye_hx.audit
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Small feed with minimal free text.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-fireeye_hx.audit
+  formats:
+  - format: syslog-cef
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom HX CEF pipeline (shared header parser, audit-specific extension mapping)
+      notes: >
+        Shares the CEF header parser with hx-alert but needs its own extension
+        stage for the audit-specific keys — the administrator identity, the
+        console client address, and the action outcome.
+    fields:
+    - vendor: rt
+      type: timestamp
+      description: CEF receipt time of the audit event
+      ecs: '@timestamp'
+      status: partial
+      transform: same explicit-UTC parse as the alert feed
+    - vendor: dvchost
+      type: string
+      description: hostname of the emitting HX controller
+      ecs: observer.hostname
+      status: mapped
+    - vendor: 'CEF header: Name (field 6)'
+      type: enum
+      description: >-
+        audit action — login, logout, policy change, host-set change,
+        containment request/release
+      ecs: event.action
+      status: mapped
+    - vendor: suser
+      type: string
+      description: administrator who performed the action
+      ecs: user.name
+      status: partial
+      notes: >-
+        confirm against the deployed template whether the actor arrives as
+        suser or duser
+    - vendor: outcome (label-resolved)
+      type: string
+      description: result of the action — success or failure — carried in a label-named custom slot
+      ecs: event.outcome
+      status: partial
+      notes: >-
+        resolve by Label value and translate to the ECS success/failure
+        vocabulary; confirm the deployed slot and value set in-tool
+    - vendor: src
+      type: ip
+      description: console client address the action came from
+      ecs: source.ip
+      status: partial
+      notes: confirm presence and key on the deployed template
+    - vendor: msg
+      type: string
+      description: free-text detail of the audit action
+      ecs: null
+      status: unmapped
+      custom: fireeye.hx.audit_detail
+      notes: >-
+        the only unbounded field on this feed — cap to a declared length ahead
+        of the guard
+    - vendor: externalId
+      type: long
+      description: controller-assigned audit record identifier
+      ecs: event.id
+      status: partial
+      notes: confirm presence on the deployed template
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Reuse the hx-alert header parser with an audit-specific extension
+          stage. Containment actions are the security-relevant subset of this
+          feed — make sure they emit distinct event.action values the CSOC can
+          alert on rather than collapsing into a generic audit action, and
+          populate event.outcome from the result key so failed admin logins
+          are queryable. Schema-Library-validate with a dead-letter route and
+          Persistent Queue backpressure ahead of the guard destination.
+        elastic: >
+          Custom ingest pipeline and index template for logs-fireeye_hx.audit,
+          with a custom-namespace keyword mapping for fireeye.hx.audit_detail.
+          Assert that user.name and event.action are populated — an audit
+          record without actor or action is noise.
+        relay: >
+          Small, low-volume feed with bounded fields; the only free text is
+          the audit detail message, so cap it to a declared length before the
+          guard destination. Standard crossing discipline applies:
+          at-most-once, Persistent Queue (never Block), and per (dataset,
+          hour) count reconciliation.
+      direct:
+        parse_location: low
+        cribl: >
+          Reuse the hx-alert header parser with an audit-specific extension
+          stage. Containment actions are the security-relevant subset of this
+          feed — make sure they emit distinct event.action values the CSOC can
+          alert on rather than collapsing into a generic audit action, and
+          populate event.outcome from the result key so failed admin logins
+          are queryable.
+        elastic: >
+          Custom ingest pipeline and index template for logs-fireeye_hx.audit,
+          with a custom-namespace keyword mapping for fireeye.hx.audit_detail.
+          Assert that user.name and event.action are populated — an audit
+          record without actor or action is noise.

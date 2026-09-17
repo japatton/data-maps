@@ -1,0 +1,1026 @@
+id: carbon-black-edr
+name: Carbon Black EDR (on-premises)
+vendor: Broadcom
+versions: >-
+  Carbon Black EDR 7.5-7.9 (the on-premises product formerly sold as Cb
+  Response); cb-event-forwarder 3.x for the JSON path
+draft: true
+references:
+- >-
+  https://developer.carbonblack.com/reference/enterprise-response/connectors/event-forwarder/event-schema/
+- >-
+  https://techdocs.broadcom.com/us/en/carbon-black/edr/carbon-black-edr/7-9-1/integration-guide/GUID-6E43DE94-3737-450B-949A-14C69E4BD5C3-en.html
+- >-
+  https://techdocs.broadcom.com/us/en/carbon-black/edr/carbon-black-edr/7-9-1/integration-guide/GUID-6E43DE94-3737-450B-949A-14C69E4BD5C3-en/GUID-1590E6D0-6F9E-4917-8C53-12A377E60141-en.html
+- >-
+  https://knowledge.broadcom.com/external/article/285764/edr-how-to-change-syslog-output-to-cef-f.html
+datasets:
+- id: watchlist-hit
+  name: Watchlist and feed hit
+  description: |
+    The detection event. A watchlist is a saved query the server re-runs; a feed is a threat-intelligence source whose indicators the server matches against incoming data. Both produce a hit event naming what matched and the process or binary document it matched on. This is the dataset CSOC builds detections against - the raw telemetry datasets below are the corroborating evidence a hunt pivots into, not the alerting surface.
+    Two transports carry it and they are not equivalent. The cb-event-forwarder emits JSON; the server's own rsyslog can emit templated CEF. Broadcom documents the CEF path as lossy in its own integration guide: the CEF extension dictionary predates endpoint telemetry of this shape, so the default templates put every field without a natural CEF key into the catch-all msg. For a migration whose whole point is per-field ECS fidelity, that is the wrong path.
+  event_categories:
+  - malware
+  - process
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Receives NDJSON from cb-event-forwarder over its HTTP or TCP output.
+        Command lines and file paths inside the embedded docs list are the
+        free-text fields a content-inspection policy will reject or truncate.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-carbon_black_edr.alert
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Receives NDJSON from cb-event-forwarder over its HTTP output.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-carbon_black_edr.alert
+  formats:
+  - format: json
+    recommended: true
+    recommended_because: >-
+      The only path that carries every field as its own key. Broadcom's
+      integration guide states that the CEF extension dictionary does not map
+      well to Carbon Black EDR's data and that the default templates route the
+      remainder into the catch-all msg parameter, which would have to be
+      re-parsed downstream to recover fields the forwarder hands over already
+      separated.
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Carbon Black EDR event-forwarder normalization pipeline
+      notes: >
+        There is no Elastic integration for on-premises Carbon Black EDR - the
+        elastic/integrations catalogue ships carbon_black_cloud, which is a
+        different product with a different field vocabulary (camelCase
+        deviceId/threatInfo rather than snake_case sensor_id/process_guid).
+        Pointing the Cloud integration at this feed will not work and the
+        similarity of the product names makes that an easy mistake. A
+        hand-built pipeline owns this schema.
+    fields:
+    - vendor: type
+      type: string
+      description: >-
+        the event type of the record, e.g. watchlist.hit.process,
+        feed.storage.hit.binary
+      ecs: event.action
+      status: partial
+      notes: >
+        the dotted vendor name is the most specific statement of what happened
+        and is kept verbatim; event.category and event.type are derived from
+        it in the pipeline rather than replacing it
+    - vendor: watchlist_id
+      type: integer
+      description: numeric id of the watchlist that fired
+      ecs: rule.id
+      status: partial
+      transform: cast to string
+      notes: >-
+        ECS types rule.id as a keyword; the forwarder emits an int32, so the
+        cast is mandatory or the document is rejected by the mapping
+    - vendor: watchlist_name
+      type: string
+      description: display name of the watchlist that fired
+      ecs: rule.name
+      status: mapped
+    - vendor: feed_id
+      type: integer
+      description: numeric id of the threat-intelligence feed that matched
+      ecs: null
+      status: partial
+      custom: carbon_black.feed.id
+      transform: cast to string
+      notes: >
+        rule.id is already taken by watchlist_id and a single record never
+        carries both - a hit is a watchlist hit or a feed hit, never both -
+        but modelling them as one field would lose which kind of thing fired,
+        which is the first question an analyst asks
+    - vendor: feed_name
+      type: string
+      description: display name of the threat-intelligence feed that matched
+      ecs: null
+      status: partial
+      custom: carbon_black.feed.name
+      notes: same reasoning as feed_id
+    - vendor: ioc_type
+      type: string
+      description: the kind of indicator that matched - md5, ipv4, dns, query
+      ecs: threat.indicator.type
+      status: partial
+      transform: map vendor vocabulary to ECS indicator type vocabulary
+      notes: >-
+        vendor values are lowercase and do not match the ECS allowed values
+        (file, ipv4-addr, domain-name); query has no ECS equivalent at all
+        because it is a saved search rather than an indicator
+    - vendor: ioc_value
+      type: string
+      description: the indicator value that matched
+      ecs: threat.indicator.name
+      status: partial
+      notes: >-
+        typed by ioc_type, so the same key carries a hash, an address or a
+        domain; the pipeline additionally copies it to the typed ECS field
+        (threat.indicator.file.hash.md5, threat.indicator.ip) so it is
+        queryable without knowing which kind it was
+    - vendor: ioc_attr
+      type: object
+      description: JSON attributes of the matching indicator
+      ecs: null
+      status: unmapped
+      custom: carbon_black.ioc.attributes
+      notes: shape varies by feed; kept whole rather than flattened
+    - vendor: hostname
+      type: string
+      description: hostname of the sensor the hit is attributed to
+      ecs: host.hostname
+      status: mapped
+    - vendor: sensor_id
+      type: integer
+      description: numeric id of the sensor
+      ecs: null
+      status: partial
+      custom: carbon_black.sensor.id
+      transform: cast to string
+      notes: >-
+        the join key to every other Carbon Black dataset and to the console;
+        agent.id is deliberately not used, because it is reserved for the
+        Elastic Agent shipping the data, not the EDR sensor
+    - vendor: process_id
+      type: string
+      description: the unique process key of the process document that matched (process hits only)
+      ecs: process.entity_id
+      status: mapped
+    - vendor: segment_id
+      type: integer
+      description: >-
+        which storage segment of the process the hit landed in; needed with
+        process_id to address the event in the console
+      ecs: null
+      status: unmapped
+      custom: carbon_black.segment.id
+      transform: cast to string
+      notes: >-
+        meaningless alone, but a console deep link is invalid without it, so
+        it travels with process_id rather than being dropped
+    - vendor: md5
+      type: string
+      description: MD5 of the binary that matched (binary hits only)
+      ecs: file.hash.md5
+      status: mapped
+    - vendor: report_id
+      type: string
+      description: id of the feed report that carried the indicator
+      ecs: null
+      status: partial
+      custom: carbon_black.report.id
+      notes: the citation for why this fired; rule.reference would misrepresent it as a URL
+    - vendor: cb_version
+      type: string
+      description: version of the Carbon Black server that emitted the record
+      ecs: observer.version
+      status: mapped
+    - vendor: server_name
+      type: string
+      description: display name of the Carbon Black server
+      ecs: observer.name
+      status: mapped
+    - vendor: event_timestamp
+      type: timestamp
+      description: when the server generated the hit, epoch seconds with fraction
+      ecs: '@timestamp'
+      status: partial
+      transform: epoch_seconds to ISO-8601 UTC
+      notes: >
+        this is server hit time, not endpoint event time - a watchlist re-runs
+        on a schedule, so a hit can post minutes to hours after the behaviour
+        it matched. The endpoint time lives in the embedded docs entry and is
+        mapped to event.start so both are queryable and the lag is visible.
+    - vendor: docs
+      type: array
+      description: the full process or binary documents that matched, embedded in the hit
+      ecs: null
+      status: partial
+      custom: carbon_black.docs
+      notes: >
+        a hit carries its evidence inline rather than only pointing at it. The
+        pipeline promotes the first document's process fields to the ECS
+        process.* set (see the telemetry datasets for the same field names)
+        and keeps the array whole for the rest, because a hit can match more
+        than one document and ECS has no repeated-object shape for this. This
+        is the field a guard content filter is most likely to reject: it
+        contains every command line in the match.
+  - format: syslog-cef
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: Cribl CEF parser plus a Carbon Black extension-key pipeline
+      notes: |
+        Emitted by the server's own rsyslog using the templates in /usr/share/cb/syslog_templates (process_cef.txt, binary_cef.txt), selected by the WatchlistSyslogTemplateProcess and WatchlistSyslogTemplateBinary settings. Included because an ArcSight estate is likely already receiving this feed and turning it off is a migration step, not a precondition - but it is not the recommended path.
+        The field table below is the templated keys only. Everything else the server knows lands inside msg as a free-text remainder; those fields are documented on the JSON format above, which carries them as keys, rather than being restated here as substring extractions.
+    fields:
+    - vendor: dhost
+      type: string
+      description: CEF destination host - the sensor hostname
+      ecs: host.hostname
+      status: mapped
+    - vendor: dproc
+      type: string
+      description: CEF destination process - the process name that matched
+      ecs: process.name
+      status: mapped
+    - vendor: fname
+      type: string
+      description: CEF file name - the process or binary path
+      ecs: process.executable
+      status: partial
+      notes: >-
+        carries a full path despite the CEF key meaning file name; on the
+        binary template it is the observed filename and maps to file.path
+        instead, which the pipeline decides from the CEF header signature id
+    - vendor: start
+      type: timestamp
+      description: CEF start time - process start
+      ecs: process.start
+      status: mapped
+    - vendor: process_md5
+      type: string
+      description: MD5 of the process image, as a custom CEF extension
+      ecs: process.hash.md5
+      status: mapped
+    - vendor: guid
+      type: string
+      description: the unique process key, as a custom CEF extension
+      ecs: process.entity_id
+      status: mapped
+    - vendor: segment_id
+      type: integer
+      description: storage segment of the process, as a custom CEF extension
+      ecs: null
+      status: unmapped
+      custom: carbon_black.segment.id
+      transform: cast to string
+    - vendor: last_update
+      type: timestamp
+      description: last time the process document was updated
+      ecs: event.end
+      status: partial
+      notes: >-
+        the close of the observation window for the process, not the end of
+        the matched behaviour
+    - vendor: msg
+      type: string
+      description: >-
+        the catch-all remainder - every field the CEF extension dictionary has
+        no key for
+      ecs: message
+      status: partial
+      notes: >
+        Broadcom's integration guide names this explicitly: the built-in CEF
+        extension keys do not map well to Carbon Black EDR's data, so the
+        default template routes the rest here. Recovering a field from it
+        means substring parsing a free-text blob whose shape is set by a
+        template file on the server, which is why the JSON format is
+        recommended.
+- id: process-events
+  name: Process telemetry (procstart, childproc)
+  description: >
+    Raw process execution telemetry from the sensor, delivered only by
+    cb-event-forwarder. There is no CEF path for these: the server's rsyslog
+    templates cover watchlist and binary output, not the ingress.event.*
+    stream. Volume is the defining constraint - this is every process start on
+    every sensor.
+  event_categories:
+  - process
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Receives NDJSON from cb-event-forwarder. This is the highest-volume
+        Carbon Black feed and the first candidate for edge sampling or
+        allow-listing by process path before the guard, because guard
+        throughput, not Elastic storage, is the binding limit. There is no
+        second format: the alternative is not a different encoding but a
+        different product surface, the API, which is a pull rather than a
+        stream.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes. Command lines cross as free text and are the
+        field most likely to trip a content filter.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-carbon_black_edr.process
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Receives NDJSON from cb-event-forwarder over its HTTP output.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-carbon_black_edr.process
+  formats:
+  - format: json
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Carbon Black EDR event-forwarder normalization pipeline
+    fields:
+    - vendor: type
+      type: string
+      description: ingress.event.procstart or ingress.event.childproc
+      ecs: event.action
+      status: partial
+      notes: >-
+        procstart is the process describing its own start; childproc is the
+        parent reporting a child. The same execution produces both, from two
+        sensors' points of view, and de-duplication is a pipeline decision
+        rather than a mapping one.
+    - vendor: command_line
+      type: string
+      description: full command line of the process
+      ecs: process.command_line
+      status: mapped
+    - vendor: path
+      type: string
+      description: full path of the process image
+      ecs: process.executable
+      status: mapped
+    - vendor: pid
+      type: integer
+      description: operating-system process id
+      ecs: process.pid
+      status: mapped
+    - vendor: process_guid
+      type: string
+      description: the sensor-unique process key
+      ecs: process.entity_id
+      status: mapped
+      notes: >-
+        stable across the life of the process and the join key between this
+        dataset and every other Carbon Black event for the same process
+    - vendor: md5
+      type: string
+      description: MD5 of the process image
+      ecs: process.hash.md5
+      status: mapped
+    - vendor: username
+      type: string
+      description: user the process runs as
+      ecs: user.name
+      status: partial
+      transform: split DOMAIN\user into user.domain and user.name
+      notes: >-
+        Windows sensors emit DOMAIN\user; Linux sensors emit a bare name.
+        Storing the composite in user.name would break any join against
+        identity data.
+    - vendor: logon_type
+      type: integer
+      description: Windows logon type of the session the process started in
+      ecs: null
+      status: partial
+      custom: carbon_black.logon.type
+      transform: cast to string, decode to the Windows logon-type name
+      notes: >-
+        ECS has no vendor-neutral logon-type field; winlog.logon.type belongs
+        to the Windows integration's namespace and using it here would imply
+        this record came from the Windows event log
+    - vendor: parent_path
+      type: string
+      description: full path of the parent process image
+      ecs: process.parent.executable
+      status: mapped
+    - vendor: parent_md5
+      type: string
+      description: MD5 of the parent process image
+      ecs: process.parent.hash.md5
+      status: mapped
+    - vendor: parent_process_guid
+      type: string
+      description: the sensor-unique process key of the parent
+      ecs: process.parent.entity_id
+      status: mapped
+    - vendor: parent_create_time
+      type: timestamp
+      description: when the parent process started
+      ecs: process.parent.start
+      status: mapped
+    - vendor: child_process_guid
+      type: string
+      description: process key of the child (childproc events only)
+      ecs: null
+      status: partial
+      custom: carbon_black.child.entity_id
+      notes: >-
+        on a childproc event the reporting process is the parent, so the ECS
+        process.* set describes the parent and the child has nowhere
+        conventional to go; a pipeline that instead re-frames the record
+        around the child would double-count against procstart
+    - vendor: created
+      type: boolean
+      description: whether the child was created or only observed (childproc events)
+      ecs: null
+      status: unmapped
+      custom: carbon_black.child.created
+    - vendor: computer_name
+      type: string
+      description: hostname of the sensor
+      ecs: host.hostname
+      status: mapped
+    - vendor: sensor_id
+      type: integer
+      description: numeric id of the sensor
+      ecs: null
+      status: partial
+      custom: carbon_black.sensor.id
+      transform: cast to string
+    - vendor: cb_server
+      type: string
+      description: the Carbon Black server the sensor reports to
+      ecs: observer.name
+      status: mapped
+    - vendor: timestamp
+      type: timestamp
+      description: when the sensor observed the event
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: event_type
+      type: string
+      description: coarse event family, e.g. ingress.event
+      ecs: null
+      status: unmapped
+      custom: carbon_black.event.family
+      notes: >-
+        redundant with type, which is more specific; kept because the
+        forwarder emits both and dropping one silently would surprise anyone
+        comparing against the raw feed
+    - vendor: expect_followon_w_md5
+      type: boolean
+      description: the sensor will send a second record for this event once it has hashed the image
+      ecs: null
+      status: unmapped
+      custom: carbon_black.expect_followon
+      notes: >
+        an operational flag with a real detection consequence: when true, the
+        md5 on this record may be absent and a later record supersedes it. A
+        rule that alerts on a missing hash will fire on every one of these.
+    - vendor: link_process
+      type: string
+      description: console URL for the process
+      ecs: event.reference
+      status: partial
+      notes: >-
+        only one of the three link_* fields can hold event.reference; the
+        process link is chosen because it is the pivot an analyst wants
+    - vendor: link_sensor
+      type: string
+      description: console URL for the sensor
+      ecs: null
+      status: unmapped
+      custom: carbon_black.link.sensor
+    - vendor: link_parent
+      type: string
+      description: console URL for the parent process
+      ecs: null
+      status: unmapped
+      custom: carbon_black.link.parent
+- id: network-events
+  name: Network telemetry (netconn)
+  description: >
+    Per-connection network telemetry from the sensor, attributed to the
+    process that made the connection. The attribution is the value here -
+    firewall and Zeek feeds already record the connection, but only the
+    endpoint knows which process opened it.
+  event_categories:
+  - network
+  - process
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Receives NDJSON from cb-event-forwarder. High volume, but the records
+        are short and structured - no free-text field - so this feed is a
+        better guard citizen than the process stream.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-carbon_black_edr.network
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Receives NDJSON from cb-event-forwarder over its HTTP output.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-carbon_black_edr.network
+  formats:
+  - format: json
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Carbon Black EDR event-forwarder normalization pipeline
+    fields:
+    - vendor: local_ip
+      type: ip
+      description: local address of the connection
+      ecs: source.ip
+      status: partial
+      transform: swap source and destination when direction is inbound
+      notes: >
+        local and remote are sensor-relative, not flow-relative. Mapping
+        local_ip to source.ip unconditionally would invert every inbound
+        connection, and ECS source/destination are defined by who initiated.
+        The direction field is what resolves it, which is why neither address
+        field can be called mapped on its own.
+    - vendor: local_port
+      type: integer
+      description: local port of the connection
+      ecs: source.port
+      status: partial
+      transform: swap with destination.port when direction is inbound
+    - vendor: remote_ip
+      type: ip
+      description: remote address of the connection
+      ecs: destination.ip
+      status: partial
+      transform: swap source and destination when direction is inbound
+    - vendor: remote_port
+      type: integer
+      description: remote port of the connection
+      ecs: destination.port
+      status: partial
+      transform: swap with source.port when direction is inbound
+    - vendor: direction
+      type: string
+      description: inbound or outbound, relative to the sensor
+      ecs: network.direction
+      status: mapped
+      notes: >-
+        also the control field for the source/destination swap above; ECS
+        allows the same ingress/egress vocabulary after lowercasing
+    - vendor: protocol
+      type: integer
+      description: IANA protocol number
+      ecs: network.iana_number
+      status: partial
+      transform: >-
+        cast to string for network.iana_number, and decode to tcp/udp for
+        network.transport
+      notes: >-
+        ECS types iana_number as keyword, so the int must be cast; almost
+        every query wants network.transport instead, so both are populated
+    - vendor: domain
+      type: string
+      description: the hostname the process resolved, when the sensor saw the lookup
+      ecs: destination.domain
+      status: partial
+      notes: >
+        present only when the sensor correlated a DNS answer to the
+        connection; absent for connections to a literal address. Absence means
+        the sensor did not see the lookup, not that none happened - a rule
+        treating absence as "direct-to-IP" will produce false positives.
+    - vendor: ipv4
+      type: ip
+      description: legacy single-address field
+      ecs: null
+      status: unmapped
+      custom: carbon_black.netconn.ipv4
+      notes: >-
+        superseded by local_ip and remote_ip; retained by the forwarder for
+        older consumers and duplicated from one of them
+    - vendor: port
+      type: integer
+      description: legacy single-port field
+      ecs: null
+      status: unmapped
+      custom: carbon_black.netconn.port
+      notes: superseded by local_port and remote_port
+    - vendor: proxy
+      type: boolean
+      description: whether the connection went through a proxy
+      ecs: null
+      status: unmapped
+      custom: carbon_black.proxy.used
+    - vendor: proxy_ip
+      type: ip
+      description: address of the proxy
+      ecs: network.forwarded_ip
+      status: partial
+      notes: >-
+        the closest ECS field, though it is defined for the forwarded-for
+        chain rather than an endpoint-observed proxy hop
+    - vendor: proxy_port
+      type: integer
+      description: port of the proxy
+      ecs: null
+      status: unmapped
+      custom: carbon_black.proxy.port
+    - vendor: proxy_domain
+      type: string
+      description: hostname of the proxy
+      ecs: null
+      status: unmapped
+      custom: carbon_black.proxy.domain
+    - vendor: process_guid
+      type: string
+      description: the process that opened the connection
+      ecs: process.entity_id
+      status: mapped
+      notes: the whole point of this dataset; joins to process-events for the command line
+    - vendor: pid
+      type: integer
+      description: operating-system process id
+      ecs: process.pid
+      status: mapped
+    - vendor: md5
+      type: string
+      description: MD5 of the process image
+      ecs: process.hash.md5
+      status: mapped
+    - vendor: computer_name
+      type: string
+      description: hostname of the sensor
+      ecs: host.hostname
+      status: mapped
+    - vendor: sensor_id
+      type: integer
+      description: numeric id of the sensor
+      ecs: null
+      status: partial
+      custom: carbon_black.sensor.id
+      transform: cast to string
+    - vendor: cb_server
+      type: string
+      description: the Carbon Black server the sensor reports to
+      ecs: observer.name
+      status: mapped
+    - vendor: timestamp
+      type: timestamp
+      description: when the sensor observed the connection
+      ecs: '@timestamp'
+      status: mapped
+- id: file-registry-events
+  name: File, registry and module telemetry
+  description: >
+    filemod, regmod and moduleload in one dataset: three event types that
+    share an envelope and differ only in what the path means. Splitting them
+    would triple the route and recommendation text to describe one pipeline.
+  event_categories:
+  - file
+  - configuration
+  - process
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Receives NDJSON from cb-event-forwarder. Registry modification is the
+        highest-volume of the three by a wide margin and is the usual
+        candidate for edge filtering.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes. File and registry paths carry user-supplied
+        names and are a content-filter concern.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-carbon_black_edr.file
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Receives NDJSON from cb-event-forwarder over its HTTP output.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-carbon_black_edr.file
+  formats:
+  - format: json
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Carbon Black EDR event-forwarder normalization pipeline
+    fields:
+    - vendor: type
+      type: string
+      description: ingress.event.filemod, ingress.event.regmod or ingress.event.moduleload
+      ecs: event.action
+      status: partial
+      notes: >-
+        also the control field that decides whether path maps to file.path,
+        registry.path or dll.path
+    - vendor: path
+      type: string
+      description: the file, registry key or module path that was touched
+      ecs: file.path
+      status: partial
+      transform: >-
+        route by type - file.path for filemod, registry.path for regmod,
+        dll.path for moduleload
+      notes: >
+        one vendor key carrying three different kinds of object. Leaving all
+        three in file.path would make a registry query return module loads;
+        the type field is what disambiguates, and this is the single most
+        important transform in the dataset.
+    - vendor: action
+      type: string
+      description: what was done to the path, as a name
+      ecs: event.type
+      status: partial
+      transform: map vendor vocabulary to the ECS event.type vocabulary
+      notes: >-
+        vendor names (created, first-wrote, deleted, last-wrote) do not match
+        ECS allowed values (creation, change, deletion) one for one, and
+        first-wrote and last-wrote both become change
+    - vendor: actiontype
+      type: integer
+      description: numeric form of action
+      ecs: null
+      status: unmapped
+      custom: carbon_black.action.code
+      notes: >-
+        the same information as action; kept because vendor documentation and
+        console filters are written against the numeric form
+    - vendor: filetype
+      type: integer
+      description: numeric type of the file as the sensor classified it
+      ecs: null
+      status: unmapped
+      custom: carbon_black.file.type_code
+    - vendor: filetype_name
+      type: string
+      description: 'the sensor''s classification of the file, e.g. PE, ELF, PDF'
+      ecs: null
+      status: partial
+      custom: carbon_black.file.type
+      notes: >
+        deliberately not file.extension, which ECS defines as the trailing
+        characters of the name. This is content-sniffed, and the difference
+        between the two is exactly what a masquerading-extension detection
+        looks for - collapsing them would delete the signal.
+    - vendor: md5
+      type: string
+      description: MD5 of the file or module
+      ecs: file.hash.md5
+      status: partial
+      transform: dll.hash.md5 instead when type is moduleload
+      notes: absent on regmod, where there is no content to hash
+    - vendor: process_guid
+      type: string
+      description: the process that performed the modification
+      ecs: process.entity_id
+      status: mapped
+    - vendor: pid
+      type: integer
+      description: operating-system process id
+      ecs: process.pid
+      status: mapped
+    - vendor: computer_name
+      type: string
+      description: hostname of the sensor
+      ecs: host.hostname
+      status: mapped
+    - vendor: sensor_id
+      type: integer
+      description: numeric id of the sensor
+      ecs: null
+      status: partial
+      custom: carbon_black.sensor.id
+      transform: cast to string
+    - vendor: cb_server
+      type: string
+      description: the Carbon Black server the sensor reports to
+      ecs: observer.name
+      status: mapped
+    - vendor: timestamp
+      type: timestamp
+      description: when the sensor observed the event
+      ecs: '@timestamp'
+      status: mapped
+- id: enforcement-audit
+  name: Enforcement and sensor audit
+  description: >
+    What the product did rather than what it saw: process blocks from a ban or
+    a policy, sensor tamper attempts, and the server-side audit of banning,
+    host isolation and Live Response sessions. Low volume and high value - a
+    Live Response session is a responder taking a shell on an endpoint, and it
+    is the record an inspector asks for.
+  event_categories:
+  - malware
+  - iam
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Process blocks and tamper events arrive as NDJSON from
+        cb-event-forwarder; the server audit log is a file on the server and
+        is tailed by a collector rather than pushed.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-carbon_black_edr.audit
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        NDJSON from cb-event-forwarder, plus a file tail for the server audit
+        log.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-carbon_black_edr.audit
+  formats:
+  - format: json
+    recommended: true
+    recommended_because: >-
+      Carries the enforcement events as keys. The server audit log has no JSON
+      form and is covered by the raw format below.
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Carbon Black EDR event-forwarder normalization pipeline
+    fields:
+    - vendor: type
+      type: string
+      description: ingress.event.processblock or ingress.event.tamper
+      ecs: event.action
+      status: partial
+    - vendor: blocked_reason
+      type: string
+      description: why the process was blocked
+      ecs: rule.description
+      status: partial
+      notes: >-
+        names the ban or policy that caused the block; rule.name is left for
+        the ban name once it is confirmed which of the two the field carries
+    - vendor: blocked_result
+      type: string
+      description: the outcome of the block attempt
+      ecs: event.outcome
+      status: partial
+      transform: map vendor vocabulary to success or failure
+      notes: >-
+        a block that failed is the interesting case and the vendor vocabulary
+        is not the ECS one
+    - vendor: blocked_event
+      type: string
+      description: which event was blocked, e.g. ProcessCreate
+      ecs: event.type
+      status: partial
+    - vendor: command_line
+      type: string
+      description: command line of the blocked process
+      ecs: process.command_line
+      status: mapped
+    - vendor: path
+      type: string
+      description: image path of the blocked process
+      ecs: process.executable
+      status: mapped
+    - vendor: md5
+      type: string
+      description: MD5 of the blocked process image
+      ecs: process.hash.md5
+      status: mapped
+    - vendor: username
+      type: string
+      description: user the blocked process ran as
+      ecs: user.name
+      status: partial
+      transform: split DOMAIN\user into user.domain and user.name
+    - vendor: uid
+      type: string
+      description: operating-system user id
+      ecs: user.id
+      status: mapped
+    - vendor: tamper_type
+      type: string
+      description: what was attempted against the sensor, on tamper events
+      ecs: event.action
+      status: partial
+      notes: >-
+        shares event.action with type because a tamper record's type is always
+        ingress.event.tamper and the specific attempt is the informative half
+    - vendor: computer_name
+      type: string
+      description: hostname of the sensor
+      ecs: host.hostname
+      status: mapped
+    - vendor: sensor_id
+      type: integer
+      description: numeric id of the sensor
+      ecs: null
+      status: partial
+      custom: carbon_black.sensor.id
+      transform: cast to string
+    - vendor: cb_server
+      type: string
+      description: the Carbon Black server the sensor reports to
+      ecs: observer.name
+      status: mapped
+    - vendor: timestamp
+      type: timestamp
+      description: when the sensor observed the event
+      ecs: '@timestamp'
+      status: mapped
+  - format: syslog-raw
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: Carbon Black server audit-log grok pipeline
+      notes: |
+        The server's own audit records - banning, host isolation and Live Response sessions - are written to files under /var/log/cb rather than emitted by the event forwarder, so they are collected by tailing and parsed by pattern. Field names below are the parsed captures, not vendor keys, because the source is a log line.
+        The same files carry server-component debug lines. Those are operational noise for the Carbon Black administrator rather than security telemetry, and are dropped at the edge rather than mapped.
+    fields:
+    - vendor: timestamp
+      type: timestamp
+      description: when the server recorded the action
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: username
+      type: string
+      description: the console user who performed the action
+      ecs: user.name
+      status: mapped
+      notes: >-
+        this is a Carbon Black console operator, not an endpoint user - the
+        distinction matters when the same name exists in both
+    - vendor: action
+      type: string
+      description: what was done - ban, isolate, live-response session start or stop
+      ecs: event.action
+      status: partial
+      transform: normalize to a lowercase dotted vocabulary
+    - vendor: sensor_id
+      type: integer
+      description: the sensor acted upon
+      ecs: null
+      status: partial
+      custom: carbon_black.sensor.id
+      transform: cast to string
+    - vendor: message
+      type: string
+      description: the remainder of the audit line
+      ecs: message
+      status: mapped

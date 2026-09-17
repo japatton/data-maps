@@ -1,0 +1,1754 @@
+id: moveit-mft
+name: Managed File Transfer (MOVEit/Axway/GoAnywhere)
+vendor: Progress
+versions: MOVEit Transfer 2021–2024, MOVEit Automation 2021–2024
+draft: true
+references:
+- https://docs.ipswitch.com/MOVEit/Transfer2021/Help/Admin/en/23428.htm
+- https://docs.ipswitch.com/MOVEit/Transfer2021/Help/Admin/en/31496.htm
+- >-
+  https://docs.progress.com/bundle/moveit-transfer-web-admin-help-2023/page/Logs_2.html
+- >-
+  https://docs.progress.com/bundle/moveit-automation-web-admin-help-2024/page/Schema.html
+- https://docs.ipswitch.com/MOVEit/Automation2023/API/REST-API/index.html
+- >-
+  https://community.progress.com/s/article/MOVEit-Transfer-Critical-Vulnerability-31May2023
+- >-
+  https://www.huntress.com/blog/moveit-transfer-critical-vulnerability-rapid-response
+- https://www.elastic.co/docs/reference/integrations/iis
+datasets:
+- id: audit
+  name: MOVEit Transfer audit log
+  description: >
+    The tamper-evident audit record MOVEit Transfer writes for every file
+    transfer, sign-on, and administrative action. Records live in the
+    product's `log` database table and are additionally emitted to a remote
+    SysLog host (SETTINGS > System > Auditing > Syslog) and/or to the Windows
+    Application Event Log under the source MOVEit_DMZ_Audit, which is how a
+    SIEM normally receives them. The exported record body is a free-text
+    summary line followed by newline-separated `Key: Value` pairs (IP,
+    Username, AgentBrand, AgentVersion, XFerSize, Error, ...), so the field
+    names below are the `log` table column names that those keys mirror.
+    IMPORTANT CLASS CAVEAT - this map is grounded entirely in Progress MOVEit
+    documentation. Axway SecureTransport and Fortra GoAnywhere MFT cover the
+    same use case but emit different field names and action vocabularies;
+    treat those products as separate mapping work rather than assuming these
+    fields carry over.
+  event_categories:
+  - file
+  - authentication
+  - iam
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Receives the MOVEit SysLog feed (UDP/514 by default) or the
+        MOVEit_DMZ_Audit Windows Event Log channel via Elastic Agent. MFT
+        servers in a DMZ enclave are the low-side instances and cross the
+        guard as shown.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-moveit.audit
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Receives the MOVEit SysLog feed (UDP/514 by default) or the
+        MOVEit_DMZ_Audit Windows Event Log channel via Elastic Agent,
+        forwarded straight to the Elastic side with no guard hops.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-moveit.audit
+  formats:
+  - format: syslog-kv
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom MOVEit audit pipeline
+      notes: >
+        Checked and confirmed absent: there is no MOVEit package in
+        elastic/integrations and no MOVEit pack in the Cribl Pack Dispensary,
+        so the key-value body has to be parsed by a hand-built Cribl pipeline.
+        The pipeline owns the action-code vocabulary, so it needs a review
+        cadence tied to MOVEit upgrades that add new action codes.
+    fields:
+    - vendor: LogTime
+      type: timestamp
+      description: date and time the MOVEit Transfer server recorded the audit entry
+      ecs: '@timestamp'
+      status: mapped
+      transform: >-
+        server-local datetime with no zone offset; normalize to UTC using the
+        server's configured timezone before indexing
+    - vendor: Action
+      type: string
+      description: >-
+        short action code for the audited operation, e.g. file_upload,
+        file_download, sec_signon, sec_signoff, folder_add
+      ecs: event.action
+      status: mapped
+      transform: >
+        the nvarchar(16) code is copied to event.action verbatim and also
+        drives a lookup that assigns event.category/event.type - file_* to
+        file, sec_signon/sec_signoff to authentication, user_* and perm_* to
+        iam - since no vendor column carries a category
+    - vendor: Username
+      type: string
+      description: login name of the user who performed the action
+      ecs: user.name
+      status: mapped
+    - vendor: TargetName
+      type: string
+      description: display name of the object the action affected
+      ecs: user.target.name
+      status: partial
+      notes: >
+        only holds a user for account-management actions; for file and folder
+        actions the same column carries the affected file or folder name, so
+        the mapping must be gated on the action code or it will invent users
+    - vendor: TargetID
+      type: string
+      description: internal identifier of the object the action affected
+      ecs: null
+      status: unmapped
+      custom: moveit.transfer.target_id
+      notes: >-
+        opaque MOVEit id whose referent depends on the action code (user id,
+        folder id, or file id)
+    - vendor: IPAddress
+      type: ip
+      description: IP address the audited action was initiated from
+      ecs: source.ip
+      status: mapped
+      notes: >-
+        declared nvarchar(16) in the shipped schema, which is too narrow for a
+        full IPv6 literal - verify the column width on the deployed version
+        before relying on IPv6 source data
+    - vendor: Error
+      type: integer
+      description: MOVEit error code for the action, 0 meaning success
+      ecs: event.outcome
+      status: mapped
+      transform: >
+        0 becomes success and any non-zero value becomes failure; the
+        four-digit numeric code itself is preserved in a custom field
+        (moveit.transfer.error_code) because collapsing it to success/failure
+        discards the reason, which is what failed-transfer triage actually
+        needs
+    - vendor: Message
+      type: string
+      description: human-readable description of the audited action
+      ecs: message
+      status: mapped
+    - vendor: FileName
+      type: string
+      description: name of the file the action applied to
+      ecs: file.name
+      status: mapped
+    - vendor: FolderPath
+      type: string
+      description: full MOVEit folder path the file was stored in or acted on
+      ecs: file.directory
+      status: mapped
+      notes: >-
+        user-visible virtual path inside MOVEit, not a filesystem path on the
+        server; up to 2500 characters
+    - vendor: FileID
+      type: string
+      description: MOVEit-assigned identifier of the file involved in the action
+      ecs: null
+      status: unmapped
+      custom: moveit.transfer.file_id
+      notes: >-
+        the join key back to the MOVEit Automation file-activity dataset's
+        SourceFileID/DestFileID
+    - vendor: XferSize
+      type: float
+      description: number of bytes actually moved by this transfer
+      ecs: file.size
+      status: partial
+      notes: >
+        bytes transferred, which equals the stored file size only for
+        completed transfers - aborted, resumed and partial transfers make this
+        smaller than the file, so volume-exfiltration rules should sum it
+        rather than treat it as file size
+    - vendor: Duration
+      type: float
+      description: elapsed time of the transfer
+      ecs: event.duration
+      status: mapped
+      transform: >-
+        vendor value is fractional seconds (double); multiply by 1e9 for ECS
+        event.duration nanoseconds
+    - vendor: AgentBrand
+      type: string
+      description: >-
+        brand string of the client application that performed the action, e.g.
+        Mozilla or MOVEit Automation
+      ecs: user_agent.name
+      status: partial
+      notes: >
+        populated for FTPS, SFTP and REST clients as well as browsers, where
+        there is no HTTP User-Agent header at all; useful as a
+        client-fingerprint field but do not read it as evidence the action was
+        a web request
+    - vendor: AgentVersion
+      type: string
+      description: version string of the client application that performed the action
+      ecs: user_agent.version
+      status: partial
+      notes: same non-HTTP caveat as AgentBrand; frequently empty for non-browser clients
+    - vendor: Hash
+      type: string
+      description: 40-character hash value carried on the audit record
+      ecs: null
+      status: partial
+      custom: moveit.transfer.hash
+      notes: >
+        the 40-character width implies SHA-1, but the vendor schema does not
+        document whether this is MOVEit's tamper-evident per-record audit hash
+        or the transferred file's integrity hash (the files table carries its
+        own). Do NOT map it to file.hash.sha1 until the deployment confirms
+        which it is - guessing wrong would make file-integrity alerting fire
+        on log-chain values
+    - vendor: InstID
+      type: integer
+      description: numeric identifier of the MOVEit organization (instance) the entry belongs to
+      ecs: organization.id
+      status: partial
+      notes: >
+        MOVEit-internal org id for multi-organization deployments, not an
+        enterprise-wide organization identifier - keep the raw number and add
+        organization.name from an inventory lookup before anyone builds a
+        tenant-scoped alert on it
+    - vendor: Cert
+      type: string
+      description: >-
+        client certificate material recorded when client-certificate
+        authentication was used
+      ecs: null
+      status: unmapped
+      custom: moveit.transfer.client_cert
+      notes: >-
+        free-text certificate blob (a text column); kilobyte-scale and the
+        least bounded value on this feed - a content-filter and index-size
+        problem rather than a useful detection field
+    - vendor: Parm1..Parm4
+      type: string
+      description: >-
+        four action-specific parameter slots whose meaning is determined by
+        the Action code
+      ecs: null
+      status: unmapped
+      custom: moveit.transfer.params
+      notes: >
+        up to 4096 characters each and semantically overloaded - the same slot
+        holds a policy name for one action and a file count for another, so
+        they cannot be mapped without an action-code-keyed table
+    - vendor: Hostname
+      type: string
+      description: hostname of the MOVEit Transfer server that recorded the entry
+      ecs: host.name
+      status: mapped
+      notes: >-
+        comes from the syslog/Windows-event envelope rather than the log table
+        itself; in a clustered MOVEit deployment this is the node, not the
+        service name
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Parse the `Key: Value` body low-side into full ECS-shaped JSON,
+          because there is no integration to defer to: split the summary line
+          from the key-value block, run the action-code lookup that sets
+          event.category/event.type and translates Error 0/non-zero into
+          event.outcome while retaining the numeric code, and convert Duration
+          from seconds to nanoseconds. Drop or truncate the Cert column here -
+          a kilobyte-scale PEM blob is the single worst thing on this feed to
+          push downstream - and cap FolderPath and the Parm1..Parm4 slots at
+          their declared lengths. Gate the destination with
+          C.Schema(...).validate plus a dead-letter route that alerts on its
+          own rate, since a hand-built parser with no vendor pack will
+          silently miss action codes added by an upgrade, and run Persistent
+          Queue backpressure rather than Block.
+        elastic: >
+          Own a custom logs-moveit.audit ingest pipeline that finishes only
+          what the low side cannot: an enrich policy resolving the four-digit
+          MOVEit error code to a readable failure reason, and an assertion
+          that event.action arrived from the lookup rather than as a bare
+          vendor code. Add explicit custom-namespace index template mappings -
+          moveit.transfer.file_id, .target_id and .hash as keyword, .org_id as
+          keyword, .params as a flattened object - so the action-specific Parm
+          slots stay queryable without dynamic mapping exploding the field
+          count. Leave moveit.transfer.hash out of any file.hash.* alerting
+          until the deployment confirms what that column actually holds.
+        relay: >
+          Full ECS-shaped NDJSON crosses (envelope mode B) - UTF-8,
+          LF-terminated, nesting depth <=2, compression disabled - since there
+          is no Elastic integration whose ingest pipeline could do the
+          extraction high-side. The vendor feed is key-value syslog, not CEF,
+          so nothing CEF-shaped reaches the boundary. The content filter's
+          friction here is user-controlled free text: file names and folder
+          paths are attacker-and-user-supplied, may carry non-ASCII and
+          percent-encoded bytes, and FolderPath is a 2500+ character column -
+          normalize and cap all three low-side so a custom NDJSON filter rule
+          can stay simple. Crossing is at-most-once with no return channel:
+          reconcile low-side and high-side counts per (dataset, hour), which
+          matters more than usual because MOVEit's own tamper-evident audit
+          chain gives no protection against records dropped in transit.
+      direct:
+        parse_location: low
+        cribl: >
+          Parse the `Key: Value` body in the collector into full ECS-shaped
+          JSON, because there is no integration to defer to: split the summary
+          line from the key-value block, run the action-code lookup that sets
+          event.category/event.type and translates Error 0/non-zero into
+          event.outcome while retaining the numeric code, and convert Duration
+          from seconds to nanoseconds. Drop or truncate the Cert column here -
+          a kilobyte-scale PEM blob is the single worst thing on this feed to
+          push downstream - and cap FolderPath and the Parm1..Parm4 slots at
+          their declared lengths. Gate the destination with
+          C.Schema(...).validate plus a dead-letter route that alerts on its
+          own rate, since a hand-built parser with no vendor pack will
+          silently miss action codes added by an upgrade, and run Persistent
+          Queue backpressure rather than Block.
+        elastic: >
+          Own a custom logs-moveit.audit ingest pipeline that finishes only
+          what the collector cannot: an enrich policy resolving the four-digit
+          MOVEit error code to a readable failure reason, and an assertion
+          that event.action arrived from the lookup rather than as a bare
+          vendor code. Add explicit custom-namespace index template mappings -
+          moveit.transfer.file_id, .target_id and .hash as keyword, .org_id as
+          keyword, .params as a flattened object - so the action-specific Parm
+          slots stay queryable without dynamic mapping exploding the field
+          count. Leave moveit.transfer.hash out of any file.hash.* alerting
+          until the deployment confirms what that column actually holds.
+  - format: windows-event
+    enable: >
+      The same audit records that feed the remote SysLog host are also written
+      to the Windows Event Log, and MOVEit Transfer documents that transport
+      as a first-class SIEM integration surface. SETTINGS > System > Auditing
+      controls it; the LogAuditEventSource registry/config setting decides
+      where and under what source name entries land. With "MOVEit_DMZ_Audit"
+      entries go to a dedicated "MOVEit" event log with source
+      MOVEit_DMZ_Audit; with "MOVEit DMZ Audit" (or unset) they go to the
+      Windows Application log with source "MOVEit DMZ Audit". Progress' own
+      guidance is to use the dedicated "MOVEit" log when a forwarder will
+      boost the channel, so the collector does not have to screen the busy
+      Application log by source. Successful actions are written at Information
+      level and failed actions at Error level. The event message body is the
+      identical free-text summary line plus newline-separated Key: Value block
+      that the SysLog feed carries, so the record content is the same as the
+      key-value stream - only the envelope differs.
+    references:
+    - https://docs.ipswitch.com/MOVEit/DMZ90/Help/Admin/en/31496.htm
+    - >-
+      https://docs.ipswitch.com/MOVEit/DMZ%207.5/online%20guide/MOVEitDMZ_WebInterface_Settings_System_Auditing.htm
+    - >-
+      https://docs.ipswitch.com/MOVEit/Central/onlineguide/en/MICMonitoringTasksWithoutAdminEventLog.htm
+    parsing:
+      mechanism: elastic-integration
+      artifact: >-
+        Custom Windows Event Log integration (channel 'MOVEit') collecting the
+        envelope, plus a logs-moveit.audit@custom body parser for the Key:
+        Value block
+      notes: >
+        The stock Windows integration only ships the standard Security,
+        Application and System channels, so the dedicated "MOVEit" channel
+        needs the Custom Windows Event Log integration (or a winlogbeat
+        custom-channel input) pointed at it by name. That collector fills the
+        event envelope - provider, level, record time, computer - but the
+        audit payload sits inside the event message as the same free-text-
+        plus-Key:Value block the SysLog feed emits, so the identical hand-
+        built action-code parser the syslog-kv feed relies on still has to run
+        over the message body. Prefer the dedicated "MOVEit" log source over
+        the shared Application log so the collector does not filter a noisy
+        channel by source string.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Collect the "MOVEit" channel with a Windows Event Log source and do
+          the same low-side Key: Value extraction the syslog-kv feed uses -
+          there is still no vendor pack, so the envelope buys structure for
+          the wrapper only, not the body. Split the event message into the
+          summary line and the Key: Value block, run the action-code lookup
+          that sets event.category/event.type, and reconcile the envelope
+          Level against the body Error code: Information/Error is a coarser
+          success/failure signal than the four-digit numeric error, so keep
+          the numeric code from the body and treat Level as a cross-check, not
+          the source of event.outcome. Drop or truncate the Cert value and cap
+          FolderPath and the Parm slots low-side exactly as on the SysLog
+          feed, gate the destination with C.Schema validate plus a dead-letter
+          route, and run Persistent Queue backpressure.
+        elastic: >
+          Own the same logs-moveit.audit@custom pipeline the SysLog feed
+          targets, adding only the envelope reconciliation: assert that
+          event.outcome derived from the body Error code agrees with the
+          Windows Level, and carry event.provider (the MOVEit_DMZ_Audit source
+          name) so a channel-source mismatch is visible. Declare the same
+          custom-namespace mappings - moveit.transfer.file_id, .target_id,
+          .params, .hash - since the body is byte-identical to the SysLog body
+          and the field inventory below is only the wrapper the channel adds.
+        relay: >
+          Full ECS-shaped NDJSON crosses (envelope mode B) once the body is
+          parsed low-side, since no high-side integration can extract the Key:
+          Value block. The Windows envelope adds no new attacker- controlled
+          surface beyond what the SysLog feed already carries - the free-text
+          file names, folder paths and the kilobyte-scale Cert blob are still
+          the friction points, so normalize and cap them low-side. The channel
+          does add one reconciliation lever the SysLog feed lacks: the event
+          Record ID is monotonic per channel, so low-side and high-side counts
+          can be reconciled on a contiguous id range per (channel, hour)
+          rather than on volume alone.
+      direct:
+        parse_location: low
+        cribl: >
+          High-side instances need no guard hops: collect the "MOVEit" channel
+          straight into the core worker group and run the Key: Value body
+          parser and action-code lookup in the collector - the envelope buys
+          structure for the wrapper only, not the body. Carry the provider and
+          Level in the envelope so an operator can tell a channel that has
+          gone silent from one that is only emitting Information events.
+        elastic: >
+          Own the same logs-moveit.audit@custom pipeline the SysLog feed
+          targets, adding only the envelope reconciliation: assert that
+          event.outcome derived from the body Error code agrees with the
+          Windows Level, and carry event.provider (the MOVEit_DMZ_Audit source
+          name) so a channel-source mismatch is visible. Declare the same
+          custom-namespace mappings - moveit.transfer.file_id, .target_id,
+          .params, .hash - since the body is byte-identical to the SysLog body
+          and the field inventory below is only the wrapper the channel adds.
+    fields:
+    - vendor: Provider
+      type: string
+      description: >-
+        Windows Event Log source name the audit entry was written under, e.g.
+        MOVEit_DMZ_Audit in the dedicated "MOVEit" log or "MOVEit DMZ Audit"
+        in the Application log
+      ecs: event.provider
+      status: mapped
+      notes: >-
+        set by the LogAuditEventSource setting; the value tells the collector
+        which channel to bind and is the discriminator when MOVEit shares the
+        Application log with other software
+    - vendor: Level
+      type: string
+      description: >-
+        Windows event level - Information for a successful action, Error for a
+        failed one
+      ecs: event.outcome
+      status: partial
+      transform: >
+        Information becomes success and Error becomes failure, but this is a
+        coarser signal than the body's four-digit Error code - derive
+        event.outcome from the body Error and use Level only as a cross-check
+      notes: >-
+        also drives log.level; a bare Information/Error flag cannot
+        distinguish the specific failure reason the numeric code carries
+    - vendor: TimeGenerated
+      type: timestamp
+      description: time the Windows Event Log recorded the entry
+      ecs: '@timestamp'
+      status: mapped
+      notes: >-
+        the EVTX System time is stored in UTC, so unlike the log-table LogTime
+        column this envelope timestamp needs no server-zone correction; it can
+        differ from the body's own LogTime by the write latency
+    - vendor: Computer
+      type: string
+      description: hostname of the Windows server that wrote the event
+      ecs: host.name
+      status: mapped
+      notes: >-
+        from the event envelope; in a clustered MOVEit deployment this is the
+        node that served the action, not the service name
+    - vendor: EventID
+      type: integer
+      description: Windows Event Identifier carried on the record
+      ecs: event.code
+      status: partial
+      notes: >
+        MOVEit does not document a per-action Event ID scheme - the action
+        vocabulary lives in the message body, not the Event ID - so treat this
+        as a coarse channel discriminator and keep event.action from the
+        parsed body Action key rather than from the Event ID
+    - vendor: Message
+      type: string
+      description: >-
+        full event message - the free-text summary line followed by the
+        newline-separated Key: Value audit block (IP, Username, AgentBrand,
+        XferSize, Error, ...)
+      ecs: message
+      status: mapped
+      notes: >
+        carries the identical body the SysLog feed emits; the summary line
+        maps to message and the Key: Value block below it must be extracted by
+        the same custom parser, resolving to the same ECS targets the
+        key-value stream uses (user.name, source.ip, event.action, file.name,
+        and the rest)
+    - vendor: LogName
+      type: string
+      description: >-
+        which Windows Event Log channel the entry was written to - the
+        dedicated "MOVEit" log or the shared "Application" log
+      ecs: null
+      status: unmapped
+      custom: moveit.transfer.event_log
+      notes: >-
+        determined by LogAuditEventSource; retain it so a config drift that
+        moves audit entries back to the noisy Application log is visible
+        downstream
+  - format: jdbc-sql
+    enable: >
+      Every audit entry is persisted as a typed row in the MOVEit Transfer
+      database `log` table before it is ever emitted to SysLog or the Event
+      Log, so the table can be read directly instead of tailing a feed. The
+      backing store is the bundled MySQL instance or an external Microsoft SQL
+      Server (both are supported and carry the same schema). Grant a read-only
+      account and enable Database > Remote Access, then poll with a scheduled
+      query - Elastic Agent's SQL input, Logstash JDBC, or a Cribl Database
+      Collector - tracking a high-water mark on the auto-increment ID (or
+      LogTime) so each row is read once. The table exposes columns that never
+      reach the SysLog body: the durable primary-key ID, numeric FolderID and
+      VirtualFolderID, and the coded InterfaceType, so a database pull is a
+      strictly richer record than the key-value feed at the cost of a polling
+      collector rather than a push listener.
+    references:
+    - >-
+      https://docs.progress.com/bundle/moveit-transfer-web-admin-help-2022/page/Database-Partial-Schema.html
+    - https://docs.ipswitch.com/MOVEit/Transfer2018SP2/Help/Admin/en/23428.htm
+    - >-
+      https://docs.progress.com/bundle/moveit-transfer-web-admin-help-2022/page/Database-Remote-Access.html
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom MOVEit audit collector pipeline (Database Collector + ECS shaping)
+      notes: >
+        No Elastic integration or Cribl pack reads the MOVEit log table, but
+        because the rows are already typed columns the pipeline does no text
+        parsing - its job is ECS shaping, the action-code lookup, and
+        pagination state. The action-code vocabulary that sets
+        event.category/event.type is the same one the SysLog pipeline owns and
+        carries the same upgrade-review cadence. LogTime is a server-local
+        DATETIME with no offset, so the source zone must be applied on ingest
+        exactly as on the SysLog feed; the ID column is the natural checkpoint
+        and dedup key.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Run a Database Collector low-side against the `log` table with a
+          high-water mark on ID (monotonic and gap-free, unlike LogTime which
+          can tie at sub-second resolution), read the typed columns straight
+          into ECS, and de-duplicate on ID across overlapping polls. Because
+          the rows are already structured there is no _raw line to
+          disambiguate, but the same low-side hygiene applies: drop or
+          truncate the Cert column, cap FolderPath and the four Parm slots at
+          their declared widths, and derive event.outcome from Error while
+          keeping the numeric code. Treat the log database as a low-side asset
+          - poll it low-side and cross the resulting NDJSON rather than
+          opening a broad database port across the guard. Validate against a
+          Schema Library schema with a dead-letter route, on Persistent Queue
+          backpressure.
+        elastic: >
+          Own a logs-moveit.audit ingest pipeline and index template with the
+          same typed custom-namespace mappings the SysLog feed uses, plus the
+          database-only columns: moveit.transfer.folder_id and
+          .virtual_folder_id as keyword, .interface_type as keyword, and the
+          durable moveit.transfer.log_id as keyword so the DB primary key is
+          queryable for reconciliation against the SysLog stream. The
+          InterfaceType column is worth surfacing - it is a reliable coded
+          signal of the client channel (web, FTP, SFTP, API) where AgentBrand
+          is only a best-effort string. Keep moveit.transfer.hash out of any
+          file.hash.* alerting until the deployment confirms what the column
+          holds, same as on the SysLog feed.
+        relay: >
+          Full ECS-shaped NDJSON crosses (envelope mode B): one object per
+          row, already structured, so nothing a high-side integration could
+          parse remains. The content-filter friction is the same
+          user-controlled free text - FolderPath is a 2500-character column,
+          file names are attacker-and-user-supplied and may be non-ASCII, and
+          Cert is a kilobyte-scale blob - all capped and normalized low-side.
+          The pull model changes the reconciliation story for the better: the
+          contiguous ID range collected per (dataset, hour) can be checked for
+          gaps directly, which the at-most-once crossing needs because
+          MOVEit's tamper-evident audit chain gives no protection against rows
+          dropped in transit.
+      direct:
+        parse_location: low
+        cribl: >
+          High-side instances run a Database Collector against the local `log`
+          table with no guard hops, checkpointing on ID (monotonic and
+          gap-free) and shaping to ECS in the collector pipeline. Own the pull
+          semantics carefully - a collector that silently stops is invisible
+          in a way a SysLog listener is not - so alert on collection gaps in
+          the ID sequence.
+        elastic: >
+          Own a logs-moveit.audit ingest pipeline and index template with the
+          typed custom-namespace mappings the SysLog feed uses, plus the
+          database-only columns: moveit.transfer.folder_id and
+          .virtual_folder_id as keyword, .interface_type as keyword, and the
+          durable moveit.transfer.log_id as keyword so the DB primary key is
+          queryable for reconciliation against the SysLog stream. The
+          InterfaceType column is worth surfacing - it is a reliable coded
+          signal of the client channel (web, FTP, SFTP, API) where AgentBrand
+          is only a best-effort string. Keep moveit.transfer.hash out of any
+          file.hash.* alerting until the deployment confirms what the column
+          holds. Collection is over the Elastic Agent SQL input or Logstash
+          JDBC directly against the database with no boundary in between.
+    fields:
+    - vendor: ID
+      type: integer
+      description: auto-increment bigint primary key of the audit row
+      ecs: null
+      status: unmapped
+      custom: moveit.transfer.log_id
+      notes: >-
+        the durable record identifier and the collector's
+        high-water-mark/dedup key; monotonic and gap-free, so preferable to
+        LogTime for both pagination and count reconciliation
+    - vendor: LogTime
+      type: timestamp
+      description: date and time the server recorded the audit entry
+      ecs: '@timestamp'
+      status: mapped
+      transform: >-
+        server-local DATETIME with no zone offset; apply the server's
+        configured timezone to normalize to UTC before indexing
+    - vendor: Action
+      type: string
+      description: >-
+        nvarchar(16) action code for the audited operation, e.g. file_upload,
+        file_download, sec_signon, folder_add
+      ecs: event.action
+      status: mapped
+      transform: >
+        copied to event.action verbatim and used as the lookup key that
+        assigns event.category/event.type - file_* to file, sec_signon/
+        sec_signoff to authentication, user_*/perm_* to iam - since no column
+        carries a category
+    - vendor: InstID
+      type: integer
+      description: numeric identifier of the MOVEit organization (instance) the entry belongs to
+      ecs: organization.id
+      status: partial
+      notes: >-
+        MOVEit-internal org id for multi-organization deployments, not an
+        enterprise-wide identifier; keep the raw number and add
+        organization.name from an inventory lookup before a tenant-scoped
+        alert relies on it
+    - vendor: Username
+      type: string
+      description: nvarchar(128) login name of the user who performed the action
+      ecs: user.name
+      status: mapped
+    - vendor: TargetName
+      type: string
+      description: nvarchar(128) display name of the object the action affected
+      ecs: user.target.name
+      status: partial
+      notes: >-
+        only a user for account-management actions; for file and folder
+        actions the same column carries the affected file or folder name, so
+        the mapping must be gated on the action code or it will invent users
+    - vendor: TargetID
+      type: string
+      description: nvarchar(128) internal identifier of the object the action affected
+      ecs: null
+      status: unmapped
+      custom: moveit.transfer.target_id
+      notes: >-
+        opaque id whose referent (user id, folder id, or file id) depends on
+        the action code
+    - vendor: FolderID
+      type: integer
+      description: numeric identifier of the folder associated with the action
+      ecs: null
+      status: unmapped
+      custom: moveit.transfer.folder_id
+      notes: >-
+        database-only column absent from the SysLog body; the numeric key
+        behind FolderPath, useful for joining actions on the same folder
+        without string-matching the path
+    - vendor: FileID
+      type: string
+      description: nvarchar(12) MOVEit-assigned identifier of the file involved in the action
+      ecs: null
+      status: unmapped
+      custom: moveit.transfer.file_id
+      notes: >-
+        the join key back to the MOVEit Automation file-activity dataset's
+        SourceFileID/DestFileID
+    - vendor: IPAddress
+      type: ip
+      description: nvarchar(16) IP address the audited action was initiated from
+      ecs: source.ip
+      status: mapped
+      notes: >-
+        the declared nvarchar(16) width is too narrow for a full IPv6 literal
+        - verify the column width on the deployed version before relying on
+        IPv6 source data
+    - vendor: Error
+      type: integer
+      description: int MOVEit error code for the action, 0 meaning success
+      ecs: event.outcome
+      status: mapped
+      transform: >-
+        0 becomes success and any non-zero becomes failure; preserve the
+        numeric code in moveit.transfer.error_code because collapsing it to
+        success/failure discards the reason failed-transfer triage needs
+    - vendor: Parm1..Parm4
+      type: string
+      description: >-
+        four nvarchar(2500) action-specific parameter slots whose meaning is
+        set by the Action code
+      ecs: null
+      status: unmapped
+      custom: moveit.transfer.params
+      notes: >-
+        semantically overloaded - the same slot holds a policy name for one
+        action and a file count for another - so they cannot be mapped without
+        an action-code-keyed table
+    - vendor: Message
+      type: string
+      description: ntext human-readable description of the audited action
+      ecs: message
+      status: mapped
+    - vendor: AgentBrand
+      type: string
+      description: >-
+        nvarchar(1024) brand string of the client application that performed
+        the action, e.g. Mozilla or MOVEit Automation
+      ecs: user_agent.name
+      status: partial
+      notes: >-
+        populated for FTPS, SFTP and REST clients as well as browsers, where
+        there is no HTTP User-Agent header at all; a client fingerprint, not
+        evidence the action was a web request
+    - vendor: AgentVersion
+      type: string
+      description: nvarchar(16) version string of the client application
+      ecs: user_agent.version
+      status: partial
+      notes: same non-HTTP caveat as AgentBrand; frequently empty for non-browser clients
+    - vendor: XferSize
+      type: float
+      description: double number of bytes actually moved by this transfer
+      ecs: file.size
+      status: partial
+      notes: >-
+        bytes transferred equals the stored file size only for completed
+        transfers; aborted, resumed and partial transfers make it smaller than
+        the file, so volume rules should sum it rather than treat it as file
+        size
+    - vendor: Duration
+      type: float
+      description: double elapsed time of the transfer, in fractional seconds
+      ecs: event.duration
+      status: mapped
+      transform: multiply by 1e9 for ECS event.duration nanoseconds
+    - vendor: FileName
+      type: string
+      description: nvarchar(1024) name of the file the action applied to
+      ecs: file.name
+      status: mapped
+    - vendor: FolderPath
+      type: string
+      description: nvarchar(2500) full MOVEit folder path the file was stored in or acted on
+      ecs: file.directory
+      status: mapped
+      notes: >-
+        user-visible virtual path inside MOVEit, not a filesystem path on the
+        server; up to 2500 characters and a cap-low-side candidate
+    - vendor: Hash
+      type: string
+      description: nvarchar(40) 40-character hash value carried on the audit row
+      ecs: null
+      status: partial
+      custom: moveit.transfer.hash
+      notes: >-
+        the 40-character width implies SHA-1 but the schema does not document
+        whether this is the tamper-evident per-record audit hash or the
+        transferred file's integrity hash; do NOT map to file.hash.sha1 until
+        the deployment confirms which, or file-integrity alerting will fire on
+        log-chain values
+    - vendor: VirtualFolderID
+      type: integer
+      description: numeric identifier of the virtual folder reference for the action
+      ecs: null
+      status: unmapped
+      custom: moveit.transfer.virtual_folder_id
+      notes: >-
+        database-only column absent from the SysLog body; disambiguates a
+        shared/virtual folder from the physical FolderID
+    - vendor: InterfaceType
+      type: integer
+      description: >-
+        tinyint code for the client interface the action arrived through (web,
+        FTP, SFTP, API)
+      ecs: null
+      status: unmapped
+      custom: moveit.transfer.interface_type
+      notes: >-
+        database-only column absent from the SysLog body; a reliable coded
+        channel signal where AgentBrand is only a best-effort string - decode
+        it against the vendor's interface-type table on ingest
+- id: web-access
+  name: MOVEit Transfer web tier access log
+  description: >
+    W3C extended-format IIS access logs from the MOVEit Transfer web
+    application (wwwroot). This is not a MOVEit-native log type, but the 2023
+    mass exploitation made it the most operationally important feed on the
+    product: the CVE-2023-34362 chain is only fully visible as HTTP
+    transactions - POST /moveitisapi/moveitisapi.dll?action=m2, POST
+    /guestaccess.aspx, POST /api/v1/folders/{id}/files, and GET /human2.aspx
+    against the dropped web shell - none of which appear as MOVEit audit
+    actions because the SQL injection wrote directly to the database. Any MFT
+    onboarding that ships only the audit dataset is blind to the attack that
+    defined this product class.
+  event_categories:
+  - web
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        W3C log files collected from the MOVEit web servers by Elastic Agent's
+        IIS integration.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-iis.access
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        W3C log files collected from the MOVEit web servers by Elastic Agent's
+        IIS integration, forwarded straight to the Elastic side with no guard
+        hops.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-iis.access
+  formats:
+  - format: other
+    parsing:
+      mechanism: elastic-integration
+      artifact: IIS integration (access data stream)
+      notes: >
+        The stock Elastic IIS integration parses W3C extended format and
+        already owns the iis.access.* field names used below. Point it at the
+        MOVEit wwwroot site and keep MOVEit's IIS site logging fields aligned
+        with what the integration expects - cs-uri-query and cs(User-Agent) in
+        particular are optional W3C fields that are commonly disabled and are
+        exactly the ones the 2023 detections need. The IIS map documents this
+        platform's alternate log formats for the same site (native IIS, NCSA
+        common, and ODBC logging); this feed assumes the W3C extended format
+        they are alternatives to.
+    fields:
+    - vendor: date, time
+      type: timestamp
+      description: UTC date and time the IIS request completed, emitted as two separate W3C fields
+      ecs: '@timestamp'
+      status: mapped
+      transform: >-
+        concatenate the date and time fields; IIS writes W3C timestamps in UTC
+        regardless of server timezone, so no offset correction is needed
+    - vendor: c-ip
+      type: ip
+      description: IP address of the client that issued the request
+      ecs: source.ip
+      status: mapped
+    - vendor: cs-username
+      type: string
+      description: authenticated username for the request
+      ecs: user.name
+      status: partial
+      notes: >
+        written as "-" for anonymous requests, which covers every
+        pre-authentication request in the 2023 exploit chain - joining this
+        feed to the audit dataset on username will therefore silently exclude
+        the attack traffic
+    - vendor: s-ip
+      type: ip
+      description: IP address of the MOVEit web server that served the request
+      ecs: destination.ip
+      status: mapped
+    - vendor: s-port
+      type: port
+      description: server port the request was received on
+      ecs: destination.port
+      status: mapped
+    - vendor: cs-method
+      type: string
+      description: HTTP request method
+      ecs: http.request.method
+      status: mapped
+    - vendor: cs-uri-stem
+      type: string
+      description: requested URI path without the query string
+      ecs: url.path
+      status: mapped
+      notes: >
+        the exploitation-relevant values for this product are
+        /moveitisapi/moveitisapi.dll, /guestaccess.aspx, /machine2.aspx,
+        /api/v1/folders/{id}/files and the dropped web shell /human2.aspx
+    - vendor: cs-uri-query
+      type: string
+      description: query string portion of the request
+      ecs: url.query
+      status: mapped
+      notes: >
+        unbounded and attacker-controlled; carried the CVE-2023-34362 SQL
+        injection (action=m2). This is an optional W3C field that is off in
+        some IIS configurations - confirm it is enabled or the highest-value
+        detection surface on this technology is missing
+    - vendor: sc-status
+      type: integer
+      description: HTTP status code returned to the client
+      ecs: http.response.status_code
+      status: mapped
+    - vendor: sc-substatus
+      type: integer
+      description: IIS sub-status code refining the HTTP status
+      ecs: null
+      status: unmapped
+      custom: iis.access.sub_status
+      notes: >-
+        IIS-specific refinement with no ECS home; matters here because the web
+        shell answers unauthenticated probes with a plain 404
+    - vendor: sc-win32-status
+      type: integer
+      description: Windows Win32 status code for the request
+      ecs: null
+      status: unmapped
+      custom: iis.access.win32_status
+    - vendor: time-taken
+      type: integer
+      description: time taken to process the request
+      ecs: event.duration
+      status: mapped
+      transform: IIS emits milliseconds; multiply by 1e6 for ECS event.duration nanoseconds
+    - vendor: cs(User-Agent)
+      type: string
+      description: User-Agent header sent by the client
+      ecs: user_agent.original
+      status: mapped
+      transform: >-
+        IIS escapes spaces as "+" in this field; unescape before user-agent
+        parsing or every multi-token agent string is misparsed
+    - vendor: cs(Referer)
+      type: string
+      description: Referer header sent by the client
+      ecs: http.request.referrer
+      status: mapped
+    - vendor: sc-bytes
+      type: bytes
+      description: bytes sent by the server in the response
+      ecs: http.response.bytes
+      status: mapped
+    - vendor: cs-bytes
+      type: bytes
+      description: bytes received by the server in the request
+      ecs: http.request.bytes
+      status: mapped
+      notes: >-
+        the practical size signal for uploads on this tier, since MOVEit's own
+        XferSize only appears once the audit record is written
+    - vendor: s-sitename
+      type: string
+      description: IIS site identifier serving the request
+      ecs: null
+      status: unmapped
+      custom: iis.access.site_name
+      notes: distinguishes the MOVEit Transfer site from any other site sharing the server
+    - vendor: s-computername
+      type: string
+      description: hostname of the IIS server that handled the request
+      ecs: host.name
+      status: mapped
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Keep the core worker group a pass-through for this route and let the
+          integration's ingest pipeline parse; limit low-side work to
+          Persistent Queue backpressure on the Elastic destination and a
+          host-to-site/owner enrichment so multi-node MOVEit clusters resolve
+          to one service. Do not sample or trim this feed for volume - the
+          exploitation evidence lives in the request lines a volume filter
+          would discard first.
+        elastic: >
+          Parse with the stock IIS integration and layer a
+          logs-iis.access@custom pipeline for the two gaps this map records:
+          convert time-taken from milliseconds to event.duration nanoseconds,
+          and keep sc-substatus and sc-win32-status as explicitly typed long
+          fields rather than letting dynamic mapping guess, since the
+          web-shell probe signature is a 404-with-substatus pattern. Add a
+          MOVEit-specific detection layer over url.path rather than over the
+          MOVEit audit dataset - the endpoints that matter
+          (/moveitisapi/moveitisapi.dll, /guestaccess.aspx, /human2.aspx,
+          /api/v1/folders/*/files) never produce audit actions.
+        relay: >
+          Low-side instances cross the guard with the thin envelope (_dataId,
+          "@timestamp", host, _raw) with _dataId set to the logs-iis.access
+          route key and let the IIS integration do extraction high-side - the
+          W3C line is compact enough that _raw carries the whole record. The
+          content-filter friction to raise with the guard owner is
+          cs-uri-query: it is unbounded, attacker-controlled, and on this
+          exact product it carried SQL injection payloads, so a filter that
+          inspects or rejects on query strings will drop precisely the records
+          the CSOC needs. Cap and flag its length low-side rather than letting
+          the guard silently truncate.
+      direct:
+        parse_location: high
+        cribl: >
+          Keep the core worker group a pass-through for this route and let the
+          integration's ingest pipeline parse; limit collector-side work to
+          Persistent Queue backpressure on the Elastic destination and a
+          host-to-site/owner enrichment so multi-node MOVEit clusters resolve
+          to one service. Do not sample or trim this feed for volume - the
+          exploitation evidence lives in the request lines a volume filter
+          would discard first.
+        elastic: >
+          Parse with the stock IIS integration and layer a
+          logs-iis.access@custom pipeline for the two gaps this map records:
+          convert time-taken from milliseconds to event.duration nanoseconds,
+          and keep sc-substatus and sc-win32-status as explicitly typed long
+          fields rather than letting dynamic mapping guess, since the
+          web-shell probe signature is a 404-with-substatus pattern. Add a
+          MOVEit-specific detection layer over url.path rather than over the
+          MOVEit audit dataset - the endpoints that matter
+          (/moveitisapi/moveitisapi.dll, /guestaccess.aspx, /human2.aspx,
+          /api/v1/folders/*/files) never produce audit actions.
+- id: automation-transfers
+  name: MOVEit Automation file activity
+  description: >
+    Per-file transfer attempt records from MOVEit Automation (formerly MOVEit
+    Central), the scheduling and workflow engine that drives
+    machine-to-machine transfers between MOVEit Transfer and external partner
+    endpoints. Records come from the product's `stats` table, retrieved via
+    POST /api/v1/reports/fileactivity; the companion `taskruns` table (task
+    start/end, StartedBy, Success, FilesSent, TotalBytesSent) rides the same
+    API and is a natural follow-on. Note that MOVEit Automation has no native
+    SysLog output - the vendor documents Windows Event Log plus the REST API
+    as the only integration surfaces - so this dataset is api-pull, unlike the
+    Transfer audit dataset above.
+  event_categories:
+  - file
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Cribl REST Collector polling /api/v1/reports/fileactivity on a
+        schedule, checkpointed on LogStamp. Because this is a pull rather than
+        a push, the low-side route needs the collector itself to live in the
+        low-side enclave.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-moveit.automation
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Cribl REST Collector polling /api/v1/reports/fileactivity on a
+        schedule, checkpointed on LogStamp. Because this is a pull rather than
+        a push, the collector itself lives in the same enclave as the source.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-moveit.automation
+  formats:
+  - format: api-pull
+    recommended: true
+    recommended_because: >-
+      the REST report endpoints return structured per-transfer records; the
+      event-log integration only fills the envelope and leaves the task-run
+      detail as free text in the message body, one event per task run rather
+      than one per file.
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom MOVEit Automation collector pipeline
+      notes: >
+        No Elastic integration and no Cribl pack exists for MOVEit Automation.
+        The REST report endpoints return already-structured records, so the
+        pipeline's job is ECS shaping and pagination state, not text parsing -
+        the vendor guidance is to page with predicate
+        StatusCode=out=("5000","5010") ordered by !LogStamp.
+    fields:
+    - vendor: LogStamp
+      type: timestamp
+      description: time the file-activity record was written
+      ecs: '@timestamp'
+      status: mapped
+      transform: >-
+        millisecond-precision datetime; also the checkpoint key for the REST
+        collector's pagination
+    - vendor: TaskName
+      type: string
+      description: name of the Automation task that performed the transfer
+      ecs: null
+      status: unmapped
+      custom: moveit.automation.task_name
+      notes: >
+        deliberately not mapped to rule.name - this is a scheduled workflow
+        definition, not a detection rule, and pairing it with any rule.id
+        would mislead every dashboard that reads rule.* as a signature name/id
+        pair
+    - vendor: TaskID
+      type: string
+      description: internal identifier of the Automation task
+      ecs: null
+      status: unmapped
+      custom: moveit.automation.task_id
+    - vendor: Action
+      type: enum
+      description: the transfer operation attempted - get, send, process, delete, or internal
+      ecs: event.action
+      status: mapped
+      transform: >-
+        vendor values map to event.action verbatim; "internal" records are
+        engine bookkeeping rather than file movement and should be excluded
+        from transfer-volume aggregations
+    - vendor: SourceHost
+      type: string
+      description: friendly name of the configured source host the file was retrieved from
+      ecs: source.address
+      status: partial
+      notes: >-
+        a MOVEit host-definition label (an FTP/SFTP/MOVEit Transfer endpoint
+        entry), not necessarily a resolvable hostname or address - needs an
+        inventory lookup to become a real identity
+    - vendor: SourceFilename
+      type: string
+      description: full path of the file on the source host
+      ecs: file.path
+      status: partial
+      notes: >
+        ECS models a single file object, but every record here has two - the
+        destination path has no second ECS home and stays custom, so any
+        file.* aggregation on this dataset silently describes the source side
+        only
+    - vendor: SourceFilenameOnly
+      type: string
+      description: name of the source file without its path
+      ecs: file.name
+      status: mapped
+    - vendor: SourceFileID
+      type: string
+      description: >-
+        MOVEit Transfer file identifier of the source file, when the source is
+        a MOVEit Transfer host
+      ecs: null
+      status: unmapped
+      custom: moveit.automation.source_file_id
+      notes: >-
+        the join key back to the Transfer audit dataset's FileID; empty for
+        non-MOVEit source endpoints
+    - vendor: SourceNBytes
+      type: float
+      description: size in bytes of the source file
+      ecs: file.size
+      status: mapped
+    - vendor: SourceDuration
+      type: float
+      description: seconds spent downloading the file from the source host
+      ecs: event.duration
+      status: partial
+      transform: multiply by 1e9 for nanoseconds
+      notes: >-
+        covers the download leg only; total transfer time is SourceDuration +
+        DestDuration, so alerting on slow transfers using this field alone
+        understates them
+    - vendor: DestHost
+      type: string
+      description: friendly name of the configured destination host the file was sent to
+      ecs: destination.address
+      status: partial
+      notes: same host-definition-label caveat as SourceHost
+    - vendor: DestFilename
+      type: string
+      description: full path of the file written on the destination host
+      ecs: null
+      status: unmapped
+      custom: moveit.automation.dest_filename
+    - vendor: DestDuration
+      type: float
+      description: seconds spent uploading the file to the destination host
+      ecs: null
+      status: unmapped
+      custom: moveit.automation.dest_duration
+      notes: >-
+        the second transfer leg; kept custom because event.duration is already
+        occupied by the source leg
+    - vendor: NBytes
+      type: float
+      description: number of bytes actually transferred, 0 when the attempt errored
+      ecs: network.bytes
+      status: partial
+      notes: >
+        transfer volume rather than file size - it is 0 on failure while
+        SourceNBytes still reports the file's real size, so
+        exfiltration-volume rules must use this field and failed-transfer
+        rules must not
+    - vendor: ErrCode
+      type: integer
+      description: error code for the transfer attempt, 0 meaning success
+      ecs: event.outcome
+      status: mapped
+      transform: >-
+        0 becomes success and non-zero becomes failure; retain the numeric
+        code in a custom field, and note the vendor's own report default
+        excludes StatusCode 5000/5010 as non-error informational records
+    - vendor: Message
+      type: string
+      description: error description, or notes about the action taken
+      ecs: message
+      status: mapped
+    - vendor: Hash
+      type: string
+      description: tamper-detection hash carried on the log record
+      ecs: null
+      status: unmapped
+      custom: moveit.automation.record_hash
+      notes: >
+        documented as a tamper-detection value over the audit record itself,
+        NOT a hash of the transferred file - do not map it to file.hash.*, and
+        do not expect file-integrity coverage from this dataset
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Do the ECS shaping in the collector pipeline: derive event.outcome
+          from ErrCode, convert SourceDuration and DestDuration from seconds
+          to nanoseconds, and resolve the source/destination host friendly
+          names against the Automation host inventory so partner endpoints
+          carry a real identity rather than a MOVEit-internal label. Own the
+          pull semantics carefully - checkpoint on LogStamp with overlap and
+          de-duplicate on the record ID, because an api-pull source that
+          silently stops is invisible in a way a syslog listener is not - and
+          validate against a Schema Library schema with a dead-letter route
+          before the destination, on Persistent Queue backpressure.
+        elastic: >
+          Own a custom logs-moveit.automation ingest pipeline and index
+          template with typed custom-namespace mappings -
+          moveit.automation.task_name, .task_id, .source_file_id and
+          .dest_filename as keyword, .dest_duration as long, .record_hash as
+          keyword. The normalization worth doing high-side is the two-legged
+          transfer: assert that event.duration is the source leg only and
+          expose the combined leg explicitly, and keep network.bytes (0 on
+          error) out of any dashboard that reads it as file size. Build the
+          join to the Transfer audit dataset on source_file_id/file_id rather
+          than on filename, which is not unique across partner folders.
+        relay: >
+          Full ECS-shaped NDJSON crosses (envelope mode B) - the records
+          arrive already structured from the API, so there is nothing a
+          high-side integration could parse that the collector has not already
+          done, and no CEF is involved anywhere on this route. The
+          content-filter friction is partner-supplied path text:
+          SourceFilename and DestFilename carry external file naming
+          conventions with non-ASCII characters and deep directory structures,
+          and the Message column holds unbounded vendor error prose - cap and
+          normalize all three low-side. Crossing is at-most-once, so reconcile
+          counts per (dataset, hour); on this feed the reconciliation doubles
+          as collector-health monitoring, since a stalled pull and a guard
+          drop look identical high-side.
+      direct:
+        parse_location: low
+        cribl: >
+          Do the ECS shaping in the collector pipeline: derive event.outcome
+          from ErrCode, convert SourceDuration and DestDuration from seconds
+          to nanoseconds, and resolve the source/destination host friendly
+          names against the Automation host inventory so partner endpoints
+          carry a real identity rather than a MOVEit-internal label. Own the
+          pull semantics carefully - checkpoint on LogStamp with overlap and
+          de-duplicate on the record ID, because an api-pull source that
+          silently stops is invisible in a way a syslog listener is not - and
+          validate against a Schema Library schema with a dead-letter route
+          before the destination, on Persistent Queue backpressure.
+        elastic: >
+          Own a custom logs-moveit.automation ingest pipeline and index
+          template with typed custom-namespace mappings -
+          moveit.automation.task_name, .task_id, .source_file_id and
+          .dest_filename as keyword, .dest_duration as long, .record_hash as
+          keyword. The normalization worth doing high-side is the two-legged
+          transfer: assert that event.duration is the source leg only and
+          expose the combined leg explicitly, and keep network.bytes (0 on
+          error) out of any dashboard that reads it as file size. Build the
+          join to the Transfer audit dataset on source_file_id/file_id rather
+          than on filename, which is not unique across partner folders.
+  - format: windows-event
+    enable: >
+      MOVEit Automation can write task and file-transfer events to the Windows
+      Event Log, and the vendor documents this alongside the REST API as an
+      integration surface for enterprises that already forward event logs to a
+      SIEM. The Automation admin console's event-log setting has a Log Name
+      (the dedicated "MOVEit" log versus the shared "Application" log, source
+      MOVEit_DMZ_Audit / "MOVEit DMZ Audit") and a verbosity level: at "Task
+      Completions or higher" Automation emits one event per task run reporting
+      success or failure. Successful runs are written at Information level and
+      failed runs at Error level. Because these events are task-run summaries,
+      this feed is coarser than the per-file REST report - it carries the task
+      name, file counts, byte totals and error text of a whole run rather than
+      one record per file - so it is a task-health surface, not a
+      per-file-activity substitute.
+    references:
+    - >-
+      https://docs.ipswitch.com/MOVEit/Central/onlineguide/en/MICMonitoringTasksWithoutAdminEventLog.htm
+    - >-
+      https://docs.ipswitch.com/MOVEit/Central/onlineguide/en/MICMonitoringTasksRelatedSettings.htm
+    - >-
+      https://docs.ipswitch.com/MOVEit/Central/onlineguide/en/MICAdvancedTopicsSysLogAndSNMP.htm
+    parsing:
+      mechanism: elastic-integration
+      artifact: >-
+        Custom Windows Event Log integration (channel 'MOVEit') +
+        logs-moveit.automation@custom task-run parser
+      notes: >
+        The Custom Windows Event Log integration binds the dedicated "MOVEit"
+        channel and fills the envelope, but the task-run detail (task name,
+        files sent, bytes, error text) lives inside the event message as free
+        text, so a custom pipeline still parses the body. Model this feed at
+        task-run granularity: one event per run keyed on the task, not one per
+        file, so it aligns with the companion taskruns table rather than the
+        per-file stats records the REST report returns.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Collect the "MOVEit" channel and parse the task-run message body
+          low-side into task-health ECS: derive event.outcome from the Windows
+          Level (Information success, Error failure) and pull the task name
+          and file/byte counts out of the message text into the automation
+          custom namespace. Keep this feed clearly distinct from the per-file
+          API collector - deduplicating or joining the two requires the task
+          id, since the event log has no per-file record to line up against a
+          stats row. Cap the free-text error message low-side and run
+          Persistent Queue backpressure with a dead-letter route.
+        elastic: >
+          Own a logs-moveit.automation ingest pipeline branch for the task-run
+          shape, with moveit.automation.task_name and .task_id as keyword and
+          the run counters (files sent, total bytes) as long. Do not let this
+          coarse feed populate the same file.* fields as the per-file API feed
+          - a task-run event has no single file object, so mapping its byte
+          total to file.size would misrepresent it; keep run totals in the
+          custom namespace and reserve file.* for the stats-grained feeds.
+        relay: >
+          Full ECS-shaped NDJSON crosses (envelope mode B) once the task-run
+          body is parsed low-side. The only unbounded value is the run's error
+          text, which carries vendor error prose and partner path fragments -
+          cap and normalize it low-side. The event Record ID is monotonic per
+          channel, so reconcile a contiguous id range per (channel, hour); on
+          this feed that reconciliation doubles as task-scheduler health,
+          since a channel that stops emitting run events and a guard drop look
+          identical high-side.
+      direct:
+        parse_location: low
+        cribl: >
+          High-side instances collect the "MOVEit" channel straight into the
+          core worker group with no guard hops and run the task-run body
+          parser. Alert on gaps in the run-event Record ID sequence, because a
+          silently stalled scheduler is invisible on an event-log feed the way
+          it is on any pull.
+        elastic: >
+          Own a logs-moveit.automation ingest pipeline branch for the task-run
+          shape, with moveit.automation.task_name and .task_id as keyword and
+          the run counters (files sent, total bytes) as long. Do not let this
+          coarse feed populate the same file.* fields as the per-file API feed
+          - a task-run event has no single file object, so mapping its byte
+          total to file.size would misrepresent it; keep run totals in the
+          custom namespace and reserve file.* for the stats-grained feeds.
+    fields:
+    - vendor: Provider
+      type: string
+      description: >-
+        Windows Event Log source name the task-run event was written under -
+        MOVEit_DMZ_Audit in the dedicated "MOVEit" log or "MOVEit DMZ Audit"
+        in the Application log
+      ecs: event.provider
+      status: mapped
+      notes: >-
+        set by the Automation Log Name setting; the value tells the collector
+        which channel to bind
+    - vendor: Level
+      type: string
+      description: >-
+        Windows event level - Information for a successful task run, Error for
+        a failed one
+      ecs: event.outcome
+      status: partial
+      transform: Information becomes success and Error becomes failure
+      notes: >-
+        also drives log.level; a run-level flag only - a task that moved some
+        files and failed others still resolves to a single Information/Error
+        verdict, so per-file outcome must come from the stats-grained feeds
+    - vendor: TimeGenerated
+      type: timestamp
+      description: time the Windows Event Log recorded the task-run event
+      ecs: '@timestamp'
+      status: mapped
+      notes: >-
+        the EVTX System time is UTC; it marks when the run event was written,
+        close to but not identical to the run's own end time reported in the
+        body
+    - vendor: Computer
+      type: string
+      description: hostname of the Automation node that wrote the event
+      ecs: host.name
+      status: mapped
+      notes: >-
+        in a multi-node Automation deployment this identifies the node that
+        executed the run
+    - vendor: EventID
+      type: integer
+      description: Windows Event Identifier carried on the record
+      ecs: event.code
+      status: partial
+      notes: >-
+        MOVEit Automation does not document a per-action Event ID scheme;
+        treat it as a coarse discriminator and take the operation from the
+        parsed body, not the Event ID
+    - vendor: Message
+      type: string
+      description: >-
+        full event message - free-text task-run summary carrying the task
+        name, files-sent and total-bytes counts, and the error text on failure
+      ecs: message
+      status: mapped
+      notes: >-
+        the run detail is embedded as free text, not structured fields; a
+        custom parser extracts task name and the run counters into the
+        moveit.automation namespace
+    - vendor: LogName
+      type: string
+      description: >-
+        which Windows Event Log channel the entry was written to - the
+        dedicated "MOVEit" log or the shared "Application" log
+      ecs: null
+      status: unmapped
+      custom: moveit.automation.event_log
+      notes: >-
+        set by the Automation Log Name setting; retain it so a drift back to
+        the noisy Application log is visible downstream
+  - format: jdbc-sql
+    enable: >
+      MOVEit Automation persists every file-activity record as a typed row in
+      the `stats` table of its database before that record is ever served by
+      the REST report, so the table can be queried directly at the same
+      per-file granularity as the api-pull feed. The backing store is MySQL,
+      Microsoft SQL Server, or Azure SQL (all supported, same schema). Grant a
+      read-only account and poll `stats` with a scheduled query - Elastic
+      Agent SQL input, Logstash JDBC, or a Cribl Database Collector - tracking
+      a high-water mark on the auto-increment ID (or LogStamp). The table
+      carries columns the REST fileactivity report does not surface - the
+      durable ID, the Automation Node that ran the leg, NominalStart,
+      SourceStamp, and the destination file's DestFileID and DestFilenameOnly
+      - but it lacks the report's joined-in TaskName, which lives in the
+      companion `taskruns` table and must be joined on TaskID.
+    references:
+    - https://docs.ipswitch.com/MOVEit/Automation2019/Help/Admin/en/27385.htm
+    - >-
+      https://docs.progress.com/bundle/moveit-automation-web-admin-help-2024/page/Schema.html
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom MOVEit Automation collector pipeline (Database Collector + ECS shaping)
+      notes: >
+        No Elastic integration or Cribl pack reads the Automation database.
+        The stats rows are already typed columns, so the pipeline does ECS
+        shaping and pagination state, not text parsing - derive event.outcome
+        from ErrCode, convert the two duration columns from seconds to
+        nanoseconds, and join TaskID to the taskruns table for TaskName. The
+        REST feed's report predicate (StatusCode filtering) has no SQL
+        equivalent for free, so the collector query owns the 5000/5010
+        informational-record exclusion itself. ID is the natural checkpoint
+        and dedup key.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Run a Database Collector low-side against `stats` with a high-water
+          mark on ID (gap-free, unlike LogStamp which can tie at its
+          resolution), read the typed columns into ECS, and de-duplicate on
+          ID. Resolve SourceHost/DestHost friendly names against the
+          Automation host inventory so partner endpoints carry a real
+          identity, and join TaskID to taskruns for the task name the stats
+          table omits. Exclude StatusCode 5000/5010 informational rows in the
+          query to match the REST report's default. Cap the partner-supplied
+          SourceFilename/ DestFilename path text and the free-text Message
+          low-side, validate against a Schema Library schema with a
+          dead-letter route, and run Persistent Queue backpressure. Treat the
+          Automation database as a low-side asset - poll it low-side and cross
+          NDJSON rather than opening a database port across the guard.
+        elastic: >
+          Own a logs-moveit.automation ingest pipeline and index template with
+          typed custom-namespace mappings, including the stats-only columns:
+          moveit.automation.stat_id, .node and .source_file_id and
+          .dest_file_id as keyword, .dest_duration as long. Assert that
+          event.duration is the source leg only and expose the destination leg
+          explicitly, and keep network.bytes (0 on error) out of any dashboard
+          that reads it as file size - the same two-legged-transfer caveats
+          the REST feed carries apply here because it is the same stats rows.
+          Build the join to the Transfer audit dataset on
+          source_file_id/file_id rather than on filename.
+        relay: >
+          Full ECS-shaped NDJSON crosses (envelope mode B): the rows arrive
+          already structured, so nothing a high-side integration could parse
+          remains. The content-filter friction is partner-supplied path text -
+          SourceFilename, DestFilename and DestFilenameOnly carry external
+          naming conventions with non-ASCII characters and deep directory
+          structures, and Message holds unbounded vendor error prose - cap and
+          normalize all of them low-side. The contiguous ID range collected
+          per (dataset, hour) reconciles the at-most-once crossing directly,
+          and on this feed that reconciliation doubles as collector-health
+          monitoring.
+      direct:
+        parse_location: low
+        cribl: >
+          High-side instances run a Database Collector against the local
+          `stats` table with no guard hops, checkpointing on ID and shaping to
+          ECS in the collector pipeline, with the taskruns join and 5000/5010
+          exclusion. Alert on gaps in the ID sequence so a stalled collector
+          is not mistaken for a quiet transfer schedule.
+        elastic: >
+          Own a logs-moveit.automation ingest pipeline and index template with
+          typed custom-namespace mappings, including the stats-only columns:
+          moveit.automation.stat_id, .node and .source_file_id and
+          .dest_file_id as keyword, .dest_duration as long. Assert that
+          event.duration is the source leg only and expose the destination leg
+          explicitly, and keep network.bytes (0 on error) out of any dashboard
+          that reads it as file size - the same two-legged-transfer caveats
+          the REST feed carries apply here because it is the same stats rows.
+          Build the join to the Transfer audit dataset on
+          source_file_id/file_id rather than on filename. Collection is over
+          the Elastic Agent SQL input or Logstash JDBC directly against the
+          database.
+    fields:
+    - vendor: ID
+      type: integer
+      description: auto-increment bigint primary key of the file-activity row
+      ecs: null
+      status: unmapped
+      custom: moveit.automation.stat_id
+      notes: >-
+        the durable record identifier and the collector's
+        high-water-mark/dedup key; gap-free, so preferable to LogStamp for
+        pagination and count reconciliation
+    - vendor: LogStamp
+      type: timestamp
+      description: time the file-activity record was written
+      ecs: '@timestamp'
+      status: mapped
+      transform: >-
+        millisecond-precision datetime; the REST feed uses it as the
+        checkpoint key, but the gap-free ID is a safer high-water mark for a
+        SQL pull
+    - vendor: TaskID
+      type: integer
+      description: internal identifier of the Automation task that performed the transfer
+      ecs: null
+      status: unmapped
+      custom: moveit.automation.task_id
+      notes: >-
+        the stats table carries only the id, not the name - join to the
+        taskruns table on TaskID to recover TaskName, which the REST
+        fileactivity report joins in for you
+    - vendor: Node
+      type: integer
+      description: identifier of the Automation node that executed this transfer leg
+      ecs: null
+      status: unmapped
+      custom: moveit.automation.node
+      notes: >-
+        table-only column absent from the REST report; in a multi-node
+        Automation cluster it attributes the leg to a node, the
+        machine-to-machine analogue of the Transfer audit Hostname
+    - vendor: NominalStart
+      type: timestamp
+      description: scheduled nominal start time of the task run this record belongs to
+      ecs: event.start
+      status: partial
+      notes: >-
+        table-only column; the run's scheduled start, not this file's transfer
+        time - useful to group per-file rows into their parent run without a
+        taskruns join
+    - vendor: Action
+      type: string
+      description: the transfer operation attempted - get, send, process, delete, or internal
+      ecs: event.action
+      status: mapped
+      transform: >-
+        maps to event.action verbatim; "internal" rows are engine bookkeeping
+        rather than file movement and should be excluded from transfer-volume
+        aggregations
+    - vendor: SourceHost
+      type: string
+      description: friendly name of the configured source host the file was retrieved from
+      ecs: source.address
+      status: partial
+      notes: >-
+        a MOVEit host-definition label, not necessarily a resolvable hostname
+        or address - needs an inventory lookup to become a real identity
+    - vendor: SourceFilename
+      type: string
+      description: full path of the file on the source host
+      ecs: file.path
+      status: partial
+      notes: >-
+        ECS models one file object but every row has two; the destination path
+        stays custom, so any file.* aggregation on this dataset describes the
+        source side only
+    - vendor: SourceFilenameOnly
+      type: string
+      description: name of the source file without its path
+      ecs: file.name
+      status: mapped
+    - vendor: SourceFileID
+      type: string
+      description: >-
+        MOVEit Transfer file identifier of the source file, when the source is
+        a MOVEit Transfer host
+      ecs: null
+      status: unmapped
+      custom: moveit.automation.source_file_id
+      notes: >-
+        the join key back to the Transfer audit dataset's FileID; empty for
+        non-MOVEit source endpoints
+    - vendor: SourceNBytes
+      type: float
+      description: double size in bytes of the source file
+      ecs: file.size
+      status: mapped
+    - vendor: SourceDuration
+      type: float
+      description: double seconds spent downloading the file from the source host
+      ecs: event.duration
+      status: partial
+      transform: multiply by 1e9 for nanoseconds
+      notes: >-
+        the download leg only; total transfer time is SourceDuration +
+        DestDuration, so slow-transfer alerting on this field alone
+        understates it
+    - vendor: SourceStamp
+      type: timestamp
+      description: >-
+        timestamp of the source file (its own modification/creation time on
+        the source host)
+      ecs: null
+      status: unmapped
+      custom: moveit.automation.source_stamp
+      notes: >-
+        table-only column absent from the REST report; the file's own time on
+        the partner endpoint, distinct from when Automation moved it
+    - vendor: DestHost
+      type: string
+      description: friendly name of the configured destination host the file was sent to
+      ecs: destination.address
+      status: partial
+      notes: same host-definition-label caveat as SourceHost
+    - vendor: DestFilename
+      type: string
+      description: full path of the file written on the destination host
+      ecs: null
+      status: unmapped
+      custom: moveit.automation.dest_filename
+    - vendor: DestFilenameOnly
+      type: string
+      description: name of the destination file without its path
+      ecs: null
+      status: unmapped
+      custom: moveit.automation.dest_filename_only
+      notes: >-
+        table-only column absent from the REST report; ECS has no second file
+        object, so the destination name stays custom alongside DestFilename
+    - vendor: DestFileID
+      type: string
+      description: >-
+        MOVEit Transfer file identifier of the destination file, when the
+        destination is a MOVEit Transfer host
+      ecs: null
+      status: unmapped
+      custom: moveit.automation.dest_file_id
+      notes: >-
+        table-only column absent from the REST report; the join key forward to
+        the Transfer audit FileID for the written copy, empty for non-MOVEit
+        destinations
+    - vendor: DestDuration
+      type: float
+      description: double seconds spent uploading the file to the destination host
+      ecs: null
+      status: unmapped
+      custom: moveit.automation.dest_duration
+      notes: >-
+        the second transfer leg; kept custom because event.duration is already
+        occupied by the source leg
+    - vendor: NBytes
+      type: float
+      description: double number of bytes actually transferred, 0 when the attempt errored
+      ecs: network.bytes
+      status: partial
+      notes: >-
+        transfer volume rather than file size - 0 on failure while
+        SourceNBytes still reports the real size, so exfiltration-volume rules
+        must use this field and failed-transfer rules must not
+    - vendor: ErrCode
+      type: integer
+      description: int error code for the transfer attempt, 0 meaning success
+      ecs: event.outcome
+      status: mapped
+      transform: >-
+        0 becomes success and non-zero becomes failure; retain the numeric
+        code in a custom field, and exclude StatusCode 5000/5010 non-error
+        informational rows in the collector query as the REST report default
+        does
+    - vendor: Message
+      type: string
+      description: char error description, or notes about the action taken
+      ecs: message
+      status: mapped
+    - vendor: Hash
+      type: string
+      description: tamper-detection hash carried on the row
+      ecs: null
+      status: unmapped
+      custom: moveit.automation.record_hash
+      notes: >-
+        a tamper-detection value over the record itself, NOT a hash of the
+        transferred file - do not map to file.hash.* and do not expect
+        file-integrity coverage from this dataset

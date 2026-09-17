@@ -1,0 +1,843 @@
+id: symantec-endpoint
+name: Symantec Endpoint Protection
+vendor: Broadcom
+versions: >-
+  Symantec Endpoint Protection 14.x, exported from the SEP Manager to an
+  external syslog target
+draft: true
+references:
+- https://github.com/elastic/integrations/tree/main/packages/symantec_endpoint
+- https://knowledge.broadcom.com/external/article?legacyId=tech171741
+- https://www.elastic.co/docs/reference/integrations/symantec_endpoint
+datasets:
+- id: detection
+  name: Risk and proactive detection
+  description: |
+    Two SEP log types with one schema. The Agent Risk Log carries signature-based antivirus detections; the Agent Proactive Detection Log carries SONAR behavioural and reputation detections. They are separate logs in the SEP Manager and they share almost their entire field set, so they are mapped together here rather than duplicated - the discriminator is risk_type on one and detection_type on the other, and both are worth keeping for exactly that reason.
+    This is the alerting surface. The reputation fields - prevalence, confidence, disposition, first_seen - are what make it more than a signature log: they say how many other Symantec customers have seen the file and how sure the cloud is about it, which is the judgement a signature cannot express.
+  event_categories:
+  - malware
+  - file
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Receives comma-separated records from the SEP Manager's external
+        logging. File paths, download sites and web domains are the free-text
+        content a filter will object to. The alternative is reading the
+        manager's database directly, which is unsupported and breaks across
+        upgrades.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes. Detection volume is low in a healthy estate and
+        spikes hard during an outbreak, which is the shape a guard throughput
+        budget has to accommodate rather than average over.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-symantec_endpoint.log
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Receives comma-separated records from the SEP Manager's external
+        logging.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-symantec_endpoint.log
+  formats:
+  - format: syslog-csv
+    parsing:
+      mechanism: elastic-integration
+      artifact: elastic/integrations symantec_endpoint, data stream log
+      notes: |
+        The parse is unusual and worth understanding before rebuilding it. SEP emits comma-separated columns where some carry an embedded "Label Name: value" and others carry a bare value whose meaning depends only on its position. The integration parses the columns, reads the labels where present, and then fingerprints the record by joining the label sequence - using NONE for unlabelled columns - to decide which of the twelve SEP log types it is looking at. Only then can it assign keys to the unlabelled columns.
+        That means field position is load-bearing and the log type is inferred, not declared. A SEP release that adds a column, or a record whose optional fields are absent, shifts the fingerprint and the record falls through unrecognised rather than being mis-parsed - which is the better failure, but it is silent. Count unrecognised records; a rising count is the signal that a SEP upgrade changed the format.
+    fields:
+    - vendor: event_time
+      type: timestamp
+      description: when the agent detected the risk
+      ecs: '@timestamp'
+      status: partial
+      transform: 'parse in the SEP Manager''s configured timezone'
+      notes: >
+        SEP emits local time without an offset on most columns, and the
+        integration applies a configured timezone rather than reading one off
+        the record. Get that setting wrong and every detection is skewed by
+        the offset with nothing on the record to reveal it.
+    - vendor: inserted
+      type: timestamp
+      description: when the SEP Manager received the record from the agent
+      ecs: event.ingested
+      status: partial
+      notes: >-
+        the gap from event_time is agent reporting lag; a large gap on a
+        detection means the endpoint was offline while infected
+    - vendor: end
+      type: timestamp
+      description: when the event ended
+      ecs: event.end
+      status: mapped
+    - vendor: first_seen
+      type: timestamp
+      description: 'when Symantec''s reputation cloud first saw this file anywhere'
+      ecs: null
+      status: partial
+      custom: symantec_endpoint.reputation.first_seen
+      notes: >
+        globally first seen, not first seen here. A file first seen hours ago
+        is the classic targeted-attack signal, and it is the single most
+        useful field on this record for that purpose - which is why it
+        deserves a named custom rather than staying in the vendor remainder.
+    - vendor: risk_name
+      type: string
+      description: name of the detected threat
+      ecs: threat.software.name
+      status: mapped
+    - vendor: risk_type
+      type: string
+      description: the kind of risk, on Agent Risk Log records
+      ecs: null
+      status: partial
+      custom: symantec_endpoint.risk_type
+      notes: >-
+        one of the two fields that says which log type this record came from;
+        the other is detection_type
+    - vendor: detection_type
+      type: string
+      description: the detection engine, on Agent Proactive Detection Log records
+      ecs: null
+      status: partial
+      custom: symantec_endpoint.detection_type
+      notes: >-
+        SONAR heuristic against reputation-based; the two have very different
+        false-positive profiles and merging them loses that
+    - vendor: actual_action
+      type: string
+      description: what SEP actually did about the risk
+      ecs: event.action
+      status: partial
+      notes: >
+        the field that matters, and it is not requested_action. A quarantine
+        that was requested and failed leaves the file on disk; reading
+        requested_action as the outcome reports containment that did not
+        happen. Where they disagree the endpoint is still dirty.
+    - vendor: requested_action
+      type: string
+      description: what policy asked SEP to do
+      ecs: null
+      status: partial
+      custom: symantec_endpoint.requested_action
+      notes: >-
+        kept precisely so the disagreement with actual_action is visible;
+        withheld from event.action, which actual_action holds
+    - vendor: secondary_action
+      type: string
+      description: the fallback action if the first one failed
+      ecs: null
+      status: unmapped
+      custom: symantec_endpoint.secondary_action
+    - vendor: disposition
+      type: string
+      description: 'the reputation cloud''s verdict on the file'
+      ecs: null
+      status: partial
+      custom: symantec_endpoint.reputation.disposition
+      notes: >-
+        good, bad or unknown from Symantec's cloud, independent of whether a
+        signature matched; an unknown disposition on a blocked file is a
+        heuristic detection and is likelier to be a false positive
+    - vendor: confidence
+      type: string
+      description: how confident the reputation service is
+      ecs: null
+      status: partial
+      custom: symantec_endpoint.reputation.confidence
+      notes: >-
+        ECS threat.indicator.confidence exists but is defined for indicator
+        feeds with a documented vocabulary; SEP's values are its own, and
+        forcing them in would misrepresent the scale
+    - vendor: prevalence
+      type: string
+      description: 'how widely the file is seen across Symantec''s customers'
+      ecs: null
+      status: partial
+      custom: symantec_endpoint.reputation.prevalence
+      notes: >-
+        low prevalence plus recent first_seen is the pair that distinguishes a
+        targeted sample from commodity malware
+    - vendor: sensitivity
+      type: string
+      description: sensitivity setting that governed the detection
+      ecs: null
+      status: unmapped
+      custom: symantec_endpoint.sensitivity
+    - vendor: detection_score
+      type: string
+      description: numeric score the detection engine assigned
+      ecs: event.risk_score
+      status: partial
+      transform: cast to float
+    - vendor: risk_level
+      type: string
+      description: severity band SEP assigned the risk
+      ecs: event.severity
+      status: partial
+      transform: map the vendor words to an integer scale
+    - vendor: application_name
+      type: string
+      description: 'product name from the file''s PE metadata'
+      ecs: file.pe.product
+      status: mapped
+      notes: >-
+        self-declared by the file, so it is an attacker-controlled string on
+        exactly the files this record is about
+    - vendor: application_version
+      type: string
+      description: 'version from the file''s PE metadata'
+      ecs: file.pe.file_version
+      status: mapped
+    - vendor: application_type
+      type: string
+      description: the kind of application SEP classified it as
+      ecs: null
+      status: unmapped
+      custom: symantec_endpoint.application_type
+    - vendor: company_name
+      type: string
+      description: 'company name from the file''s PE metadata'
+      ecs: file.pe.company
+      status: mapped
+      notes: same self-declared caveat as application_name
+    - vendor: application_hash
+      type: string
+      description: hash of the detected file
+      ecs: file.hash.sha256
+      status: partial
+      transform: route by hash_type - sha256, md5 or sha1
+      notes: >
+        one column carrying whichever digest SEP computed, and hash_type is
+        the only thing that says which. Writing it to file.hash.sha256
+        unconditionally puts MD5 values in a SHA-256 field, where they will
+        never match a threat-intelligence join and will look like data rather
+        than an error.
+    - vendor: hash_type
+      type: string
+      description: which digest algorithm application_hash holds
+      ecs: null
+      status: partial
+      custom: symantec_endpoint.hash_type
+      notes: the control field for the transform above; dropping it makes the hash unusable
+    - vendor: file_size_bytes
+      type: integer
+      description: size of the detected file
+      ecs: file.size
+      status: mapped
+    - vendor: file_path
+      type: string
+      description: path of the detected file
+      ecs: file.path
+      status: mapped
+    - vendor: download_site
+      type: string
+      description: where the file was downloaded from
+      ecs: url.original
+      status: partial
+      notes: >-
+        populated only when SEP's browser protection saw the download; its
+        absence does not mean the file arrived some other way
+    - vendor: web_domain
+      type: string
+      description: domain the file was downloaded from
+      ecs: url.domain
+      status: mapped
+    - vendor: downloaded_by
+      type: string
+      description: the process that downloaded the file
+      ecs: process.executable
+      status: mapped
+      notes: >-
+        the provenance chain in one field - browser, mail client or script
+        engine - and the pivot a hunt starts from
+    - vendor: url_tracking_status
+      type: string
+      description: whether SEP was able to track the download source
+      ecs: null
+      status: unmapped
+      custom: symantec_endpoint.url_tracking_status
+    - vendor: certificate_issuer
+      type: string
+      description: 'issuer of the file''s code-signing certificate'
+      ecs: file.x509.issuer.common_name
+      status: mapped
+    - vendor: certificate_signer
+      type: string
+      description: 'subject of the file''s code-signing certificate'
+      ecs: file.x509.subject.common_name
+      status: mapped
+      notes: >-
+        a signed detection is either a false positive or a compromised signing
+        key, and the two are worth telling apart quickly
+    - vendor: certificate_thumbprint
+      type: string
+      description: thumbprint of the signing certificate
+      ecs: null
+      status: unmapped
+      custom: symantec_endpoint.certificate.thumbprint
+    - vendor: certificate_serial_number
+      type: string
+      description: serial number of the signing certificate
+      ecs: file.x509.serial_number
+      status: mapped
+    - vendor: signing_timestamp
+      type: timestamp
+      description: when the file was signed
+      ecs: file.x509.not_before
+      status: partial
+      notes: >-
+        the signing time, which is not the certificate's validity start - ECS
+        has no better home, and the two coincide often enough that the
+        difference goes unnoticed until it matters
+    - vendor: computer_name
+      type: string
+      description: hostname of the endpoint
+      ecs: host.hostname
+      status: mapped
+    - vendor: ip_address
+      type: ip
+      description: address of the endpoint
+      ecs: host.ip
+      status: mapped
+    - vendor: user_name
+      type: string
+      description: user logged on to the endpoint
+      ecs: user.name
+      status: partial
+      notes: >-
+        shares user.name with user1 on other log types and with admin on the
+        administrative log; a record carries one
+    - vendor: domain_name
+      type: string
+      description: domain of the user or the SEP domain
+      ecs: user.domain
+      status: partial
+      notes: >
+        SEP overloads this. On agent records it is the user's Windows domain;
+        on manager records it is the SEP Manager's own administrative domain,
+        which is a different namespace entirely. Which one it is depends on
+        the log type, so a pipeline that maps it blindly mixes two unrelated
+        vocabularies into user.domain.
+    - vendor: group
+      type: string
+      description: SEP group the endpoint belongs to
+      ecs: null
+      status: partial
+      custom: symantec_endpoint.group
+      notes: >-
+        the policy grouping, which decides what protection was even enabled on
+        the endpoint; a detection's absence in one group can be a policy fact
+        rather than a clean result
+    - vendor: server
+      type: string
+      description: SEP Manager that recorded the event
+      ecs: observer.name
+      status: mapped
+    - vendor: source_computer
+      type: string
+      description: the remote computer involved, where one is known
+      ecs: source.domain
+      status: partial
+      notes: on a network-borne detection this is the other end, not the endpoint itself
+    - vendor: source_ip
+      type: ip
+      description: address of the remote computer
+      ecs: source.address
+      status: partial
+      notes: >-
+        Elastic maps this to source.address rather than source.ip; address
+        accepts a name or an address, and the integration leaves the
+        conversion to a downstream processor
+    - vendor: occurrences
+      type: integer
+      description: how many times the event was seen
+      ecs: null
+      status: partial
+      custom: symantec_endpoint.occurrences
+      notes: >
+        ECS has no event count field, so one record can stand for many
+        detections with nothing in ECS to say so. A dashboard that counts
+        documents undercounts the outbreak by whatever this says.
+    - vendor: permitted_application_reason
+      type: string
+      description: why an application was allowed despite the detection
+      ecs: event.reason
+      status: partial
+      notes: >-
+        populated when an exception let the file run; the audit trail for why
+        something known-bad was permitted
+    - vendor: intensive_protection_level
+      type: string
+      description: the aggressiveness setting in force
+      ecs: null
+      status: unmapped
+      custom: symantec_endpoint.intensive_protection_level
+    - vendor: location
+      type: string
+      description: SEP location the endpoint was in
+      ecs: null
+      status: partial
+      custom: symantec_endpoint.location
+      notes: >
+        deliberately not source.geo.name, which the shipped integration uses
+        for this field. A SEP location is a network-posture profile - on the
+        corporate LAN, on VPN, off network - and not a geographic place, so
+        the ECS geo field would put policy names where map coordinates belong.
+- id: traffic
+  name: Agent firewall traffic
+  description: >
+    The SEP client firewall's record of connections it allowed or blocked,
+    attributed to the local application. Duplicates the perimeter view for
+    anything crossing the gateway, and is the only view at all for
+    host-to-host traffic inside a segment.
+  event_categories:
+  - network
+  - process
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Receives comma-separated records from the SEP Manager. Highest volume
+        of the SEP feeds by a wide margin, and the first candidate for edge
+        reduction.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes. Structurally simple with no free text beyond the
+        application path.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-symantec_endpoint.log
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Receives comma-separated records from the SEP Manager.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-symantec_endpoint.log
+  formats:
+  - format: syslog-csv
+    parsing:
+      mechanism: elastic-integration
+      artifact: elastic/integrations symantec_endpoint, data stream log
+      notes: >
+        Same fingerprint-based parse as the detection dataset. This log type's
+        fingerprint is the longest positional sequence SEP emits, so it is the
+        one most sensitive to a column change across versions.
+    fields:
+    - vendor: local_host_ip
+      type: ip
+      description: 'address on the endpoint''s side of the connection'
+      ecs: source.address
+      status: partial
+      transform: swap source and destination when traffic_direction is inbound
+      notes: >
+        local and remote are endpoint-relative, not flow-relative, exactly as
+        on the ProxySG feed. Mapping local to source unconditionally inverts
+        every inbound connection, and traffic_direction is what resolves it.
+    - vendor: local_port
+      type: integer
+      description: 'port on the endpoint''s side'
+      ecs: source.port
+      status: partial
+      transform: swap with destination.port when traffic_direction is inbound
+    - vendor: local_host_mac
+      type: string
+      description: MAC address of the endpoint
+      ecs: source.mac
+      status: partial
+      transform: normalize to upper-case hyphen-separated, per ECS
+    - vendor: remote_host_ip
+      type: ip
+      description: address at the other end
+      ecs: destination.address
+      status: partial
+      transform: swap source and destination when traffic_direction is inbound
+    - vendor: remote_port
+      type: integer
+      description: port at the other end
+      ecs: destination.port
+      status: partial
+      transform: swap with source.port when traffic_direction is inbound
+    - vendor: remote_host_mac
+      type: string
+      description: MAC address at the other end
+      ecs: destination.mac
+      status: partial
+      transform: normalize to upper-case hyphen-separated, per ECS
+      notes: >-
+        only meaningful on the same layer-2 segment; on routed traffic it is
+        the gateway's MAC and joining on it groups unrelated hosts
+    - vendor: remote_host_name
+      type: string
+      description: hostname at the other end
+      ecs: destination.domain
+      status: mapped
+    - vendor: traffic_direction
+      type: string
+      description: inbound or outbound, relative to the endpoint
+      ecs: network.direction
+      status: mapped
+      notes: the control field for every swap above
+    - vendor: network_protocol
+      type: string
+      description: transport protocol
+      ecs: network.transport
+      status: partial
+      transform: lowercase, per ECS
+    - vendor: application
+      type: string
+      description: the local application that made or received the connection
+      ecs: process.executable
+      status: mapped
+      notes: >-
+        the reason to collect this feed at all - the perimeter sees the
+        connection, only the endpoint knows which binary opened it
+    - vendor: action
+      type: string
+      description: whether the firewall allowed or blocked the connection
+      ecs: event.action
+      status: mapped
+    - vendor: rule
+      type: string
+      description: the firewall rule that matched
+      ecs: rule.name
+      status: mapped
+    - vendor: begin
+      type: timestamp
+      description: when the connection started
+      ecs: event.start
+      status: partial
+      transform: 'parse in the SEP Manager''s configured timezone'
+    - vendor: end
+      type: timestamp
+      description: when the connection ended
+      ecs: '@timestamp'
+      status: partial
+      transform: 'parse in the SEP Manager''s configured timezone'
+    - vendor: occurrences
+      type: integer
+      description: how many connections this record aggregates
+      ecs: null
+      status: partial
+      custom: symantec_endpoint.occurrences
+      notes: >-
+        SEP aggregates repeated identical connections into one record, so
+        document count is not connection count on this feed
+    - vendor: user_name
+      type: string
+      description: user logged on to the endpoint
+      ecs: user.name
+      status: mapped
+    - vendor: domain_name
+      type: string
+      description: domain of the user
+      ecs: user.domain
+      status: mapped
+    - vendor: sha-256
+      type: string
+      description: SHA-256 of the local application
+      ecs: process.hash.sha256
+      status: partial
+      notes: >-
+        the vendor key contains a hyphen, which is not a valid dotted-path
+        segment in Elasticsearch and has to be renamed before indexing
+    - vendor: md-5
+      type: string
+      description: MD5 of the local application
+      ecs: process.hash.md5
+      status: partial
+      notes: same hyphen caveat as sha-256
+    - vendor: location
+      type: string
+      description: SEP location the endpoint was in
+      ecs: null
+      status: partial
+      custom: symantec_endpoint.location
+      notes: >-
+        a network-posture profile rather than a place; the same caveat as on
+        the detection dataset
+- id: scan
+  name: Agent scan
+  description: >
+    One record per completed or aborted scan, with what it covered and what it
+    found. Not a detection feed - the detections are in the detection dataset
+    - but the coverage record that says whether a clean result means clean or
+    means the scan never finished.
+  event_categories:
+  - malware
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Receives comma-separated records from the SEP Manager. Very low volume
+        - a handful per endpoint per day at most.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes. Small enough for a tight allow-listed policy.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-symantec_endpoint.log
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Receives comma-separated records from the SEP Manager.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-symantec_endpoint.log
+  formats:
+  - format: syslog-csv
+    parsing:
+      mechanism: elastic-integration
+      artifact: elastic/integrations symantec_endpoint, data stream log
+    fields:
+    - vendor: scan_id
+      type: string
+      description: identifier of the scan
+      ecs: event.id
+      status: mapped
+    - vendor: begin
+      type: timestamp
+      description: when the scan started
+      ecs: event.start
+      status: partial
+      transform: 'parse in the SEP Manager''s configured timezone'
+    - vendor: end
+      type: timestamp
+      description: when the scan finished
+      ecs: '@timestamp'
+      status: partial
+      transform: 'parse in the SEP Manager''s configured timezone'
+    - vendor: duration_seconds
+      type: integer
+      description: how long the scan took
+      ecs: event.duration
+      status: partial
+      transform: multiply by 1000000000 - ECS event.duration is nanoseconds
+    - vendor: scan_complete
+      type: string
+      description: whether the scan finished
+      ecs: event.outcome
+      status: partial
+      transform: map to success or failure
+      notes: >
+        the field this dataset exists for. An incomplete scan reporting zero
+        threats is not a clean endpoint, and nothing in the detection feed
+        distinguishes the two - a host that never finished a scan simply has
+        no detections.
+    - vendor: threats
+      type: integer
+      description: threats found by the scan
+      ecs: null
+      status: unmapped
+      custom: symantec_endpoint.scan.threats
+    - vendor: infected
+      type: integer
+      description: files found infected
+      ecs: null
+      status: unmapped
+      custom: symantec_endpoint.scan.infected
+    - vendor: total_files
+      type: integer
+      description: files examined
+      ecs: null
+      status: partial
+      custom: symantec_endpoint.scan.total_files
+      notes: >-
+        with omitted below, the coverage measure - a scan that examined far
+        fewer files than usual for that host was scoped down or interrupted
+    - vendor: omitted
+      type: integer
+      description: files skipped
+      ecs: null
+      status: partial
+      custom: symantec_endpoint.scan.omitted
+      notes: >-
+        skipped files are exclusions or access failures, and a rising count is
+        how a tampered-with exclusion list first shows
+    - vendor: command
+      type: string
+      description: what initiated the scan
+      ecs: null
+      status: unmapped
+      custom: symantec_endpoint.scan.command
+    - vendor: user1
+      type: string
+      description: user context the scan ran as
+      ecs: user.name
+      status: partial
+      notes: >-
+        SEP emits user1 and user2 as positional columns with no label; which
+        is the logged-on user and which the scan context is not stated on the
+        record
+    - vendor: computer_name
+      type: string
+      description: hostname of the endpoint
+      ecs: host.hostname
+      status: mapped
+    - vendor: ip_address
+      type: ip
+      description: address of the endpoint
+      ecs: host.ip
+      status: mapped
+    - vendor: domain_name
+      type: string
+      description: domain of the endpoint
+      ecs: user.domain
+      status: partial
+    - vendor: group
+      type: string
+      description: SEP group the endpoint belongs to
+      ecs: null
+      status: partial
+      custom: symantec_endpoint.group
+    - vendor: server
+      type: string
+      description: SEP Manager that recorded the scan
+      ecs: observer.name
+      status: mapped
+- id: admin
+  name: Manager administration and policy
+  description: >
+    The SEP Manager's own record: console administrator actions, policy
+    changes, and manager system events. Four SEP log types share a short
+    envelope here - Administrative, System, Policy and Agent Activity - and
+    they are the audit surface rather than the detection one. Who changed an
+    exclusion, or disabled a protection on a group, is a question only this
+    feed answers.
+  event_categories:
+  - iam
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Receives comma-separated records from the SEP Manager. Low volume and
+        high value; this feed should not be sampled.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-symantec_endpoint.log
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Receives comma-separated records from the SEP Manager.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-symantec_endpoint.log
+  formats:
+  - format: syslog-csv
+    parsing:
+      mechanism: elastic-integration
+      artifact: elastic/integrations symantec_endpoint, data stream log
+      notes: >
+        These four log types have the shortest fingerprints in the set -
+        System Log is two columns - which makes them the most likely to
+        collide with each other during type detection. Assert on
+        event.provider rather than assuming the type from field presence
+        alone.
+    fields:
+    - vendor: site
+      type: string
+      description: SEP site the record came from
+      ecs: null
+      status: partial
+      custom: symantec_endpoint.site
+      notes: >-
+        the replication boundary in a multi-site SEP estate, and the field
+        that says which manager estate an event belongs to
+    - vendor: server
+      type: string
+      description: SEP Manager that recorded the event
+      ecs: observer.name
+      status: mapped
+    - vendor: domain_name
+      type: string
+      description: the SEP administrative domain
+      ecs: null
+      status: partial
+      custom: symantec_endpoint.domain_name
+      notes: >
+        withheld from user.domain here, unlike on the agent datasets. On a
+        manager record this is SEP's own administrative domain, not a Windows
+        domain, and putting the two in one field mixes namespaces that look
+        alike and are not.
+    - vendor: admin
+      type: string
+      description: the console administrator who performed the action
+      ecs: user.name
+      status: mapped
+      notes: >-
+        a SEP console account, not an endpoint user; the same name can exist
+        in both and mean different people
+    - vendor: event_description
+      type: string
+      description: what was done, in prose
+      ecs: message
+      status: partial
+      notes: >
+        the only description of the change - SEP does not emit a structured
+        before-and-after for policy edits, so what exactly changed is
+        recoverable only by reading this string. That is a real limit on using
+        this feed for configuration-drift detection.

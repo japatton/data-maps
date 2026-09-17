@@ -1,0 +1,541 @@
+id: linux-auditd
+name: Linux auditd
+vendor: Linux
+versions: audit-2.8.x (RHEL 8/9), audit-3.0.x (RHEL 9)
+draft: true
+references:
+- https://man7.org/linux/man-pages/man8/auditd.8.html
+- https://github.com/linux-audit/audit-userspace
+datasets:
+- id: auditd
+  name: auditd log
+  description: >
+    Kernel audit records (syscall, execve argument, and login-uid events)
+    collected by auditd and forwarded off-host; multiple raw record types are
+    reassembled by msgid before they reach Elastic.
+  event_categories:
+  - process
+  - authentication
+  route:
+    guarded:
+    - hop: cribl
+      location: edge Cribl worker group, on-prem enclave
+      notes: Receives raw audit.log lines shipped by rsyslog/audisp-syslog.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        allow-list on logs-linux.auditd destination data stream only; EXECVE
+        argument strings are length-capped before crossing
+      notes: >
+        Crossing transport is confirmed. TODAY the low-side Cribl ships
+        through a Cribl Syslog Destination, using the __syslogout internal
+        field whose value is a CEF-structured string, and the high-side Cribl
+        receives each message as _raw containing a JSON object string, runs a
+        Parser function (Extract JSON) over _raw, adds Cribl fields and ships
+        to Routes. That syslog/CEF leg is being retired. PLANNED and confirmed
+        as the plan of record: low-side Cribl HTTP Destination -> guard ->
+        high-side Cribl HTTP Source carrying NDJSON. This matters on this
+        route because reassembled EXECVE records are the largest single events
+        crossing, and the syslog leg imposes message-size limits the HTTP leg
+        will not.
+    - hop: cribl
+      location: core worker group, Elastic side
+      notes: >-
+        reassembles multi-line EXECVE records (a0..aN) by shared msgid before
+        the Elastic Bulk destination
+    - hop: elastic
+      data_stream: logs-linux.auditd
+    direct:
+    - hop: cribl
+      location: edge Cribl worker group
+      notes: Receives raw audit.log lines shipped by rsyslog/audisp-syslog.
+    - hop: cribl
+      location: core worker group, Elastic side
+      notes: >-
+        reassembles multi-line EXECVE records (a0..aN) by shared msgid before
+        the Elastic Bulk destination
+    - hop: elastic
+      data_stream: logs-linux.auditd
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom auditd pipeline
+      notes: hand-built key=value pipeline; no vendor pack exists for raw auditd records
+    fields:
+    - vendor: type
+      type: string
+      description: 'the audit record''s type (alphanumeric name)'
+      ecs: null
+      status: unmapped
+      custom: auditd.log.record_type
+      notes: >-
+        audit record type (SYSCALL, EXECVE, LOGIN, USER_AUTH, ...); drives
+        which other fields are present on the line
+    - vendor: syscall
+      type: integer
+      description: syscall number in effect when the event occurred (numeric decimal)
+      ecs: null
+      status: unmapped
+      custom: auditd.log.syscall
+      notes: >-
+        numeric syscall id, architecture-dependent; needs a syscall table to
+        become human-readable
+    - vendor: exe
+      type: string
+      description: executable name, an encoded (escaped or hex) path string
+      ecs: process.executable
+      status: mapped
+    - vendor: comm
+      type: string
+      description: command line program name, an encoded string
+      ecs: process.name
+      status: mapped
+    - vendor: pid
+      type: integer
+      description: process ID (numeric decimal)
+      ecs: process.pid
+      status: mapped
+    - vendor: ppid
+      type: integer
+      description: parent process ID (numeric decimal)
+      ecs: process.parent.pid
+      status: mapped
+    - vendor: uid
+      type: integer
+      description: user ID the process ran as (numeric decimal)
+      ecs: user.id
+      status: mapped
+    - vendor: auid
+      type: integer
+      description: login user ID (numeric decimal)
+      ecs: null
+      status: unmapped
+      custom: auditd.log.auid
+      notes: >
+        the audit login uid (original authenticated user, survives su/ sudo);
+        there is no ECS equivalent to loginuid distinct from user.id, so it is
+        kept as a custom field rather than overloading user.id
+    - vendor: success
+      type: enum
+      description: whether the syscall was successful or not (yes/no)
+      ecs: event.outcome
+      status: mapped
+      transform: vendor values yes/no are translated to success/failure
+    - vendor: key
+      type: string
+      description: key assigned from the triggered audit rule (encoded string)
+      ecs: rule.name
+      status: partial
+      custom: auditd.log.key
+      transform: >
+        a rule can carry more than one key, which reaches the parser as a
+        single delimited token, so the value must be split into an array
+        before it is usable as rule.name; the undecoded token stays in
+        auditd.log.key
+      notes: >
+        the administrator-assigned key is the only identity the record carries
+        for the audit rule that fired, so it is the rule name in the ECS sense
+        even though administrators reuse one key across the related syscall
+        rules they want grouped. That is the same reading as zos-acf2's
+        LOOKUP-KEY, a rule *set* name that is rule.name because no other rule
+        identifier appears in the record. rule.ruleset is declined for that
+        reason: everywhere this catalog uses it the ruleset is a container
+        sitting beside a separately populated rule.name, and auditd has no
+        second identifier to fill that pair. auditd exposes no rule id, so
+        rule.id is deliberately left empty. Only records produced by a keyed
+        rule populate it — the RAW feed prints key=(null) on most SYSCALL
+        records — so rule.name is sparse on this dataset rather than absent.
+    - vendor: a0..aN (EXECVE)
+      type: string
+      description: >-
+        per-argument argv values on an EXECVE record, each an encoded (escaped
+        or hex) string
+      ecs: process.args
+      status: partial
+      notes: >
+        argv is split across one a0, a1, ... aN field per EXECVE record and
+        must be reassembled in argument order before it forms a usable
+        process.args array
+    - vendor: addr
+      type: ip
+      description: the remote address that the user is connecting from
+      ecs: source.ip
+      status: mapped
+    - vendor: terminal
+      type: string
+      description: terminal name the user is running programs on
+      ecs: null
+      status: unmapped
+      custom: auditd.log.terminal
+      notes: controlling tty of the process, e.g. pts/0
+    - vendor: hostname
+      type: string
+      description: the hostname that the user is connecting from
+      ecs: source.domain
+      status: partial
+      transform: >
+        this is the remote peer sshd/PAM reports, the same connection addr
+        carries as source.ip, so it belongs on the source side and never in
+        host.* — host.* on this dataset is the auditd machine the record was
+        written on. Under the sshd default UseDNS no the token repeats the
+        numeric peer address; it becomes a resolved name only under UseDNS
+        yes. Write it to source.domain only when it fails to parse as an IP,
+        so the numeric case is not duplicated out of source.ip into a domain
+        field.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Move EXECVE reassembly to the edge worker group: join a0..aN by
+          shared msgid into an ordered process.args array and decode auditd's
+          escaped/ hex string encoding before the guard, because the crossing
+          is at-most-once and a msgid group that loses a record on the high
+          side can never be completed there. Emit one full ECS-shaped record
+          per event with explicit, flagged argv truncation rather than relying
+          on the guard's silent length cap, and mask credential-bearing argv
+          patterns (mysql -p, curl -u, sshpass) before they leave the enclave.
+          Because this is a hand-built key=value parser with no vendor pack
+          tracking new record types, gate the guard destination with
+          C.Schema(...).validate plus a dead-letter route that alerts on its
+          own rate, and run the destination on Persistent Queue backpressure —
+          never Block. Set host.name at the edge from the source connection:
+          no auditd field names the machine the record was written on (the
+          record's hostname field is the remote peer), while the process and
+          authentication alerting profiles both require host.name, and the
+          crossing has no return channel to repair it afterwards. Where the
+          origin hosts can be configured, auditd.conf's name_format (hostname,
+          fqd, or user with name) prepends a node= token to every record and
+          gives the edge an authoritative value to read instead of one
+          inferred from the connection.
+        elastic: >
+          No auditd integration exists, so own a custom logs-linux.auditd
+          ingest pipeline that finishes only what the low side cannot: resolve
+          the architecture-dependent syscall number to a readable name through
+          an enrich policy, and assert event.outcome is the derived
+          success/failure enum rather than the raw yes/no. Split the audit
+          rule key on its delimiter into a rule.name array so a record
+          carrying several keys names each of them, and leave rule.id unset
+          because auditd exposes no rule id to pair with it. Add explicit
+          custom-namespace index-template mappings for auditd.log.record_type,
+          .key (the undecoded key token, retained beside rule.name) and
+          .terminal as keyword, .auid as long, and .syscall as long with the
+          resolved name as a separate keyword, so the login uid stays
+          queryable without overloading user.id under dynamic mapping.
+        relay: >
+          Full ECS-shaped NDJSON crosses (envelope mode B) — one reassembled
+          event per line, UTF-8, LF-terminated, compression disabled, nesting
+          depth ≤2 — so the guard's allow-list on the logs-linux.auditd data
+          stream inspects whole command lines instead of argv fragments. The
+          friction to settle with the guard owner is EXECVE argv: unbounded
+          free-text carrying decoded non-ASCII bytes and kilobyte-scale
+          values, which should be capped and flagged low-side to a length the
+          content filter accepts. The vendor feed is raw syslog rather than
+          CEF, so nothing CEF-shaped originates at the source - though the
+          crossing itself is CEF-shaped today, the confirmed current transport
+          being a Cribl Syslog Destination on a CEF-structured __syslogout
+          value that the high side recovers from _raw with an Extract JSON
+          parser before Cribl fields and Routes. That leg is being retired:
+          the confirmed plan of record is a low-side Cribl HTTP Destination to
+          a high-side Cribl HTTP Source carrying exactly the NDJSON described
+          above, with AST/file drop demoted to a replay-capable fallback
+          rather than a co-equal option. With no return channel, detect silent
+          drops by reconciling low-side and high-side counts per (dataset,
+          hour), and carry _raw only for EXECVE and USER_AUTH records until
+          the hand-built parser is proven, dropping it on bulk SYSCALL volume
+          first.
+      direct:
+        parse_location: low
+        cribl: >
+          Reassemble EXECVE records in the core worker group before the
+          Elastic Bulk destination: join a0..aN by shared msgid into an
+          ordered process.args array and decode auditd's escaped/hex string
+          encoding. Emit one full ECS-shaped record per event, and mask
+          credential-bearing argv patterns (mysql -p, curl -u, sshpass) as a
+          data-hygiene step. Because this is a hand-built key=value parser
+          with no vendor pack tracking new record types, gate the Elastic Bulk
+          destination with C.Schema(...).validate plus a dead-letter route
+          that alerts on its own rate, and run the destination on Persistent
+          Queue backpressure — never Block. Set host.name in the core worker
+          group from the source connection: no auditd field names the machine
+          the record was written on (the record's hostname field is the remote
+          peer), and the process and authentication alerting profiles both
+          require host.name. Setting name_format in auditd.conf on the origin
+          hosts (hostname, fqd, or user with name) prepends a node= token the
+          pipeline can read instead of inferring the value from the
+          connection.
+        elastic: >
+          No auditd integration exists, so own a custom logs-linux.auditd
+          ingest pipeline: resolve the architecture-dependent syscall number
+          to a readable name through an enrich policy, and assert
+          event.outcome is the derived success/failure enum rather than the
+          raw yes/no. Split the audit rule key on its delimiter into a
+          rule.name array so a record carrying several keys names each of
+          them, and leave rule.id unset because auditd exposes no rule id to
+          pair with it. Add explicit custom-namespace index-template mappings
+          for auditd.log.record_type, .key (the undecoded key token, retained
+          beside rule.name) and .terminal as keyword, .auid as long, and
+          .syscall as long with the resolved name as a separate keyword, so
+          the login uid stays queryable without overloading user.id under
+          dynamic mapping.
+  - format: other
+    enable: >
+      auditd's on-disk record shape is chosen by the log_format keyword in
+      /etc/audit/auditd.conf. The deployed hosts run log_format = RAW, which
+      stores each record exactly as the kernel emits it (numeric uid/gid/auid,
+      the architecture-dependent syscall number, a hex arch token, and the raw
+      sockaddr). Setting log_format = ENRICHED and restarting the daemon
+      (service auditd restart - auditd is not restartable through systemctl on
+      most distros) makes auditd resolve uid, gid, syscall, architecture, and
+      socket-address information AT WRITE TIME on the originating host, and
+      append the resolved values to the same record. The resolution is not a
+      rewrite of the raw fields: the original lowercase fields are left
+      intact, a single 0x1D ASCII group-separator (GS) control byte is
+      inserted after the last raw field, and the resolved values follow it as
+      uppercase-named KEY="value" pairs in order of occurrence - e.g. a
+      SYSCALL record that raw-mode ends `...key=(null)` continues, after the
+      0x1D byte, with `ARCH=x86_64 SYSCALL=sendmsg AUID="unset" UID="root"
+      GID="root" EUID="root" SUID="root" FSUID="root" EGID="root" SGID="root"
+      FSGID="root"` (and SADDR=... on socket syscalls). The setting governs
+      both the local audit.log and the record stream handed to the audisp
+      plugins, so an ENRICHED origin host forwards enriched records over
+      whatever transport (rsyslog/audisp-syslog today, or the planned HTTP
+      leg) is in front of it. The upstream enrichment spec requires that
+      user-controlled resolved data (the uid/gid name strings) be encoded, and
+      a long-standing userspace bug can drop the space before ARCH so the GS
+      byte sits flush against the preceding `key=` value - both matter to a
+      parser and a content filter downstream.
+    references:
+    - https://man7.org/linux/man-pages/man5/auditd.conf.5.html
+    - >-
+      https://github.com/linux-audit/audit-documentation/wiki/SPEC-Audit-Event-Enrichment
+    - https://github.com/linux-audit/audit-userspace/blob/master/docs/auditd.conf.5
+    - https://github.com/linux-audit/audit-userspace/issues/140
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        custom auditd pipeline, extended: split each record on the 0x1D
+        group-separator byte, key=value-parse the uppercase resolved tail, and
+        fold it onto the record the existing RAW parser already builds
+      notes: >
+        No vendor pack parses auditd records in either format, so this is the
+        same hand-built pipeline the RAW feed uses with one added stage. The
+        record is split on the single 0x1D (GS) byte: the head is parsed by
+        the existing RAW key=value logic (the syslog-raw field inventory -
+        type, syscall, exe, comm, pid, ppid, uid, auid, success, key, a0..aN,
+        addr, terminal, hostname - is unchanged and is NOT re-documented
+        here), and the uppercase tail is parsed as ordinary KEY="value" pairs
+        into the new fields below. Two mechanical hazards are specific to this
+        format: the 0x1D byte is a raw control character that must be consumed
+        and dropped (never forwarded verbatim), and the userspace
+        missing-space bug can leave the GS byte with no delimiter before ARCH,
+        so anchor the split on the 0x1D byte itself rather than on whitespace.
+        Because the resolution happens on the origin host, the resolved
+        SYSCALL name and uid/gid names reflect that host's own syscall table
+        and passwd/group databases - which is the whole point of the format
+        and is more authoritative than a downstream lookup, but also means a
+        deleted local user still resolves to the name it had at event time.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          ENRICHED is a net positive for the crossing and should be embraced
+          at the edge, not merely tolerated: it does at the source exactly
+          what the RAW recommendation asks the far side to reconstruct - it
+          turns the architecture-dependent syscall number into a name and the
+          numeric uid/gid/auid into the account names that existed on the true
+          origin host, which the high side has no authoritative table to
+          derive. Split on the 0x1D group-separator byte on the edge worker
+          group, fold the uppercase tail onto the record, and DROP the raw
+          0x1D control byte before the guard, because a bare control character
+          in the stream is the kind of thing a content filter rejects
+          outright. The new exposure is free text: the resolved UID/AUID/EUID
+          and the SYSCALL name are strings (the upstream spec itself flags
+          uid/gid enrichment as user-controlled and requiring encoding), so
+          length-cap and control-strip the resolved name fields alongside the
+          existing exe/comm/argv masking, and keep the credential-argv masking
+          (mysql -p, curl -u, sshpass) unchanged since a0..aN are untouched by
+          enrichment. Continue to reassemble EXECVE a0..aN before the guard as
+          the RAW path already does; enrichment does not touch argv. Gate the
+          guard destination with C.Schema(...).validate extended for the
+          uppercase fields plus the dead-letter route, and run it on
+          Persistent Queue backpressure, never Block.
+        elastic: >
+          An ENRICHED origin removes most of the custom logs-linux.auditd
+          ingest work the RAW feed needs: the syscall-number enrich policy is
+          redundant because SYSCALL already carries the resolved name, and the
+          resolved UID gives a real user.name without a lookup. Do NOT run
+          both - if a host is ENRICHED, trust its SYSCALL name and skip the
+          enrich-policy step for that record rather than re-deriving a name
+          against the wrong (Elastic side) syscall table. Keep the RAW-format
+          mappings the syslog-raw feed defines (auditd.log.record_type, .key,
+          .terminal as keyword, .auid as long, numeric .syscall as long),
+          including the key split into a rule.name array with rule.id left
+          unset, which enrichment does not touch, and add keyword mappings for
+          the new resolved-name custom fields (auditd.log.syscall_name,
+          auditd.log.auid_name, and the *_name identity fields) so the
+          resolved and numeric forms stay independently queryable. Still
+          assert event.outcome from the raw success yes/no; enrichment does
+          not resolve it. The one caveat to carry as an alert is format skew:
+          hosts may be RAW or ENRICHED, so a record with a numeric syscall and
+          no SYSCALL name is a RAW host, not an error, and the pipeline must
+          handle both without flagging the RAW records as malformed.
+        relay: >
+          Enrichment helps the guard owner: with resolved names in the record
+          the content filter inspects `SYSCALL=execve UID="root"` instead of
+          opaque numbers, so the allow-list on the logs-linux.auditd data
+          stream reads the human-meaningful values directly. Two frictions to
+          settle up front. First, the 0x1D GS control byte must be stripped
+          low-side - raw control characters in an otherwise-NDJSON envelope
+          (envelope mode B carries one reassembled event per line) are exactly
+          what a strict content filter refuses, so the byte should never
+          approach the boundary. Second, the resolved uid/gid name strings are
+          user-influenced free text (a username can be attacker-chosen on a
+          compromised host) and, like EXECVE argv, must be capped and
+          control-stripped low-side to a length the filter accepts. As with
+          the RAW feed the crossing is at-most-once with no return channel, so
+          reconcile low-side and high-side counts per (dataset, hour);
+          enrichment does not change the reassembly obligation, EXECVE argv is
+          still the largest event and is still capped and flagged low-side.
+      direct:
+        parse_location: low
+        cribl: >
+          For high-side auditd instances there is no guard to shape for, so
+          the only decision is whether to enrich at the source at all. Prefer
+          it: an ENRICHED high-side host still benefits because the resolved
+          SYSCALL name and account names are computed against that host's own
+          tables, which is more reliable than a core worker-group lookup, and
+          it lets the core pipeline skip the syscall-name enrich step. Do the
+          0x1D split and uppercase-tail parse on the core worker group: drop
+          the GS byte so it never lands in Elastic, fold the uppercase tail
+          onto the record, and keep the parsing logic identical to the RAW
+          path so ENRICHED and RAW hosts merge into one dataset. Reassemble
+          EXECVE a0..aN before the Elastic Bulk destination as today;
+          enrichment does not touch argv.
+        elastic: >
+          Land ENRICHED and RAW records in the same logs-linux.auditd data
+          stream and the same custom ingest pipeline; the format must not fork
+          the mapping story. The pipeline branches only on presence of the
+          resolved tail - when SYSCALL/UID names are present, populate the
+          resolved-name custom fields and user.name directly and skip the
+          syscall enrich policy; when they are absent, run the RAW path's
+          number-to-name enrichment. Map the resolved-name fields as the
+          keyword custom fields listed below, keep the numeric raw fields
+          exactly as the deployed map defines them, and add a monitor for
+          records that carry neither a numeric syscall nor a resolved SYSCALL
+          name, which would indicate a truncated split rather than a format
+          difference.
+    fields:
+    - vendor: UID
+      type: string
+      description: resolved account name for the raw uid field, added after the 0x1D separator
+      ecs: user.name
+      status: mapped
+      notes: >
+        the RAW feed maps numeric uid to user.id; ENRICHED adds the name
+        auditd resolved on the origin host, which is the natural user.name.
+        Keep both - user.id from raw uid, user.name from resolved UID - rather
+        than overloading one. User-controlled per the enrichment spec, so
+        encode/cap before any crossing.
+    - vendor: AUID
+      type: string
+      description: resolved account name for the raw auid (login uid) field
+      ecs: null
+      status: unmapped
+      custom: auditd.log.auid_name
+      notes: >
+        names the original authenticated user (survives su/sudo), the resolved
+        form of the raw auid the deployed map keeps as auditd.log.auid. There
+        is no ECS field for a loginuid name distinct from user.name, so it
+        stays a custom field alongside the numeric auid. Value "unset" appears
+        when no login uid applies (e.g. daemon-initiated syscalls).
+    - vendor: EUID
+      type: string
+      description: resolved account name for the effective uid
+      ecs: user.effective.name
+      status: mapped
+      notes: >
+        the effective user the syscall ran as after any setuid transition; ECS
+        user.effective.name is the correct home. Raw euid is not in the
+        syslog-raw inventory, so no numeric companion is carried unless added
+        later.
+    - vendor: GID
+      type: string
+      description: resolved group name for the raw gid field
+      ecs: user.group.name
+      status: mapped
+    - vendor: EGID
+      type: string
+      description: resolved group name for the effective gid
+      ecs: user.effective.group.name
+      status: mapped
+    - vendor: SUID
+      type: string
+      description: resolved account name for the saved uid
+      ecs: null
+      status: unmapped
+      custom: auditd.log.suid_name
+      notes: saved-set uid name; no distinct ECS slot for the saved uid, kept custom
+    - vendor: FSUID
+      type: string
+      description: resolved account name for the filesystem uid
+      ecs: null
+      status: unmapped
+      custom: auditd.log.fsuid_name
+      notes: filesystem-access uid name; no ECS equivalent, kept custom
+    - vendor: SGID
+      type: string
+      description: resolved group name for the saved gid
+      ecs: null
+      status: unmapped
+      custom: auditd.log.sgid_name
+    - vendor: FSGID
+      type: string
+      description: resolved group name for the filesystem gid
+      ecs: null
+      status: unmapped
+      custom: auditd.log.fsgid_name
+    - vendor: ARCH
+      type: string
+      description: resolved CPU architecture string (e.g. x86_64) for the raw hex arch token
+      ecs: host.architecture
+      status: partial
+      transform: >
+        ARCH is the syscall ABI architecture the record executed under,
+        resolved from the kernel's hex arch value (e.g. c000003e -> x86_64).
+        It equals the host architecture in the common case, which is why
+        host.architecture is the closest ECS field, but on a mixed-ABI host a
+        32-bit syscall on a 64-bit kernel makes ARCH the syscall's ABI, not
+        the host's - note that caveat rather than treating them as identical.
+        The raw hex arch is not in the syslog-raw inventory, so ARCH is
+        carried alone.
+    - vendor: SYSCALL
+      type: string
+      description: resolved syscall name (e.g. execve, sendmsg) for the raw numeric syscall field
+      ecs: null
+      status: unmapped
+      custom: auditd.log.syscall_name
+      notes: >
+        the human-readable name the elastic recommendation reconstructs from
+        the numeric syscall via an enrich policy; ENRICHED provides it at the
+        source, resolved against the origin host's own syscall table. Keep it
+        as a keyword custom field paired with the numeric auditd.log.syscall
+        the deployed map already defines, so both the number and the name
+        query.
+    - vendor: SADDR
+      type: string
+      description: >-
+        resolved/structured socket address, split into constituent pieces,
+        present only on socket-related syscalls
+      ecs: null
+      status: unmapped
+      custom: auditd.log.saddr
+      notes: >
+        the enrichment spec resolves the raw packed sockaddr into readable
+        constituent pieces (address family, address, port). It appears only on
+        socket syscalls (connect, bind, sendto, ...), so it is sparse. Left
+        custom and unmapped here rather than guessed into
+        source.*/destination.*: the direction (local vs remote endpoint)
+        depends on the syscall and is not self-describing in the field, so a
+        safe ECS split needs per-syscall logic in the pipeline before any
+        address/port is asserted.

@@ -1,0 +1,1230 @@
+id: windows-dns-dhcp
+name: Windows DNS/DHCP
+vendor: Microsoft
+versions: Windows Server 2012 R2 (with KB2956577), 2016, 2019, 2022, 2025
+draft: true
+references:
+- >-
+  https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-server-2012-r2-and-2012/dn800669(v=ws.11)
+- >-
+  https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-server-2008-r2-and-2008/dd759178(v=ws.11)
+- https://www.elastic.co/docs/reference/integrations/microsoft_dnsserver
+- https://www.elastic.co/docs/reference/integrations/microsoft_dhcp
+- https://learn.microsoft.com/en-us/azure/sentinel/connect-dns-ama
+datasets:
+- id: dns-analytical
+  name: DNS Server analytical (ETW) events
+  description: >
+    Per-transaction DNS Server telemetry from the
+    Microsoft-Windows-DNSServer/Analytical ETW channel (provider GUID
+    EB79061A-A566-4698-9119-3ED2807060E7), event IDs 256-280. This is the
+    modern replacement for the legacy dns.log debug file and the feed a SOC
+    actually hunts on: 256 QUERY_RECEIVED and 257 RESPONSE_SUCCESS are the
+    client-facing query/answer pair, 258/259 carry failures and ignored
+    queries, 260/261 the recursive lookups out to forwarders, 263/264 the
+    dynamic-update wire events, and 265-276 the IXFR/AXFR zone-transfer and
+    NOTIFY events that unauthorized-zone-transfer detections need. The legacy
+    %SystemRoot%\System32\dns\dns.log debug log carries roughly the same
+    information as unstructured text and is still what many older ArcSight
+    connectors read; prefer the analytical channel, which is structured, has
+    documented per-event field lists, and is explicitly designed for low
+    performance impact (about 5 percent degradation at 100,000 QPS, none at
+    50,000 QPS and below). Analytical logging is NOT enabled by default.
+  event_categories:
+  - dns
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Elastic Agent on the DNS server subscribes to the Analytical channel
+        and lands on Cribl, replacing the ArcSight Windows/file connector that
+        read dns.log. This is by far the highest-volume dataset in this map
+        and needs an explicit sampling, event-ID allow-list, or aggregation
+        decision at this hop before onboarding.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-microsoft_dnsserver.analytical
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        High-side instances land directly on Cribl with no guard hop. Elastic
+        Agent on the DNS server subscribes to the Analytical channel and lands
+        on Cribl, replacing the ArcSight Windows/file connector that read
+        dns.log. This is by far the highest-volume dataset in this map and
+        needs an explicit sampling, event-ID allow-list, or aggregation
+        decision at this hop before onboarding.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-microsoft_dnsserver.analytical
+  formats:
+  - format: windows-event
+    parsing:
+      mechanism: elastic-integration
+      artifact: Microsoft DNS Server Audit and Analytical logs integration (microsoft_dnsserver)
+      notes: >
+        The Elastic microsoft_dnsserver integration ships an analytical data
+        stream whose ingest pipeline splits the event-text template
+        (RESPONSE_SUCCESS: TCP=%1; InterfaceIP=%2; Destination=%3; ...) into
+        microsoft_dnsserver.analytical.* fields and a partial ECS dns.* set.
+        Requires Windows 10 / Server 2016 or later and Kibana 8.13+. If the
+        legacy dns.log debug file is used instead, none of this applies and a
+        hand-built Cribl regex pipeline over the debug-log grammar is
+        required.
+    fields:
+    - vendor: EventID
+      type: integer
+      description: >-
+        analytical event identifier, 256-280 (QUERY_RECEIVED,
+        RESPONSE_SUCCESS, RESPONSE_FAILURE, IGNORED_QUERY, RECURSE_QUERY_OUT,
+        DYN_UPDATE_RECV, AXFR_REQ_RECV, ...).
+      ecs: event.code
+      status: mapped
+      transform: >
+        also drives event.action and event.category - 256/257 are the
+        client-facing query and answer, 265-276 are zone transfer and NOTIFY,
+        263/264/277/278 are dynamic update. Each event ID has its own field
+        list, so the parser needs one branch per ID rather than one grammar
+    - vendor: QNAME
+      type: string
+      description: fully qualified domain name carried in the DNS question section.
+      ecs: dns.question.name
+      status: mapped
+      transform: >
+        emitted with a trailing dot; strip it and lowercase before indexing,
+        then derive dns.question.registered_domain / top_level_domain /
+        subdomain with a registered-domain processor
+    - vendor: QTYPE
+      type: integer
+      description: >-
+        resource record type requested, emitted as the numeric RR type code
+        rather than the mnemonic.
+      ecs: dns.question.type
+      status: partial
+      transform: >
+        numeric code needs a lookup to the ECS mnemonic (1=A, 28=AAAA, 16=TXT,
+        15=MX, 12=PTR, 252=AXFR, 251=IXFR); indexing the raw integer breaks
+        every detection rule written against dns.question.type
+    - vendor: Source
+      type: ip
+      description: >-
+        peer address on inbound events - the querying client on
+        QUERY_RECEIVED, the upstream server on RECURSE_RESPONSE_IN.
+      ecs: source.ip
+      status: mapped
+      notes: >
+        only present on the received-side events; on the sent-side events
+        (257/258/260) the peer is in Destination instead, so a naive source.ip
+        mapping leaves half the transactions with no client address
+    - vendor: Destination
+      type: ip
+      description: >-
+        peer address on outbound events - the client being answered on
+        RESPONSE_SUCCESS, the forwarder being queried on RECURSE_QUERY_OUT.
+      ecs: destination.ip
+      status: partial
+      notes: >
+        semantically the same host as Source on the matching inbound event;
+        normalize both into client/server (or copy into related.ip) or the
+        256/257 pair cannot be joined on one address field
+    - vendor: InterfaceIP
+      type: ip
+      description: 'the DNS server''s own listening address that handled the transaction.'
+      ecs: observer.ip
+      status: partial
+      notes: >
+        the stock Elastic integration keeps this as the keyword
+        microsoft_dnsserver.analytical.interface_ip; observer.ip is the right
+        ECS home because this is the DNS server itself, never a flow endpoint.
+        DYN_UPDATE_FORWARD (277) uses ForwardInterfaceIP for the same concept
+    - vendor: Port
+      type: port
+      description: 'peer''s UDP/TCP port for the transaction.'
+      ecs: source.port
+      status: partial
+      notes: >
+        direction-dependent exactly like Source/Destination - it is the source
+        port on received events and the destination port on sent events, so
+        the branch that sets it has to match the event ID
+    - vendor: XID
+      type: integer
+      description: DNS transaction ID from the message header.
+      ecs: dns.id
+      status: mapped
+      transform: numeric in the source, keyword in ECS - cast to string
+    - vendor: RCODE
+      type: integer
+      description: >-
+        DNS response code on response and update-response events (257, 258,
+        264, 267/268, 271/272, 277/278).
+      ecs: dns.response_code
+      status: partial
+      transform: >
+        numeric code needs a lookup to the ECS mnemonic (0=NOERROR,
+        2=SERVFAIL, 3=NXDOMAIN, 5=REFUSED, 9=NOTAUTH) and should also drive
+        event.outcome, which is more reliable than inferring outcome from the
+        257-vs-258 event ID alone
+    - vendor: TCP
+      type: boolean
+      description: transport indicator, 0 for UDP and 1 for TCP.
+      ecs: network.transport
+      status: mapped
+      transform: >
+        0 to udp, 1 to tcp. Unlike BIND querylog there is a positive value for
+        both, so no default is needed - but TCP=1 on a QUERY_RECEIVED for a
+        non-AXFR QTYPE is itself a tunnelling signal worth keeping
+    - vendor: RD
+      type: boolean
+      description: recursion-desired bit from the request (events 256, 260, 279, 280).
+      ecs: dns.header_flags
+      status: partial
+      transform: >-
+        append the RD token to the dns.header_flags array rather than indexing
+        the raw boolean
+    - vendor: AA
+      type: boolean
+      description: authoritative-answer bit on response events (257, 261).
+      ecs: dns.header_flags
+      status: partial
+      transform: append the AA token to dns.header_flags
+    - vendor: AD
+      type: boolean
+      description: authenticated-data (DNSSEC validated) bit on response events (257, 261).
+      ecs: dns.header_flags
+      status: partial
+      transform: append the AD token to dns.header_flags
+    - vendor: Flags
+      type: string
+      description: the raw DNS header flags word, printed as a hex value.
+      ecs: null
+      status: partial
+      custom: microsoft_dnsserver.analytical.flags
+      notes: >
+        the only carrier for the flags that have no dedicated column (TC, RA,
+        CD, and the opcode); decoding this word once is cheaper and more
+        complete than trusting the separate AA/AD/RD booleans, and it is the
+        only route to dns.op_code for this dataset
+    - vendor: Zone
+      type: string
+      description: authoritative zone that answered, or the zone a transfer/update targeted.
+      ecs: null
+      status: unmapped
+      custom: microsoft_dnsserver.analytical.zone
+      notes: >
+        ECS dns.* models a transaction, not zone authority; this is the field
+        that separates internal authoritative answers from recursed ones and
+        the pivot for zone-transfer events 265-276
+    - vendor: PolicyName
+      type: string
+      description: >-
+        name of the DNS policy that selected the scope or blocked the query
+        (events 257, 258, 259, 260, 264).
+      ecs: rule.name
+      status: mapped
+      notes: >
+        the Windows DNS equivalent of an RPZ hit and the highest-value
+        security field in this dataset - a populated PolicyName on a 259
+        IGNORED_QUERY is a block. rule.name is free here (no other policy
+        object competes for it) and rule.id is deliberately left unset per the
+        repo convention, since no signature id accompanies the name
+    - vendor: PacketData
+      type: string
+      description: >-
+        the complete DNS message as a hex-encoded blob (events 257-261,
+        263-270, 273-278).
+      ecs: null
+      status: partial
+      custom: microsoft_dnsserver.analytical.packet_data
+      notes: >
+        the ONLY place the answer section exists - the analytical event has no
+        decoded answer columns at all, so dns.answers.data, dns.answers.type
+        and dns.resolved_ip are unreachable without decoding this blob. That
+        is the single biggest ECS coverage gap in this map, and it is also the
+        largest field on the wire
+    - vendor: ServerScope / CacheScope / ZoneScope
+      type: string
+      description: >-
+        DNS server, cache and zone scope names used by DNS policy and
+        split-brain configurations.
+      ecs: null
+      status: unmapped
+      custom: microsoft_dnsserver.analytical.cache_scope
+      notes: >-
+        the Windows analogue of a BIND view; needed to disambiguate
+        split-horizon answers
+    - vendor: Reason
+      type: string
+      description: >-
+        why the server failed or ignored the query (events 258
+        RESPONSE_FAILURE and 259 IGNORED_QUERY).
+      ecs: event.reason
+      status: partial
+      notes: >-
+        present only on the failure events, and the discriminator between a
+        policy block and a genuine server error
+    - vendor: Computer
+      type: string
+      description: >-
+        hostname of the DNS server that emitted the event, from the Windows
+        event envelope.
+      ecs: observer.name
+      status: mapped
+      notes: >
+        the Elastic integration also populates host.name; observer.name is
+        what lets this dataset join to the DNS audit and DHCP datasets on the
+        same appliance
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Keep the core worker group a pass-through and let the integration
+          pipeline parse, but take the volume decision here: an event-ID
+          allow-list (256/257/258/259 for hunting, 263/264 and 265-276 for
+          update and transfer detection) is the single highest-leverage
+          low-side control, and it belongs near the source rather than in an
+          ingest pipeline. Add Persistent Queue backpressure on the Elastic
+          destination and host-to-site/host-to-owner enrichment, and decide
+          explicitly whether the PacketData hex blob is forwarded at all - it
+          roughly doubles event size and is the first thing to drop if it is
+          not being decoded.
+        elastic: >
+          The stock microsoft_dnsserver analytical ingest pipeline is the
+          parser; layer a logs-microsoft_dnsserver.analytical@custom pipeline
+          that resolves the numeric QTYPE and RCODE codes through
+          lookup/enrich tables into the ECS mnemonics, derives event.outcome
+          from RCODE rather than from the event ID alone, collapses the
+          AA/AD/RD booleans plus the Flags hex word into a single
+          dns.header_flags array, and normalizes the direction-dependent
+          Source/Destination/Port pair so a 256 and its matching 257 present
+          the client consistently. Decode PacketData into dns.answers.* and
+          dns.resolved_ip there if resolved-IP detections are in scope, and
+          map the microsoft_dnsserver.analytical.* customs (policy_name, zone,
+          cache_scope, flags, packet_data) as keyword in the index template.
+        relay: >
+          Low-side instances cross the guard with a thin envelope (_dataId,
+          @timestamp, host, _raw) rather than full ECS so the integration
+          pipeline stays the parser, and treat the crossing as at-most-once
+          with low-side vs high-side count reconciliation per (dataset, hour).
+          Two values are real content-filter friction here: QNAME is
+          attacker-chosen and can be long, non-ASCII or punycode, and
+          PacketData is a kilobyte-scale hex blob - bound both low-side, or
+          drop PacketData before the guard, so a custom NDJSON filter can stay
+          simple.
+      direct:
+        parse_location: high
+        cribl: >
+          Keep the core worker group a pass-through and let the integration
+          pipeline parse, but take the volume decision here: an event-ID
+          allow-list (256/257/258/259 for hunting, 263/264 and 265-276 for
+          update and transfer detection) is the single highest-leverage
+          control, and it belongs near the source rather than in an ingest
+          pipeline. Add Persistent Queue backpressure on the Elastic
+          destination and host-to-site/host-to-owner enrichment, and decide
+          explicitly whether the PacketData hex blob is forwarded at all - it
+          roughly doubles event size and is the first thing to drop if it is
+          not being decoded.
+        elastic: >
+          The stock microsoft_dnsserver analytical ingest pipeline is the
+          parser; layer a logs-microsoft_dnsserver.analytical@custom pipeline
+          that resolves the numeric QTYPE and RCODE codes through
+          lookup/enrich tables into the ECS mnemonics, derives event.outcome
+          from RCODE rather than from the event ID alone, collapses the
+          AA/AD/RD booleans plus the Flags hex word into a single
+          dns.header_flags array, and normalizes the direction-dependent
+          Source/Destination/Port pair so a 256 and its matching 257 present
+          the client consistently. Decode PacketData into dns.answers.* and
+          dns.resolved_ip there if resolved-IP detections are in scope, and
+          map the microsoft_dnsserver.analytical.* customs (policy_name, zone,
+          cache_scope, flags, packet_data) as keyword in the index template.
+  - format: syslog-raw
+    enable: >
+      On the DNS server, open DNS Manager, right-click the server, choose
+      Properties and open the Debug Logging tab, check "Log packets for
+      debugging" and select the packet directions (Send/Receive), transport
+      (UDP/TCP), packet type (Request/Response) and contents (Standard queries
+      / Updates / Notifies) to record, then set the File name (default
+      %windir%\System32\dns\dns.log) and a maximum size. The equivalent
+      PowerShell is Set-DnsServerDiagnostics, e.g. `Set-DnsServerDiagnostics
+      -Queries $true -Answers $true -Notifications $true -SendPackets $true
+      -ReceivePackets $true -TcpPackets $true -UdpPackets $true
+      -EnableLoggingToFile $true`, with -EnableLogFileRollover to start a new
+      file at the size cap rather than overwrite. All debug options are OFF by
+      default and the feature is resource-intensive (Microsoft advises
+      temporary use only), so scope it to the directions and packet types
+      actually needed rather than -All $true. The file itself carries no
+      server-hostname column, so emitting-host attribution has to come from
+      the Elastic Agent filestream host metadata, not from a field in the
+      line.
+    references:
+    - >-
+      https://learn.microsoft.com/en-us/windows-server/networking/dns/dns-logging-and-diagnostics
+    - >-
+      https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-server-2003/cc776361(v=ws.10)
+    - https://woshub.com/enable-dns-query-logging-parse-logfile/
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom DNS debug-log (dns.log) grammar pipeline
+      notes: >
+        The microsoft_dnsserver integration's analytical ingest pipeline is
+        written for the RESPONSE_SUCCESS/QUERY_RECEIVED event-text templates
+        and never matches this fixed-column debug grammar, so a dedicated
+        regex parse is required. Three quirks the parser must handle
+        explicitly: the QNAME is emitted in DNS wire label-length form -
+        (8)woshub(2)com(0) - and has to be reassembled into woshub.com; a
+        single logical packet spans MULTIPLE physical lines because the debug
+        log appends the decoded question/answer/authority sections below the
+        header line, so the reader needs a multiline grammar keyed on the
+        PACKET header rather than one-line-per-event; and the peer address is
+        a single Remote IP column whose role flips with the Snd/Rcv direction
+        exactly as Source/Destination do in the analytical feed. Unlike the
+        analytical channel, RCODE and QTYPE arrive as mnemonics (NOERROR, A)
+        not numeric codes, so no code-to-mnemonic lookup is needed for those
+        two.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Branch this off the DNS filestream on the fixed PACKET header shape
+          and parse the debug grammar into ECS-shaped JSON low-side with a
+          multiline reader, since org doctrine keeps unparsed text off the
+          wire and the answer/authority sections make this a multi-line
+          record. Reassemble the label-length QNAME into a dotted name, map
+          Snd/Rcv onto network.direction and use it to assign the Remote IP to
+          source.ip or destination.ip consistently so a query line and its
+          matching response line present the client on one field, expand the
+          flag character codes (A/T/D/R) into dns.header_flags, and lowercase
+          the transport. This is the highest- volume DNS rendering, so take
+          the sampling / packet-type allow-list decision here at the source
+          (Answers and the full-packet sections are the first thing to drop),
+          bound QNAME length and non-ASCII / punycode forms before the
+          destination, and validate the emitted envelope with a dead-letter
+          route for lines that fail the grammar.
+        elastic: >
+          Take pre-shaped ECS JSON into a small custom
+          logs-microsoft_dnsserver.analytical@custom-style ingest pipeline (or
+          a dedicated debug-log pipeline if kept as its own data stream):
+          derive dns.question.registered_domain / subdomain / top_level_domain
+          from the reassembled name, set event.outcome from dns.response_code
+          on response lines, and map the microsoft_dnsserver.debug.* customs
+          (packet_id, flags, qr) as keyword in the index template. Do NOT
+          route these records through the stock analytical event-text pipeline
+          - its Dissect patterns are written for the ETW templates and will
+          drop every debug line.
+        relay: >
+          Highest-volume DNS rendering in this map, so cross only the thin ECS
+          envelope and make this the first feed to drop `_raw` once the
+          grammar is proven; the debug text is converted low-side and never
+          crosses the guard, which also removes the multi-line off-grammar
+          content (the decoded question/answer sections) that is exactly the
+          shape a content filter mishandles. QNAME is attacker-chosen and can
+          be long, non-ASCII or punycode, so bound it low-side before the
+          guard, and reconcile low-side vs high-side counts per (dataset,
+          hour) since the crossing is unacknowledged.
+      direct:
+        parse_location: low
+        cribl: >
+          High-side instances with no guard still parse the debug grammar at
+          the source into ECS JSON with the custom multiline pipeline;
+          shipping raw multi-line debug text to Elastic would leave it
+          unparsed. The decision that matters is not double-counting against a
+          co-collected analytical ETW feed for the same server: pick one
+          authoritative query transport per server, or key de-duplication on
+          dns.id (Xid) plus source and question name if both run briefly
+          during a debug-log-to-analytical cutover.
+        elastic: >
+          Take pre-shaped ECS JSON into a small custom
+          logs-microsoft_dnsserver.analytical@custom-style ingest pipeline (or
+          a dedicated debug-log pipeline if kept as its own data stream):
+          derive dns.question.registered_domain / subdomain / top_level_domain
+          from the reassembled name, set event.outcome from dns.response_code
+          on response lines, and map the microsoft_dnsserver.debug.* customs
+          (packet_id, flags, qr) as keyword in the index template. Do NOT
+          route these records through the stock analytical event-text pipeline
+          - its Dissect patterns are written for the ETW templates and will
+          drop every debug line. With no boundary, retain the decoded
+          answer/authority sections for resolution forensics rather than
+          dropping them, and standardize on either the debug log or the
+          analytical channel as the single authoritative query feed so
+          answer-type and rcode aggregations are not split across two parsers.
+    fields:
+    - vendor: Date
+      type: string
+      description: >-
+        date the packet was logged on the DNS server, in the server's locale
+        short-date form (e.g. 11/17/2021).
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        combine with the Time column and stamp with the DNS server's
+        configured time zone - the debug log carries no UTC offset, so a
+        server in a non-UTC zone silently skews every event, the same hazard
+        the DHCP audit log has
+    - vendor: Time
+      type: string
+      description: >-
+        local time the packet was logged, HH:MM:SS with an AM/PM marker in
+        12-hour locales.
+      ecs: '@timestamp'
+      status: partial
+      notes: second half of the timestamp; see the Date transform
+    - vendor: Thread ID
+      type: string
+      description: internal DNS Server service thread that handled the packet, printed as hex.
+      ecs: process.thread.id
+      status: partial
+      transform: >
+        parse the hex to an integer; this is a server-internal thread handle
+        with no security value on its own, useful only to group the multi-line
+        sections of one packet before they are collapsed
+    - vendor: Context (PACKET)
+      type: string
+      description: >-
+        literal keyword marking a packet trace line (as opposed to the other
+        debug line types the log can contain).
+      ecs: null
+      status: unmapped
+      custom: microsoft_dnsserver.debug.context
+      notes: >-
+        the grammar discriminator the multiline reader keys on to find the
+        start of a packet record; a constant, kept only as the parse anchor
+    - vendor: Internal packet identifier
+      type: string
+      description: >-
+        hex memory handle the DNS server uses to correlate the request and
+        response halves of one transaction (e.g. 00000272D98DD0B0).
+      ecs: null
+      status: unmapped
+      custom: microsoft_dnsserver.debug.packet_id
+      notes: >
+        a process-local pointer, not a stable id - it is only valid within the
+        running server instance, so use dns.id (Xid) as the cross-event join
+        key and keep this for intra-file request/response pairing only
+    - vendor: Protocol
+      type: string
+      description: transport the packet used, UDP or TCP.
+      ecs: network.transport
+      status: mapped
+      transform: >
+        lowercase to udp / tcp for ECS style; TCP on an ordinary query for a
+        non-AXFR type is itself a tunnelling signal worth keeping, as in the
+        analytical feed
+    - vendor: Direction
+      type: string
+      description: whether the DNS server sent (Snd) or received (Rcv) the packet.
+      ecs: network.direction
+      status: partial
+      transform: >
+        map Rcv to inbound and Snd to outbound; this field is also the
+        discriminator that decides whether the Remote IP is the source or the
+        destination, so the branch that sets source.ip/destination.ip has to
+        read it
+    - vendor: Remote IP
+      type: ip
+      description: >-
+        the peer address of the transaction - the querying client on a
+        received packet, the client or forwarder being answered on a sent
+        packet.
+      ecs: source.ip
+      status: partial
+      notes: >
+        a single column whose role flips with Direction exactly like
+        Source/Destination in the analytical feed - it is the client on Rcv
+        (source.ip) and the answered peer on Snd (destination.ip), so a naive
+        source.ip mapping leaves half the packets with the client on the wrong
+        field; copy into related.ip so the query and response lines join
+        regardless of direction
+    - vendor: Xid
+      type: string
+      description: DNS transaction ID from the message header, printed as a 4-digit hex value.
+      ecs: dns.id
+      status: mapped
+      transform: >-
+        keep as the hex string ECS expects (dns.id is a keyword); the stable
+        join key between a query line and its response line
+    - vendor: Query/Response
+      type: string
+      description: message direction flag - Q for a query message, R for a response message.
+      ecs: null
+      status: unmapped
+      custom: microsoft_dnsserver.debug.qr
+      notes: >
+        drives event.type (query vs the answer half) and tells the parser
+        whether the response-only fields (Response Code, answer sections) are
+        present on this line; the QR header bit, distinct from the Opcode
+    - vendor: Opcode
+      type: string
+      description: DNS opcode letter of the message - Q standard query, N notify, U update.
+      ecs: dns.op_code
+      status: partial
+      transform: >
+        expand the single letter to the ECS opcode mnemonic (Q to QUERY, N to
+        NOTIFY, U to UPDATE); indexing the raw letter breaks any detection
+        written against dns.op_code
+    - vendor: Flags (hex)
+      type: string
+      description: >-
+        the raw DNS header flags word for the message, printed as a hex value
+        (e.g. 0001).
+      ecs: null
+      status: partial
+      custom: microsoft_dnsserver.debug.flags
+      notes: >
+        the only complete carrier of the header flags - the separate
+        character-code column only surfaces AA/TC/RD/RA, so decoding this word
+        once is the sole route to the truncation, checking-disabled and
+        authenticated-data bits and to a reliable dns.op_code
+    - vendor: Flags (char codes)
+      type: string
+      description: >-
+        the set-flag character codes for the message - A authoritative answer,
+        T truncated, D recursion desired, R recursion available.
+      ecs: dns.header_flags
+      status: partial
+      transform: >
+        expand each present letter into its ECS header-flag token (A to AA, T
+        to TC, D to RD, R to RA) and append to the dns.header_flags array
+        rather than indexing the raw letter string
+    - vendor: Response Code
+      type: string
+      description: >-
+        DNS response code on response packets, emitted as the mnemonic
+        (NOERROR, NXDOMAIN, SERVFAIL, REFUSED).
+      ecs: dns.response_code
+      status: mapped
+      transform: >
+        already the ECS mnemonic - no numeric lookup needed, unlike the
+        analytical channel's numeric RCODE - so also derive event.outcome from
+        it (NOERROR success, everything else failure); present on response
+        lines only
+    - vendor: Question Type
+      type: string
+      description: >-
+        resource record type of the question, emitted as the mnemonic (A,
+        AAAA, PTR, MX, TXT, SRV).
+      ecs: dns.question.type
+      status: mapped
+      notes: >
+        already the ECS mnemonic - no numeric-code lookup needed, unlike the
+        analytical channel's numeric QTYPE - so this maps straight to
+        dns.question.type
+    - vendor: Question Name
+      type: string
+      description: >-
+        the queried domain name, emitted in DNS wire label-length form such as
+        (8)woshub(2)com(0).
+      ecs: dns.question.name
+      status: partial
+      transform: >
+        reassemble the length-prefixed labels into a dotted FQDN (woshub.com),
+        strip any trailing dot and lowercase, then derive
+        dns.question.registered_domain / top_level_domain / subdomain with a
+        registered-domain processor; the label-length encoding is unique to
+        this format and is the single most load-bearing transform in the
+        grammar
+- id: dhcp-audit
+  name: DHCP Server audit log
+  description: >
+    Comma-delimited DHCP Server audit records written to
+    %windir%\System32\Dhcp\DhcpSrvLog-<DAY>.log for IPv4 and
+    DhcpV6SrvLog-<DAY>.log for IPv6, one file per day of the week on a
+    rotating overwrite. Enabled per server with "Enable DHCP audit logging".
+    This is the authoritative IP-to-MAC-to-hostname binding record for
+    Windows-served networks and underpins asset attribution for every other
+    data source in the estate. Event codes fall in four bands: 00-02 log
+    lifecycle, 10-25 lease activity (10 lease granted, 11 renewed, 12
+    released, 13 address already in use, 14 scope exhausted, 15 lease denied,
+    20 BOOTP lease), 30-34 DNS dynamic-update activity performed on behalf of
+    clients, and 50-64 Active Directory authorization and rogue-DHCP detection
+    - the last band being the one a SOC cares about most, since 62 "another
+    server found" is the rogue-DHCP signal.
+  event_categories:
+  - network
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Deliberately not syslog and not a Windows event channel - this is a
+        flat CSV file on the DHCP server's disk, tailed by the Elastic Agent
+        filestream input and landed on Cribl, replacing the ArcSight file
+        connector. Note the daily-rotating overwrite: if a collector is down
+        for more than seven days the data is gone, so collection-gap alerting
+        matters more here than on the ETW feeds.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-microsoft_dhcp.log
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        High-side instances land directly on Cribl with no guard hop.
+        Deliberately not syslog and not a Windows event channel - this is a
+        flat CSV file on the DHCP server's disk, tailed by the Elastic Agent
+        filestream input and landed on Cribl, replacing the ArcSight file
+        connector. Note the daily-rotating overwrite: if a collector is down
+        for more than seven days the data is gone, so collection-gap alerting
+        matters more here than on the ETW feeds.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-microsoft_dhcp.log
+  formats:
+  - format: other
+    parsing:
+      mechanism: elastic-integration
+      artifact: Microsoft DHCP integration (microsoft_dhcp)
+      notes: >
+        The microsoft_dhcp integration reads both the IPv4 and IPv6 audit
+        files and parses the CSV into ECS plus a microsoft.dhcp.* namespace.
+        Two parsing hazards: the files carry a multi-line preamble containing
+        the event-ID legend and a header row that must be skipped, and the
+        IPv6 log has a different column set (DUID in place of MAC Address) so
+        it needs its own branch rather than the same CSV schema.
+    fields:
+    - vendor: ID
+      type: integer
+      description: >-
+        DHCP server event code, written zero-padded (00-02 log lifecycle,
+        10-25 lease activity, 30-34 DNS update, 50-64 AD authorization and
+        rogue detection).
+      ecs: event.code
+      status: mapped
+      transform: >
+        drives event.action and event.outcome - 13 (address already in use),
+        14 (scope exhausted), 15 (lease denied) and 31 (DNS update failed) are
+        failures; 62 (another DHCP server found) is the rogue-DHCP detection
+        and is not a lease event at all
+    - vendor: Date
+      type: string
+      description: date the entry was logged on the DHCP server, in MM/DD/YY form.
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        must be combined with the Time column and stamped with the DHCP
+        server's configured time zone - the log carries no UTC offset at all,
+        so a server in a non-UTC zone silently skews every lease event
+    - vendor: Time
+      type: string
+      description: local time the entry was logged, in HH:MM:SS form.
+      ecs: '@timestamp'
+      status: partial
+      notes: second half of the timestamp; see the Date transform
+    - vendor: Description
+      type: string
+      description: >-
+        short text describing the event, e.g. Assign, Renew, Release, Denied,
+        DNS Update Request.
+      ecs: event.action
+      status: partial
+      notes: >
+        the Elastic integration routes this to message and event.reason; the
+        leading verb is the usable action token and should be lowercased into
+        event.action so this dataset's actions line up with the BlueCat DHCP
+        map, which derives event.action from the DHCP verb
+    - vendor: IP Address
+      type: ip
+      description: the IPv4/IPv6 address leased, renewed, released or denied.
+      ecs: client.ip
+      status: mapped
+      notes: >
+        deliberately client.ip and not source.ip, matching the sibling BlueCat
+        DHCP dataset - on a denial or a scope-exhaustion event the client has
+        no address of its own, so source.ip would be wrong. The stock Elastic
+        integration maps this column to source.ip, so this is a real
+        divergence that has to be settled org-wide or the two DHCP sources
+        will not join
+    - vendor: Host Name
+      type: string
+      description: client-supplied host name (DHCP option 12) or the FQDN the server registered.
+      ecs: host.hostname
+      status: partial
+      notes: >
+        attacker-controllable - it is whatever the client sent - so it must
+        not be treated as authoritative asset identity. The Elastic
+        integration puts it in source.domain, which is a poorer fit than
+        host.hostname for a client name
+    - vendor: MAC Address
+      type: mac
+      description: 'hardware address of the client''s network adapter.'
+      ecs: client.mac
+      status: mapped
+      transform: >
+        the audit log prints twelve unseparated hex digits (000C291A2B3C)
+        while ECS requires uppercase dash-separated form (00-0C-29-1A-2B-3C);
+        this normalization is the single most load-bearing transform in the
+        dataset because every asset join depends on it
+    - vendor: User Name
+      type: string
+      description: user or machine account associated with the lease where one is available.
+      ecs: user.name
+      status: partial
+      notes: >
+        usually empty on ordinary leases and populated mainly in NAP and
+        authenticated scenarios; on authorization events (50-64) this column
+        instead holds the Active Directory domain name, not a user
+    - vendor: TransactionID
+      type: integer
+      description: DHCP transaction identifier (the packet xid).
+      ecs: null
+      status: unmapped
+      custom: microsoft.dhcp.transaction_id
+      notes: >-
+        the join key that stitches the DISCOVER/OFFER/REQUEST/ACK rows of a
+        single exchange together; no ECS equivalent
+    - vendor: QResult
+      type: integer
+      description: NAP quarantine result for the lease.
+      ecs: null
+      status: partial
+      custom: microsoft.dhcp.result
+      notes: >
+        numeric code (0 no quarantine, 1 quarantine, 2 drop packet, 3
+        probation, 6 no quarantine information) that needs a lookup to a
+        readable label; the integration carries both result and
+        result_description
+    - vendor: Probationtime
+      type: timestamp
+      description: time at which a NAP probation period for the client expires.
+      ecs: null
+      status: unmapped
+      custom: microsoft.dhcp.probation_time
+    - vendor: CorrelationID
+      type: string
+      description: NAP correlation reference linking the lease to a health-policy decision.
+      ecs: null
+      status: unmapped
+      custom: microsoft.dhcp.correlation_id
+    - vendor: Dhcid
+      type: string
+      description: DHCID value identifying which client owns the DNS name the server registered.
+      ecs: null
+      status: unmapped
+      custom: microsoft.dhcp.dhc_id
+      notes: >-
+        the field that exposes DNS-name-takeover attempts, where a second
+        client claims a name an existing DHCID already owns
+    - vendor: VendorClass(ASCII)
+      type: string
+      description: >-
+        DHCP option 60 vendor class string sent by the client, e.g. MSFT 5.0
+        or PXEClient.
+      ecs: null
+      status: unmapped
+      custom: microsoft.dhcp.vendor.string
+      notes: >-
+        coarse device and OS fingerprint with no ECS home; PXEClient here is
+        also the signal for network-boot activity
+    - vendor: VendorClass(Hex)
+      type: string
+      description: hex representation of the same option 60 value.
+      ecs: null
+      status: unmapped
+      custom: microsoft.dhcp.vendor.hex
+      notes: >-
+        keep only if the ASCII rendering is lossy for the client populations
+        in scope, otherwise drop it as duplicate volume
+    - vendor: UserClass(ASCII)
+      type: string
+      description: DHCP option 77 user class string sent by the client.
+      ecs: null
+      status: unmapped
+      custom: microsoft.dhcp.user.string
+    - vendor: RelayAgentInformation
+      type: string
+      description: DHCP option 82 relay agent information, carried as a hex blob.
+      ecs: null
+      status: partial
+      custom: microsoft.dhcp.relay_agent_info
+      notes: >
+        contains the circuit-id (sub-option 1) and remote-id (sub-option 2)
+        that give switch-port-level attribution, but only as an undecoded hex
+        string - it has to be split into sub-options before it is useful, and
+        it is switch-supplied unbounded content
+    - vendor: DnsRegError
+      type: integer
+      description: >-
+        DNS registration error code returned to the client on DNS
+        dynamic-update events (31/32).
+      ecs: null
+      status: unmapped
+      custom: microsoft.dhcp.dns_error_code
+    - vendor: raw log line
+      type: string
+      description: unparsed CSV record retained for reprocessing.
+      ecs: message
+      status: mapped
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Pass through to the integration pipeline, but do two things low-side
+          that are cheap near the source and awkward later: drop the file
+          preamble and header rows so they never become events, and normalize
+          the MAC from the unseparated 12-hex-digit form to the ECS
+          dash-separated form, because every join against the Windows, switch
+          and NAC data depends on one MAC format across the estate. Add
+          Persistent Queue backpressure and a collection-gap monitor keyed on
+          the daily file rotation, and sanitize the client-supplied Host Name
+          before it travels.
+        elastic: >
+          Use the stock microsoft_dhcp pipeline plus a
+          logs-microsoft_dhcp.log@custom pipeline that resolves the numeric
+          event code to a readable action and sets event.outcome (failure for
+          13/14/15/31, success for 10/11/20/32), stamps @timestamp from the
+          combined Date and Time columns with the server's configured time
+          zone since the log carries no UTC offset, and splits
+          RelayAgentInformation into its option-82 circuit-id and remote-id
+          sub-options so switch-port attribution is queryable. Reconcile the
+          client-address decision with the sibling BlueCat map before either
+          goes live, and map the microsoft.dhcp.* customs (transaction_id,
+          dhc_id, relay_agent_info, vendor.string, user.string,
+          correlation_id) as keyword in the index template.
+        relay: >
+          Low-side instances cross the guard: send the parsed thin envelope
+          rather than raw CSV lines - the preamble and header rows are exactly
+          the kind of off-grammar content that trips a content filter. Two
+          values here are attacker-controllable free text and need bounding
+          and sanitizing low-side: the client-supplied Host Name (option 12)
+          and the RelayAgentInformation hex blob, which is unbounded and
+          switch-supplied.
+      direct:
+        parse_location: high
+        cribl: >
+          Pass through to the integration pipeline, but do two things near the
+          source that are cheap to do there and awkward later: drop the file
+          preamble and header rows so they never become events, and normalize
+          the MAC from the unseparated 12-hex-digit form to the ECS
+          dash-separated form, because every join against the Windows, switch
+          and NAC data depends on one MAC format across the estate. Add
+          Persistent Queue backpressure and a collection-gap monitor keyed on
+          the daily file rotation, and sanitize the client-supplied Host Name
+          before it travels.
+        elastic: >
+          Use the stock microsoft_dhcp pipeline plus a
+          logs-microsoft_dhcp.log@custom pipeline that resolves the numeric
+          event code to a readable action and sets event.outcome (failure for
+          13/14/15/31, success for 10/11/20/32), stamps @timestamp from the
+          combined Date and Time columns with the server's configured time
+          zone since the log carries no UTC offset, and splits
+          RelayAgentInformation into its option-82 circuit-id and remote-id
+          sub-options so switch-port attribution is queryable. Reconcile the
+          client-address decision with the sibling BlueCat map before either
+          goes live, and map the microsoft.dhcp.* customs (transaction_id,
+          dhc_id, relay_agent_info, vendor.string, user.string,
+          correlation_id) as keyword in the index template.
+- id: dns-audit
+  name: DNS Server audit and change-tracking events
+  description: >
+    Change-tracking events from the Microsoft-Windows-DNSServer/Audit ETW
+    channel, event IDs 513-582. Unlike the analytical channel these are
+    enabled by default and have negligible performance cost, and they are the
+    record of who changed DNS: zone create/delete/update (513, 514), resource
+    record create/delete/scavenge (515-518, 521), record writes driven by
+    client dynamic update with the originating client address (519, 520), zone
+    reload/refresh/expire from a master server (561-563), delegation and
+    forwarder changes (573, 537, 540, 557), DNSSEC signing and trust-point
+    operations (525-535, 544-547), and DNS policy create/delete (574-582).
+    Note the split with the analytical dataset above: the AXFR/IXFR wire
+    events live in the analytical channel (265-276), so an
+    unauthorized-zone-transfer detection needs that feed and cannot be built
+    from this one - this channel only sees the resulting zone reload.
+  event_categories:
+  - configuration
+  - dns
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same Elastic Agent subscription and the same Cribl worker group as the
+        analytical channel, separated by the Audit vs Analytical channel name.
+        Low volume, high value - the inverse of the analytical feed.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-microsoft_dnsserver.audit
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        High-side instances land directly on Cribl with no guard hop. Same
+        Elastic Agent subscription and the same Cribl worker group as the
+        analytical channel, separated by the Audit vs Analytical channel name.
+        Low volume, high value - the inverse of the analytical feed.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-microsoft_dnsserver.audit
+  formats:
+  - format: windows-event
+    parsing:
+      mechanism: elastic-integration
+      artifact: Microsoft DNS Server Audit and Analytical logs integration (microsoft_dnsserver)
+      notes: >
+        The microsoft_dnsserver integration's audit data stream parses this
+        channel. Field names below are taken from the documented event-text
+        templates, which use positional substitutions whose meaning changes
+        per event ID - the same slot is a zone name on 513 and a record type
+        on 515 - so the parser needs a per-event-ID branch rather than one
+        grammar.
+    fields:
+    - vendor: EventID
+      type: integer
+      description: audit event identifier, 513-582.
+      ecs: event.code
+      status: mapped
+      notes: >-
+        the primary discriminator - the meaning of every other field in the
+        event depends on it
+    - vendor: audit event type
+      type: enum
+      description: >-
+        the documented event type label - Zone delete, Zone updated, Record
+        create, Record delete, Record create - dynamic update, Zone scope
+        create, Zone sign, Cache purge, Server setting, Create zone level
+        policy, and so on.
+      ecs: event.action
+      status: partial
+      transform: >-
+        lowercase and hyphenate for ECS style (record-create-dynamic-update,
+        zone-delete)
+    - vendor: category
+      type: enum
+      description: >-
+        documented event category - Zone operations, Dynamic update, Aging,
+        Online signing, DNSSEC operations, Cache operations, Configuration,
+        Server operations, Policy operations.
+      ecs: null
+      status: unmapped
+      custom: microsoft_dnsserver.audit.category
+      notes: >-
+        the natural grouping for dashboards and for scoping alert rules to the
+        change classes a CSOC actually watches
+    - vendor: Level
+      type: enum
+      description: >-
+        event level, Informational for almost all audit events and Warning for
+        the forced key-rollover event 533.
+      ecs: log.level
+      status: mapped
+    - vendor: zone
+      type: string
+      description: DNS zone the change was made in.
+      ecs: null
+      status: unmapped
+      custom: microsoft_dnsserver.audit.zone
+      notes: ECS has no zone-authority concept; this is the main pivot for the whole dataset
+    - vendor: resource record type
+      type: enum
+      description: >-
+        type of the resource record created, deleted or scavenged (events
+        515-518, 519-521).
+      ecs: null
+      status: unmapped
+      custom: microsoft_dnsserver.audit.record_type
+      notes: >
+        deliberately not dns.answers.type or dns.question.type - ECS dns.*
+        models a query transaction, and these are record-management changes
+        rather than answers, so reusing the transaction fields would
+        contaminate DNS query analytics
+    - vendor: resource record name
+      type: string
+      description: owner name of the resource record that changed.
+      ecs: null
+      status: unmapped
+      custom: microsoft_dnsserver.audit.record_name
+      notes: >
+        some pipelines additionally copy this into dns.question.name to make
+        record tampering joinable against the analytical query stream; that is
+        a semantic stretch and should be a deliberate decision, not a side
+        effect
+    - vendor: RDATA
+      type: string
+      description: record data of the created, deleted or scavenged record.
+      ecs: null
+      status: unmapped
+      custom: microsoft_dnsserver.audit.rdata
+      notes: >
+        for an A record this is the address a DNS-hijack detection compares
+        against; for TXT it is unbounded free text and the largest value in
+        this dataset
+    - vendor: TTL
+      type: integer
+      description: time-to-live of the record involved in the change, in seconds.
+      ecs: null
+      status: unmapped
+      custom: microsoft_dnsserver.audit.ttl
+    - vendor: IP Address (dynamic update source)
+      type: ip
+      description: >-
+        address of the client that performed a dynamic update, on events 519
+        and 520 only.
+      ecs: source.ip
+      status: mapped
+      notes: >
+        the highest-value field in the dataset - it is the only thing that
+        says who wrote or removed a record, and it is absent from every
+        administratively driven change event
+    - vendor: scope
+      type: string
+      description: >-
+        zone scope or server scope the change applied to (events 515-518, 522,
+        523, 536, 537, 541-543).
+      ecs: null
+      status: unmapped
+      custom: microsoft_dnsserver.audit.scope
+    - vendor: setting
+      type: string
+      description: name of the zone or server setting that was changed (events 514 and 541).
+      ecs: null
+      status: unmapped
+      custom: microsoft_dnsserver.audit.setting
+      notes: >-
+        covers the configuration weakenings worth alerting on, such as
+        enabling insecure dynamic updates or widening zone transfer
+        permissions
+    - vendor: value
+      type: string
+      description: new value the setting was set to.
+      ecs: null
+      status: unmapped
+      custom: microsoft_dnsserver.audit.setting_value
+      notes: >
+        the audit event records only the new value; there is no before-value
+        anywhere in this channel, so change detection needs a state baseline
+        rather than a single event
+    - vendor: policy name
+      type: string
+      description: >-
+        name of the DNS server-level, zone-level or forwarding policy created
+        or deleted (events 577-582).
+      ecs: rule.name
+      status: mapped
+      notes: >
+        same rule.name treatment as PolicyName in the analytical dataset so
+        the two join; rule.id stays unset because no signature id accompanies
+        the name
+    - vendor: Criteria
+      type: string
+      description: match criteria of a DNS policy being created (events 577-579).
+      ecs: null
+      status: unmapped
+      custom: microsoft_dnsserver.audit.policy_criteria
+      notes: >-
+        a policy created here can silently redirect a whole zone to an
+        attacker-chosen scope, which makes the criteria as important as the
+        policy name
+    - vendor: Action
+      type: string
+      description: action a created DNS policy takes (allow, deny, ignore) on events 577-579.
+      ecs: null
+      status: unmapped
+      custom: microsoft_dnsserver.audit.policy_action
+      notes: >
+        deliberately kept off event.action, which already carries the audit
+        operation verb - one event cannot represent both the change that was
+        made and the behaviour of the object it created
+    - vendor: master server
+      type: string
+      description: master server a secondary zone was refreshed or expired from (events 562, 563).
+      ecs: null
+      status: unmapped
+      custom: microsoft_dnsserver.audit.master_server
+      notes: >
+        may be a name or an address depending on configuration, so it is not
+        safely an ip-typed ECS field; a zone refreshing from an unexpected
+        master is the closest thing this channel has to a zone-transfer alert
+    - vendor: Computer
+      type: string
+      description: hostname of the DNS server that emitted the audit event.
+      ecs: observer.name
+      status: mapped
+      notes: joins this dataset to the analytical and DHCP datasets on the same server
+    - vendor: rendered message
+      type: string
+      description: fully rendered event text with the substitutions filled in.
+      ecs: message
+      status: mapped
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Pass through unparsed with Persistent Queue backpressure and no
+          low-side extraction; this channel is low volume and forensically
+          load-bearing, so it is the last DNS dataset where dropping _raw
+          would be acceptable. The only low-side work worth doing is appliance
+          enrichment (server to site, server to owner) so that DNS change
+          events can be attributed without a high-side lookup.
+        elastic: >
+          Let the microsoft_dnsserver audit pipeline parse, and add a
+          logs-microsoft_dnsserver.audit@custom pipeline that branches on
+          event ID before assigning meaning, since the positional
+          substitutions are not stable across IDs, and that promotes the
+          dynamic-update client address on 519/520 to source.ip - the one
+          field that answers who wrote a record. Keep the DNS policy Action
+          out of event.action so it does not collide with the audit operation
+          verb, and map the microsoft_dnsserver.audit.* customs (zone,
+          record_type, record_name, rdata, scope, setting, setting_value,
+          policy_criteria, policy_action) as keyword in the index template so
+          DNS-tampering hunts are queryable.
+      direct:
+        parse_location: high
+        cribl: >
+          Pass through unparsed with Persistent Queue backpressure and no
+          extraction at the source; this channel is low volume and
+          forensically load-bearing, so it is the last DNS dataset where
+          dropping _raw would be acceptable. The only work worth doing near
+          the source is appliance enrichment (server to site, server to owner)
+          so that DNS change events can be attributed without a downstream
+          lookup.
+        elastic: >
+          Let the microsoft_dnsserver audit pipeline parse, and add a
+          logs-microsoft_dnsserver.audit@custom pipeline that branches on
+          event ID before assigning meaning, since the positional
+          substitutions are not stable across IDs, and that promotes the
+          dynamic-update client address on 519/520 to source.ip - the one
+          field that answers who wrote a record. Keep the DNS policy Action
+          out of event.action so it does not collide with the audit operation
+          verb, and map the microsoft_dnsserver.audit.* customs (zone,
+          record_type, record_name, rdata, scope, setting, setting_value,
+          policy_criteria, policy_action) as keyword in the index template so
+          DNS-tampering hunts are queryable.

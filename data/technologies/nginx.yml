@@ -1,0 +1,1066 @@
+id: nginx
+name: Nginx
+vendor: F5 / Nginx
+versions: nginx 1.26.x, 1.28.x (stable), 1.29.x (mainline); NGINX Plus
+draft: true
+references:
+- https://nginx.org/en/docs/http/ngx_http_log_module.html
+- https://nginx.org/en/docs/ngx_core_module.html
+- https://nginx.org/en/docs/http/ngx_http_core_module.html
+- https://nginx.org/en/docs/http/ngx_http_upstream_module.html
+- https://www.elastic.co/docs/reference/integrations/nginx
+- https://github.com/elastic/integrations/tree/main/packages/nginx
+datasets:
+- id: access
+  name: Access log
+  description: >
+    One line per completed HTTP request served or proxied by nginx, written by
+    the ngx_http_log_module access_log directive. The built-in "combined"
+    format is the default wire shape — '$remote_addr - $remote_user
+    [$time_local] "$request" $status $body_bytes_sent "$http_referer"
+    "$http_user_agent"' — but the log_format directive lets every deployment
+    define its own field set, so reverse-proxy tiers routinely append
+    $request_time, $upstream_addr, $upstream_status and TLS variables. Because
+    log_format also accepts escape=json (1.11.8), nginx can be configured to
+    emit one JSON object per request directly at the source, which is the
+    cheapest way to reach the org's NDJSON crossing shape without a text
+    parser in the middle. The vendor field names below are the nginx variable
+    names, not positional column names.
+  event_categories:
+  - web
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Access lines reach Cribl either by Elastic Agent / filebeat tail of
+        /var/log/nginx/access.log or by the access_log syslog:server=...
+        target. Internet-facing web tiers and internal application-proxy tiers
+        do not all sit in the same enclave, so which instances are low-side
+        and cross the Everfox HSG is a per-estate fact rather than a
+        per-technology one.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-nginx.access
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Access lines reach Cribl either by Elastic Agent / filebeat tail of
+        /var/log/nginx/access.log or by the access_log syslog:server=...
+        target.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-nginx.access
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: elastic-integration
+      artifact: Nginx integration (access data stream)
+      notes: >
+        The Elastic Nginx integration's access ingest pipeline greps the
+        combined line into ECS, splits the request line into method / URL /
+        http.version, resolves $http_x_forwarded_for into
+        nginx.access.remote_ip_list and restores the first non-private address
+        to source.ip, then runs user_agent and geoip enrichment. It only
+        understands combined-shaped lines: any locally defined log_format that
+        reorders or adds columns needs either a custom grok in a @custom
+        pipeline or low-side extraction in Cribl.
+    fields:
+    - vendor: $remote_addr
+      type: ip
+      description: client address of the TCP peer that made the request
+      ecs: source.ip
+      status: mapped
+    - vendor: $remote_user
+      type: string
+      description: user name supplied with HTTP Basic authentication
+      ecs: user.name
+      status: mapped
+      transform: >-
+        logged as a literal '-' when no Basic credentials were presented; the
+        placeholder must be dropped rather than indexed as a user name
+    - vendor: $time_local
+      type: timestamp
+      description: local time the log line was written, in Common Log Format
+      ecs: '@timestamp'
+      status: mapped
+      transform: >-
+        parsed as dd/MMM/yyyy:HH:mm:ss Z; prefer configuring $time_iso8601
+        where the format can be changed, since the CLF form carries only a
+        numeric offset and no sub-second precision
+    - vendor: $request
+      type: string
+      description: the full original request line as received, e.g. "GET /path?q=1 HTTP/1.1"
+      ecs: url.original
+      status: partial
+      notes: >
+        composite value holding method, request URI and protocol version in
+        one string; it must be split before url.original is usable, and a
+        malformed or truncated request line leaves the whole field unparsed
+    - vendor: $request_method
+      type: string
+      description: request method taken from the request line, usually GET or POST
+      ecs: http.request.method
+      status: mapped
+    - vendor: $server_protocol
+      type: string
+      description: protocol name and version of the request, e.g. HTTP/1.1 or HTTP/2.0
+      ecs: http.version
+      status: partial
+      notes: >
+        the value carries both the protocol name and the version, so the HTTP/
+        prefix must be stripped for http.version; the prefix is the only place
+        network.protocol can be derived from on this dataset
+    - vendor: $status
+      type: integer
+      description: HTTP status code nginx returned to the client
+      ecs: http.response.status_code
+      status: mapped
+      notes: >
+        this is also the only available source of event.outcome — the
+        integration pipeline does not derive it, so 2xx/3xx to success and
+        4xx/5xx to failure has to be applied downstream
+    - vendor: $body_bytes_sent
+      type: long
+      description: bytes sent to the client not counting the response header
+      ecs: http.response.body.bytes
+      status: mapped
+    - vendor: $bytes_sent
+      type: long
+      description: total bytes sent to the client including the response header
+      ecs: http.response.bytes
+      status: mapped
+    - vendor: $request_length
+      type: long
+      description: request length including the request line, headers and body
+      ecs: http.request.bytes
+      status: mapped
+    - vendor: $http_referer
+      type: string
+      description: value of the Referer request header field
+      ecs: http.request.referrer
+      status: mapped
+    - vendor: $http_user_agent
+      type: string
+      description: value of the User-Agent request header field
+      ecs: user_agent.original
+      status: mapped
+    - vendor: $http_x_forwarded_for
+      type: string
+      description: >-
+        value of the X-Forwarded-For request header, a comma-separated chain
+        of client and proxy addresses
+      ecs: null
+      status: partial
+      custom: nginx.access.remote_ip_list
+      notes: >
+        the Elastic integration keeps the whole chain here as an array and
+        promotes the first non-private address to source.ip; the header is
+        client-supplied and trivially spoofed, so the promoted value is only
+        trustworthy when the upstream proxy set is known
+    - vendor: $host
+      type: string
+      description: host from the request line, else the Host header, else the matching server name
+      ecs: url.domain
+      status: mapped
+    - vendor: $request_time
+      type: float
+      description: >-
+        request processing time in seconds with millisecond resolution,
+        measured from the first bytes read from the client
+      ecs: event.duration
+      status: partial
+      transform: >-
+        fractional seconds must be multiplied to nanoseconds for
+        event.duration; the stock integration instead stores it as
+        milliseconds in nginx.access.response_time
+    - vendor: $upstream_addr
+      type: string
+      description: >-
+        address and port of the upstream server (or UNIX socket path) that
+        served the proxied request
+      ecs: null
+      status: unmapped
+      custom: nginx.access.upstream_addr
+      notes: >
+        holds a comma-separated list when several upstreams were tried and a
+        colon-separated list of those lists across internal redirects, so it
+        is not a single address; it is deliberately not mapped to
+        destination.* because the last-hop value has to be extracted first
+    - vendor: $upstream_status
+      type: string
+      description: status code returned by the upstream server
+      ecs: null
+      status: partial
+      custom: nginx.access.upstream_status
+      notes: >
+        same comma/colon list shape as $upstream_addr; it differs from $status
+        whenever nginx rewrote the response (error_page, retry to the next
+        upstream), which is exactly the case a proxy-error alert needs
+    - vendor: $upstream_response_time
+      type: float
+      description: >-
+        time spent receiving the response from the upstream server, in seconds
+        with millisecond resolution
+      ecs: null
+      status: unmapped
+      custom: nginx.access.upstream_response_time
+      notes: >
+        comma/colon list like the other upstream variables; the difference
+        against $request_time is the signal that separates a slow backend from
+        a slow client
+    - vendor: $ssl_protocol
+      type: string
+      description: TLS protocol negotiated for the connection, e.g. TLSv1.2 or TLSv1.3
+      ecs: tls.version
+      status: partial
+      transform: >-
+        the TLSv prefix must be stripped so tls.version holds '1.2'/'1.3',
+        with tls.version_protocol set to 'tls' separately
+    - vendor: $ssl_cipher
+      type: string
+      description: name of the cipher suite negotiated for the connection
+      ecs: tls.cipher
+      status: mapped
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Keep the core worker group a pass-through for combined-format access
+          lines and carry _raw end-to-end until the integration grok is proven
+          against this estate's actual log_format, because a locally
+          customised format fails the stock pattern silently rather than
+          loudly. Limit low-side work to Persistent Queue backpressure on the
+          Elastic destination and to enrichment that is cheaper near the
+          source than in an ingest pipeline — vhost-to-application-owner and
+          host-to-site lookups — plus a drop rule for query strings on the
+          known credential-bearing endpoints so secrets in $request never
+          leave the web tier. Where an estate has already customised
+          log_format, prefer switching it to escape=json at the source over
+          writing a bespoke Cribl grok.
+        elastic: >
+          Let the stock Nginx integration access pipeline parse, and add a
+          logs-nginx.access@custom pipeline that derives event.outcome from
+          http.response.status_code (2xx/3xx success, 4xx/5xx failure) since
+          the integration sets neither outcome nor a status-class field, and
+          converts $request_time from fractional seconds into event.duration
+          nanoseconds rather than leaving it in nginx.access.response_time
+          milliseconds. Add explicit custom-namespace index-template mappings
+          for the upstream fields the map carries — nginx.access.upstream_addr
+          and .upstream_status as keyword, .upstream_response_time as
+          scaled_float — noting all three are comma/colon-delimited lists when
+          nginx retries a request, so they must be split before the last-hop
+          value is queryable.
+        relay: >
+          On the low-side instances that cross the guard this dataset flips
+          from high to hybrid: emit the thin envelope (_dataId, @timestamp,
+          host, _raw) as NDJSON — UTF-8, LF-terminated, compression disabled,
+          nesting depth 2 or less — and keep field extraction on the Elastic
+          side. The content-filter friction to settle with the guard owner is
+          entirely attacker-controlled free text: $request URIs and
+          $http_user_agent / $http_referer values are unbounded, routinely
+          kilobyte-scale, and carry percent-encoded and non-ASCII bytes by
+          design, so they need explicit low-side length caps and a flagged
+          truncation marker rather than a silent guard-side cut. Nothing
+          CEF-shaped is involved here — the vendor feed is plain text today
+          and log_format escape=json is the supported path to a stable
+          crossing schema, which keeps the custom NDJSON filter on the guard
+          simple.
+      direct:
+        parse_location: high
+        cribl: >
+          Keep the core worker group a pass-through for combined-format access
+          lines and carry _raw end-to-end until the integration grok is proven
+          against this estate's actual log_format, because a locally
+          customised format fails the stock pattern silently rather than
+          loudly. Confine Cribl to Persistent Queue backpressure on the
+          Elastic destination and to enrichment that is cheaper near the
+          source than in an ingest pipeline — vhost-to-application-owner and
+          host-to-site lookups — plus a drop rule for query strings on the
+          known credential-bearing endpoints so secrets in $request never
+          leave the web tier. Where an estate has already customised
+          log_format, prefer switching it to escape=json at the source over
+          writing a bespoke Cribl grok.
+        elastic: >
+          Let the stock Nginx integration access pipeline parse, and add a
+          logs-nginx.access@custom pipeline that derives event.outcome from
+          http.response.status_code (2xx/3xx success, 4xx/5xx failure) since
+          the integration sets neither outcome nor a status-class field, and
+          converts $request_time from fractional seconds into event.duration
+          nanoseconds rather than leaving it in nginx.access.response_time
+          milliseconds. Add explicit custom-namespace index-template mappings
+          for the upstream fields the map carries — nginx.access.upstream_addr
+          and .upstream_status as keyword, .upstream_response_time as
+          scaled_float — noting all three are comma/colon-delimited lists when
+          nginx retries a request, so they must be split before the last-hop
+          value is queryable.
+  - format: json
+    enable: >
+      nginx emits one JSON object per request when a log_format template is
+      declared with the escape=json parameter (1.11.8) and its body
+      interleaves the normal $variables with literal JSON punctuation, e.g.
+      log_format access_json escape=json
+      '{"@timestamp":"$time_iso8601","client_ip":"$remote_addr",
+      "user":"$remote_user","request":"$request","method":"$request_method",
+      "protocol":"$server_protocol","status":$status,
+      "body_bytes":$body_bytes_sent,"bytes_sent":$bytes_sent,
+      "request_length":$request_length,"referer":"$http_referer",
+      "user_agent":"$http_user_agent","xff":"$http_x_forwarded_for",
+      "vhost":"$host","request_time":$request_time,
+      "upstream_addr":"$upstream_addr","upstream_status":"$upstream_status",
+      "upstream_time":"$upstream_response_time","tls_protocol":"$ssl_protocol",
+      "tls_cipher":"$ssl_cipher"}'  followed by access_log
+      /var/log/nginx/access_json.log access_json (or access_log
+      syslog:server=host:514,tag=nginx access_json for syslog transport of the
+      same JSON payload). The keys are operator-chosen, so the deployed
+      nginx.conf log_format line — not any nginx variable reference — is the
+      authoritative key list for a given server; the variables below are what
+      a reverse-proxy-tier JSON template typically carries. Two rendering
+      choices make the JSON clean: place numeric variables ($status,
+      $body_bytes_sent, $bytes_sent, $request_length, $request_time) OUTSIDE
+      quotes so they serialise as native JSON numbers, and prefer
+      $time_iso8601 over $time_local so the timestamp parses directly. Unlike
+      some web servers, nginx's escape=json produces RFC 8259-compliant
+      escaping — control bytes become \u00XX and only " and \ are
+      backslash-escaped — so a strict JSON parser accepts every line without a
+      repair pass.
+    references:
+    - https://nginx.org/en/docs/http/ngx_http_log_module.html
+    - https://nginx.org/en/docs/syslog.html
+    parsing:
+      mechanism: elastic-ingest-pipeline
+      artifact: >-
+        logs-nginx.access@custom (JSON decode + ECS rename), replacing the
+        stock nginx-integration combined grok
+      notes: >
+        The stock Nginx integration access pipeline greps a combined-shaped
+        text line and will not match a JSON object, so a JSON feed needs a
+        json processor at the head of the pipeline (or ndjson decoding at the
+        Elastic Agent / Cribl edge) followed by rename-to-ECS rather than the
+        integration grok. Because escape=json already emits RFC-compliant
+        strings, the decoder needs no \xhh-style repair step — the standing
+        advantage over a bespoke text grok is that hostile bytes in $request,
+        $http_user_agent and $http_referer arrive as valid \u00XX escapes that
+        keep the object well-formed. The operator-chosen key names mean the
+        rename map, not a fixed field reference, is what has to be maintained
+        per estate.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Decode JSON at the edge worker group with a Parser (or Eval
+          JSON.parse) so the object is structured and typed before it crosses,
+          letting the content filter see one flat object instead of a text
+          line the integration grok would have to disambiguate. Stamp
+          originating vhost and device owner onto each event where the
+          template omits $host, mask credentials that ride in the query
+          portion of $request and in $http_x_forwarded_for before forwarding,
+          and cap the unbounded free-text keys (see relay). Run the
+          guard-facing destination on Persistent Queue backpressure. Where an
+          estate has already customised log_format into a non-combined text
+          shape, switching that template to escape=json here is cheaper than
+          authoring a Cribl grok for it.
+        elastic: >
+          With the object decoded low-side the high side only reshapes: a
+          logs-nginx.access@custom pipeline that renames the JSON keys to ECS
+          (client_ip -> source.ip, user_agent -> user_agent.original, vhost ->
+          url.domain, ...), splits $request into http.request.method /
+          url.original / http.version, strips the TLSv prefix off
+          $ssl_protocol so tls.version holds a bare version, converts
+          $request_time fractional seconds to event.duration nanoseconds, and
+          derives event.outcome from status (2xx/3xx success, 4xx/5xx failure)
+          since the integration sets neither outcome nor a status class.
+          Because numerics arrive as JSON numbers there is no "-"-to-0
+          coercion or string-to-int cast to do. Split the
+          comma/colon-delimited $upstream_addr, $upstream_status and
+          $upstream_response_time lists before the last-hop value is
+          queryable, and map the nginx.access.* surplus keys into the custom
+          namespace as keyword / scaled_float.
+        relay: >
+          Cross as the same thin NDJSON envelope the raw access feed uses
+          (mode A) so one JSON schema faces the content filter — here the
+          payload is already the operator's JSON object rather than a _raw
+          text line, which is the whole reason to prefer this format at the
+          boundary. The friction to settle with the guard owner is unchanged
+          in kind: the query portion of $request, plus $http_user_agent and
+          $http_referer, still carry percent-encoded, non-ASCII,
+          multi-kilobyte attacker-controlled text (now as JSON string values),
+          so cap and flag their length low-side to what a simple custom filter
+          accepts. Because escape=json is already RFC-compliant there is no
+          \xhh-sanitisation contract to pin down — the high side is never
+          handed a string a strict parser rejects. Nothing CEF-shaped crosses;
+          high-volume, moderate-forensic-value, an early candidate for
+          dropping surplus keys once the mapping is proven.
+      direct:
+        parse_location: high
+        cribl: >
+          High-side instances need no guard hops: keep the core worker group a
+          pass-through and let the ingest pipeline decode. Enabling ndjson on
+          the Elastic Agent / Cribl input so the object is parsed at
+          collection is enough; no low-side repair is required because
+          escape=json emits valid JSON.
+        elastic: >
+          Point the source at a logs-nginx.access@custom pipeline whose first
+          processor is a json decode (or enable ndjson on the agent input),
+          then rename the JSON keys to ECS (client_ip -> source.ip, user_agent
+          -> user_agent.original, vhost -> url.domain, ...), split $request
+          into http.request.method / url.original / http.version, strip the
+          TLSv prefix off $ssl_protocol, convert $request_time fractional
+          seconds to event.duration nanoseconds, and derive event.outcome from
+          status (2xx/3xx success, 4xx/5xx failure). Add index-template
+          mappings for the nginx.access.* keys that have no ECS home —
+          upstream_addr / upstream_status as keyword and
+          upstream_response_time as scaled_float, all of which are comma/colon
+          lists on a retried request.
+    fields:
+    - vendor: $time_iso8601
+      type: timestamp
+      description: >-
+        local time in ISO 8601 format with a numeric offset, e.g.
+        2026-05-13T10:30:15+00:00
+      ecs: '@timestamp'
+      status: mapped
+      transform: >
+        JSON templates should carry $time_iso8601 rather than the CLF
+        $time_local, since it parses directly to a date with an explicit
+        offset; note it has second resolution, so sub-second precision is
+        still unavailable on this variable
+    - vendor: $remote_addr
+      type: ip
+      description: client address of the TCP peer that made the request
+      ecs: source.ip
+      status: mapped
+    - vendor: $remote_user
+      type: string
+      description: user name supplied with HTTP Basic authentication
+      ecs: user.name
+      status: mapped
+      transform: >-
+        rendered as a quoted '-' when no Basic credentials were presented; the
+        placeholder must be dropped rather than indexed as a user name
+    - vendor: $request
+      type: string
+      description: >-
+        the full original request line as received, e.g. "GET /path?q=1
+        HTTP/1.1", as a single JSON string
+      ecs: url.original
+      status: partial
+      notes: >
+        composite value holding method, request URI and protocol version in
+        one string; JSON templates often also carry the split $request_method
+        / $server_protocol keys, but where $request is the only form it must
+        be split before url.original is usable and the split has to tolerate a
+        malformed or truncated request line
+    - vendor: $request_method
+      type: string
+      description: request method taken from the request line, usually GET or POST
+      ecs: http.request.method
+      status: mapped
+    - vendor: $server_protocol
+      type: string
+      description: protocol name and version of the request, e.g. HTTP/1.1 or HTTP/2.0
+      ecs: http.version
+      status: partial
+      notes: >
+        the value carries both the protocol name and the version, so the HTTP/
+        prefix must be stripped for http.version; the prefix is the only place
+        network.protocol can be derived from on this dataset
+    - vendor: $status
+      type: integer
+      description: HTTP status code nginx returned to the client, emitted unquoted as a JSON number
+      ecs: http.response.status_code
+      status: mapped
+      notes: >
+        this is also the only available source of event.outcome — the
+        integration pipeline does not derive it, so 2xx/3xx to success and
+        4xx/5xx to failure has to be applied downstream
+    - vendor: $body_bytes_sent
+      type: integer
+      description: bytes sent to the client not counting the response header, unquoted JSON number
+      ecs: http.response.body.bytes
+      status: mapped
+    - vendor: $bytes_sent
+      type: integer
+      description: >-
+        total bytes sent to the client including the response header, unquoted
+        JSON number
+      ecs: http.response.bytes
+      status: mapped
+    - vendor: $request_length
+      type: integer
+      description: >-
+        request length including the request line, headers and body, unquoted
+        JSON number
+      ecs: http.request.bytes
+      status: mapped
+    - vendor: $http_referer
+      type: string
+      description: value of the Referer request header field
+      ecs: http.request.referrer
+      status: mapped
+    - vendor: $http_user_agent
+      type: string
+      description: value of the User-Agent request header field
+      ecs: user_agent.original
+      status: mapped
+    - vendor: $http_x_forwarded_for
+      type: string
+      description: >-
+        value of the X-Forwarded-For request header, a comma-separated chain
+        of client and proxy addresses
+      ecs: null
+      status: partial
+      custom: nginx.access.remote_ip_list
+      notes: >
+        the Elastic integration keeps the whole chain here and promotes the
+        first non-private address to source.ip; the header is client-supplied
+        and trivially spoofed, so the promoted value is only trustworthy when
+        the upstream proxy set is known
+    - vendor: $host
+      type: string
+      description: host from the request line, else the Host header, else the matching server name
+      ecs: url.domain
+      status: mapped
+    - vendor: $request_time
+      type: float
+      description: >-
+        request processing time in seconds with millisecond resolution,
+        emitted unquoted as a JSON number
+      ecs: event.duration
+      status: partial
+      transform: >-
+        fractional seconds must be multiplied to nanoseconds for
+        event.duration; the stock integration instead stores it as
+        milliseconds in nginx.access.response_time
+    - vendor: $upstream_addr
+      type: string
+      description: >-
+        address and port of the upstream server (or UNIX socket path) that
+        served the proxied request
+      ecs: null
+      status: unmapped
+      custom: nginx.access.upstream_addr
+      notes: >
+        holds a comma-separated list when several upstreams were tried and a
+        colon-separated list of those lists across internal redirects, so it
+        is not a single address and must have its last-hop value extracted
+        before any destination.* mapping is meaningful
+    - vendor: $upstream_status
+      type: string
+      description: status code returned by the upstream server
+      ecs: null
+      status: partial
+      custom: nginx.access.upstream_status
+      notes: >
+        same comma/colon list shape as $upstream_addr; it differs from $status
+        whenever nginx rewrote the response (error_page, retry to the next
+        upstream), which is exactly the case a proxy-error alert needs
+    - vendor: $upstream_response_time
+      type: float
+      description: >-
+        time spent receiving the response from the upstream server, in seconds
+        with millisecond resolution
+      ecs: null
+      status: unmapped
+      custom: nginx.access.upstream_response_time
+      notes: >
+        comma/colon list like the other upstream variables; the difference
+        against $request_time is the signal that separates a slow backend from
+        a slow client
+    - vendor: $ssl_protocol
+      type: string
+      description: TLS protocol negotiated for the connection, e.g. TLSv1.2 or TLSv1.3
+      ecs: tls.version
+      status: partial
+      transform: >-
+        the TLSv prefix must be stripped so tls.version holds '1.2'/'1.3',
+        with tls.version_protocol set to 'tls' separately
+    - vendor: $ssl_cipher
+      type: string
+      description: name of the cipher suite negotiated for the connection
+      ecs: tls.cipher
+      status: mapped
+- id: error
+  name: Error log
+  description: >
+    Diagnostic records written by the error_log directive when nginx cannot
+    serve or proxy a request. The classic text line is 'yyyy/mm/dd hh:mm:ss
+    [level] pid#tid: *cnum message' followed by comma-separated context tags —
+    client, server, request, upstream, host, referrer — appended to the
+    message text rather than emitted as structured fields. Eight severities
+    exist (debug, info, notice, warn, error, crit, alert, emerg) and the
+    directive's default is error, so anything below it is absent unless
+    deliberately enabled. From 1.29.8 the directive accepts a json parameter
+    that emits the same content as one JSON object per line with the context
+    tags as real keys; that form is an NGINX Plus commercial feature and caps
+    each entry at 2 KB, flagging overflow with "truncated":1. Field names
+    below use those documented JSON key names, which are also the context-tag
+    names in the text form.
+  event_categories:
+  - web
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same collection path as the access dataset — agent tail of
+        /var/log/nginx/error.log or the error_log syslog: target. Error and
+        access must stay together per estate, because splitting them across
+        the boundary breaks the connection-id correlation between the two.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-nginx.error
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Same collection path as the access dataset — agent tail of
+        /var/log/nginx/error.log or the error_log syslog: target. Error and
+        access must stay together per estate, because splitting them across
+        the boundary breaks the connection-id correlation between the two.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-nginx.error
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: elastic-integration
+      artifact: Nginx integration (error data stream)
+      notes: >
+        The integration's error ingest pipeline greps only the envelope —
+        timestamp, log.level, process.pid, process.thread.id and
+        nginx.error.connection_id — and leaves the entire remainder, including
+        every client/server/request/upstream context tag, in the free-text
+        message field. Extracting those tags is genuinely unsolved by the
+        stock pipeline and is the main mapping work on this dataset.
+    fields:
+    - vendor: timestamp
+      type: timestamp
+      description: >-
+        time nginx wrote the entry — leading "yyyy/mm/dd hh:mm:ss" in the text
+        form, ISO 8601 with milliseconds in the JSON form
+      ecs: '@timestamp'
+      status: mapped
+      transform: >-
+        the text form parses as yyyy/MM/dd H:m:s in the server's local zone
+        with no offset in the line, so an explicit timezone must be supplied;
+        the JSON form already carries an offset
+    - vendor: level
+      type: enum
+      description: severity of the entry - debug, info, notice, warn, error, crit, alert or emerg
+      ecs: log.level
+      status: mapped
+      notes: >
+        maps cleanly as a label, but ECS's numeric event.severity needs a
+        lookup over these eight values; note the error_log default is error,
+        so info/notice entries are absent unless the level was lowered
+        deliberately
+    - vendor: pid
+      type: integer
+      description: PID of the nginx worker process that logged the entry
+      ecs: process.pid
+      status: mapped
+    - vendor: tid
+      type: integer
+      description: thread id within the worker process
+      ecs: process.thread.id
+      status: mapped
+    - vendor: cnum
+      type: long
+      description: connection serial number, written as *N in the text form
+      ecs: null
+      status: unmapped
+      custom: nginx.error.connection_id
+      notes: >
+        the field the Elastic integration itself defines; it is the only key
+        that ties several error entries back to one client connection, and it
+        corresponds to $connection in the access log so the two datasets can
+        be joined when that variable is logged
+    - vendor: msg
+      type: string
+      description: 'the error text itself, e.g. ''connect() failed'' or ''open() failed'''
+      ecs: message
+      status: mapped
+    - vendor: client
+      type: ip
+      description: address of the client whose request produced the error
+      ecs: source.ip
+      status: mapped
+    - vendor: server
+      type: string
+      description: server_name of the virtual server that handled the request
+      ecs: server.domain
+      status: mapped
+      notes: >
+        the nginx-side vhost that matched, distinct from the Host header in
+        the host tag; carries the literal '_' or an empty value on a catch-all
+        server block
+    - vendor: request
+      type: string
+      description: the quoted request line that produced the error, e.g. "GET /api HTTP/1.1"
+      ecs: url.original
+      status: partial
+      notes: >
+        same composite method/URI/version shape as the access log's $request
+        and needs the same split; absent entirely for errors raised before the
+        request line was read
+    - vendor: upstream
+      type: string
+      description: URL of the upstream server nginx was talking to when the error occurred
+      ecs: null
+      status: unmapped
+      custom: nginx.error.upstream
+      notes: >
+        a full URL including scheme, upstream address, port and the rewritten
+        path; not mapped to url.full because that would collide with the
+        client-side request URL on the same document
+    - vendor: host
+      type: string
+      description: value of the Host request header for the failing request
+      ecs: url.domain
+      status: mapped
+      notes: >-
+        client-supplied and therefore distinct from the server tag, which is
+        the vhost nginx actually selected
+    - vendor: errno
+      type: integer
+      description: numeric system error code that caused the failure, e.g. 111
+      ecs: error.code
+      status: partial
+      transform: >-
+        a bare platform errno; it needs an errno-to-name lookup (111 to
+        ECONNREFUSED) before error.code is readable, and ECS types error.code
+        as keyword so the integer must be stringified
+    - vendor: errtext
+      type: string
+      description: 'system error string matching errno, e.g. ''Connection refused'''
+      ecs: error.message
+      status: mapped
+    - vendor: truncated
+      type: boolean
+      description: set to 1 when the JSON-format entry exceeded the 2 KB limit and was cut
+      ecs: null
+      status: unmapped
+      custom: nginx.error.truncated
+      notes: >
+        only present in the NGINX Plus JSON form; it is the sole signal that
+        an error entry is incomplete, so it must survive to Elastic rather
+        than being dropped as a formatting artefact
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Normalise the two possible wire shapes into one envelope on the core
+          worker group before anything else: classic text lines and NGINX Plus
+          JSON lines carry the same content under different structures, so
+          detect and reshape them low-side rather than maintaining two parsers
+          downstream. Reassemble multi-line error entries — stack-like
+          continuations and embedded newlines in upstream responses — into a
+          single event keyed on pid#tid and connection id before forwarding,
+          keep _raw for the whole dataset because error-log volume is low and
+          forensic value is high, and run the Elastic destination on
+          Persistent Queue backpressure.
+        elastic: >
+          Own a logs-nginx.error@custom pipeline that does what the stock
+          pipeline does not: dissect the client, server, request, upstream and
+          host context tags out of the message tail into ECS, split the quoted
+          request tag into method / url / version the same way the access
+          pipeline does, and turn the numeric errno into a readable reason
+          through an enrich policy so error.code is not a bare integer.
+          Convert the eight nginx severities into ECS's numeric event.severity
+          with an explicit lookup rather than leaving log.level as the only
+          severity signal, and add index-template mappings for
+          nginx.error.connection_id as long plus nginx.error.upstream as
+          keyword so upstream failure counts group correctly.
+        relay: >
+          Hybrid envelope mode A crosses here — thin NDJSON envelope with _raw
+          carried and field extraction on the Elastic side — which suits a
+          guard content filter that can allow-list a handful of short outer
+          keys and treat the payload as one opaque bounded string. The
+          friction to raise with the guard owner is the message body: it is
+          unbounded operator-facing free text that quotes attacker-supplied
+          request lines and upstream URLs verbatim, and in the JSON form nginx
+          itself truncates at 2 KB and sets truncated=1, so the low-side cap
+          should be set at or below that boundary and flagged the same way
+          rather than letting the filter cut mid-value. No CEF is involved on
+          this feed, and with no return channel the drop check is a low-side
+          versus high-side count reconciliation per (dataset, hour), which for
+          this dataset should be run alongside the access counts so a
+          one-sided loss is visible.
+      direct:
+        parse_location: hybrid
+        cribl: >
+          Normalise the two possible wire shapes into a single structure on
+          the core worker group before anything else: classic text lines and
+          NGINX Plus JSON lines carry the same content under different
+          structures, so detect and reshape them there rather than maintaining
+          two parsers downstream. Reassemble multi-line error entries —
+          stack-like continuations and embedded newlines in upstream responses
+          — into a single event keyed on pid#tid and connection id before
+          forwarding, keep _raw for the whole dataset because error-log volume
+          is low and forensic value is high, and run the Elastic destination
+          on Persistent Queue backpressure.
+        elastic: >
+          Own a logs-nginx.error@custom pipeline that does what the stock
+          pipeline does not: dissect the client, server, request, upstream and
+          host context tags out of the message tail into ECS, split the quoted
+          request tag into method / url / version the same way the access
+          pipeline does, and turn the numeric errno into a readable reason
+          through an enrich policy so error.code is not a bare integer.
+          Convert the eight nginx severities into ECS's numeric event.severity
+          with an explicit lookup rather than leaving log.level as the only
+          severity signal, and add index-template mappings for
+          nginx.error.connection_id as long plus nginx.error.upstream as
+          keyword so upstream failure counts group correctly.
+  - format: json
+    enable: >
+      From 1.29.8 the error_log directive accepts a json parameter that writes
+      one JSON object per entry instead of the classic 'yyyy/mm/dd hh:mm:ss
+      [level] pid#tid: *cnum message' text line: error_log
+      /var/log/nginx/error.log error json (the level token still precedes
+      json, and error_log syslog:server=host:514 error json ships the same
+      JSON payload over syslog transport). This is an NGINX Plus
+      commercial-subscription feature. Its decisive advantage over the text
+      form is that the client / server / request / upstream / host context
+      tags — which the text line appends to the message tail rather than
+      emitting as structured fields — become real top-level JSON keys, so the
+      extraction work the stock text pipeline leaves unsolved disappears. Two
+      constraints carry from the vendor: each entry is capped at 2 KB with any
+      overflow flagged as "truncated":1, and debug logging is not supported in
+      JSON form, so debug/trace entries are only available in the text format.
+    references:
+    - https://nginx.org/en/docs/ngx_core_module.html
+    - https://docs.nginx.com/nginx/admin-guide/monitoring/logging/
+    parsing:
+      mechanism: elastic-ingest-pipeline
+      artifact: >-
+        logs-nginx.error@custom (JSON decode + context-tag rename), replacing
+        the stock envelope-only error grok
+      notes: >
+        The stock Nginx integration error pipeline greps only the envelope
+        (timestamp, log.level, process.pid, process.thread.id, connection id)
+        from a text line and leaves every context tag in the free-text message
+        field — the JSON form instead hands those tags over as named keys, so
+        the pipeline becomes a json decode plus rename-to-ECS with no dissect
+        of the message tail. One JSON object per entry means the multi-line
+        reassembly the text form needs (embedded newlines in upstream
+        responses) does not arise. The 2 KB cap and truncated flag must
+        survive decoding so a clipped entry is visible rather than silently
+        short.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Decode JSON at the core worker group so the context tags are
+          structured before crossing, which also collapses the two-parser
+          problem the text form creates — high-side no longer maintains a grok
+          for the classic line alongside a JSON path. Keep _raw for the whole
+          dataset because error-log volume is low and forensic value is high,
+          honour the vendor's own 2 KB boundary by setting the low-side length
+          cap at or below it and flagging a clip the same way nginx sets
+          truncated=1 rather than cutting mid-value, and run the Elastic
+          destination on Persistent Queue backpressure. Keep the error and
+          access feeds together per estate so the connection-id correlation
+          between them survives the crossing.
+        elastic: >
+          Own a logs-nginx.error@custom pipeline that json-decodes and then
+          renames the context tags the stock text pipeline never extracts —
+          client -> source.ip, server -> server.domain, host -> url.domain,
+          request -> url.original (split into method / url / version the same
+          way the access pipeline does), upstream -> nginx.error.upstream.
+          Turn the numeric errno into a readable reason through an
+          errno-to-name enrich policy so error.code is not a bare integer,
+          convert the eight nginx severities into ECS's numeric event.severity
+          with an explicit lookup rather than leaving log.level as the only
+          severity signal, and add index-template mappings for
+          nginx.error.connection_id as long, nginx.error.upstream as keyword
+          and nginx.error.truncated as boolean so upstream failure counts and
+          clipped entries group correctly.
+        relay: >
+          Hybrid envelope mode A crosses here — thin NDJSON envelope with _raw
+          carried and field extraction on the Elastic side — which suits a
+          guard content filter that can allow-list a handful of short outer
+          keys and treat the payload as one opaque bounded string. The
+          friction to raise with the guard owner is the msg body: it is
+          unbounded operator-facing free text that quotes attacker-supplied
+          request lines and upstream URLs verbatim, but in the JSON form nginx
+          itself caps each entry at 2 KB and sets truncated=1, so the low-side
+          cap should be set at or below that boundary and flagged the same way
+          rather than letting the filter cut mid-value. No CEF is involved on
+          this feed, and with no return channel the drop check is a low-side
+          versus high-side count reconciliation per (dataset, hour), which for
+          this dataset should be run alongside the access counts so a
+          one-sided loss is visible.
+      direct:
+        parse_location: high
+        cribl: >
+          High-side instances skip the guard hops: keep the core worker group
+          a pass-through with Persistent Queue and let the ingest pipeline
+          decode. The only job still worth doing near the source is carrying
+          _raw, since the dataset is low-volume and the highest forensic value
+          on the whole technology.
+        elastic: >
+          Point the source at a logs-nginx.error@custom pipeline whose first
+          processor is a json decode, then rename the context tags — client ->
+          source.ip, server -> server.domain, host -> url.domain, request ->
+          url.original (split into method / url / version the same way the
+          access pipeline does), upstream -> nginx.error.upstream — turn the
+          numeric errno into a readable reason through an errno-to-name enrich
+          policy, convert the eight nginx severities into ECS's numeric
+          event.severity with an explicit lookup, and add index-template
+          mappings for nginx.error.connection_id as long, nginx.error.upstream
+          as keyword and nginx.error.truncated as boolean. Because the context
+          tags arrive as real keys, the request/upstream/client extraction
+          that is genuinely unsolved for the text form is a straight rename
+          here.
+    fields:
+    - vendor: timestamp
+      type: timestamp
+      description: >-
+        time nginx wrote the entry, ISO 8601 with milliseconds and a numeric
+        offset, e.g. 2026-05-13T10:30:15.042+00:00
+      ecs: '@timestamp'
+      status: mapped
+      transform: >-
+        the JSON form already carries an offset and sub-second precision, so
+        unlike the text line it needs no explicit timezone supplied at parse
+        time
+    - vendor: level
+      type: enum
+      description: >-
+        severity of the entry - info, notice, warn, error, crit, alert or
+        emerg (debug is unavailable in JSON form)
+      ecs: log.level
+      status: mapped
+      notes: >
+        maps cleanly as a label, but ECS's numeric event.severity needs a
+        lookup over these values; the error_log default is error, so
+        info/notice entries are absent unless the level was lowered, and
+        debug/trace entries only exist in the text format
+    - vendor: pid
+      type: integer
+      description: PID of the nginx worker process that logged the entry, unquoted JSON number
+      ecs: process.pid
+      status: mapped
+    - vendor: tid
+      type: integer
+      description: thread id within the worker process, unquoted JSON number
+      ecs: process.thread.id
+      status: mapped
+    - vendor: cnum
+      type: integer
+      description: >-
+        connection serial number, written as *N in the text form and as a bare
+        number here
+      ecs: null
+      status: unmapped
+      custom: nginx.error.connection_id
+      notes: >
+        the field the Elastic integration itself defines; it is the only key
+        that ties several error entries back to one client connection, and it
+        corresponds to $connection in the access log so the two datasets can
+        be joined when that variable is logged
+    - vendor: msg
+      type: string
+      description: 'the error text itself, e.g. ''connect() failed'' or ''open() failed'''
+      ecs: message
+      status: mapped
+    - vendor: client
+      type: ip
+      description: >-
+        address of the client whose request produced the error, a real
+        top-level key in JSON form
+      ecs: source.ip
+      status: mapped
+    - vendor: server
+      type: string
+      description: server_name of the virtual server that handled the request
+      ecs: server.domain
+      status: mapped
+      notes: >
+        the nginx-side vhost that matched, distinct from the Host header in
+        the host tag; carries the literal '_' or an empty value on a catch-all
+        server block
+    - vendor: request
+      type: string
+      description: >-
+        the request line that produced the error, e.g. "GET /api HTTP/1.1", as
+        a JSON string
+      ecs: url.original
+      status: partial
+      notes: >
+        same composite method/URI/version shape as the access log's $request
+        and needs the same split; absent entirely for errors raised before the
+        request line was read
+    - vendor: upstream
+      type: string
+      description: URL of the upstream server nginx was talking to when the error occurred
+      ecs: null
+      status: unmapped
+      custom: nginx.error.upstream
+      notes: >
+        a full URL including scheme, upstream address, port and the rewritten
+        path; not mapped to url.full because that would collide with the
+        client-side request URL on the same document
+    - vendor: host
+      type: string
+      description: value of the Host request header for the failing request
+      ecs: url.domain
+      status: mapped
+      notes: >-
+        client-supplied and therefore distinct from the server tag, which is
+        the vhost nginx actually selected
+    - vendor: errno
+      type: integer
+      description: >-
+        numeric system error code that caused the failure, e.g. 111, unquoted
+        JSON number
+      ecs: error.code
+      status: partial
+      transform: >-
+        a bare platform errno; it needs an errno-to-name lookup (111 to
+        ECONNREFUSED) before error.code is readable, and ECS types error.code
+        as keyword so the integer must be stringified
+    - vendor: errtext
+      type: string
+      description: 'system error string matching errno, e.g. ''Connection refused'''
+      ecs: error.message
+      status: mapped
+    - vendor: truncated
+      type: boolean
+      description: set to 1 when the JSON entry exceeded the 2 KB limit and was cut
+      ecs: null
+      status: unmapped
+      custom: nginx.error.truncated
+      notes: >
+        present only in the JSON form; it is the sole signal that an error
+        entry is incomplete, so it must survive to Elastic rather than being
+        dropped as a formatting artefact

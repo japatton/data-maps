@@ -1,0 +1,511 @@
+id: mysql-audit
+name: MySQL Enterprise Audit
+vendor: Oracle
+versions: MySQL Enterprise Edition 5.7 and 8.x with the audit_log plugin in JSON format
+draft: true
+references:
+- https://github.com/elastic/integrations/tree/main/packages/mysql_enterprise
+- https://dev.mysql.com/doc/refman/8.0/en/audit-log-file-formats.html
+- https://dev.mysql.com/doc/refman/8.0/en/audit-log-reference.html
+datasets:
+- id: connection
+  name: Connection audit (class connection)
+  description: |
+    Connect, disconnect and change-user events, with who authenticated as what and from where. Completes the catalogue's database-audit set - Oracle, PostgreSQL and SQL Server were all covered and MySQL was not, which left the one engine most likely to sit under a bespoke application without an authentication record.
+    The distinction this dataset turns on is that MySQL authenticates a client as an account that need not be the account it asked for. login names what was offered, account names what the server decided, and a difference between them is either proxying working as designed or an authentication mapping nobody documented.
+  event_categories:
+  - authentication
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Tails the audit log file the plugin writes on the database host.
+        Structurally simple, no free text, and low volume relative to the
+        statement audit. The audit_log plugin can also write XML. Only JSON
+        gives one self-describing object per event; the XML formats nest
+        differently per event class and were designed for offline reading
+        rather than streaming.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-mysql_enterprise.audit
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Tails the audit log file the plugin writes on the database host.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-mysql_enterprise.audit
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: elastic/integrations mysql_enterprise, data stream audit
+      notes: |
+        One parsing trap dominates this feed and it is not obvious from the file. MySQL writes the audit log as a single infinite JSON array rather than as a JSON stream, so every record ends with a trailing comma and the opening bracket appears only once, at the top of the file. A tail-based collector never sees that bracket and every line it reads is invalid JSON until the trailing comma is stripped. The Elastic pipeline does exactly that before parsing; a hand-built one must too, and the failure looks like a total parse failure rather than a subtle one.
+        The class field is the discriminator: connection, general, table_access and audit. Each carries its own sub-object - connection_data, general_data, table_access_data - so field presence follows class, and the datasets here split on it.
+    fields:
+    - vendor: timestamp
+      type: timestamp
+      description: when the event occurred, UTC
+      ecs: '@timestamp'
+      status: mapped
+      notes: >-
+        the plugin writes UTC regardless of the server's time zone, which is
+        unusual enough among database logs to be worth stating
+    - vendor: id
+      type: integer
+      description: event id, unique within the same timestamp
+      ecs: event.id
+      status: partial
+      transform: cast to string, and combine with timestamp for uniqueness
+      notes: >
+        not globally unique - it resets, and only the pair of timestamp and id
+        identifies an event. Using it alone as a document id silently
+        collapses distinct events that happened in the same second.
+    - vendor: class
+      type: string
+      description: the event class - connection, general, table_access or audit
+      ecs: event.category
+      status: partial
+      transform: map to the ECS event.category vocabulary
+      notes: the discriminator for which sub-object the record carries
+    - vendor: event
+      type: string
+      description: the specific event within the class - connect, disconnect, change_user
+      ecs: event.action
+      status: partial
+      transform: prefix with mysql-, matching the shipped integration
+    - vendor: connection_id
+      type: integer
+      description: the client connection identifier
+      ecs: null
+      status: unmapped
+      custom: mysql.connection_id
+      notes: >
+        the join key between a connection record and every statement executed
+        on it, which is what turns a suspicious query into a session with a
+        source address. It is reused after a connection closes, so a join must
+        be bounded by the connect and disconnect events rather than done on
+        the id alone.
+    - vendor: account.user
+      type: string
+      description: the user the server authenticated the client as
+      ecs: server.user.name
+      status: partial
+      notes: >
+        what the server decided, not what the client asked for - compare
+        against login.user. Elastic maps it to server.user.name, which reads
+        oddly but is right: the account is a server-side object, and
+        client.user.name holds the operating-system user on the other end.
+    - vendor: account.host
+      type: string
+      description: client host name as the server sees it
+      ecs: client.domain
+      status: partial
+      notes: >-
+        part of the MySQL account identity - an account is user plus host, and
+        the same user name from two hosts is two different accounts with
+        potentially different grants
+    - vendor: login.user
+      type: string
+      description: the user name the client offered
+      ecs: user.target.name
+      status: partial
+      notes: >-
+        differs from account.user when proxying or an authentication plugin
+        remapped it; the pair is the record of that remapping
+    - vendor: login.proxy
+      type: string
+      description: the proxy user, where user proxying is in effect
+      ecs: null
+      status: unmapped
+      custom: mysql.login.proxy
+      notes: >-
+        empty unless proxying applied; a populated value means the effective
+        privileges came from an account the client never named
+    - vendor: login.os
+      type: string
+      description: >-
+        the external user name supplied during authentication, typically the
+        operating-system user
+      ecs: client.user.name
+      status: partial
+    - vendor: login.ip
+      type: ip
+      description: address the client connected from
+      ecs: client.ip
+      status: mapped
+      notes: >-
+        client rather than source, matching the integration; for a database
+        the client/server pair describes the relationship better than a flow
+        does
+    - vendor: connection_data.connection_type
+      type: string
+      description: how the connection was made - tcp/ip, socket, named_pipe, ssl or shared_memory
+      ecs: network.type
+      status: partial
+      notes: >
+        the security state of the connection, and the only field that says
+        whether it was encrypted. A value of tcp/ip rather than ssl on a
+        connection carrying credentials is a finding in its own right, and it
+        is not visible anywhere else in the audit trail.
+    - vendor: connection_data.status
+      type: integer
+      description: command status - 0 on success, non-zero on error
+      ecs: event.outcome
+      status: partial
+      transform: 0 to success, anything else to failure
+      notes: >-
+        a failed connect is an authentication failure and is the record a
+        brute-force detection is built on
+    - vendor: connection_data.db
+      type: string
+      description: the default database for the connection
+      ecs: null
+      status: unmapped
+      custom: mysql.database
+      notes: >-
+        the default schema, not necessarily the one later statements touch;
+        table_access_data.db is authoritative for what was actually read
+    - vendor: connection_data.connection_attributes
+      type: object
+      description: attributes the client library supplied
+      ecs: null
+      status: unmapped
+      custom: mysql.connection_attributes
+      notes: >
+        client-supplied and therefore forgeable, but it carries the client
+        program name and process id, which is often the only way to tell an
+        application connection from an interactive one on a shared account.
+        The integration lifts _pid to process.pid; the rest stays flattened.
+    - vendor: connection_data.connection_attributes._pid
+      type: integer
+      description: process id of the client program
+      ecs: process.pid
+      status: partial
+      notes: >-
+        the client's process id, not the server's; joining it to endpoint
+        process telemetry needs the client host, which is account.host
+- id: table-access
+  name: Table access audit (class table_access)
+  description: |
+    Which table was read, written, updated or deleted, by whom, and with what statement. This is the dataset an insider-threat or data-exposure question actually needs - the statement audit says a query ran, and this says what it touched.
+    It is also the expensive one. Table-access auditing produces a record per table per statement, so a join across five tables is five records, and enabling it broadly on a busy server is the change most likely to be reverted for performance reasons. Scope it by schema rather than switching it on globally.
+  event_categories:
+  - configuration
+  - iam
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Tails the audit log file. Highest volume of the MySQL classes by a
+        wide margin, and it carries SQL text - the free-text field a content
+        filter will object to, and one that can contain data values from the
+        rows themselves.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes. Query text is the specific reason this feed
+        needs a redaction decision before it crosses: a WHERE clause can
+        contain the very values the data is classified for.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-mysql_enterprise.audit
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Tails the audit log file on the database host.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-mysql_enterprise.audit
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: elastic/integrations mysql_enterprise, data stream audit
+      notes: |
+        Same infinite-JSON-array trap as the connection dataset - trailing commas must be stripped before parsing.
+        Query text is truncated by the server at a configurable length, so a long statement arrives cut off with nothing on the record to say it was. A detection matching on the tail of a statement will miss exactly the large queries worth noticing.
+    fields:
+    - vendor: timestamp
+      type: timestamp
+      description: when the access occurred, UTC
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: class
+      type: string
+      description: the event class, table_access on this dataset
+      ecs: event.category
+      status: partial
+      transform: map to the ECS event.category vocabulary
+    - vendor: event
+      type: string
+      description: the access type - read, insert, update or delete
+      ecs: event.action
+      status: partial
+      transform: prefix with mysql-, matching the shipped integration
+      notes: >-
+        the verb that matters; read is the one that has no other record
+        anywhere, because a SELECT changes nothing and leaves no trace outside
+        the audit log
+    - vendor: table_access_data.db
+      type: string
+      description: the database the accessed table lives in
+      ecs: null
+      status: unmapped
+      custom: mysql.database
+      notes: authoritative for what was touched, unlike the connection default
+    - vendor: table_access_data.table
+      type: string
+      description: the table that was accessed
+      ecs: null
+      status: unmapped
+      custom: mysql.table
+      notes: >-
+        ECS has no table concept; this and the database name together are what
+        a data-classification policy is written against
+    - vendor: table_access_data.query
+      type: string
+      description: the SQL statement text
+      ecs: null
+      status: partial
+      custom: mysql.query
+      notes: >
+        deliberately not mapped to message, which the shipped integration
+        leaves free. Query text is the most sensitive content on the feed -
+        literal values in a WHERE clause can carry the data the database is
+        classified for - and keeping it in a named field makes it
+        straightforward to redact or drop at the edge without touching
+        anything else.
+    - vendor: table_access_data.sql_command
+      type: string
+      description: the statement type, e.g. select, insert, update
+      ecs: null
+      status: unmapped
+      custom: mysql.sql_command
+      notes: >-
+        the structured form of what the query did, and the field to build
+        detections on rather than pattern-matching the query text
+    - vendor: connection_id
+      type: integer
+      description: the connection the access happened on
+      ecs: null
+      status: unmapped
+      custom: mysql.connection_id
+      notes: >-
+        the join back to the connection dataset for the source address and the
+        authenticated account, neither of which appears on this record
+    - vendor: account.user
+      type: string
+      description: the account the statement ran as
+      ecs: server.user.name
+      status: partial
+    - vendor: account.host
+      type: string
+      description: client host of the account
+      ecs: client.domain
+      status: partial
+    - vendor: id
+      type: integer
+      description: event id within the timestamp
+      ecs: event.id
+      status: partial
+      transform: cast to string, and combine with timestamp for uniqueness
+- id: general
+  name: Statement and server audit (classes general and audit)
+  description: |
+    Statement execution with its status, plus the server's own lifecycle - startup, shutdown, and the arguments it was started with. Two classes with little in common except that neither is about a specific table, grouped here because splitting them would mean two datasets carrying one field each.
+    The server lifecycle half is small and disproportionately useful: the startup arguments say what auditing was actually enabled, so a gap in the audit trail can be attributed to a configuration change rather than guessed at.
+  event_categories:
+  - configuration
+  - iam
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Tails the audit log file. Carries SQL text with the same redaction
+        question as the table-access dataset.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-mysql_enterprise.audit
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Tails the audit log file on the database host.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-mysql_enterprise.audit
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: elastic/integrations mysql_enterprise, data stream audit
+      notes: >
+        Same infinite-JSON-array trap - trailing commas must be stripped
+        before parsing.
+    fields:
+    - vendor: timestamp
+      type: timestamp
+      description: when the event occurred, UTC
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: class
+      type: string
+      description: the event class - general or audit on this dataset
+      ecs: event.category
+      status: partial
+      transform: map to the ECS event.category vocabulary
+    - vendor: event
+      type: string
+      description: >-
+        the specific event - status on a general record, startup or shutdown
+        on an audit record
+      ecs: event.action
+      status: partial
+      transform: prefix with mysql-, matching the shipped integration
+    - vendor: general_data.command
+      type: string
+      description: the instruction that generated the event
+      ecs: null
+      status: unmapped
+      custom: mysql.command
+      notes: >-
+        the protocol-level command, coarser than sql_command and populated on
+        events that carry no SQL at all
+    - vendor: general_data.sql_command
+      type: string
+      description: the SQL statement type
+      ecs: null
+      status: unmapped
+      custom: mysql.sql_command
+      notes: >
+        the field the shipped integration reads to decide whether a record is
+        identity-related - create_user, drop_user, grant and flush_privileges
+        each add iam to event.category. Those four are the privilege-change
+        record for the whole engine, and there is no other feed that carries
+        them.
+    - vendor: general_data.query
+      type: string
+      description: the SQL statement text
+      ecs: null
+      status: partial
+      custom: mysql.query
+      notes: >-
+        same sensitivity and truncation caveats as on the table-access
+        dataset; on a GRANT this is where the privileges granted appear,
+        because nothing structured records them
+    - vendor: general_data.status
+      type: integer
+      description: command status - 0 on success, non-zero on error
+      ecs: event.outcome
+      status: partial
+      transform: 0 to success, anything else to failure
+      notes: >-
+        a non-zero status on a GRANT or a DROP USER is a privilege change that
+        was attempted and refused, which is worth as much as one that
+        succeeded
+    - vendor: connection_id
+      type: integer
+      description: the connection the statement ran on
+      ecs: null
+      status: unmapped
+      custom: mysql.connection_id
+    - vendor: account.user
+      type: string
+      description: the account the statement ran as
+      ecs: server.user.name
+      status: partial
+    - vendor: account.host
+      type: string
+      description: client host of the account
+      ecs: client.domain
+      status: partial
+    - vendor: startup_data.args
+      type: string
+      description: the arguments mysqld was started with
+      ecs: process.args
+      status: partial
+      transform: also join to process.command_line
+      notes: >
+        the audit configuration in force, in the one place it is recorded.
+        Whether audit_log_policy excluded a class, or the plugin loaded at
+        all, is answerable only from here - which makes this the field that
+        distinguishes an absent event from an unaudited one.
+    - vendor: startup_data.mysql_version
+      type: string
+      description: the server version
+      ecs: service.version
+      status: mapped
+      notes: >-
+        Elastic's own field definition describes this as the server id, which
+        is a copy-paste error in their documentation rather than in the data;
+        the value is the version
+    - vendor: startup_data.os_version
+      type: string
+      description: the operating system the server runs on
+      ecs: host.os.full
+      status: mapped
+    - vendor: startup_data.server_id
+      type: integer
+      description: the server id
+      ecs: service.id
+      status: partial
+      transform: cast to string
+      notes: >-
+        the replication identity, so it distinguishes a primary from its
+        replicas when several ship audit logs to the same place
+    - vendor: shutdown_data.server_id
+      type: integer
+      description: the server id, on a shutdown record
+      ecs: service.id
+      status: partial
+      transform: cast to string
+      notes: >
+        a shutdown record is the boundary of an audit gap. Pairing startup and
+        shutdown by server_id is how a legitimate maintenance window is told
+        apart from a plugin that stopped writing.

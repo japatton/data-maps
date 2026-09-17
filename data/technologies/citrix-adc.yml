@@ -1,0 +1,1517 @@
+id: citrix-adc
+name: Citrix ADC (NetScaler)
+vendor: Citrix
+versions: NetScaler ADC 13.0, 13.1, 14.1 (product formerly branded Citrix ADC)
+draft: true
+references:
+- >-
+  https://developer-docs.netscaler.com/en-us/netscaler-syslog-message-reference/current-release.html
+- >-
+  https://docs.netscaler.com/en-us/citrix-adc/current-release/system/audit-logging.html
+- >-
+  https://support.citrix.com/external/article/CTX464125/how-to-recognize-netscaler-gateway-user.html
+- https://www.elastic.co/docs/reference/integrations/citrix_adc
+- >-
+  https://github.com/elastic/integrations/tree/main/packages/citrix_adc/data_stream/log
+- >-
+  https://cloud.google.com/blog/topics/threat-intelligence/session-hijacking-citrix-cve-2023-4966/
+datasets:
+- id: gateway-session
+  name: Gateway / AAA session events
+  description: >
+    SSLVPN, AAA and AAATM session lifecycle records (LOGIN, LOGOUT,
+    LOGIN_FAILED, REMOVE_SESSION_DEBUG) written to the appliance audit log and
+    forwarded by an audit-syslogAction. SCOPE NOTE: this map covers the
+    ADC/NetScaler APPLIANCE syslog only. The catalog row name hides two other
+    Citrix sources that are NOT modelled here and need their own rows - the
+    Citrix Gateway/StoreFront remote-access application logs, and the Virtual
+    Apps and Desktops (Delivery Controller) broker logs - which have different
+    formats, transports and owners. The appliance's native format is a syslog
+    header followed by "<hostname> <MM/DD/YYYY:HH:MM:SS TZ> <ns-ip>
+    <N>-PPE-<n> : default <FEATURE> <MESSAGETYPE> <msgid> <flag> : " and then
+    a hyphen-separated list of space-delimited "Name value" pairs (not
+    "key=value"). WAF / APPFW violations are emitted as CEF and belong to a
+    separate technology row (Elastic ships citrix_waf for those), not here.
+  event_categories:
+  - authentication
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        NetScaler audit-syslogAction ships over TCP/UDP syslog to a Cribl
+        Syslog source.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-citrix_adc.log
+      notes: >
+        the Elastic integration collapses every ADC message type into the
+        single citrix_adc.log data stream; the three datasets in this map are
+        logical splits distinguished by citrix.device_event_class_id (the
+        FEATURE token) and citrix.name (the MESSAGETYPE token), not by
+        separate data streams.
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        NetScaler audit-syslogAction ships over TCP/UDP syslog to a Cribl
+        Syslog source.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-citrix_adc.log
+      notes: >
+        the Elastic integration collapses every ADC message type into the
+        single citrix_adc.log data stream; the three datasets in this map are
+        logical splits distinguished by citrix.device_event_class_id (the
+        FEATURE token) and citrix.name (the MESSAGETYPE token), not by
+        separate data streams.
+  formats:
+  - format: syslog-kv
+    recommended: true
+    recommended_because: >-
+      the citrix_adc integration already parses this feed alongside every
+      other NetScaler dataset; AppFlow with Gateway Insight adds two fields at
+      the price of an IPFIX collector and a second collection path for one
+      dataset.
+    parsing:
+      mechanism: elastic-integration
+      artifact: Citrix ADC integration (citrix_adc), log data stream
+      notes: >
+        No Cribl pack exists for NetScaler. The citrix_adc integration is
+        primarily a metrics package (interface, lbvserver, service, system,
+        vpn) with one log data stream bolted on; its ingest pipeline handles
+        the native session grammar well but leaves several ECS gaps this map
+        records, so a logs-citrix_adc.log@custom pipeline is expected work,
+        not an exception.
+    fields:
+    - vendor: MESSAGETYPE (LOGIN / LOGOUT / LOGIN_FAILED)
+      type: enum
+      description: message-type token in the syslog header naming the session event
+      ecs: event.action
+      status: partial
+      transform: >
+        lowercase the header token into event.action and drive event.outcome
+        from it (LOGIN and LOGOUT are success, LOGIN_FAILED is failure); the
+        stock integration parks this token at citrix.name and sets neither
+        event.action nor, for these message types, event.outcome
+    - vendor: FEATURE (SSLVPN / AAA / AAATM)
+      type: enum
+      description: NetScaler feature module that emitted the record
+      ecs: null
+      status: unmapped
+      custom: citrix.device_event_class_id
+      notes: >
+        SSLVPN is full/clientless VPN and ICA-proxy sessions, AAA is
+        authentication-only, AAATM is AAA for traffic management; the same
+        MESSAGETYPE means slightly different things per feature, so this token
+        must be retained to disambiguate LOGIN/LOGOUT semantics
+    - vendor: User
+      type: string
+      description: account name the gateway or AAA session belongs to
+      ecs: user.name
+      status: mapped
+      transform: >
+        frequently arrives as user@domain.tld or a UPN; split on the last "@"
+        so the bare account lands in user.name and the realm in user.domain,
+        otherwise account-based correlation with Windows and identity sources
+        fails
+    - vendor: Client_ip
+      type: ip
+      description: client address the SSLVPN/AAA session was established from
+      ecs: source.ip
+      status: mapped
+      notes: >
+        the integration populates both source.ip and client.ip from this
+        value; on session records the two are the same address, but on the
+        per-connection records in the tcp-http-access dataset they are
+        deliberately different and must not be coalesced
+    - vendor: Nat_ip
+      type: ip
+      description: 'NetScaler mapped/SNIP address applied to the session''s outbound traffic'
+      ecs: source.nat.ip
+      status: partial
+      transform: >
+        emits the literal quoted string "Mapped Ip" (not an address) when no
+        NAT mapping applies; that placeholder must be dropped rather than
+        coerced, or the ip-typed field rejects the document
+    - vendor: Vserver
+      type: string
+      description: >-
+        address and port of the VPN/AAA virtual server the session terminated
+        on, formatted "ip:port"
+      ecs: server.ip
+      status: partial
+      transform: >
+        split the composite "ip:port" value - address to server.ip, port to
+        server.port - and keep the pair at citrix_adc.log.vserver.ip/.port so
+        per-vserver dashboards survive; note some AAATM records emit 0.0.0.0:0
+        when the session is not bound to a vserver
+    - vendor: SessionId
+      type: string
+      description: NetScaler-assigned identifier for the gateway/AAA session
+      ecs: null
+      status: unmapped
+      custom: citrix_adc.log.session_id
+      notes: >
+        ECS 9.4 has no session identifier field (nothing outside the
+        process.session_leader.* tree), so this stays custom. It is the only
+        join key between LOGIN, LOGOUT and the per-connection TCPCONNSTAT
+        records, which makes it load-bearing for CVE-2023-4966 (CitrixBleed)
+        session-hijack triage
+    - vendor: Group(s)
+      type: string
+      description: authorization group(s) bound to the session at logon
+      ecs: group.name
+      status: partial
+      transform: >
+        quoted value, literally "N/A" when no group is extracted; multiple
+        groups arrive comma-separated in one string and should be split into
+        an array rather than indexed as a single keyword
+    - vendor: Browser_type
+      type: string
+      description: user-agent string reported by the connecting client
+      ecs: user_agent.original
+      status: partial
+      notes: >
+        the stock integration leaves this at citrix_adc.log.browser_type and
+        never populates user_agent.original, so no user-agent parsing runs;
+        copying it and invoking the user_agent processor is the single
+        cheapest ECS coverage win on this dataset
+    - vendor: SSLVPN_client_type
+      type: enum
+      description: client mode used for the session (ICA, Agent, Clientless, Android, ...)
+      ecs: null
+      status: unmapped
+      custom: citrix_adc.log.sslvpn_client_type
+      notes: >
+        distinguishes ICA-proxy sessions from full VPN tunnels and clientless
+        browser access; no ECS equivalent, but it is the field that separates
+        two very different risk profiles on one vserver
+    - vendor: Start_time
+      type: timestamp
+      description: time the session was established
+      ecs: event.start
+      status: partial
+      transform: >
+        MM/DD/YYYY:HH:MM:SS with an optional trailing zone token; whether the
+        zone is GMT or appliance-local depends on the audit-syslogAction
+        dateformat/timezone settings, so the parse must be configured per
+        appliance rather than assumed UTC
+    - vendor: End_time
+      type: timestamp
+      description: time the session was torn down
+      ecs: event.end
+      status: partial
+      notes: same per-appliance timezone caveat as Start_time
+    - vendor: Duration
+      type: string
+      description: elapsed session time rendered as HH:MM:SS
+      ecs: event.duration
+      status: partial
+      transform: >
+        HH:MM:SS string must be converted to nanoseconds for event.duration;
+        sessions longer than 24 hours roll the hour field past 24 rather than
+        wrapping, so a naive time parse breaks
+    - vendor: Total_bytes_send
+      type: long
+      description: bytes the appliance sent over the session
+      ecs: source.bytes
+      status: partial
+      notes: >
+        send/recv are appliance-relative, not client-relative; the integration
+        assigns send to source.bytes and recv to destination.bytes, which
+        should be validated against real sessions before any volumetric
+        detection relies on the direction
+    - vendor: Total_bytes_recv
+      type: long
+      description: bytes the appliance received over the session
+      ecs: destination.bytes
+      status: partial
+      notes: same appliance-relative direction caveat as Total_bytes_send
+    - vendor: Total_policies_denied
+      type: long
+      description: count of authorization policy denials that occurred during the session
+      ecs: null
+      status: unmapped
+      custom: citrix_adc.log.total_policies_denied
+      notes: >
+        a non-zero value on an otherwise normal session is a cheap
+        lateral-movement/probing signal; no ECS counter models per-session
+        policy denials
+    - vendor: LogoutMethod
+      type: enum
+      description: how the session ended (Explicit, TimedOut, Killed, ...)
+      ecs: null
+      status: unmapped
+      custom: citrix_adc.log.logout_method
+      notes: >
+        separates a deliberate user logout from an idle timeout or an
+        administrator kill; without it, timed-out sessions are
+        indistinguishable from user activity in session-duration analytics
+    - vendor: Failure_reason
+      type: string
+      description: text reason an AAA LOGIN_FAILED record was produced
+      ecs: event.reason
+      status: partial
+      notes: >
+        present only on AAA/AAATM LOGIN_FAILED records; free text from the
+        authentication back end (e.g. "External authentication server denied
+        access"), so it needs a lookup to a stable failure taxonomy before it
+        can drive alert thresholds
+    - vendor: hostname (syslog header)
+      type: string
+      description: >-
+        appliance host token in the message header identifying the ADC that
+        logged the session
+      ecs: observer.hostname
+      status: mapped
+      notes: >
+        in an HA pair both nodes emit under their own hostname, so
+        per-appliance rather than per-VIP grouping is what this field gives
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Ship the thin envelope (_dataId, @timestamp, host, _raw) keyed to
+          the logs-citrix_adc.log route rather than teaching the low side
+          every SSLVPN/AAA/AAATM message grammar, and keep _raw on this route
+          indefinitely - remote-access session records are the forensic
+          artifact of record for gateway compromise. Do the two normalizations
+          that are cheapest near the source: drop the literal "Mapped Ip"
+          placeholder so it never reaches an ip-typed field, and attach the
+          appliance-to-site/owner enrichment from the inventory lookup.
+          Validate the envelope with C.Schema(...).validate immediately before
+          the forwarding destination with a dead-letter route, and run the
+          destination on Persistent Queue backpressure, never Block.
+        elastic: >
+          Let the citrix_adc integration's log ingest pipeline extract, and
+          add a logs-citrix_adc.log@custom pipeline for the gaps: derive
+          event.action from the MESSAGETYPE token (which the stock pipeline
+          only stores at citrix.name) and event.outcome from LOGIN vs
+          LOGIN_FAILED, copy Browser_type into user_agent.original and run the
+          user_agent processor, convert the HH:MM:SS Duration into
+          event.duration nanoseconds, and split user@domain / UPN values into
+          user.name plus user.domain. Map citrix_adc.log.session_id,
+          .logout_method and .sslvpn_client_type as keyword in the index
+          template - session_id is the join key for LOGIN/LOGOUT/TCPCONNSTAT
+          correlation and must not be left to dynamic mapping.
+        relay: >
+          Only the thin envelope crosses, so the content filter sees one
+          stable NDJSON schema shared with the other two ADC datasets instead
+          of the vendor's per-message-type grammar. Content-filter friction
+          here is the quoted Browser_type user-agent string and the Group(s)
+          list carried inside _raw - both unbounded free text with embedded
+          quotes and non-ASCII - so cap _raw length and strip control
+          characters low-side. Nothing CEF-shaped crosses on this route (the
+          CEF feed is APPFW/WAF, a different technology row); treat the
+          crossing as at-most-once and reconcile counts per (dataset, hour).
+      direct:
+        parse_location: high
+        cribl: >
+          For a high-side ADC collocated with the Elastic stack, forward the
+          audit syslog straight through Cribl to the citrix_adc integration -
+          with no guard there is no boundary to defer parsing across, so
+          Cribl's role is routing plus the two normalizations cheapest near
+          the source: drop the literal "Mapped Ip" placeholder so it never
+          reaches an ip-typed field, and attach the appliance-to-site/owner
+          enrichment from the inventory lookup. Keep _raw indefinitely -
+          remote-access session records are the forensic artifact of record
+          for gateway compromise.
+        elastic: >
+          Let the citrix_adc integration's log ingest pipeline extract, and
+          add a logs-citrix_adc.log@custom pipeline for the gaps: derive
+          event.action from the MESSAGETYPE token (which the stock pipeline
+          only stores at citrix.name) and event.outcome from LOGIN vs
+          LOGIN_FAILED, copy Browser_type into user_agent.original and run the
+          user_agent processor, convert the HH:MM:SS Duration into
+          event.duration nanoseconds, and split user@domain / UPN values into
+          user.name plus user.domain. Map citrix_adc.log.session_id,
+          .logout_method and .sslvpn_client_type as keyword in the index
+          template - session_id is the join key for LOGIN/LOGOUT/TCPCONNSTAT
+          correlation and must not be left to dynamic mapping.
+  - format: netflow
+    enable: >
+      Enable AppFlow and turn on Gateway Insight so the SSLVPN/AAA sessions
+      are exported. `enable ns feature appflow`; add an IPFIX collector with
+      `add appflow collector <name> -IPAddress <collector> -port 4739
+      -Transport ipfix`, then `add appflow action <name> -collectors <name>`
+      and `add appflow policy <name> -rule true -action <name>`. Bind the
+      policy to the VPN/AAA virtual server (`bind vpn vserver <vs> -policy
+      <policy> -priority <n> -type REQUEST`) or globally, and turn on the
+      identity fields with `set appflow param -AAAUserName ENABLED` (default
+      DISABLED). Gateway Insight is enabled by binding an AppFlow policy with
+      the built-in Gateway-Insight expression to the VPN vserver; HDX Insight
+      adds the ICA session records. IPFIX transport targets a standard flow
+      collector; the logstream transport feeds the JSON path documented on the
+      tcp-http-access dataset.
+    references:
+    - >-
+      https://docs.netscaler.com/en-us/citrix-adc/current-release/ns-ag-appflow-intro-wrapper-con.html
+    - >-
+      https://docs.netscaler.com/en-us/citrix-adc/current-release/ns-ag-appflow-intro-wrapper-con/ns-ag-appflow-config-tsk.html
+    - >-
+      https://developer-docs.netscaler.com/en-us/adc-command-reference-int/current-release/appflow/appflow-param.html
+    - >-
+      https://github.com/splunk/ipfix/blob/master/app/Splunk_TA_IPFIX/bin/IPFIX/information-elements/netscaler.iespec
+    parsing:
+      mechanism: elastic-integration
+      artifact: Elastic NetFlow Records integration (netflow), data stream logs-netflow.log
+      notes: >
+        AppFlow IPFIX is binary NetFlow v10 over UDP, so the syslog-line
+        citrix_adc integration cannot read it; an Elastic Agent netflow input
+        (or a flow collector) must terminate the stream. The netflow input
+        decodes the IANA-standard IEs (8/12/7/11/4/154/155) into netflow.*
+        automatically, but every Citrix enterprise IE (5951/*) arrives as a
+        raw template field and needs a custom ingest pipeline to reach ECS.
+        Cribl does not natively decode binary IPFIX, so on a Cribl-first path
+        the UDP stream must be terminated by a collector or the Elastic Agent
+        input first. The ICA/HDX performance IEs belong to the broker source
+        and are kept as transport metadata here.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          A CDS content filter cannot inspect opaque binary IPFIX, and the v10
+          template packets travel on a separate cadence from the data records,
+          so decode Gateway Insight AppFlow to structured records LOW-SIDE
+          before the crossing. Resolve the AAA username split there while the
+          directory is reachable, and keep the ICA session GUID as the session
+          join key so a decoded record still correlates to the syslog
+          LOGIN/LOGOUT feed. This is a low-cardinality session feed, so do not
+          sample it; stamp observer identity from the exporting ADC.
+        elastic: >
+          Run the netflow integration for the standard sockets and add a
+          logs-netflow.log@custom pipeline for the Citrix IEs: split
+          netscalerAaaUsername on the last "@" into user.name plus user.domain
+          exactly as the syslog dataset does so account correlation is
+          consistent, map netscalerICASessionGuid to a keyword join key,
+          derive event.start/event.end from flowStart/flowEndMicroseconds and
+          event.duration from the pair, and keep the ICA RTT/latency IEs as
+          citrix_adc.appflow.* customs rather than forcing them into ECS.
+        relay: >
+          Cross decoded NDJSON, never raw IPFIX - it is un-inspectable at the
+          guard and template-dependent. Once decoded the free-text exposure is
+          the AAA username and the ICA client version banner; length-cap and
+          ASCII-constrain those low-side, validate the envelope with
+          C.Schema(...) into a low-side dead-letter route, and run the
+          forwarding destination on Persistent Queue backpressure. Crossing is
+          at-most-once; reconcile low-side and high-side counts per (dataset,
+          hour) against the syslog session feed.
+      direct:
+        parse_location: high
+        cribl: >
+          For a high-side ADC with no guard, terminate the IPFIX stream at an
+          Elastic Agent netflow input directly; there is little reason to
+          interpose Cribl for binary flow beyond routing. Decide per appliance
+          whether AppFlow or the audit-syslog session feed is authoritative
+          for gateway sessions and avoid double-counting a login across both.
+        elastic: >
+          Run the netflow integration and add a logs-netflow.log@custom
+          pipeline with the citrix_adc.appflow.* mappings: split
+          netscalerAaaUsername on the last "@" into user.name plus
+          user.domain, map netscalerICASessionGuid to a keyword join key, and
+          derive event.start/event.end from flowStart/flowEndMicroseconds.
+          With no boundary, treat AppFlow as the performance-rich session view
+          - RTT, latency and the ICA session GUID it adds over the syslog -
+          but retain the syslog session feed for the LOGIN_FAILED /
+          LogoutMethod / group semantics AppFlow does not carry.
+    fields:
+    - vendor: sourceIPv4Address
+      type: ip
+      description: IPFIX IE 8 - client address the gateway/VPN session was established from.
+      ecs: source.ip
+      status: mapped
+    - vendor: destinationIPv4Address
+      type: ip
+      description: IPFIX IE 12 - address of the VPN/AAA virtual server the session terminated on.
+      ecs: destination.ip
+      status: mapped
+    - vendor: netscalerAaaUsername
+      type: string
+      description: AppFlow enterprise IE 5951/205 - AAA/gateway account the session belongs to.
+      ecs: user.name
+      status: partial
+      transform: >
+        frequently arrives as user@domain / UPN; split on the last "@" so the
+        bare account lands in user.name and the realm in user.domain, the same
+        split the syslog User field needs, or account correlation across the
+        two feeds diverges.
+    - vendor: netscalerICASessionGuid
+      type: string
+      description: >-
+        AppFlow enterprise IE 5951/200 - globally unique identifier of the
+        gateway/ICA session (octetArray).
+      ecs: null
+      status: unmapped
+      custom: citrix_adc.appflow.ica_session_guid
+      notes: >
+        the AppFlow session join key; ECS 9.4 has no session identifier field
+        outside the process.session_leader.* tree, so it stays custom. It is
+        what ties an AppFlow session record back to the syslog LOGIN/LOGOUT
+        records and to the per-connection tcp-http-access data.
+    - vendor: netscalerIcaClientIP
+      type: ip
+      description: >-
+        AppFlow enterprise IE 5951/203 - client endpoint address recorded at
+        session/launch time.
+      ecs: client.ip
+      status: mapped
+      notes: >
+        kept on client.ip rather than source.ip so it stays distinct from the
+        per-connection source address, mirroring the tcp-http-access dataset's
+        deliberate Client_ip / Source separation.
+    - vendor: netscaleIcaClientVersion
+      type: string
+      description: >-
+        AppFlow enterprise IE 5951/201 - Citrix Workspace/Receiver client
+        version string (vendor IE name is spelled without the 'r', verbatim).
+      ecs: null
+      status: unmapped
+      custom: citrix_adc.appflow.ica_client_version
+      notes: >
+        the vendor's own IE spec spells this "netscaleIcaClientVersion"; the
+        name is reproduced as sourced. Free-text client banner, so length-cap
+        it before any crossing.
+    - vendor: netscalerIcaLaunchMechanism
+      type: integer
+      description: AppFlow enterprise IE 5951/237 - how the ICA session was launched (enum).
+      ecs: null
+      status: unmapped
+      custom: citrix_adc.appflow.ica_launch_mechanism
+      notes: >-
+        HDX/broker-source overlap; retained as transport metadata rather than
+        mapped to ECS here.
+    - vendor: netscalerIcaRTT
+      type: integer
+      description: AppFlow enterprise IE 5951/215 - end-to-end ICA session round-trip time.
+      ecs: null
+      status: unmapped
+      custom: citrix_adc.appflow.ica_rtt
+      notes: >-
+        HDX performance metric with no ECS equivalent; part of the
+        broker-source overlap, kept custom.
+    - vendor: netscalerIcaL7ClientLatency
+      type: integer
+      description: AppFlow enterprise IE 5951/265 - layer-7 client-side latency of the ICA session.
+      ecs: null
+      status: unmapped
+      custom: citrix_adc.appflow.ica_l7_client_latency
+    - vendor: flowStartMicroseconds
+      type: timestamp
+      description: IPFIX IE 154 - time the session/flow opened, microsecond precision.
+      ecs: event.start
+      status: mapped
+    - vendor: flowEndMicroseconds
+      type: timestamp
+      description: IPFIX IE 155 - time the session/flow closed, microsecond precision.
+      ecs: event.end
+      status: mapped
+      notes: >-
+        event.duration is derivable from the flowStart/flowEnd pair without
+        the syslog HH:MM:SS Duration string parse.
+- id: tcp-http-access
+  name: TCP / UDP / HTTP access records
+  description: >
+    Per-connection and per-request records for traffic inside a gateway
+    session - SSLVPN TCPCONNSTAT and UDPFLOWSTAT connection summaries,
+    SSLVPN/AAATM HTTPREQUEST request lines, and TCP CONN_TERMINATE /
+    CONN_DELINK records for load-balanced traffic. This is the highest-volume
+    ADC dataset and the one that carries the CVE-2023-4966 ("CitrixBleed")
+    hijack signal: TCPCONNSTAT records the session's originating Client_ip
+    alongside the Source address of each individual connection, and a mismatch
+    between them - or one Source address appearing under several distinct User
+    values in a short window - is Mandiant's primary detection for stolen
+    session tokens, since the appliance's web server logs no requests at all
+    to the vulnerable endpoint.
+  event_categories:
+  - network
+  - web
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        same audit-syslogAction feed as the session dataset; this is by far
+        the highest-volume route on the technology, so the guard's throughput
+        is the binding constraint.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-citrix_adc.log
+      notes: shares the single citrix_adc.log data stream with the other two datasets
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        same audit-syslogAction feed as the session dataset; by far the
+        highest-volume route on the technology.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-citrix_adc.log
+      notes: shares the single citrix_adc.log data stream with the other two datasets
+  formats:
+  - format: syslog-kv
+    parsing:
+      mechanism: elastic-integration
+      artifact: Citrix ADC integration (citrix_adc), log data stream
+      notes: >
+        The integration's log ingest pipeline recognizes TCPCONNSTAT,
+        UDPFLOWSTAT, HTTPREQUEST, ICASTART/ICAEND_CONNSTAT and TCP
+        CONN_TERMINATE/CONN_DELINK grammars; ICA records are parsed but their
+        Virtual Apps/Desktops session semantics belong to the separate broker
+        source, so treat them as transport metadata here.
+    fields:
+    - vendor: MESSAGETYPE (TCPCONNSTAT / UDPFLOWSTAT / HTTPREQUEST / CONN_TERMINATE)
+      type: enum
+      description: message-type token in the syslog header naming the connection or request record
+      ecs: event.action
+      status: partial
+      transform: >
+        lowercase the header token into event.action; the stock integration
+        stores it only at citrix.name, so without this every record type on
+        the dataset is indistinguishable in event.* terms
+    - vendor: Source
+      type: string
+      description: source address and port of this individual connection, formatted "ip:port"
+      ecs: source.ip
+      status: partial
+      transform: >
+        split the composite value - address to source.ip, port to source.port;
+        on TCPCONNSTAT this is the address of the connection being logged,
+        which is NOT necessarily the address that created the session
+    - vendor: Destination
+      type: string
+      description: destination address and port the connection was proxied to, formatted "ip:port"
+      ecs: destination.ip
+      status: partial
+      transform: split the composite value - address to destination.ip, port to destination.port
+    - vendor: Client_ip
+      type: ip
+      description: client address recorded when the parent gateway session was created
+      ecs: client.ip
+      status: mapped
+      notes: >
+        the CitrixBleed field. Deliberately mapped to client.ip rather than
+        source.ip so it stays distinct from the per-connection Source address:
+        a mismatch between the two on TCPCONNSTAT is the primary CVE-2023-4966
+        session-hijack signal, and any pipeline that normalizes both into
+        source.ip destroys the detection
+    - vendor: SessionId
+      type: string
+      description: identifier of the gateway session the connection belongs to
+      ecs: null
+      status: unmapped
+      custom: citrix_adc.log.session_id
+      notes: >-
+        joins these records to the LOGIN/LOGOUT records in the gateway-session
+        dataset; no ECS session field exists in 9.4
+    - vendor: User
+      type: string
+      description: account owning the gateway session the connection belongs to
+      ecs: user.name
+      status: mapped
+      transform: >
+        same user@domain / UPN split as the session dataset; a single Source
+        address resolving to several distinct User values within minutes is
+        the second Mandiant CitrixBleed indicator, so the split must be
+        consistent across both datasets for the correlation to work
+    - vendor: Vserver
+      type: string
+      description: >-
+        address and port of the virtual server the session terminated on,
+        formatted "ip:port"
+      ecs: server.ip
+      status: partial
+      transform: >-
+        split into server.ip and server.port; retained at
+        citrix_adc.log.vserver.ip/.port for per-vserver aggregation
+    - vendor: Nat_ip
+      type: ip
+      description: NetScaler mapped/SNIP address applied to the connection
+      ecs: source.nat.ip
+      status: partial
+      transform: >-
+        same literal "Mapped Ip" placeholder as the session dataset; drop it
+        rather than coercing it into an ip-typed field
+    - vendor: Access
+      type: enum
+      description: authorization verdict for the connection (Allowed or Denied)
+      ecs: event.outcome
+      status: partial
+      transform: >
+        Allowed maps to success and Denied to failure. This is a policy
+        verdict rather than a true outcome, but event.action is already
+        occupied by the MESSAGETYPE token on this dataset, so the verdict
+        lands on event.outcome; the raw verdict is kept at
+        citrix_adc.log.access so the distinction is recoverable
+    - vendor: domain / hostname (HTTPREQUEST)
+      type: string
+      description: >-
+        host the HTTP request was destined for, emitted as a bare token before
+        the User field
+      ecs: url.domain
+      status: mapped
+      notes: >
+        positional rather than named in the vendor grammar, which is why a
+        generic key-value parser misses it; the integration also retains it at
+        citrix_adc.log.domain_name
+    - vendor: method (HTTPREQUEST request line)
+      type: string
+      description: HTTP method of the proxied request (GET, POST, CONNECT, ...)
+      ecs: http.request.method
+      status: mapped
+      notes: >
+        CONNECT appears for tunnelled clientless-VPN traffic, where the "path"
+        token is a host:port authority rather than a URI path
+    - vendor: URI path (HTTPREQUEST request line)
+      type: string
+      description: request target of the proxied request
+      ecs: url.path
+      status: partial
+      notes: >
+        the integration parks this at citrix_adc.log.request.path; Citrix
+        StoreFront and clientless-VPN URLs embed kilobyte-scale base64
+        segments, so cap the length and treat CONNECT authorities as not a
+        path before promoting it to url.path
+    - vendor: Total_bytes_send
+      type: long
+      description: bytes the appliance sent on this connection
+      ecs: source.bytes
+      status: partial
+      notes: appliance-relative direction, same caveat as the session dataset
+    - vendor: Total_bytes_recv
+      type: long
+      description: bytes the appliance received on this connection
+      ecs: destination.bytes
+      status: partial
+      notes: appliance-relative direction, same caveat as the session dataset
+    - vendor: Start_time
+      type: timestamp
+      description: time the connection or flow opened
+      ecs: event.start
+      status: partial
+      transform: >-
+        MM/DD/YYYY:HH:MM:SS with an optional zone token; TCP CONN_TERMINATE
+        spells the same field "Start Time" with a space, so both spellings
+        must be handled
+    - vendor: End_time
+      type: timestamp
+      description: time the connection or flow closed
+      ecs: event.end
+      status: partial
+      transform: >-
+        same dual spelling ("End_time" on SSLVPN records, "End Time" on TCP
+        records) and the same per-appliance timezone caveat
+    - vendor: Duration
+      type: string
+      description: elapsed connection time rendered as HH:MM:SS
+      ecs: event.duration
+      status: partial
+      transform: HH:MM:SS string must be converted to nanoseconds for event.duration
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Ship the same thin envelope as the session dataset so both share one
+          schema, but make this the first route where volume shaping happens
+          low-side: suppress TCP CONN_DELINK and health-monitor connections by
+          vserver before forwarding rather than trimming fields, and make this
+          the first dataset to drop _raw once the integration parser is
+          proven, since a connection summary carries almost no forensic value
+          beyond its parsed fields. Do NOT let any low-side normalization
+          coalesce Client_ip and Source into one address - that pair is the
+          CitrixBleed detection and must survive as two distinct fields.
+          Schema-validate before the forwarding destination with a dead-letter
+          route and Persistent Queue backpressure.
+        elastic: >
+          Parse with the citrix_adc log ingest pipeline and extend
+          logs-citrix_adc.log@custom to derive event.action from the
+          MESSAGETYPE token, translate the Access verdict into event.outcome,
+          and split the composite "ip:port" Source, Destination and Vserver
+          values into separate address and port fields rather than leaving
+          them as strings. Add a runtime or ingest-time boolean comparing
+          client.ip to source.ip on TCPCONNSTAT so the CVE-2023-4966 mismatch
+          is a filterable field instead of a per-query scripted comparison,
+          and map citrix_adc.log.session_id as keyword so the same query can
+          pivot into the LOGIN/LOGOUT records.
+        relay: >
+          The thin envelope crosses on the low-side instances, giving the
+          content filter the same NDJSON shape as the other two datasets. The
+          friction on this route is volume rather than content: at
+          per-connection cardinality the guard is the throughput bottleneck,
+          so the low-side suppression above has to happen before the guard
+          destination, not after. The HTTPREQUEST request path is the one
+          unbounded field - StoreFront and clientless-VPN URLs carry
+          kilobyte-scale base64 segments and percent-encoded bytes - so cap
+          and normalize it low-side before content inspection sees it.
+          At-most-once crossing; reconcile counts per (dataset, hour).
+      direct:
+        parse_location: high
+        cribl: >
+          Forward the same syslog feed as the session dataset so both share
+          one route. With no boundary the shaping is purely about cost:
+          suppress TCP CONN_DELINK and health-monitor connections by vserver
+          before forwarding, and drop _raw once the integration parser is
+          proven, since a connection summary carries almost no forensic value
+          beyond its parsed fields. Do NOT let any normalization coalesce
+          Client_ip and Source into one address - that pair is the CitrixBleed
+          detection and must survive as two distinct fields.
+        elastic: >
+          Parse with the citrix_adc log ingest pipeline and extend
+          logs-citrix_adc.log@custom to derive event.action from the
+          MESSAGETYPE token, translate the Access verdict into event.outcome,
+          and split the composite "ip:port" Source, Destination and Vserver
+          values into separate address and port fields rather than leaving
+          them as strings. Add a runtime or ingest-time boolean comparing
+          client.ip to source.ip on TCPCONNSTAT so the CVE-2023-4966 mismatch
+          is a filterable field instead of a per-query scripted comparison,
+          and map citrix_adc.log.session_id as keyword so the same query can
+          pivot into the LOGIN/LOGOUT records.
+  - format: netflow
+    enable: >
+      Enable AppFlow and export IPFIX where the HTTP/TCP traffic is handled.
+      `enable ns feature appflow`; `add appflow collector <name> -IPAddress
+      <collector> -port 4739 -Transport ipfix`; `add appflow action <name>
+      -collectors <name>`; `add appflow policy <name> -rule true -action
+      <name>`; bind it to the load-balancing/content-switching/VPN vserver
+      carrying the traffic (`bind lb vserver <vs> -policyName <policy>
+      -priority <n>`) or `bind appflow global <policy> <priority>`. The
+      application-layer fields are OFF by default, so turn on what the
+      transaction record needs: `set appflow param -httpUrl ENABLED
+      -httpMethod ENABLED -httpHost ENABLED -httpUserAgent ENABLED
+      -httpReferer ENABLED -httpContentType ENABLED -httpXForwardedFor ENABLED
+      -httpQueryWithUrl ENABLED -AAAUserName ENABLED` (an un-tuned collector
+      otherwise receives only the flow tuple). Leave -httpCookie /
+      -httpAuthorization DISABLED unless the credential-bearing headers are
+      genuinely required downstream.
+    references:
+    - >-
+      https://docs.netscaler.com/en-us/citrix-adc/current-release/ns-ag-appflow-intro-wrapper-con.html
+    - >-
+      https://docs.netscaler.com/en-us/citrix-adc/current-release/ns-ag-appflow-intro-wrapper-con/ns-ag-appflow-config-tsk.html
+    - >-
+      https://developer-docs.netscaler.com/en-us/adc-command-reference-int/current-release/appflow/appflow-param.html
+    - >-
+      https://github.com/splunk/ipfix/blob/master/app/Splunk_TA_IPFIX/bin/IPFIX/information-elements/netscaler.iespec
+    parsing:
+      mechanism: elastic-integration
+      artifact: Elastic NetFlow Records integration (netflow), data stream logs-netflow.log
+      notes: >
+        Binary NetFlow v10 over UDP: an Elastic Agent netflow input or a flow
+        collector must terminate the stream (the syslog citrix_adc integration
+        cannot read it, and Cribl has no native IPFIX decoder). The standard
+        socket/timing IEs decode to netflow.* automatically; the Citrix 5951/*
+        HTTP IEs arrive as raw template fields and need a
+        logs-netflow.log@custom pipeline to reach the
+        http.*/url.*/user_agent.* ECS trees. Because the HTTP header fields
+        must be explicitly enabled on the appliance, the template a collector
+        receives depends on the appflow param settings, so the custom pipeline
+        must tolerate a missing IE rather than assume the full set.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Decode AppFlow to structured records LOW-SIDE (Elastic Agent netflow
+          input or a collector in the low enclave) before the crossing, since
+          a CDS filter cannot inspect binary IPFIX. This is the highest-volume
+          form on the technology, so make it the route where volume shaping
+          happens: sample or suppress health-monitor and low-value
+          transactions by vserver before the guard destination rather than
+          trimming fields. Do NOT coalesce the connection Source with
+          netscalerHttpReqXForwardedFor or the AAA identity - the
+          per-connection source versus session client distinction is the
+          CitrixBleed-style detection surface and must survive. Length-cap
+          netscalerHttpReqUrl (StoreFront/clientless URLs carry kilobyte
+          base64 segments) low-side.
+        elastic: >
+          Run the netflow integration and extend logs-netflow.log@custom to
+          map the Citrix HTTP IEs: netscalerHttpReqMethod to
+          http.request.method, netscalerHttpReqHost to url.domain,
+          netscalerHttpReqUrl to url.original split into url.path/url.query,
+          netscalerHttpRspStatus to http.response.status_code,
+          netscalerHttpRspLen to http.response.bytes, and copy
+          netscalerHttpReqUserAgent to user_agent.original and run the
+          user_agent processor. Convert protocolIdentifier to
+          network.transport by lookup, derive event.start/event.end from
+          flowStart/flowEndMicro- seconds, and map netscalerConnectionId /
+          netscalerTransactionId to keyword join keys so a transaction can
+          pivot into the session records.
+        relay: >
+          Cross decoded NDJSON, never raw IPFIX - un-inspectable at the guard
+          and template-dependent. The unbounded content is the request URL,
+          the user-agent, and (if enabled) the cookie and authorization
+          headers; length-cap and normalise the URL and user-agent low-side
+          and drop the cookie/authorization IEs before the guard unless a
+          specific detection needs them. Persistent Queue plus a dead-letter
+          route, and per-hour count reconciliation across the boundary given
+          the at-most-once crossing.
+      direct:
+        parse_location: high
+        cribl: >
+          For a high-side ADC with no guard, terminate IPFIX at an Elastic
+          Agent netflow input directly and forward the decoded records to
+          Cribl for routing only. Choose AppFlow or the audit-syslog access
+          feed as the authoritative per-transaction source per appliance to
+          avoid counting each request twice.
+        elastic: >
+          Run the netflow integration and extend logs-netflow.log@custom to
+          map the Citrix HTTP IEs - netscalerHttpReqMethod to
+          http.request.method, netscalerHttpReqHost to url.domain,
+          netscalerHttpReqUrl to url.original split into url.path/url.query,
+          netscalerHttpRspStatus to http.response.status_code - copy
+          netscalerHttpReqUserAgent to user_agent.original and run the
+          user_agent processor, and map netscalerConnectionId /
+          netscalerTransactionId to keyword join keys. With no boundary, treat
+          AppFlow as the higher-fidelity access feed: the
+          transaction/connection join keys, round-trip time, server
+          time-to-first-byte and the complete header set it adds over the
+          HTTPREQUEST syslog are exactly the fields a performance or hijack
+          investigation needs, accepting the cost of running the netflow
+          collector and the enterprise-IE custom pipeline.
+    fields:
+    - vendor: sourceIPv4Address
+      type: ip
+      description: IPFIX IE 8 - source address of the individual connection.
+      ecs: source.ip
+      status: mapped
+    - vendor: destinationIPv4Address
+      type: ip
+      description: IPFIX IE 12 - destination address the connection was proxied to.
+      ecs: destination.ip
+      status: mapped
+    - vendor: sourceTransportPort
+      type: port
+      description: IPFIX IE 7 - source transport port.
+      ecs: source.port
+      status: mapped
+    - vendor: destinationTransportPort
+      type: port
+      description: IPFIX IE 11 - destination transport port.
+      ecs: destination.port
+      status: mapped
+    - vendor: protocolIdentifier
+      type: integer
+      description: IPFIX IE 4 - IP protocol number of the flow.
+      ecs: network.iana_number
+      status: partial
+      transform: >-
+        numeric protocol; derive network.transport (tcp/udp) by lookup rather
+        than leaving transport blank.
+    - vendor: octetDeltaCount
+      type: long
+      description: IPFIX IE 1 - bytes counted for the flow.
+      ecs: network.bytes
+      status: partial
+      notes: >-
+        a single flow total, not split sent versus received;
+        source.bytes/destination.bytes stay empty on the IPFIX form unless the
+        directional Citrix IEs are also enabled.
+    - vendor: packetDeltaCount
+      type: long
+      description: IPFIX IE 2 - packets counted for the flow.
+      ecs: network.packets
+      status: partial
+      notes: single flow total, same directional caveat as octetDeltaCount.
+    - vendor: tcpControlBits
+      type: integer
+      description: IPFIX IE 6 - TCP flags observed on the flow.
+      ecs: null
+      status: unmapped
+      custom: citrix_adc.appflow.tcp_flags
+      notes: no ECS TCP-flags field; kept custom for connection-teardown analysis.
+    - vendor: netscalerHttpReqUrl
+      type: string
+      description: AppFlow enterprise IE 5951/130 - request URL the ADC received from the client.
+      ecs: url.original
+      status: partial
+      transform: >
+        the request target, which includes the query string when
+        -httpQueryWithUrl is ENABLED; split into url.path and url.query and
+        cap the length, since StoreFront and clientless-VPN URLs embed
+        kilobyte-scale base64 segments.
+    - vendor: netscalerHttpReqMethod
+      type: string
+      description: AppFlow enterprise IE 5951/141 - HTTP method of the request.
+      ecs: http.request.method
+      status: mapped
+    - vendor: netscalerHttpReqHost
+      type: string
+      description: AppFlow enterprise IE 5951/142 - Host header of the request.
+      ecs: url.domain
+      status: mapped
+    - vendor: netscalerHttpDomainName
+      type: string
+      description: AppFlow enterprise IE 5951/267 - HTTP domain associated with the request.
+      ecs: null
+      status: unmapped
+      custom: citrix_adc.appflow.domain_name
+      notes: >-
+        frequently duplicates netscalerHttpReqHost; kept off url.domain so the
+        two do not collide into an array, mirroring the syslog domain_name
+        handling.
+    - vendor: netscalerHttpReqUserAgent
+      type: string
+      description: AppFlow enterprise IE 5951/143 - User-Agent of the client application.
+      ecs: user_agent.original
+      status: mapped
+      notes: >-
+        copy to user_agent.original and run the user_agent processor to
+        populate the parsed user_agent.* subfields, the single cheapest ECS
+        win on this form.
+    - vendor: netscalerHttpReqReferer
+      type: string
+      description: AppFlow enterprise IE 5951/140 - Referer header (last page visited).
+      ecs: http.request.referrer
+      status: mapped
+    - vendor: netscalerHttpReqCookie
+      type: string
+      description: >-
+        AppFlow enterprise IE 5951/131 - Cookie header from the request
+        (exported only when -httpCookie is enabled).
+      ecs: null
+      status: unmapped
+      custom: citrix_adc.appflow.http_req_cookie
+      notes: >
+        session-token bearing; disabled by default and should stay disabled
+        unless a detection needs it, and masked/dropped before any crossing.
+        No safe ECS home (http.request headers are not modelled as a keyword).
+    - vendor: netscalerHttpReqAuthorization
+      type: string
+      description: AppFlow enterprise IE 5951/185 - HTTP Authorization header.
+      ecs: null
+      status: unmapped
+      custom: citrix_adc.appflow.http_req_authorization
+      notes: >-
+        credential-bearing free text; keep disabled or mask before the value
+        leaves the enclave, exactly as the management-audit Command field is
+        masked.
+    - vendor: netscalerHttpContentType
+      type: string
+      description: >-
+        AppFlow enterprise IE 5951/183 - Content-Type header returned from the
+        server to the client.
+      ecs: http.response.mime_type
+      status: partial
+      notes: >-
+        server-to-client media type; on requests with no response body it is
+        absent, so leave http.response.mime_type unset rather than defaulting
+        it.
+    - vendor: netscalerHttpRspStatus
+      type: integer
+      description: AppFlow enterprise IE 5951/144 - HTTP response status code.
+      ecs: http.response.status_code
+      status: mapped
+    - vendor: netscalerHttpRspLen
+      type: long
+      description: AppFlow enterprise IE 5951/145 - length in bytes of the HTTP response.
+      ecs: http.response.bytes
+      status: mapped
+    - vendor: netscalerHttpReqXForwardedFor
+      type: string
+      description: >-
+        AppFlow enterprise IE 5951/190 - X-Forwarded-For header (original
+        client behind a proxy).
+      ecs: network.forwarded_ip
+      status: partial
+      transform: >
+        may carry a comma-separated proxy chain rather than a single address;
+        take the left-most client address for network.forwarded_ip and keep it
+        distinct from the connection sourceIPv4Address.
+    - vendor: netscalerHttpReqVia
+      type: string
+      description: >-
+        AppFlow enterprise IE 5951/186 - Via header (proxy the client accessed
+        the server through).
+      ecs: null
+      status: unmapped
+      custom: citrix_adc.appflow.http_req_via
+    - vendor: netscalerConnectionId
+      type: integer
+      description: >-
+        AppFlow enterprise IE 5951/133 - identifier of the connection the
+        transaction belongs to.
+      ecs: null
+      status: unmapped
+      custom: citrix_adc.appflow.connection_id
+      notes: >-
+        keep as a keyword; with netscalerTransactionId it joins the request
+        records to their connection and to the session records, the AppFlow
+        equivalent of the syslog SessionId join.
+    - vendor: netscalerTransactionId
+      type: integer
+      description: AppFlow enterprise IE 5951/129 - identifier of the individual HTTP transaction.
+      ecs: null
+      status: unmapped
+      custom: citrix_adc.appflow.transaction_id
+      notes: >-
+        the per-request join key; unique within an ADC, so deduplication/join
+        must key on (observer, transaction_id).
+    - vendor: netscalerConnectionChainID
+      type: string
+      description: >-
+        AppFlow enterprise IE 5951/192 - connection-chain identifier
+        correlating a transaction across multiple ADC hops (octetArray).
+      ecs: null
+      status: unmapped
+      custom: citrix_adc.appflow.connection_chain_id
+      notes: >-
+        correlates the same request across a multi-tier ADC deployment; no ECS
+        equivalent, kept as a keyword.
+    - vendor: netscalerAaaUsername
+      type: string
+      description: >-
+        AppFlow enterprise IE 5951/205 - AAA account owning the session the
+        transaction belongs to.
+      ecs: user.name
+      status: partial
+      transform: >-
+        same user@domain / UPN split as the gateway-session and syslog
+        datasets, applied consistently so the identity correlates across
+        feeds.
+    - vendor: netscalerRoundTripTime
+      type: integer
+      description: AppFlow enterprise IE 5951/128 - round-trip time measured for the flow (ms).
+      ecs: null
+      status: unmapped
+      custom: citrix_adc.appflow.round_trip_time
+      notes: >-
+        an AppFlow-only performance metric the syslog never prints; no ECS RTT
+        field, kept custom.
+    - vendor: netscalerServerTTFB
+      type: long
+      description: AppFlow enterprise IE 5951/146 - server time-to-first-byte for the transaction.
+      ecs: null
+      status: unmapped
+      custom: citrix_adc.appflow.server_ttfb
+    - vendor: netscalerAppName
+      type: string
+      description: >-
+        AppFlow enterprise IE 5951/152 - AppExpert application /
+        virtual-server name the transaction was served by.
+      ecs: null
+      status: unmapped
+      custom: citrix_adc.appflow.app_name
+      notes: >-
+        the NetScaler application/vserver label, not an App-ID protocol name,
+        so network.application is not a safe target; kept custom for
+        per-application aggregation.
+    - vendor: flowStartMicroseconds
+      type: timestamp
+      description: IPFIX IE 154 - time the connection opened, microsecond precision.
+      ecs: event.start
+      status: mapped
+    - vendor: flowEndMicroseconds
+      type: timestamp
+      description: IPFIX IE 155 - time the connection closed, microsecond precision.
+      ecs: event.end
+      status: mapped
+      notes: >-
+        event.duration is the flowEnd minus flowStart delta, no HH:MM:SS
+        Duration string parse as on the syslog form.
+  - format: json
+    enable: >
+      Instrument AppFlow as for the IPFIX entry, but ship over the NetScaler-
+      native logstream transport to the NetScaler Observability Exporter: `add
+      appflow collector <name> -IPAddress <nsoe-ip> -port 5557 -Transport
+      logstream` and `set appflow param -logstreamOverNSIP ENABLED`, then bind
+      the AppFlow policy to the vserver as before. Deploy NSOE (container)
+      with an Elasticsearch endpoint configured in lstreamd_default.conf; NSOE
+      converts each transaction to JSON and indexes regular transactions into
+      http_event and anomalies into http_error, one document per HTTP
+      transaction. NetScaler 14.1 can also post the transaction JSON to
+      Elasticsearch directly (Export transaction logs directly to
+      Elasticsearch) without the NSOE container.
+    references:
+    - https://docs.netscaler.com/en-us/netscaler-observability-exporter/overview.html
+    - >-
+      https://docs.netscaler.com/en-us/netscaler-observability-exporter/field-descriptions.html
+    - >-
+      https://docs.netscaler.com/en-us/netscaler-observability-exporter/deploy-coe-with-es.html
+    - >-
+      https://docs.netscaler.com/en-us/citrix-adc/current-release/observability/transaction-logs-elasticsearch-export.html
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom NetScaler AppFlow JSON (http_event) reparse pipeline
+      notes: >
+        The JSON http_event document is already structured, so no binary
+        decoder is needed - Cribl parses it directly and a custom pipeline
+        maps the keys to ECS. There is no stock Elastic integration for the
+        NSOE/observability JSON (the citrix_adc integration is syslog-only),
+        so the reparse is custom. The JSON key set mirrors the IPFIX
+        enterprise IE inventory with the netscaler* prefix removed
+        (httpReqUrl, httpReqMethod, httpReqHost, ...); newer NSOE builds
+        render IP addresses, timestamps and some SSL flags as strings rather
+        than raw numerics, so the pipeline must coerce types explicitly.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          This is the one alternate that crosses cleanly: build full
+          ECS-shaped JSON LOW-SIDE from the http_event document, since it is
+          already structured NDJSON that a content filter can inspect. Map the
+          keys to ECS at the source, drop observationPointId/nsPartitionId/
+          exportingProcessId to internal customs, and cap httpReqUrl and
+          httpReqUserAgent lengths. Point NSOE (or the direct-to-Elasticsearch
+          exporter) at a low-side Cribl HTTP source, schema-validate with
+          C.Schema(...) before the forwarding destination with a dead-letter
+          route, and use Persistent Queue backpressure.
+        elastic: >
+          With records arriving pre-shaped, keep high-side work to a custom
+          pipeline that fills what the low side cannot: run the user_agent
+          processor on the copied user_agent.original, split httpReqUrl into
+          url.path/url.query, and map transactionId to a keyword join key so
+          the JSON feed correlates with the IPFIX and syslog forms. Map
+          appName and the observability identifiers as keyword in the index
+          template rather than leaving them to dynamic mapping.
+        relay: >
+          Redacted ECS-shaped NDJSON crosses; the JSON shape is the
+          friendliest content-filter surface on the technology because it is
+          already one document per transaction with short ASCII keys. Hold it
+          to two levels of nesting, cap the URL and user-agent strings, and
+          drop the cookie/ authorization values entirely low-side.
+          At-most-once crossing; reconcile per-(dataset, hour) counts against
+          the IPFIX or syslog form of the same traffic.
+      direct:
+        parse_location: high
+        cribl: >
+          For a high-side ADC, point NSOE or the direct exporter straight at
+          the Elasticsearch stack (or a Cribl HTTP source for routing). The
+          JSON path needs no flow collector, so it is the lowest-friction
+          AppFlow form high-side; pick it or the IPFIX form as the single
+          authoritative transaction feed per appliance to avoid
+          double-counting.
+        elastic: >
+          Run the custom JSON reparse pipeline that maps the http_event keys
+          to ECS: run the user_agent processor on the copied
+          user_agent.original, split httpReqUrl into url.path/url.query, and
+          map transactionId to a keyword join key. With no boundary, retain
+          the full URL/user-agent values and treat the http_error index as the
+          anomaly signal - NSOE routes transactions it flags as anomalous
+          there, which is a cheap first-pass filter for investigation.
+    fields:
+    - vendor: httpReqUrl
+      type: string
+      description: >-
+        NSOE JSON http_event - request URL the ADC received from the client
+        (IPFIX netscalerHttpReqUrl with the prefix dropped).
+      ecs: url.original
+      status: partial
+      transform: split into url.path/url.query and cap the length, as on the IPFIX form.
+    - vendor: httpReqMethod
+      type: string
+      description: NSOE JSON http_event - HTTP request method.
+      ecs: http.request.method
+      status: mapped
+    - vendor: httpReqHost
+      type: string
+      description: NSOE JSON http_event - Host header of the request.
+      ecs: url.domain
+      status: mapped
+    - vendor: httpReqUserAgent
+      type: string
+      description: NSOE JSON http_event - client User-Agent.
+      ecs: user_agent.original
+      status: mapped
+      notes: run the user_agent processor after copying to user_agent.original.
+    - vendor: httpContentType
+      type: string
+      description: NSOE JSON http_event - Content-Type returned from the server.
+      ecs: http.response.mime_type
+      status: partial
+      notes: >-
+        absent on responses with no body; leave http.response.mime_type unset
+        rather than defaulting it.
+    - vendor: httpRspStatus
+      type: integer
+      description: NSOE JSON http_event - HTTP response status code.
+      ecs: http.response.status_code
+      status: mapped
+    - vendor: transactionId
+      type: integer
+      description: >-
+        NSOE JSON http_event - identifier of the HTTP transaction (IPFIX
+        netscalerTransactionId).
+      ecs: null
+      status: unmapped
+      custom: citrix_adc.appflow.transaction_id
+      notes: >-
+        the join key; map as keyword so the JSON feed pivots into the IPFIX
+        and syslog records for the same transaction.
+    - vendor: appName
+      type: string
+      description: >-
+        NSOE JSON http_event - AppExpert application / virtual-server name
+        serving the transaction.
+      ecs: null
+      status: unmapped
+      custom: citrix_adc.appflow.app_name
+      notes: >-
+        NetScaler application/vserver label, not an App-ID protocol; kept
+        custom as on the IPFIX form.
+    - vendor: clientConnStartTimestamp
+      type: timestamp
+      description: NSOE JSON http_event - time the client connection started.
+      ecs: event.start
+      status: partial
+      transform: >-
+        newer NSOE builds render this as a string rather than an epoch
+        numeric, so parse it explicitly before writing event.start.
+    - vendor: observationPointId
+      type: integer
+      description: NSOE JSON http_event - identifier of the exporting ADC observation point.
+      ecs: null
+      status: unmapped
+      custom: citrix_adc.appflow.observation_point_id
+      notes: >-
+        identifies the ADC/partition that produced the record; combined with
+        the ADC UUID it is how http_event documents are attributed to an
+        appliance.
+    - vendor: nsPartitionId
+      type: integer
+      description: NSOE JSON http_event - admin-partition id on the exporting ADC.
+      ecs: null
+      status: unmapped
+      custom: citrix_adc.appflow.partition_id
+    - vendor: exportingProcessId
+      type: integer
+      description: NSOE JSON http_event - id of the exporting process on the ADC.
+      ecs: null
+      status: unmapped
+      custom: citrix_adc.appflow.exporting_process_id
+- id: management-audit
+  name: Management audit (CLI / GUI / API)
+  description: >
+    Administrative audit records for the appliance itself - CMD_EXECUTED
+    messages emitted under the CLI, GUI, SSHD and API feature tokens when an
+    administrator runs a command through the shell, the configuration UI, or
+    NITRO - plus the syslog header fields shared by every ADC message. Low
+    volume, individually significant, and the dataset most likely to carry
+    credentials in its payload, since NetScaler configuration commands take
+    passwords and key material as inline arguments.
+  event_categories:
+  - configuration
+  - authentication
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: same audit-syslogAction feed.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-citrix_adc.log
+      notes: shares the single citrix_adc.log data stream with the other two datasets
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: same audit-syslogAction feed.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-citrix_adc.log
+      notes: shares the single citrix_adc.log data stream with the other two datasets
+  formats:
+  - format: syslog-kv
+    parsing:
+      mechanism: elastic-integration
+      artifact: Citrix ADC integration (citrix_adc), log data stream
+      notes: >
+        The integration parses CMD_EXECUTED into citrix_adc.log.command /
+        .adm_user / .remote_ip / .status and maps the command string to
+        process.command_line, the Status verdict to event.outcome and the
+        message-id token to event.id.
+    fields:
+    - vendor: User
+      type: string
+      description: administrator account that executed the command
+      ecs: user.name
+      status: mapped
+    - vendor: ADM_User
+      type: string
+      description: NetScaler ADM/Console account when the command was proxied through ADM
+      ecs: null
+      status: unmapped
+      custom: citrix_adc.log.adm_user
+      notes: >
+        distinguishes a command issued through NetScaler ADM from one typed
+        directly at the appliance; the literal string "NONE" is a placeholder,
+        not a username, and must not be promoted into user.name or
+        related.user
+    - vendor: Remote_ip
+      type: ip
+      description: address of the client the administrator connected from
+      ecs: source.ip
+      status: mapped
+      notes: >-
+        blank on commands originating on the appliance console rather than
+        over the network
+    - vendor: Command
+      type: string
+      description: the configuration or show command string that was executed
+      ecs: process.command_line
+      status: mapped
+      transform: >
+        quoted value; mask the argument of password, passcrypt, key,
+        passphrase and shared-secret parameters before the value leaves the
+        enclave, since NetScaler takes these inline on the command line
+    - vendor: Status
+      type: enum
+      description: result of the command execution (Success, Failure, or an error string)
+      ecs: event.outcome
+      status: partial
+      transform: >
+        Success maps to success and Failure to failure, but the field also
+        carries free-text error strings for rejected commands; those need an
+        explicit unknown-outcome branch or failed administrative changes are
+        undercounted
+    - vendor: MESSAGETYPE (CMD_EXECUTED)
+      type: enum
+      description: message-type token in the syslog header naming the audit event
+      ecs: event.action
+      status: partial
+      transform: >-
+        lowercase the header token into event.action; the stock integration
+        stores it only at citrix.name
+    - vendor: FEATURE (CLI / GUI / API / SSHD)
+      type: enum
+      description: administrative interface the command arrived through
+      ecs: null
+      status: unmapped
+      custom: citrix.device_event_class_id
+      notes: >
+        ECS models no "administrative access channel"; event.provider was
+        considered and rejected because it identifies the producer of the
+        event rather than the interface the human used. The distinction
+        matters - API commands from an unexpected source address are a
+        different signal from GUI commands
+    - vendor: message id (header)
+      type: long
+      description: numeric message sequence number emitted after the message type
+      ecs: event.id
+      status: partial
+      notes: >
+        monotonically increasing PER PACKET ENGINE, not globally unique - two
+        PPE cores on the same appliance reuse the same numbers - so any
+        deduplication or event-id join must key on (observer.hostname,
+        citrix.ppe_id, event.id)
+    - vendor: PPE-N (header)
+      type: string
+      description: packet processing engine core that emitted the record
+      ecs: null
+      status: unmapped
+      custom: citrix.ppe_id
+      notes: >-
+        needed to disambiguate event.id and to spot a single misbehaving core
+        in an HA pair
+    - vendor: <PRI> (syslog header)
+      type: integer
+      description: syslog priority value encoding facility and severity
+      ecs: event.severity
+      status: partial
+      transform: >
+        decode PRI into facility and severity, then map the syslog severity to
+        the ECS numeric scale explicitly - syslog ordering is inverted (0 =
+        EMERGENCY, 7 = DEBUG) relative to how ECS event.severity is normally
+        read, so copying the raw number makes threshold alerts fire backwards
+    - vendor: hostname (syslog header)
+      type: string
+      description: appliance host token identifying the ADC that logged the command
+      ecs: observer.hostname
+      status: mapped
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Break from the envelope approach on this route and build full
+          ECS-shaped JSON low-side, because the Command string routinely
+          contains cleartext secrets ("set system user ... -password", "add
+          ssl certKey ... -passcrypt", NITRO bind commands with shared keys)
+          and those must be masked inside the enclave rather than after any
+          crossing - redaction the guard cannot do is redaction that has to
+          happen first. Drop _raw entirely on this dataset once the masking
+          rules are proven, since unredacted admin commands are precisely what
+          must not leave, and resolve the "NONE" ADM_User placeholder low-side
+          so it never lands in a username field. Schema-validate with
+          C.Schema(...).validate before the forwarding destination,
+          dead-letter failures, and use Persistent Queue backpressure.
+        elastic: >
+          With records arriving pre-shaped, keep high-side work to a
+          logs-citrix_adc.log@custom pipeline that fills what the low side
+          cannot: derive event.action from the MESSAGETYPE token, and convert
+          the syslog PRI-derived severity into the ECS numeric scale
+          explicitly rather than storing the raw syslog number, whose ordering
+          is inverted relative to ECS. Map citrix.device_event_class_id,
+          citrix.ppe_id and citrix_adc.log.adm_user as keyword in the index
+          template, and note in the template that event.id is per-PPE rather
+          than globally unique, so deduplication and admin-activity dashboards
+          must key on (observer.hostname, citrix.ppe_id, event.id).
+        relay: >
+          Redacted, full ECS-shaped NDJSON crosses on the low-side instances -
+          the boundary must never see an unmasked NetScaler configuration
+          command, which is the least bounded and highest-risk content on this
+          technology. Hold the JSON to two levels of nesting with short ASCII
+          keys, no duplicate keys and bounded string lengths so a custom
+          NDJSON content filter can stay simple, and cap the quoted Command
+          string explicitly rather than relying on the guard's own length
+          policy. Crossing is at-most-once with no acknowledgement;
+          per-(dataset, hour) count reconciliation matters more here than on
+          the other two datasets because admin events are rare and
+          individually meaningful.
+      direct:
+        parse_location: low
+        cribl: >
+          Build full ECS-shaped JSON as the records arrive and mask the
+          Command string's cleartext secrets ("set system user ... -password",
+          "add ssl certKey ... -passcrypt", NITRO bind commands with shared
+          keys) at the source, since those are appliance credentials that must
+          never land unredacted in the index. Drop _raw entirely once the
+          masking rules are proven, since unredacted admin commands are
+          precisely what must not be retained, and resolve the "NONE" ADM_User
+          placeholder so it never lands in a username field.
+        elastic: >
+          Add a logs-citrix_adc.log@custom pipeline that derives event.action
+          from the MESSAGETYPE token and converts the syslog PRI-derived
+          severity into the ECS numeric scale explicitly rather than storing
+          the raw syslog number, whose ordering is inverted relative to ECS.
+          Map citrix.device_event_class_id, citrix.ppe_id and
+          citrix_adc.log.adm_user as keyword in the index template, and note
+          in the template that event.id is per-PPE rather than globally
+          unique, so deduplication and admin-activity dashboards must key on
+          (observer.hostname, citrix.ppe_id, event.id).

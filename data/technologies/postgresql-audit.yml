@@ -1,0 +1,1376 @@
+id: postgresql-audit
+name: PostgreSQL Audit (pgaudit)
+vendor: PostgreSQL
+versions: PostgreSQL 14-18; pgAudit 1.6.x (PG14), 1.7.x (PG15), 16.x/17.x/18.x
+draft: true
+references:
+- https://github.com/pgaudit/pgaudit
+- https://access.crunchydata.com/documentation/pgaudit/1.7.0/
+- https://www.postgresql.org/docs/current/runtime-config-logging.html
+- https://www.elastic.co/docs/reference/integrations/postgresql
+- >-
+  https://github.com/elastic/integrations/tree/main/packages/postgresql/data_stream/log
+datasets:
+- id: pgaudit
+  name: pgAudit session and object audit records
+  description: >
+    pgAudit has no log channel of its own - it writes audit entries through
+    the standard PostgreSQL logging facility, so every audit record is an
+    ordinary server log line whose message body starts with "AUDIT: " followed
+    by a comma-separated tail:
+    AUDIT_TYPE,STATEMENT_ID,SUBSTATEMENT_ID,CLASS,COMMAND,OBJECT_TYPE,
+    OBJECT_NAME,STATEMENT,PARAMETER (with a ROWS column appended when
+    pgaudit.log_rows is on). The vendor is explicit that the tail is compliant
+    CSV only once the log_line_prefix portion is removed, and STATEMENT is
+    verbatim SQL that routinely contains commas, double quotes and literal
+    newlines - so an audit entry is frequently a MULTI-LINE log record. The
+    critical consequence for this map is that pgAudit itself emits NO actor,
+    host, database or timestamp: who ran the statement, against which
+    database, from where and when comes entirely from log_line_prefix. A
+    deployment whose prefix omits %u/%d produces audit records that are
+    structurally unattributable, and the vendor also warns that superusers
+    cannot be reliably audited.
+  event_categories:
+  - iam
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge Cribl worker group, database enclave
+      notes: >
+        The PostgreSQL log is collected either as a file tail off the
+        logging_collector directory or as a syslog forward when
+        log_destination includes syslog; either way the collector must do
+        multi-line reassembly before the record is parseable, and that
+        reassembly must happen here, at the edge, before the crossing.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-postgresql.pgaudit
+      notes: >
+        Deliberately a separate data stream from logs-postgresql.log. The
+        stock integration's grok terminates at the message field, so AUDIT
+        records landing in the integration's data stream would be message-only
+        documents sharing a mapping with parsed server-log events.
+    direct:
+    - hop: cribl
+      location: edge Cribl worker group, database enclave
+      notes: >
+        The PostgreSQL log is collected either as a file tail off the
+        logging_collector directory or as a syslog forward when
+        log_destination includes syslog; either way the collector must do
+        multi-line reassembly before the record is parseable, done here at the
+        edge.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-postgresql.pgaudit
+      notes: >
+        Deliberately a separate data stream from logs-postgresql.log. The
+        stock integration's grok terminates at the message field, so AUDIT
+        records landing in the integration's data stream would be message-only
+        documents sharing a mapping with parsed server-log events.
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom pgAudit tail pipeline
+      notes: >
+        The Elastic PostgreSQL integration exists but does not know about
+        pgAudit: its log pipeline groks the log_line_prefix envelope and the
+        LEVEL token, then drops the whole "AUDIT: SESSION,..." body into
+        message unsplit. No Cribl pack covers pgAudit either, so the audit
+        tail needs a hand-built parser that is aware of the config-dependent
+        column count (log_parameter and log_rows both change it).
+    fields:
+    - vendor: AUDIT_TYPE
+      type: enum
+      description: >-
+        whether the entry came from session audit logging or object audit
+        logging - SESSION or OBJECT
+      ecs: null
+      status: unmapped
+      custom: postgresql.pgaudit.audit_type
+      notes: >
+        the discriminator column. OBJECT entries exist only for SELECT,
+        INSERT, UPDATE and DELETE against relations the pgaudit.role has
+        grants on (TRUNCATE is excluded), so the two types are different
+        populations and a rule written against one will not fire on the other
+    - vendor: STATEMENT_ID
+      type: long
+      description: unique statement id for this session, one per backend call
+      ecs: event.sequence
+      status: partial
+      notes: >
+        sequential within a session only, so it is unique solely when paired
+        with the session id from %c; one statement id yields several entries
+        when pgaudit.log_relation is on or when a CREATE TABLE implicitly
+        creates an index
+    - vendor: SUBSTATEMENT_ID
+      type: long
+      description: sequential id of each sub-statement within the main statement
+      ecs: null
+      status: unmapped
+      custom: postgresql.pgaudit.substatement_id
+      notes: >
+        increments for nested execution such as a function called from a
+        query; the (STATEMENT_ID, SUBSTATEMENT_ID) pair plus the session id is
+        the join key back to the statement text when
+        pgaudit.log_statement_once suppressed it on later entries
+    - vendor: CLASS
+      type: enum
+      description: statement class - READ, WRITE, FUNCTION, ROLE, DDL, MISC or MISC_SET
+      ecs: event.type
+      status: partial
+      transform: >
+        READ maps to access and WRITE to change; DDL maps to change and should
+        be refined to creation or deletion from COMMAND; ROLE maps to admin
+        plus user or group; FUNCTION, MISC and MISC_SET have no faithful ECS
+        equivalent and fall back to info
+      notes: >
+        the ECS enum collapses distinctions the auditor cares about, so the
+        raw class must also be retained as postgresql.pgaudit.class rather
+        than being consumed by the mapping
+    - vendor: COMMAND
+      type: string
+      description: the SQL command tag of the audited statement, e.g. SELECT, CREATE TABLE, GRANT
+      ecs: event.action
+      status: mapped
+      transform: >
+        arrives upper-case with spaces ("CREATE TABLE"); normalise to the ECS
+        lower-case underscore convention (create_table) so it joins actions
+        from other technologies on this map
+    - vendor: OBJECT_TYPE
+      type: enum
+      description: >-
+        type of the object the statement touched - TABLE, INDEX, VIEW,
+        MATERIALIZED VIEW, FUNCTION, etc.
+      ecs: null
+      status: unmapped
+      custom: postgresql.pgaudit.object_type
+      notes: >
+        populated for SELECT, DML and most DDL only; empty for DO blocks, MISC
+        commands and relation-less SELECTs, so an empty value is normal rather
+        than a parse failure
+    - vendor: OBJECT_NAME
+      type: string
+      description: fully-qualified name of the object affected, e.g. public.account
+      ecs: null
+      status: unmapped
+      custom: postgresql.pgaudit.object_name
+      notes: >
+        ECS 9.4 models no database, schema or relation, so the single
+        highest-value pivot for data-access alerting has no standard home and
+        stays custom. Renames are logged under the NEW name, so a rename
+        breaks name-based rule continuity silently
+    - vendor: STATEMENT
+      type: string
+      description: verbatim text of the statement executed on the backend
+      ecs: null
+      status: unmapped
+      custom: postgresql.pgaudit.statement
+      notes: >
+        unbounded free text containing commas, double quotes and literal
+        newlines - the reason audit records are multi-line and the tail is not
+        parseable as CSV until the prefix is stripped. Reads "<not logged>"
+        when pgaudit.log_statement is off, and is present only on the first
+        entry of a statement when pgaudit.log_statement_once is on
+    - vendor: PARAMETER
+      type: string
+      description: statement parameters as quoted CSV, or <none> when there are none
+      ecs: null
+      status: unmapped
+      custom: postgresql.pgaudit.parameter
+      notes: >
+        carries literal bind values, making it the most likely field on this
+        map to exfiltrate credentials or PII; mask or drop before forwarding.
+        Reads "<not logged>" when pgaudit.log_parameter is off and "<long
+        param suppressed>" for values above pgaudit.log_parameter_max_size
+    - vendor: ROWS
+      type: long
+      description: >-
+        number of rows retrieved or affected by the statement, present only
+        when pgaudit.log_rows is on
+      ecs: null
+      status: unmapped
+      custom: postgresql.pgaudit.rows
+      notes: >
+        appended AFTER the parameter column, so the audit tail's column count
+        is configuration-dependent and a positional parser must know the
+        emitting instance's log_rows and log_parameter settings
+    - vendor: '%m (log_line_prefix)'
+      type: timestamp
+      description: >-
+        statement timestamp with milliseconds, supplied by the log line prefix
+        rather than by pgAudit
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        renders as "2026-07-29 14:03:11.812 UTC"; the zone token is present
+        only when log_timezone is reflected in the prefix, so the collector
+        must attach the database host's zone when it is absent
+    - vendor: '%u (log_line_prefix)'
+      type: string
+      description: database role name that executed the statement
+      ecs: user.name
+      status: mapped
+      notes: >
+        the audited principal is a database role, not an OS or directory
+        identity; where an application tier shares one role this value
+        identifies the app, not the human, and pgAudit cannot reliably audit
+        superusers at all
+    - vendor: '%d (log_line_prefix)'
+      type: string
+      description: name of the database the session is connected to
+      ecs: null
+      status: unmapped
+      custom: postgresql.log.database
+      notes: >
+        ECS has no database-name field; the custom name matches the Elastic
+        PostgreSQL integration's own postgresql.log.database so both datasets
+        stay queryable with one field
+    - vendor: '%p (log_line_prefix)'
+      type: integer
+      description: process id of the backend serving the session
+      ecs: process.pid
+      status: mapped
+      notes: >-
+        recycled by the OS, so it identifies a session only in combination
+        with the session start time carried in %c
+    - vendor: '%c (log_line_prefix)'
+      type: string
+      description: session identifier - two hex values giving backend start time and process id
+      ecs: null
+      status: unmapped
+      custom: postgresql.log.session_id
+      notes: >
+        ECS 9.4 has no session.id field, so the only stable key joining audit
+        records to the connection and disconnection events in the server-log
+        dataset stays custom; map it as keyword, never long
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Do the two things that are only possible near the source: multi-line
+          reassembly of records whose STATEMENT contains literal newlines, and
+          a config-aware split of the audit tail, because log_parameter and
+          log_rows change the trailing column count and only the collector
+          knows the emitting instance's settings. Strip the log_line_prefix
+          before applying a real CSV parse to the remainder, and carry the
+          prefix-derived user, database, pid and session id forward explicitly
+          so the record stays attributable. Cap and truncation-flag STATEMENT
+          at an agreed byte length and mask credential and PII patterns in
+          PARAMETER before anything leaves the enclave, then gate the egress
+          destination with C.Schema(...).validate plus a dead-letter route,
+          running the destination on Persistent Queue backpressure, never
+          Block - pgAudit is documented as best-effort and non-transactional,
+          so a dropped record is unrecoverable at the source too.
+        elastic: >
+          Own a custom logs-postgresql.pgaudit ingest pipeline; there is no
+          integration behaviour to inherit for these records. It should derive
+          event.type from CLASS through an explicit lookup while keeping the
+          raw class, refine event.type further from COMMAND so that CREATE and
+          DROP become creation and deletion rather than a flat change, and
+          lowercase COMMAND into event.action. Add explicit index-template
+          mappings for the postgresql.pgaudit namespace: audit_type, class,
+          object_type and object_name as keyword (object_name is the main
+          data-access alerting pivot), substatement_id and rows as long, and
+          statement and parameter as wildcard or unindexed so unbounded SQL
+          text cannot blow up the inverted index. Document for the CSOC that
+          an absent OBJECT_NAME is normal, not missing data.
+        relay: >
+          Full ECS-shaped NDJSON crosses (envelope mode B) - one reassembled
+          audit record per line, UTF-8, LF-terminated, compression disabled,
+          nesting depth <=2 - because no Elastic integration can finish this
+          parse on the high side. The friction to settle with the guard owner
+          is STATEMENT and PARAMETER: unbounded, attacker-influenced free text
+          carrying arbitrary unicode, embedded newlines and quotes, which is
+          the worst possible input for a custom NDJSON content filter and must
+          be length-capped, charset-restricted and truncation-flagged
+          low-side. The feed is plain log text rather than CEF, so nothing
+          CEF-shaped crosses; with no return channel the crossing is
+          at-most-once, so reconcile low-side and high-side counts per
+          (dataset, hour) and carry _raw across until the hand-built tail
+          parser is proven, since a mis-parsed audit record cannot be
+          re-requested.
+      direct:
+        parse_location: low
+        cribl: >
+          Do the two things that are only possible near the source: multi-line
+          reassembly of records whose STATEMENT contains literal newlines, and
+          a config-aware split of the audit tail, because log_parameter and
+          log_rows change the trailing column count and only the collector
+          knows the emitting instance's settings. Strip the log_line_prefix
+          before applying a real CSV parse to the remainder, and carry the
+          prefix-derived user, database, pid and session id forward explicitly
+          so the record stays attributable. Cap and truncation-flag STATEMENT
+          at an agreed byte length and mask credential and PII patterns in
+          PARAMETER before anything leaves the enclave, then gate the egress
+          destination with C.Schema(...).validate plus a dead-letter route,
+          running the destination on Persistent Queue backpressure, never
+          Block - pgAudit is documented as best-effort and non-transactional,
+          so a dropped record is unrecoverable at the source too.
+        elastic: >
+          Own a custom logs-postgresql.pgaudit ingest pipeline; there is no
+          integration behaviour to inherit for these records. It should derive
+          event.type from CLASS through an explicit lookup while keeping the
+          raw class, refine event.type further from COMMAND so that CREATE and
+          DROP become creation and deletion rather than a flat change, and
+          lowercase COMMAND into event.action. Add explicit index-template
+          mappings for the postgresql.pgaudit namespace: audit_type, class,
+          object_type and object_name as keyword (object_name is the main
+          data-access alerting pivot), substatement_id and rows as long, and
+          statement and parameter as wildcard or unindexed so unbounded SQL
+          text cannot blow up the inverted index. Document for the CSOC that
+          an absent OBJECT_NAME is normal, not missing data.
+  - format: csv-file
+    enable: >
+      Same server-side switch as the server-log dataset - add csvlog to
+      log_destination and set logging_collector = on - since pgAudit has no
+      log channel of its own and rides whatever destination the server uses.
+      The consequence specific to audit records is the reason to prefer csvlog
+      here: the who/which-database/when that pgAudit itself never emits, and
+      that the plain-text form leaves to an operator-defined log_line_prefix,
+      arrives in csvlog as fixed columns (user_name, database_name,
+      process_id, session_id, session_line_num, log_time), so an audit record
+      is structurally attributable even when the prefix is misconfigured. What
+      csvlog does NOT do is structure the audit payload: the entire "AUDIT:
+      SESSION,..." tail (AUDIT_TYPE, STATEMENT_ID, CLASS, COMMAND,
+      OBJECT_TYPE, OBJECT_NAME, STATEMENT, PARAMETER, and the optional ROWS)
+      still lands as one string inside the message column and still needs the
+      config-aware tail parser. csvlog also solves the multi-line problem at
+      the encoding level - a STATEMENT containing literal newlines is emitted
+      as a quoted CSV field rather than breaking the record across lines.
+    references:
+    - https://www.postgresql.org/docs/current/runtime-config-logging.html
+    - https://github.com/pgaudit/pgaudit
+    - https://access.crunchydata.com/documentation/pgaudit/1.7.0/
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom pgAudit tail pipeline (csvlog envelope branch)
+      notes: >
+        The Elastic PostgreSQL integration's csvlog path parses the envelope
+        columns but, exactly as with the text form, drops the "AUDIT: ..."
+        body into message unsplit - it has no pgAudit awareness - so the audit
+        tail still needs the hand-built, config-aware (log_parameter /
+        log_rows) split. This is that same tail parser with a different front
+        end: instead of stripping a log_line_prefix and CSV-splitting the
+        remainder, it takes the message column straight from the already
+        CSV-parsed row, so the envelope work the text branch does by hand is
+        free here. The audit-specific columns are NOT csvlog columns; only the
+        standard log columns below exist, with the audit content packed inside
+        message.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Do near the source the one thing that stays source-only in csvlog:
+          the config-aware split of the audit tail out of the message column,
+          because log_parameter and log_rows change its trailing column count
+          and only the collector knows the emitting instance's settings.
+          csvlog removes the two chores the text branch carries - multi-line
+          reassembly (embedded newlines are quoted) and prefix-stripping
+          (attribution is already in columns) - so carry the envelope columns
+          forward as user, database, pid and session id and parse only the
+          message tail. Cap and truncation-flag STATEMENT at an agreed byte
+          length and mask credential/PII patterns in PARAMETER before egress,
+          then gate the destination with C.Schema(...).validate plus a
+          dead-letter route on Persistent Queue backpressure, never Block -
+          pgAudit is best-effort and non-transactional, so a dropped record is
+          unrecoverable at source.
+        elastic: >
+          Own the custom logs-postgresql.pgaudit ingest pipeline as with the
+          text form - there is no integration behaviour to inherit for the
+          audit body even though the integration parsed the csvlog envelope.
+          Derive event.type from CLASS through an explicit lookup while
+          keeping the raw class, refine it from COMMAND so CREATE/DROP become
+          creation/deletion, and lowercase COMMAND into event.action. Add
+          index-template mappings for the postgresql.pgaudit namespace -
+          audit_type, class, object_type and object_name as keyword
+          (object_name is the main data-access alerting pivot),
+          substatement_id and rows as long, statement and parameter as
+          wildcard or unindexed - and document for the CSOC that an absent
+          OBJECT_NAME is normal.
+        relay: >
+          Full ECS-shaped NDJSON crosses (mode B), one reassembled audit
+          record per line, because no Elastic integration can finish the audit
+          tail high-side even though it can finish the csvlog envelope. The
+          friction to settle with the guard owner is unchanged from the text
+          form: STATEMENT and PARAMETER are unbounded, attacker-influenced
+          free text carrying arbitrary unicode and quotes, the worst input for
+          a custom NDJSON content filter, so they must be length-capped,
+          charset-restricted and truncation-flagged low-side. With no return
+          channel the crossing is at-most-once, so reconcile low- and
+          high-side counts per (dataset, hour) and carry _raw across until the
+          tail parser is proven.
+      direct:
+        parse_location: low
+        cribl: >
+          High-side instances run the config-aware tail parse on the message
+          column - the split is config-dependent regardless of which side the
+          database sits on - carry the csvlog envelope columns forward as
+          attribution, and ship to the Elastic destination on Persistent Queue
+          backpressure with no guard in the path.
+        elastic: >
+          Own the custom logs-postgresql.pgaudit ingest pipeline as with the
+          text form - there is no integration behaviour to inherit for the
+          audit body even though the integration parsed the csvlog envelope.
+          Derive event.type from CLASS through an explicit lookup while
+          keeping the raw class, refine it from COMMAND so CREATE/DROP become
+          creation/deletion, and lowercase COMMAND into event.action. Add
+          index-template mappings for the postgresql.pgaudit namespace -
+          audit_type, class, object_type and object_name as keyword
+          (object_name is the main data-access alerting pivot),
+          substatement_id and rows as long, statement and parameter as
+          wildcard or unindexed - and document for the CSOC that an absent
+          OBJECT_NAME is normal.
+    fields:
+    - vendor: log_time
+      type: timestamp
+      description: >-
+        time the server wrote the audit record, with milliseconds and time
+        zone - supplied by the csvlog envelope, not by pgAudit
+      ecs: '@timestamp'
+      status: partial
+      transform: >-
+        always carries a timezone token in csvlog, removing the
+        prefix-dependent gap the text form has; abbreviations still need the
+        integration tz_map
+    - vendor: user_name
+      type: string
+      description: database role that executed the audited statement, from the csvlog envelope
+      ecs: user.name
+      status: mapped
+      notes: >-
+        the audited principal is a database role, not an OS or directory
+        identity; where an application tier shares one role this identifies
+        the app, not the human, and pgAudit cannot reliably audit superusers
+        at all
+    - vendor: database_name
+      type: string
+      description: database the audited session is connected to, from the csvlog envelope
+      ecs: null
+      custom: postgresql.log.database
+      status: unmapped
+      notes: >-
+        the attribution pgAudit itself never emits; in the text form it
+        depends on %d being present in the prefix, whereas csvlog always
+        supplies it
+    - vendor: process_id
+      type: integer
+      description: backend process id serving the audited session
+      ecs: process.pid
+      status: mapped
+      notes: >-
+        recycled by the OS, so it identifies a session only with
+        session_id/session_start_time
+    - vendor: session_id
+      type: string
+      description: >-
+        session identifier - hex backend start time and process id, from the
+        csvlog envelope
+      ecs: null
+      custom: postgresql.log.session_id
+      status: unmapped
+      notes: >-
+        the stable key joining an audit record to the connection and
+        disconnection events in the server-log dataset; map as keyword, never
+        long
+    - vendor: session_line_num
+      type: long
+      description: per-session line counter from the csvlog envelope
+      ecs: event.sequence
+      status: mapped
+      notes: >-
+        orders audit records that share a millisecond timestamp within one
+        session; pairs with STATEMENT_ID from the audit tail
+    - vendor: command_tag
+      type: string
+      description: 'command tag of the session''s current command, from the csvlog envelope'
+      ecs: event.action
+      status: partial
+      notes: >-
+        overlaps the COMMAND value in the audit tail but is the server's
+        envelope view; prefer the tail COMMAND for the audited action and
+        treat this as corroboration
+    - vendor: message
+      type: string
+      description: >-
+        the entire pgAudit record as one string -
+        AUDIT_TYPE,STATEMENT_ID,SUBSTATEMENT_ID,CLASS,COMMAND,OBJECT_TYPE,OBJECT_NAME,STATEMENT,PARAMETER[,ROWS]
+        - carried in the csvlog message column
+      ecs: message
+      status: partial
+      notes: >-
+        csvlog structures the envelope only; the audit tail stays opaque here
+        and needs the config-aware (log_parameter/log_rows) tail parser
+        exactly as in the text dataset, after which AUDIT_TYPE, CLASS,
+        COMMAND, OBJECT_NAME, STATEMENT, PARAMETER and ROWS map as documented
+        on that dataset
+- id: server-log
+  name: PostgreSQL server log (connections, authentication, errors)
+  description: >
+    The server's own log records - the same physical stream pgAudit writes
+    into, minus the AUDIT entries. This is where authentication actually
+    appears: log_connections emits connection receipt, authentication and
+    authorization messages, log_disconnections emits a session termination
+    line carrying the session duration, and failed logons arrive as FATAL
+    lines with SQLSTATE 28P01. The envelope is entirely operator-defined
+    through log_line_prefix, and that is the dataset's central risk: Elastic's
+    PostgreSQL integration groks a specific prefix family - timestamp with
+    timezone, then optional [pid-linenum], then user@db, then the LEVEL token
+    - and a prefix that does not match falls through to a catch-all that
+    yields message-only documents with no user, database or pid. The
+    integration also parses the managed-service style prefix
+    ("db=...,user=...,app=..., client=...") as key-value pairs. Note that the
+    connection details themselves live inside the message text, not in
+    dedicated columns.
+  event_categories:
+  - authentication
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge Cribl worker group, database enclave
+      notes: >
+        Collected as a file tail off the logging_collector directory, or via
+        rsyslog when log_destination includes syslog. This route is a
+        thin-envelope crossing rather than raw-through.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-postgresql.log
+    direct:
+    - hop: cribl
+      location: edge Cribl worker group, database enclave
+      notes: >
+        Collected as a file tail off the logging_collector directory, or via
+        rsyslog when log_destination includes syslog.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-postgresql.log
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: elastic-integration
+      artifact: PostgreSQL integration (log data stream)
+      notes: >
+        The stock integration parses the plain-text and csvlog forms of this
+        stream. Its csvlog path is strictly positional against the documented
+        column order, so it must be pinned to a PostgreSQL version whose
+        csvlog column list matches. Connection, disconnection and
+        authentication-failure details are left inside message and need a
+        custom pipeline to become fields.
+    fields:
+    - vendor: log_time
+      type: timestamp
+      description: >-
+        time the server wrote the log line, from %m in the prefix or the first
+        csvlog column
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        the integration's grok requires a timezone token immediately after the
+        timestamp; abbreviations such as EDT or IST are ambiguous and need the
+        integration's tz_map option to resolve
+    - vendor: user_name
+      type: string
+      description: database role associated with the session, from %u
+      ecs: user.name
+      status: mapped
+      notes: >-
+        absent on lines emitted before authentication completes and on
+        background-worker lines, where the prefix's %q suppresses session
+        fields
+    - vendor: database_name
+      type: string
+      description: database the session is connected to, from %d
+      ecs: null
+      status: unmapped
+      custom: postgresql.log.database
+    - vendor: process_id
+      type: integer
+      description: backend process id, from %p
+      ecs: process.pid
+      status: mapped
+    - vendor: connection_from
+      type: string
+      description: >-
+        client host and port that opened the connection, from %r or the csvlog
+        connection_from column
+      ecs: source.address
+      status: partial
+      transform: >
+        arrives as "host:port" and must be split into source.ip and
+        source.port; the host half may be a resolved name rather than an
+        address, and the whole field is empty for Unix-domain-socket
+        connections, which is how local superuser access presents
+    - vendor: session_id
+      type: string
+      description: session identifier - hex backend start time and process id, from %c
+      ecs: null
+      status: unmapped
+      custom: postgresql.log.session_id
+      notes: >
+        ECS 9.4 has no session.id; this is the join key between a connection
+        line, its disconnection line and every pgAudit record in between, so
+        it must be mapped as keyword
+    - vendor: session_line_num
+      type: long
+      description: per-session line counter, from %l
+      ecs: event.sequence
+      status: mapped
+      notes: >-
+        monotonic within a session; combined with session_id it orders events
+        that share a millisecond timestamp
+    - vendor: error_severity
+      type: enum
+      description: message severity - DEBUG, INFO, NOTICE, WARNING, ERROR, LOG, FATAL or PANIC
+      ecs: log.level
+      status: mapped
+      notes: >
+        LOG is routine and FATAL is a terminated session rather than a server
+        failure, so a naive severity rule inverts the meaning; failed logons
+        arrive as FATAL, and a numeric event.severity needs an explicit lookup
+        from this enum
+    - vendor: sql_state_code
+      type: string
+      description: five-character SQLSTATE code for the condition, from %e
+      ecs: error.code
+      status: mapped
+      notes: >
+        class 28 is invalid authorization - 28P01 is invalid_password and
+        28000 invalid_authorization_specification, the two codes that make
+        logon failure detectable without string-matching the message; a lookup
+        table is needed for a readable error name
+    - vendor: message
+      type: string
+      description: primary human-readable message text
+      ecs: message
+      status: partial
+      notes: >
+        the actual carrier of every connection detail - "connection received:
+        host=... port=...", "connection authorized: user=... database=...
+        application_name=...", "password authentication failed for user ...",
+        "disconnection: session time: 0:00:12.34 user=... database=...
+        host=... port=..." - none of which the stock integration decomposes
+        into fields
+    - vendor: detail
+      type: string
+      description: secondary detail line elaborating on the message
+      ecs: error.message
+      status: partial
+      notes: >
+        carries the real failure reason on authentication errors (e.g. Role
+        "app" does not exist, or Connection matched pg_hba.conf line NN), and
+        on parameterised statements carries the bind values, so it inherits
+        the same masking requirement as pgAudit's PARAMETER
+    - vendor: application_name
+      type: string
+      description: client-supplied application name for the session, from %a
+      ecs: null
+      status: unmapped
+      custom: postgresql.log.application_name
+      notes: >-
+        set by the connecting client and never verified by the server, so it
+        is a triage pivot rather than attribution
+    - vendor: backend_type
+      type: enum
+      description: >-
+        kind of backend that produced the line - client backend, autovacuum
+        worker, checkpointer, walwriter, walsender, background writer, startup
+      ecs: null
+      status: unmapped
+      custom: postgresql.log.backend_type
+      notes: >
+        the cheapest volume control on this dataset - everything other than
+        "client backend" is server housekeeping with no security value and can
+        be suppressed at the edge
+    - vendor: duration
+      type: float
+      description: >-
+        statement execution time in milliseconds, emitted when
+        log_min_duration_statement is set
+      ecs: event.duration
+      status: partial
+      transform: >
+        logged in milliseconds as a float and must be multiplied by 1e6 to
+        satisfy ECS's nanosecond contract; setting the threshold to 0 logs
+        every statement and is documented as a contention risk on busy servers
+    - vendor: query
+      type: string
+      description: the client-supplied statement text associated with the line
+      ecs: null
+      status: unmapped
+      custom: postgresql.log.query
+      notes: >
+        ECS 9.4 has no SQL or database namespace, so statement text stays
+        custom here exactly as it does on the pgAudit dataset; note this is
+        log_statement/log_min_duration output, which shows what the client
+        asked for, not pgAudit's record of what the server actually did
+    - vendor: command_tag
+      type: string
+      description: 'command tag of the session''s current command, from %i'
+      ecs: event.action
+      status: partial
+      notes: >
+        upper-case command tag needing the same lower-case underscore
+        normalisation as pgAudit's COMMAND; frequently empty on connection,
+        disconnection and authentication lines, which is precisely where an
+        action value would be most useful
+    - vendor: virtual_transaction_id
+      type: string
+      description: backend-local transaction identifier, from %v
+      ecs: null
+      status: unmapped
+      custom: postgresql.log.virtual_transaction_id
+      notes: >-
+        formatted backendID/localXID; correlates the statements of one
+        transaction where transaction_id is 0 for read-only work
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Keep the edge worker group a near pass-through and let the
+          integration pipeline be the parser, but do the two things that are
+          genuinely cheaper near the source: enforce the log_line_prefix the
+          integration's grok actually expects (timestamp with timezone,
+          [%p-%l], then user@db, then the level token) and reject or tag any
+          instance whose prefix does not match, so misparsed message-only
+          documents are caught at the enclave rather than discovered in
+          Kibana. Filter on backend_type low-side to drop autovacuum,
+          checkpointer and walwriter chatter, which dominates volume and
+          carries no security value, and run the Elastic destination on
+          Persistent Queue backpressure.
+        elastic: >
+          Use the stock PostgreSQL integration pipeline and layer a
+          logs-postgresql.log@custom pipeline that turns the message text into
+          fields: dissect the "connection authorized: user=... database=...
+          application_name=..." and "disconnection: session time: ... host=...
+          port=..." forms into user.name, source.ip and source.port, derive
+          event.outcome from log.level plus the SQLSTATE class rather than
+          from any single column (28P01 and 28000 are the authentication
+          failures), and convert the Postgres severity enum into the numeric
+          ECS event.severity scale by lookup. Confirm the duration conversion
+          stays in nanoseconds for event.duration, and add index-template
+          mappings for postgresql.log.session_id, .database, .backend_type and
+          .application_name as keyword and .query as wildcard.
+        relay: >
+          The high-side instances ship raw text end-to-end; the low-side
+          instances cross in thin-envelope mode A - {_dataId, "@timestamp",
+          host, _raw} with the integration finishing extraction high-side. The
+          specific constraint on both is that message and query are unbounded
+          free text that can carry client-supplied SQL, arbitrary unicode and
+          embedded newlines, so they need a low-side length cap and charset
+          restriction before a custom NDJSON content filter has to reason
+          about them. The feed is plain log text rather than CEF, so nothing
+          CEF-shaped crosses.
+      direct:
+        parse_location: high
+        cribl: >
+          Keep the edge worker group a near pass-through and let the
+          integration pipeline be the parser, but do the two things that are
+          genuinely cheaper near the source: enforce the log_line_prefix the
+          integration's grok actually expects (timestamp with timezone,
+          [%p-%l], then user@db, then the level token) and reject or tag any
+          instance whose prefix does not match, so misparsed message-only
+          documents are caught at the enclave rather than discovered in
+          Kibana. Filter on backend_type to drop autovacuum, checkpointer and
+          walwriter chatter, which dominates volume and carries no security
+          value, and run the Elastic destination on Persistent Queue
+          backpressure.
+        elastic: >
+          Use the stock PostgreSQL integration pipeline and layer a
+          logs-postgresql.log@custom pipeline that turns the message text into
+          fields: dissect the "connection authorized: user=... database=...
+          application_name=..." and "disconnection: session time: ... host=...
+          port=..." forms into user.name, source.ip and source.port, derive
+          event.outcome from log.level plus the SQLSTATE class rather than
+          from any single column (28P01 and 28000 are the authentication
+          failures), and convert the Postgres severity enum into the numeric
+          ECS event.severity scale by lookup. Confirm the duration conversion
+          stays in nanoseconds for event.duration, and add index-template
+          mappings for postgresql.log.session_id, .database, .backend_type and
+          .application_name as keyword and .query as wildcard.
+  - format: csv-file
+    enable: >
+      Add csvlog to log_destination and turn the collector on: ALTER SYSTEM
+      SET log_destination = 'csvlog'; ALTER SYSTEM SET logging_collector = on;
+      then SELECT pg_reload_conf() for log_destination and a restart for
+      logging_collector (both are documented as requiring the collector).
+      PostgreSQL then writes a rotating *.csv file per the
+      log_filename/log_rotation settings, one record per row, with the
+      log_line_prefix envelope replaced by fixed leading columns - so unlike
+      the plain-text form the emitting instance no longer needs a
+      correctly-configured prefix for the record to be attributable. The
+      column order is fixed by the server version (the documented CREATE TABLE
+      postgres_log layout): backend_type appears from PostgreSQL 13,
+      leader_pid from 14, and query_id from 15 (only populated when
+      compute_query_id is on), so a positional parser must be pinned to the
+      server's major version. csvlog cannot be routed to the syslog
+      destination and is collected only as a file tail.
+    references:
+    - https://www.postgresql.org/docs/current/runtime-config-logging.html
+    - https://www.elastic.co/docs/reference/integrations/postgresql
+    - >-
+      https://github.com/elastic/integrations/tree/main/packages/postgresql/data_stream/log
+    parsing:
+      mechanism: elastic-integration
+      artifact: PostgreSQL integration (log data stream, csvlog path)
+      notes: >
+        The stock PostgreSQL integration natively handles csvlog: its log
+        pipeline has a positional CSV path matched to the documented column
+        order, so this is the ONE alternate on the technology an existing
+        integration finishes rather than a hand-built parser. The catch is the
+        same one the text path has - it is strictly positional, so it must be
+        pinned to a server version whose column list matches, and
+        connection/disconnection/authentication detail still lands inside the
+        message column and needs the logs-postgresql.log@custom pipeline to
+        become fields.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Keep the edge worker group a near pass-through exactly as the text
+          path does and let the integration's csvlog path be the parser, but
+          do the two things that are cheaper at the source: reassemble the
+          rare multi-line CSV row (a message or query column carrying an
+          embedded newline is quoted, so a CSV-aware line accumulator, not a
+          newline splitter, is required before the row leaves the enclave) and
+          filter on backend_type to drop autovacuum, checkpointer and
+          walwriter housekeeping, which has no security value and dominates
+          volume. Pin the collector to the server major version so the
+          positional column count is known, and run the Elastic destination on
+          Persistent Queue backpressure, never Block.
+        elastic: >
+          Use the stock integration csvlog path, then layer the same
+          logs-postgresql.log@custom pipeline the text form uses - the
+          structured envelope columns arrive already split (user_name,
+          database_name, process_id, session_id, session_line_num) but the
+          connection detail still sits inside message, so dissect "connection
+          authorized: user=... database=... application_name=..." and
+          "disconnection: session time: ... host=... port=..." there, derive
+          event.outcome from error_severity plus the sql_state_code class
+          (28P01/28000 are the authentication failures) rather than from any
+          single column, and convert the severity enum to numeric
+          event.severity by lookup. Map postgresql.log.session_id, .database,
+          .backend_type and .application_name as keyword and .query as
+          wildcard so csvlog and text instances share one field vocabulary.
+        relay: >
+          Because the integration can finish csvlog high-side, the low-side
+          instances cross in thin-envelope mode A - {_dataId, "@timestamp",
+          host, _raw} carrying the reassembled CSV row - with extraction
+          deferred to the high side. The constraint that survives the format
+          change is that message, query, detail and internal_query are
+          unbounded free text that can carry client-supplied SQL, arbitrary
+          unicode and embedded newlines (the reason a row can span lines), so
+          they need a low-side length cap, charset restriction and truncation
+          flag before any custom NDJSON content filter has to reason about
+          them. The feed is plain CSV text, so nothing CEF-shaped crosses;
+          with no return channel the crossing is at-most-once, so reconcile
+          low-side and high-side counts per (dataset, hour).
+      direct:
+        parse_location: high
+        cribl: >
+          High-side instances run a near pass-through edge - CSV-aware
+          multi-line reassembly and a backend_type volume filter - and ship
+          straight to the Elastic destination on Persistent Queue
+          backpressure, since no guard sits in the path.
+        elastic: >
+          Use the stock integration csvlog path, then layer the same
+          logs-postgresql.log@custom pipeline the text form uses - the
+          structured envelope columns arrive already split (user_name,
+          database_name, process_id, session_id, session_line_num) but the
+          connection detail still sits inside message, so dissect "connection
+          authorized: user=... database=... application_name=..." and
+          "disconnection: session time: ... host=... port=..." there, derive
+          event.outcome from error_severity plus the sql_state_code class
+          (28P01/28000 are the authentication failures) rather than from any
+          single column, and convert the severity enum to numeric
+          event.severity by lookup. Map postgresql.log.session_id, .database,
+          .backend_type and .application_name as keyword and .query as
+          wildcard so csvlog and text instances share one field vocabulary.
+    fields:
+    - vendor: log_time
+      type: timestamp
+      description: time the server wrote the record, with milliseconds and time zone
+      ecs: '@timestamp'
+      status: partial
+      transform: >-
+        always carries a timezone token (unlike some text prefixes), but
+        abbreviations such as EDT or IST remain ambiguous and need the
+        integration tz_map option
+    - vendor: user_name
+      type: string
+      description: database role associated with the session
+      ecs: user.name
+      status: mapped
+      notes: >-
+        empty on lines emitted before authentication completes and on
+        background-worker rows
+    - vendor: database_name
+      type: string
+      description: database the session is connected to
+      ecs: null
+      custom: postgresql.log.database
+      status: unmapped
+    - vendor: process_id
+      type: integer
+      description: backend process id
+      ecs: process.pid
+      status: mapped
+    - vendor: connection_from
+      type: string
+      description: client host and port that opened the connection
+      ecs: source.address
+      status: partial
+      transform: >-
+        arrives as host:port and must be split into source.ip and source.port;
+        the host half may be a resolved name, and the field is empty for
+        Unix-domain-socket connections, which is how local superuser access
+        presents
+    - vendor: session_id
+      type: string
+      description: session identifier - hex backend start time and process id
+      ecs: null
+      custom: postgresql.log.session_id
+      status: unmapped
+      notes: >-
+        ECS 9.4 has no session.id; the join key between a connection line, its
+        disconnection line and every pgAudit record in between, so map as
+        keyword
+    - vendor: session_line_num
+      type: long
+      description: per-session line counter
+      ecs: event.sequence
+      status: mapped
+      notes: >-
+        monotonic within a session; with session_id it orders events that
+        share a millisecond timestamp
+    - vendor: command_tag
+      type: string
+      description: 'command tag of the session''s current command'
+      ecs: event.action
+      status: partial
+      notes: >-
+        upper-case tag needing the same lower-case underscore normalisation as
+        pgAudit's COMMAND; frequently empty on connection, disconnection and
+        authentication rows
+    - vendor: session_start_time
+      type: timestamp
+      description: time the backend session started, with time zone
+      ecs: null
+      custom: postgresql.log.session_start_time
+      status: unmapped
+      notes: >-
+        the wall-clock counterpart of the hex time encoded in session_id;
+        pairs with process_id to distinguish a recycled pid
+    - vendor: virtual_transaction_id
+      type: string
+      description: backend-local transaction identifier, formatted backendID/localXID
+      ecs: null
+      custom: postgresql.log.virtual_transaction_id
+      status: unmapped
+      notes: >-
+        correlates the statements of one transaction where transaction_id is 0
+        for read-only work
+    - vendor: transaction_id
+      type: long
+      description: top-level transaction id, 0 when none is assigned
+      ecs: null
+      custom: postgresql.log.transaction_id
+      status: unmapped
+    - vendor: error_severity
+      type: enum
+      description: message severity - DEBUG, INFO, NOTICE, WARNING, ERROR, LOG, FATAL or PANIC
+      ecs: log.level
+      status: mapped
+      notes: >-
+        LOG is routine and FATAL is a terminated session, not a server
+        failure; failed logons arrive as FATAL, and numeric event.severity
+        needs an explicit lookup from this enum
+    - vendor: sql_state_code
+      type: string
+      description: five-character SQLSTATE code for the condition
+      ecs: error.code
+      status: mapped
+      notes: >-
+        class 28 is invalid authorization - 28P01 invalid_password and 28000
+        invalid_authorization_specification make logon failure detectable
+        without string-matching the message
+    - vendor: message
+      type: string
+      description: primary human-readable message text
+      ecs: message
+      status: partial
+      notes: >-
+        still the carrier of every connection detail (connection
+        received/authorized, password authentication failed, disconnection:
+        session time) that the integration does not decompose into fields
+    - vendor: detail
+      type: string
+      description: secondary detail line elaborating on the message
+      ecs: error.message
+      status: partial
+      notes: >-
+        carries the real failure reason on authentication errors and the bind
+        values on parameterised statements, so it inherits pgAudit PARAMETER's
+        masking requirement
+    - vendor: hint
+      type: string
+      description: optional hint suggesting a remedy for the condition
+      ecs: null
+      custom: postgresql.log.hint
+      status: unmapped
+    - vendor: internal_query
+      type: string
+      description: internally-generated query that failed, e.g. from a PL/pgSQL function
+      ecs: null
+      custom: postgresql.log.internal_query
+      status: unmapped
+      notes: >-
+        free SQL text; inherits the same length-cap and masking requirement as
+        message and query
+    - vendor: internal_query_pos
+      type: integer
+      description: character offset of the error within internal_query
+      ecs: null
+      custom: postgresql.log.internal_query_pos
+      status: unmapped
+    - vendor: context
+      type: string
+      description: call-stack context of the message, e.g. the PL/pgSQL function and line
+      ecs: null
+      custom: postgresql.log.context
+      status: unmapped
+    - vendor: query
+      type: string
+      description: >-
+        the client-supplied statement text associated with the row, when
+        log_min_error_statement causes it to be included
+      ecs: null
+      custom: postgresql.log.query
+      status: unmapped
+      notes: >-
+        ECS 9.4 has no SQL namespace; kept under the same custom name as the
+        text and jsonlog datasets so all three encodings stay queryable
+        together
+    - vendor: query_pos
+      type: integer
+      description: character offset of the error within query
+      ecs: null
+      custom: postgresql.log.query_pos
+      status: unmapped
+    - vendor: location
+      type: string
+      description: >-
+        source-code location (file:line, function) of the message, emitted
+        only when log_error_verbosity is verbose
+      ecs: null
+      custom: postgresql.log.location
+      status: unmapped
+    - vendor: application_name
+      type: string
+      description: client-supplied application name for the session
+      ecs: null
+      custom: postgresql.log.application_name
+      status: unmapped
+      notes: >-
+        set by the connecting client and never verified by the server, so a
+        triage pivot rather than attribution
+    - vendor: backend_type
+      type: enum
+      description: >-
+        kind of backend that produced the row - client backend, autovacuum
+        worker, checkpointer, walwriter, walsender, background writer, startup
+        (PostgreSQL 13+)
+      ecs: null
+      custom: postgresql.log.backend_type
+      status: unmapped
+      notes: >-
+        the cheapest volume control on this dataset - everything other than
+        client backend is server housekeeping and can be suppressed at the
+        edge
+    - vendor: leader_pid
+      type: integer
+      description: >-
+        process id of the parallel group leader for a parallel worker row,
+        null otherwise (PostgreSQL 14+)
+      ecs: null
+      custom: postgresql.log.leader_pid
+      status: unmapped
+    - vendor: query_id
+      type: long
+      description: >-
+        computed identifier of the query, present when compute_query_id is
+        enabled (PostgreSQL 15+)
+      ecs: null
+      custom: postgresql.log.query_id
+      status: unmapped
+      notes: >-
+        a stable hash of the normalised statement, grouping every execution of
+        one query shape without carrying its text
+- id: jsonlog
+  name: Structured JSON server log (jsonlog)
+  description: >
+    PostgreSQL 15 and later accept jsonlog in log_destination, emitting the
+    SAME events as the two datasets above re-encoded as one JSON object per
+    line with fixed key names. This is an alternative encoding, not an
+    additional feed - enabling it alongside stderr duplicates every record -
+    but it is the option that matches the org's NDJSON crossing doctrine at
+    the producer, since PostgreSQL already writes UTF-8, LF-terminated,
+    one-object-per-line output with attribution in stable keys instead of an
+    operator-defined prefix. Two honest caveats: the Elastic PostgreSQL
+    integration does NOT parse jsonlog (its pipeline groks the plain-text and
+    csvlog forms only), so choosing this format trades a fragile prefix for an
+    integration gap; and jsonlog does not structure pgAudit at all - an audit
+    entry still arrives as the whole "AUDIT: SESSION,..." string inside the
+    message key and needs the same tail parser as the first dataset.
+  event_categories:
+  - authentication
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge Cribl worker group, database enclave
+      notes: >
+        File tail off the logging_collector directory; jsonlog requires
+        logging_collector = on and cannot be emitted over the syslog
+        destination.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-postgresql.jsonlog
+    direct:
+    - hop: cribl
+      location: edge Cribl worker group, database enclave
+      notes: >
+        File tail off the logging_collector directory; jsonlog requires
+        logging_collector = on and cannot be emitted over the syslog
+        destination.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-postgresql.jsonlog
+  formats:
+  - format: json
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom PostgreSQL jsonlog pipeline
+      notes: >
+        The Elastic integration's log data stream cannot ingest this format -
+        its first grok expects a bare timestamp at the head of the line and a
+        JSON object does not match - so the record is already structured but
+        nothing maps it. A Cribl JSON parse plus a rename pipeline is the
+        realistic path, reusing the pgAudit tail parser for the message key.
+    fields:
+    - vendor: timestamp
+      type: timestamp
+      description: time the server wrote the record, with milliseconds
+      ecs: '@timestamp'
+      status: mapped
+      notes: >-
+        rendered in log_timezone; unlike the text format the key is always
+        present, so there is no prefix-dependent gap
+    - vendor: user
+      type: string
+      description: database role associated with the session
+      ecs: user.name
+      status: mapped
+    - vendor: dbname
+      type: string
+      description: name of the database the session is connected to
+      ecs: null
+      status: unmapped
+      custom: postgresql.log.database
+    - vendor: pid
+      type: integer
+      description: backend process id
+      ecs: process.pid
+      status: mapped
+    - vendor: remote_host
+      type: string
+      description: client host the connection originated from
+      ecs: source.ip
+      status: partial
+      transform: >
+        already split from the port unlike the text format's host:port, but it
+        can still be a resolved hostname rather than an address when
+        log_hostname is on, so the conversion to source.ip must fall back to
+        source.address
+    - vendor: remote_port
+      type: integer
+      description: client port the connection originated from
+      ecs: source.port
+      status: mapped
+    - vendor: session_id
+      type: string
+      description: session identifier - hex backend start time and process id
+      ecs: null
+      status: unmapped
+      custom: postgresql.log.session_id
+    - vendor: error_severity
+      type: enum
+      description: message severity - LOG, WARNING, ERROR, FATAL, PANIC, NOTICE, INFO, DEBUG
+      ecs: log.level
+      status: mapped
+      notes: >-
+        same inversion trap as the text format - FATAL is a terminated
+        session, and failed logons are FATAL rather than ERROR
+    - vendor: state_code
+      type: string
+      description: five-character SQLSTATE code for the condition
+      ecs: error.code
+      status: mapped
+      notes: >-
+        named state_code here but sql_state_code in the csvlog column list and
+        %e in the prefix, so the three encodings of one stream disagree on the
+        name
+    - vendor: message
+      type: string
+      description: primary message text
+      ecs: message
+      status: partial
+      notes: >
+        still carries pgAudit's entire "AUDIT: SESSION,..." tail as one opaque
+        string, and still carries connection and disconnection details as
+        embedded key=value text; jsonlog structures the envelope only
+    - vendor: statement
+      type: string
+      description: client-supplied query string associated with the record
+      ecs: null
+      status: unmapped
+      custom: postgresql.log.query
+      notes: >-
+        named statement in jsonlog but query in the csvlog column list; mapped
+        to the same custom name as the text format so the two encodings stay
+        queryable together
+    - vendor: backend_type
+      type: enum
+      description: kind of backend that produced the record
+      ecs: null
+      status: unmapped
+      custom: postgresql.log.backend_type
+    - vendor: application_name
+      type: string
+      description: client-supplied application name for the session
+      ecs: null
+      status: unmapped
+      custom: postgresql.log.application_name
+    - vendor: query_id
+      type: long
+      description: computed identifier of the query, present when compute_query_id is enabled
+      ecs: null
+      status: unmapped
+      custom: postgresql.log.query_id
+      notes: >
+        a stable hash of the normalised statement, so it groups every
+        execution of one query shape without carrying its text - the cheapest
+        way to spot anomalous query patterns without shipping SQL across the
+        guard
+    - vendor: detail
+      type: string
+      description: secondary detail line elaborating on the message
+      ecs: error.message
+      status: partial
+      notes: >-
+        omitted entirely when null - jsonlog drops null-valued string keys, so
+        absence is normal and the key set varies line to line
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Parse the JSON at the edge and rename straight into the ECS and
+          custom names the other two datasets use, so jsonlog and text-format
+          instances land in a consistent vocabulary rather than diverging by
+          log_destination. Reuse the pgAudit tail parser here on the message
+          key, since jsonlog structures the envelope but leaves the AUDIT
+          record as one opaque string. Enforce the crossing constraints at
+          this hop - flatten to depth <=2, cap message and statement lengths,
+          and drop keys outside an allowlist - and gate the destination with
+          C.Schema(...).validate plus a dead-letter route and Persistent Queue
+          backpressure.
+        elastic: >
+          Own a custom logs-postgresql.jsonlog ingest pipeline, since no
+          integration claims this format. It should share the SQLSTATE lookup
+          and the severity-to-event.severity table with the server-log dataset
+          so both encodings resolve authentication failures identically, split
+          remote_host and remote_port into source.ip and source.port with the
+          hostname case handled explicitly, and set event.outcome from
+          error_severity plus state_code rather than either alone. Map
+          postgresql.log.session_id, .database, .backend_type and
+          .application_name as keyword and .query_id as long in the index
+          template so the field names stay identical to the text-format
+          stream.
+        relay: >
+          This is the friendliest dataset on the map for the crossing because
+          the producer already emits exactly the target shape - UTF-8,
+          LF-terminated, one JSON object per line, flat single-level keys - so
+          mode B needs a rename and a cap rather than a parse, and it is the
+          obvious pilot for the guard's custom NDJSON filter rules. Two
+          constraints remain: message and statement are still unbounded free
+          text that must be length-capped and charset-restricted low-side, and
+          null-valued string keys are omitted from the output entirely, so the
+          filter and the schema validator must treat the key set as variable
+          rather than fixed. Nothing CEF-shaped crosses; the crossing is
+          at-most-once, so reconcile low-side and high-side counts per
+          (dataset, hour).
+      direct:
+        parse_location: low
+        cribl: >
+          Parse the JSON at the edge and rename straight into the ECS and
+          custom names the other two datasets use, so jsonlog and text-format
+          instances land in a consistent vocabulary rather than diverging by
+          log_destination. Reuse the pgAudit tail parser here on the message
+          key, since jsonlog structures the envelope but leaves the AUDIT
+          record as one opaque string. Cap message and statement lengths so
+          unbounded SQL text cannot blow up the index, and gate the
+          destination with C.Schema(...).validate plus a dead-letter route and
+          Persistent Queue backpressure, shipping straight to the Elastic
+          destination with no guard in the path.
+        elastic: >
+          Own a custom logs-postgresql.jsonlog ingest pipeline, since no
+          integration claims this format. It should share the SQLSTATE lookup
+          and the severity-to-event.severity table with the server-log dataset
+          so both encodings resolve authentication failures identically, split
+          remote_host and remote_port into source.ip and source.port with the
+          hostname case handled explicitly, and set event.outcome from
+          error_severity plus state_code rather than either alone. Map
+          postgresql.log.session_id, .database, .backend_type and
+          .application_name as keyword and .query_id as long in the index
+          template so the field names stay identical to the text-format
+          stream.

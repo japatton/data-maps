@@ -1,0 +1,2080 @@
+id: tanium
+name: Tanium
+vendor: Tanium
+versions: Tanium Core Platform 7.6, Connect 5.x, Threat Response 3.x, Discover 4.x
+draft: true
+references:
+- https://www.elastic.co/docs/reference/integrations/tanium
+- https://github.com/elastic/integrations/tree/main/packages/tanium
+- https://help.tanium.com/bundle/ug_connect_cloud/page/connect/siem.html
+- https://docs.cribl.io/stream/usecase-tanium-stream/
+datasets:
+- id: threat-response
+  name: Threat Response alert
+  description: >
+    Endpoint detection alerts raised when a Threat Response intel document
+    (Tanium Signal, OpenIOC, YARA, STIX) matches recorder telemetry or an
+    at-rest file scan. Exported by a Tanium Connect connection whose source is
+    Threat Response alerts and whose destination is a Socket Receiver (TCP) or
+    HTTP endpoint with Format = JSON and "Generate Document" deselected - one
+    JSON object per line. Connect can also emit key-value or CEF over syslog
+    from the same source; JSON is the shape the Elastic integration and every
+    current parser expect, so the JSON destination is what deployment should
+    stand up.
+  event_categories:
+  - malware
+  - process
+  - file
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Tanium Connect writes to a Cribl TCP (or HTTP/S Bulk) source in the
+        worker group nearest the Tanium server; on this side that server sits
+        below the boundary, so the feed crosses the Everfox HSG as shown and
+        the recommendations run hybrid.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-tanium.threat_response
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Tanium Connect writes to a Cribl TCP (or HTTP/S Bulk) source in the
+        worker group nearest the Tanium server, which ships straight to the
+        Elastic side with no guard crossing.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-tanium.threat_response
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: Elastic Tanium integration (threat_response data stream)
+      notes: >
+        The integration's threat_response ingest pipeline JSON-decodes the
+        Connect payload into the tanium.threat_response.* namespace and
+        handles both the current "Alert Id"/"Match Details" export shape and
+        the older detect.match export, where the alert body arrives
+        base64-encoded inside a pipe-delimited "Other Parameters" string. Both
+        shapes are in the wild depending on Threat Response version, so the
+        pipeline must not be assumed to see only one.
+    fields:
+    - vendor: Alert Id
+      type: string
+      description: GUID uniquely identifying the Threat Response alert
+      ecs: event.id
+      status: mapped
+    - vendor: Timestamp
+      type: timestamp
+      description: ISO-8601 UTC time the alert was raised on the endpoint
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: Computer Name
+      type: string
+      description: hostname of the endpoint whose recorder or scan produced the match
+      ecs: host.name
+      status: mapped
+    - vendor: Computer IP
+      type: ip
+      description: IP address of the endpoint that raised the alert
+      ecs: host.ip
+      status: partial
+      notes: >
+        the stock integration pipeline copies this to source.ip (and
+        related.ip); the value is the alerting endpoint's own address, not a
+        flow source, so host.ip is the correct home and the source.ip copy
+        should be treated as a compatibility artifact
+    - vendor: Intel Id
+      type: integer
+      description: numeric identifier of the intel document that matched
+      ecs: rule.id
+      status: mapped
+      transform: >
+        emitted as a JSON number; cast to string for the keyword-typed
+        rule.id. rule.id and rule.name describe the same object here (the
+        intel document), so the signature identifier belongs on rule.* rather
+        than in a custom namespace
+    - vendor: Intel Name
+      type: string
+      description: display name of the intel document / signal that matched
+      ecs: rule.name
+      status: mapped
+    - vendor: Intel Type
+      type: enum
+      description: >-
+        format of the matching intel document (tanium-signal, openioc, yara,
+        stix, at_rest)
+      ecs: null
+      status: unmapped
+      custom: tanium.threat_response.intel_type
+      notes: >
+        intel document format, not a detection category; rule.category models
+        the detecting product's own categorization and rule.ruleset models a
+        parent group, so neither is an honest home for a serialization format
+    - vendor: Intel Labels
+      type: string
+      description: >-
+        comma-separated labels applied to the intel document in the Threat
+        Response console
+      ecs: null
+      status: unmapped
+      custom: tanium.threat_response.intel_labels
+      transform: split the comma-separated string into an array before indexing
+    - vendor: MITRE Techniques
+      type: string
+      description: ATT&CK techniques associated with the intel document
+      ecs: threat.technique.id
+      status: partial
+      transform: >
+        arrives as a JSON-encoded array rendered into a single string (e.g.
+        "[]" when empty); must be JSON-parsed and split so technique ids land
+        in threat.technique.id and technique names in threat.technique.name -
+        today it is indexed as a literal string and is unusable for ATT&CK
+        coverage queries
+    - vendor: Impact Score
+      type: integer
+      description: Threat Response impact/priority score for the alert, frequently empty
+      ecs: event.risk_score
+      status: partial
+      notes: >
+        Tanium's impact scale is not the 0-100 ECS convention and the field is
+        empty for many intel types; normalize or leave unset rather than
+        feeding raw values into risk-ordered dashboards
+    - vendor: Link
+      type: string
+      description: deep link into the Threat Response console for this alert GUID
+      ecs: event.url
+      status: mapped
+    - vendor: Match Details.match.type
+      type: enum
+      description: kind of artifact the intel matched - file, process, network, registry, driver
+      ecs: null
+      status: partial
+      custom: tanium.threat_response.match.type
+      transform: >
+        keep the vendor value in the custom namespace and use it to drive
+        event.category (file / process / network / registry) so alerts are not
+        all categorized identically
+    - vendor: Match Details.match.source
+      type: enum
+      description: >-
+        detection source that produced the match (at_rest for scans, recorder
+        for live telemetry)
+      ecs: null
+      status: unmapped
+      custom: tanium.threat_response.match.source
+    - vendor: Match Details.match.properties.fullpath
+      type: string
+      description: absolute path of the file that matched the intel document
+      ecs: file.path
+      status: mapped
+    - vendor: Match Details.match.properties.md5
+      type: string
+      description: MD5 hash of the matched file
+      ecs: file.hash.md5
+      status: mapped
+    - vendor: Match Details.match.properties.sha256
+      type: string
+      description: SHA-256 hash of the matched file
+      ecs: file.hash.sha256
+      status: mapped
+    - vendor: Match Details.match.properties.size
+      type: string
+      description: size in bytes of the matched file
+      ecs: file.size
+      status: partial
+      transform: emitted as a quoted string, not a number; cast to long before indexing
+    - vendor: >-
+        Match
+        Details.finding.whats[].artifact_activity.acting_artifact.process.file.file.path
+      type: string
+      description: image path of the process that acted on the matched artifact
+      ecs: process.executable
+      status: mapped
+    - vendor: >-
+        Match
+        Details.finding.whats[].artifact_activity.acting_artifact.process.arguments
+      type: string
+      description: full command line the acting process was launched with
+      ecs: process.command_line
+      status: mapped
+      notes: >
+        unbounded free text, routinely kilobytes for container and installer
+        activity; the main length-capping candidate on this dataset
+    - vendor: Match Details.finding.whats[].artifact_activity.acting_artifact.process.pid
+      type: long
+      description: OS process id of the acting process
+      ecs: process.pid
+      status: mapped
+    - vendor: >-
+        Match
+        Details.finding.whats[].artifact_activity.acting_artifact.process.user.user.name
+      type: string
+      description: account the acting process was running as
+      ecs: user.name
+      status: mapped
+    - vendor: >-
+        Match
+        Details.finding.whats[].artifact_activity.acting_artifact.process.parent.process.file.file.path
+      type: string
+      description: image path of the parent of the acting process
+      ecs: process.parent.executable
+      status: mapped
+      notes: >
+        the lineage nests recursively - parent.process.parent.process... -
+        with identical key names at every generation, so depth must be capped
+        before indexing or the field count grows without bound
+    - vendor: Match Details.finding.threat_id
+      type: string
+      description: Threat Response identifier grouping findings that belong to the same threat
+      ecs: null
+      status: unmapped
+      custom: tanium.threat_response.finding.threat_id
+    - vendor: Match Details.finding.hunt_id
+      type: string
+      description: identifier of the hunt/config that produced the finding (e.g. "hunt:1000123")
+      ecs: null
+      status: unmapped
+      custom: tanium.threat_response.finding.hunt_id
+    - vendor: Match Details.finding.first_seen
+      type: timestamp
+      description: first time the finding was observed on this endpoint
+      ecs: event.start
+      status: mapped
+    - vendor: Match Details.finding.system_info.platform
+      type: enum
+      description: endpoint OS platform reported with the finding (Windows, Linux, Mac)
+      ecs: host.os.platform
+      status: partial
+      transform: >-
+        vendor values are capitalized platform names; lowercase to match the
+        ECS convention
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Keep the worker group a pass-through for the alert body and let the
+          integration pipeline do the extraction, but do two things low-side
+          that the pipeline cannot: prune the Match Details subtree before it
+          reaches Elastic (the recorder lineage nests
+          acting_artifact.parent.process several generations deep and each
+          generation repeats the same key names, so an unpruned document
+          explodes the field count), and normalize the two export shapes into
+          one by base64-decoding and expanding the legacy "Other Parameters"
+          payload so downstream rules see a single schema. Use Persistent
+          Queue backpressure on the Elastic destination and keep _raw - alert
+          bodies are the forensically load-bearing artifact on this technology
+          and the last place to drop it.
+        elastic: >
+          The stock Tanium integration threat_response pipeline is the parser;
+          layer a logs-tanium.threat_response@custom pipeline for the gaps
+          this map records - parse the JSON-encoded "MITRE Techniques" array
+          string into threat.technique.id/threat.technique.name instead of
+          leaving it as a literal string, cast the string-typed file size and
+          hash properties into file.size and file.hash.*, and move the
+          alerting endpoint's address off source.ip onto host.ip so
+          endpoint-scoped queries do not have to know that a detection subject
+          is modelled as a flow source. Derive event.category from the Match
+          Details match type (file / process / network / registry) rather than
+          tagging every alert identically, and add explicitly typed keyword
+          mappings for the tanium.threat_response.* custom fields so the deep
+          Match Details subtree never relies on dynamic mapping.
+        relay: >
+          Low-side instances cross the guard: the thin envelope (_dataId,
+          @timestamp, host, _raw) is the right crossing shape and the parse
+          location becomes hybrid - but the alert body inside _raw is the
+          worst content-filter case on this technology: base64 payload blobs
+          in the legacy shape, kilobyte-scale command-line arguments and file
+          paths, and unbounded recursion depth in the process lineage. Flatten
+          and cap that structure low-side to two levels of nesting with short
+          ASCII keys and bounded string lengths so a custom NDJSON filter can
+          stay simple, and validate against a Schema Library schema with a
+          dead-letter route before the guard destination. Crossing is
+          at-most-once with no return channel - reconcile alert counts per
+          (dataset, hour) across the boundary.
+      direct:
+        parse_location: high
+        cribl: >
+          High-side instances skip the guard: keep the worker group a
+          pass-through for the alert body and let the integration pipeline do
+          the extraction, but do two things in the worker group that the
+          pipeline cannot: prune the Match Details subtree before it reaches
+          Elastic (the recorder lineage nests acting_artifact.parent.process
+          several generations deep and each generation repeats the same key
+          names, so an unpruned document explodes the field count), and
+          normalize the two export shapes into one by base64-decoding and
+          expanding the legacy "Other Parameters" payload so downstream rules
+          see a single schema. Use Persistent Queue backpressure on the
+          Elastic destination and keep _raw - alert bodies are the
+          forensically load-bearing artifact on this technology and the last
+          place to drop it.
+        elastic: >
+          The stock Tanium integration threat_response pipeline is the parser;
+          layer a logs-tanium.threat_response@custom pipeline for the gaps
+          this map records - parse the JSON-encoded "MITRE Techniques" array
+          string into threat.technique.id/threat.technique.name instead of
+          leaving it as a literal string, cast the string-typed file size and
+          hash properties into file.size and file.hash.*, and move the
+          alerting endpoint's address off source.ip onto host.ip so
+          endpoint-scoped queries do not have to know that a detection subject
+          is modelled as a flow source. Derive event.category from the Match
+          Details match type (file / process / network / registry) rather than
+          tagging every alert identically, and add explicitly typed keyword
+          mappings for the tanium.threat_response.* custom fields so the deep
+          Match Details subtree never relies on dynamic mapping.
+  - format: syslog-cef
+    enable: >
+      On the existing Connect connection whose source is Threat Response
+      alerts, change the destination Format from JSON to CEF (Connect ->
+      Connections -> the connection -> Format). Connect emits one CEF line per
+      alert: the header is "CEF:0|<device vendor>|<device product>|<device
+      version>|<signature id>|<name>|<severity>|" and the alert columns follow
+      as the extension. The Advanced Settings on the CEF format let you set
+      the device vendor, device product, device version, source and the
+      end-of-entry separator; leave them at the Tanium defaults so the header
+      identifies the feed predictably. Because the extension keys are
+      generated from the source question's columns, the deeply nested "Match
+      Details" subtree does not survive as structure -- CEF flattens each
+      selected column to one extension pair, so the recorder lineage and
+      base64 alert body that the JSON destination carries are truncated or
+      dropped unless explicitly added as columns. CEF is therefore materially
+      lossy for this dataset and JSON remains the richer feed; adopt CEF only
+      for a downstream that must ingest CEF natively.
+    references:
+    - https://help.tanium.com/bundle/ug_connect_cloud/page/connect/siem.html
+    - https://docs.tanium.com/connect/connect/formats.html
+    - >-
+      https://manuals.plus/m/db1f55993b4a28f5977d71b68810ae3fba64ea82e9c67538b136911d194c747e.pdf
+    parsing:
+      mechanism: elastic-ingest-pipeline
+      artifact: >-
+        generic CEF decode + logs-tanium.threat_response@custom (no CEF path
+        in the stock Tanium integration)
+      notes: >
+        The Elastic Tanium integration's threat_response pipeline parses only
+        Connect JSON; it has no CEF ingest path, so a CEF feed cannot ride the
+        stock eventType fan-out. A generic CEF decoder yields cef.extensions.*
+        keyed by the raw Connect column names (the standard dictionary keys
+        for recognized columns, the CP-event field keys for the rest), not the
+        tanium.threat_response.* namespace, so a hand-built @custom pipeline
+        must decode the header, resolve those extension keys and re-map into
+        the same fields the JSON path targets so CEF-sourced and JSON-sourced
+        alerts are one corpus. The field table is intentionally empty: the CEF
+        extension keys are the same alert columns already inventoried on the
+        json format, serialized as flat pairs rather than the nested Match
+        Details tree.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Decode CEF at the low-side edge worker group that tails the Connect
+          socket: split the header on "|" to recover the vendor/product/
+          version and header severity, extract the extension into fields, and
+          rename the Connect column keys to the tanium.threat_response.* shape
+          the JSON path uses so both serializations converge. The dataset's
+          structural hazard is unchanged by the format -- if the Match Details
+          lineage columns were added to the source question they arrive here
+          as long flattened extension values, so cap and encoding-normalise
+          the command-line and path extensions and prune the deep-lineage
+          pairs before the guard exactly as on the JSON route. Dead-letter any
+          line whose header does not parse so a Connect template change
+          surfaces rather than crossing unparseable.
+        elastic: >
+          There is no tanium.threat_response CEF pipeline to inherit, so land
+          these records through a dedicated generic-CEF decode feeding
+          logs-tanium.threat_response@custom that maps the resolved extension
+          keys to the same targets the JSON map documents: the alert GUID to
+          event.id, the intel document id to rule.id (cast to string) and
+          rule.name, the endpoint address to host.ip rather than the source.ip
+          the CEF dhost/src convention would suggest, and the match type to
+          event.category. Because CEF collapses the nested Match Details, the
+          ATT&CK technique array and the acting-process lineage the JSON feed
+          carries are unavailable unless they were promoted to columns, so
+          treat CEF as a reduced view and keep JSON as the forensic feed.
+        relay: >
+          A CEF line is one flat string, which a shallow-nesting content
+          filter handles far more comfortably than the nested JSON alert body
+          -- that is CEF's one crossing advantage on this, the worst
+          content-filter case on the technology. The friction is that any
+          lineage or command-line columns promoted into the extension are
+          still unbounded free text and, in the legacy detect.match shape, a
+          base64 alert blob, so length-cap and ASCII-normalise those extension
+          values low-side and validate the line against a Schema Library
+          schema with a dead-letter route before the guard destination.
+          Crossing is at-most-once with no return channel; reconcile alert
+          counts per (dataset, hour) across the boundary.
+      direct:
+        parse_location: hybrid
+        cribl: >
+          High-side instances skip the guard: decode CEF at the edge worker
+          group that tails the Connect socket -- split the header on "|" to
+          recover the vendor/product/version and header severity, extract the
+          extension into fields, and rename the Connect column keys to the
+          tanium.threat_response.* shape the JSON path uses so CEF-sourced
+          alerts line up with any JSON alerts already indexed. No guard-driven
+          capping is needed on this path; the decision that matters is whether
+          to move this connection to CEF at all -- the JSON destination with
+          the stock integration is strictly richer and lower effort here, so
+          CEF is justified only when an existing CEF collector must be reused.
+        elastic: >
+          Land these records through a dedicated generic-CEF decode feeding
+          logs-tanium.threat_response@custom that maps the resolved extension
+          keys to the same targets the JSON map documents: the alert GUID to
+          event.id, the intel document id to rule.id (cast to string) and
+          rule.name, the endpoint address to host.ip rather than the source.ip
+          the CEF dhost/src convention would suggest, and the match type to
+          event.category. Because the CEF flattening drops the nested Match
+          Details, the field-count-explosion problem the JSON map guards
+          against does not arise -- but neither does the forensic lineage (the
+          ATT&CK technique array and acting-process lineage are unavailable
+          unless promoted to columns), so this is a reduced detection view,
+          not a replacement for the JSON feed.
+    fields_omitted: >
+      The CEF extension keys are the same Threat Response alert columns the
+      json entry inventories -- standard CEF dictionary keys for the
+      recognized columns and the raw CP-event field keys for the rest --
+      serialized as flat pairs instead of the nested Match Details tree.
+    fields: []
+  - format: syslog-leef
+    enable: >
+      On the same Threat Response alert connection, set the destination Format
+      to LEEF (Connect's default for QRadar, LogRhythm and McAfee SIEM).
+      Connect emits a LEEF header --
+      "LEEF:<version>|Tanium|<product>|<version>|<event id>|" -- followed by
+      the alert columns as tab-delimited key=value attributes. The LEEF
+      Advanced Settings expose the LEEF version, product name, version, source
+      and the end-of-entry separator character. As with CEF the attribute keys
+      are generated from the source question columns, so LEEF is a flat,
+      curated view of the alert rather than the full nested record; choose it
+      only for a LEEF-native consumer.
+    references:
+    - https://help.tanium.com/bundle/ug_connect_cloud/page/connect/siem.html
+    - https://docs.tanium.com/connect/connect/formats.html
+    - >-
+      https://manuals.plus/m/db1f55993b4a28f5977d71b68810ae3fba64ea82e9c67538b136911d194c747e.pdf
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom LEEF decode pipeline (no LEEF path in the stock Tanium integration)
+      notes: >
+        The stock Tanium integration has no LEEF parser, so a LEEF feed needs
+        a hand-built decode that splits the pipe-delimited header and the
+        tab-delimited attribute list and re-maps the attribute keys into the
+        tanium.threat_response.* / ECS shape the JSON path targets. The
+        attribute keys are the same alert columns inventoried on the json
+        format, so the field table is intentionally empty rather than a
+        duplicate; the real work is the tab-delimited tokenisation and the
+        same header/extension re-mapping the CEF path needs.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Decode LEEF at the low-side edge worker group: split the header on
+          "|" to recover the event id, split the tab-delimited body into
+          attributes and rename them to the tanium.threat_response.* keys the
+          JSON path uses so LEEF-sourced and JSON-sourced alerts converge.
+          Apply the same command-line and path length-capping and
+          encoding-normalisation before the guard, and dead-letter a header
+          that does not parse.
+        elastic: >
+          Land LEEF through a dedicated logs-tanium.threat_response@custom
+          decode mapping the attributes to the same targets the CEF and JSON
+          paths use (GUID to event.id, intel id to rule.id, endpoint address
+          to host.ip). Like CEF, LEEF is a flat curated subset that cannot
+          carry the nested Match Details lineage or the ATT&CK array, so
+          prefer keeping this connection on JSON and reserve LEEF for a
+          genuinely LEEF-only downstream.
+        relay: >
+          A LEEF line is a single flat string like CEF, so it crosses a
+          shallow-nesting filter more comfortably than the nested JSON alert.
+          Resolve the tab-delimited attribute keys to named fields low-side,
+          cap and ASCII-normalise any free-text command-line or path
+          attribute, validate against a Schema Library schema with a
+          dead-letter route, and reconcile alert counts per (dataset, hour)
+          across the at-most-once boundary.
+      direct:
+        parse_location: hybrid
+        cribl: >
+          High-side instances skip the guard: decode LEEF at the edge worker
+          group -- split the header on "|" to recover the event id, split the
+          tab-delimited body into attributes and rename them to the
+          tanium.threat_response.* keys the JSON path uses so LEEF-sourced
+          alerts line up with any JSON alerts already indexed. No guard-driven
+          capping is needed on this path; the operative decision remains
+          whether to leave the connection on the richer JSON output rather
+          than switch it to LEEF at all.
+        elastic: >
+          Land LEEF through a dedicated logs-tanium.threat_response@custom
+          decode mapping the attributes to the same ECS targets the JSON path
+          uses (GUID to event.id, intel id to rule.id cast to string, endpoint
+          address to host.ip). Like CEF, LEEF is a flat curated subset that
+          cannot carry the nested Match Details lineage or the ATT&CK array,
+          so it is a reduced alert view rather than a JSON replacement.
+    fields_omitted: >
+      The LEEF attributes are the same Threat Response alert columns the json
+      entry inventories, tab-delimited behind the pipe header; LEEF adds no
+      attribute reference of its own and drops the nested Match Details and
+      ATT&CK arrays entirely.
+    fields: []
+  - format: syslog-kv
+    enable: >
+      Leaving the connection's socket destination in place, set the Format to
+      Key-Value Pairs. Connect then flattens each alert into a single line of
+      key=value pairs whose keys are the source question column names ("Alert
+      Id"=, "Computer Name"=, "Intel Name"=, ...) -- the same columns the JSON
+      destination emits, without JSON's nesting or typing. This is the
+      lightest-weight socket alternate, but the nested Match Details subtree
+      cannot be represented as flat pairs, so it is the most reduced view of
+      the three, and quoting of values that contain spaces or the separator
+      character (command lines, file paths) is the parser's main hazard.
+    references:
+    - https://help.tanium.com/bundle/ug_connect_cloud/page/connect/siem.html
+    - https://docs.tanium.com/connect/connect/formats.html
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: KV-extract pipeline re-keying Connect columns into tanium.threat_response.*
+      notes: >
+        The key=value keys are the source question column names already
+        inventoried on the json format, so no separate attribute reference
+        exists to reproduce -- a KV extraction recovers the same named fields
+        and the ECS mapping is identical to the JSON path, minus the nested
+        Match Details the KV form cannot carry. The field table is
+        intentionally empty rather than a duplicate; the real work is robust
+        KV tokenisation given unquoted, space-bearing values, not a new
+        mapping.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Run a KV extractor at the low-side edge worker group and re-key the
+          flattened column names into tanium.threat_response.* so the output
+          converges with the JSON path. The specific risk is any command-line
+          or path column, whose spaces and embedded quotes break naive
+          whitespace tokenisation, so extract with an explicit terminator and
+          cap length before the guard; because KV cannot carry the nested
+          lineage, this feed is a reduced view and should not be treated as
+          the forensic record.
+        elastic: >
+          Decode with a generic KV ingest processor feeding
+          logs-tanium.threat_response@custom, mapping the recovered keys to
+          the same ECS targets as the JSON path; because the keys are the JSON
+          column names, the @custom logic is shared, but the KV form loses
+          JSON's typing (every value arrives as a string) so the numeric intel
+          id, file size and score coercions must be explicit.
+        relay: >
+          A single flat key=value line crosses a shallow-nesting filter
+          easily, which is the format's one advantage; the friction is that
+          unquoted free-text values can smuggle the separator character, so
+          normalise and length-bound those low-side before the guard rather
+          than trusting the filter to tokenise them. Reconcile per (dataset,
+          hour) across the at-most-once boundary.
+      direct:
+        parse_location: hybrid
+        cribl: >
+          High-side instances skip the guard: run a KV extractor at the edge
+          worker group and re-key the flattened column names into
+          tanium.threat_response.* so KV-sourced alerts line up with any JSON
+          alerts already indexed. Extract any command-line or path column with
+          an explicit terminator rather than whitespace so embedded spaces and
+          quotes do not truncate it. The JSON output is preferable wherever
+          the socket destination can carry it, since KV discards both JSON's
+          typing and the nested Match Details for no gain here.
+        elastic: >
+          Decode with a generic KV ingest processor feeding
+          logs-tanium.threat_response@custom, mapping the recovered keys to
+          the same ECS targets as the JSON path; because the KV form loses
+          JSON's typing (every value arrives as a string), the numeric intel
+          id, file size and score coercions must be explicit.
+    fields_omitted: >
+      The key=value keys are the source question column names the json entry
+      inventories ("Alert Id"=, "Computer Name"=, "Intel Name"=, ...),
+      flattened one line per alert without JSON's nesting or typing, so this
+      entry adds no fields of its own and cannot carry the nested Match
+      Details tree at all.
+    fields: []
+  - format: api-pull
+    enable: >
+      Rather than receive a Connect push, pull alerts from Tanium's API
+      Gateway (GraphQL, the vendor's preferred integration path going forward)
+      at
+      https://<customer>-api.cloud.tanium.com/plugin/products/gateway/graphql,
+      or from the equivalent Threat Response REST alerts endpoint on the Core
+      Platform. Authenticate with a Tanium API token and page the alert list
+      on the createdAt/updatedAt cursor. This returns a differently shaped
+      record than the Connect export: a flat camelCase alert object (ID, GUID,
+      Type, Severity, Priority, State, AlertedAt, CreatedAt, UpdatedAt,
+      ComputerName, ComputerIpAddress, IntelDocId) with the match body carried
+      in a details member -- not the Connect "Alert Id" / "Match Details"
+      column shape -- so it is a genuine alternate, not the same JSON over a
+      different transport. It also carries the triage State the Connect push
+      does not, which is its main reason to use.
+    references:
+    - https://developer.tanium.com/guides/core-platform/integration_methods
+    - https://developer.tanium.com/apis/api_intro
+    - https://xsoar.pan.dev/docs/reference/integrations/tanium-threat-response-v2
+    - https://docs.cyderes.cloud/parser-knowledge-base/tanium_threat_response/
+    parsing:
+      mechanism: elastic-ingest-pipeline
+      artifact: >-
+        Elastic httpjson/CEL input + logs-tanium.threat_response@custom (no
+        stock API-pull path in the Tanium integration)
+      notes: >
+        The stock Tanium integration ingests Connect output, not an API pull,
+        so this path needs an httpjson or CEL input that authenticates to the
+        Gateway, pages the alert list and hands each alert to a custom
+        pipeline. The envelope differs from the Connect export -- GraphQL
+        responses nest under a data.<query>.edges.node structure and the alert
+        keys are camelCase -- so the pipeline decodes the details member (a
+        JSON-encoded Match Details blob equivalent to the Connect subtree) and
+        re-maps the camelCase alert keys onto the same
+        tanium.threat_response.* / ECS shape the Connect path targets so both
+        acquisition methods are one corpus.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          For a low-side instance the pull has to originate below the boundary
+          -- the Gateway will not be reachable from the high side -- so run
+          the httpjson/CEL collector low-side, normalise the camelCase alert
+          into the tanium.threat_response.* shape, decode and prune the
+          details blob to bounded depth exactly as on the JSON push route, and
+          cross a thin envelope. The State field the pull adds is a triage
+          value, not a detection outcome, so carry it but do not let it drive
+          event.outcome. Cap and ASCII-normalise any command-line or path
+          recovered from details before the guard.
+        elastic: >
+          Land the pulled alerts through logs-tanium.threat_response@custom,
+          mapping GUID to event.id, IntelDocId to rule.id (cast to string),
+          AlertedAt to @timestamp and CreatedAt to event.created, and keeping
+          the alerting endpoint's ComputerIpAddress on host.ip rather than
+          source.ip. Normalise the string Severity category to a numeric
+          event.severity via an explicit lookup rather than indexing the label
+          raw, and keep the workflow State and numeric Priority in custom
+          fields since ECS has no alert-triage-state model.
+        relay: >
+          The pulled alert object is flatter than the Connect push at the top
+          level, but the details member re-introduces the same nested Match
+          Details lineage and possible base64 body, so it is the same
+          content-filter problem once decoded -- flatten and cap details
+          low-side to two levels of nesting with bounded string lengths,
+          validate against a Schema Library schema, and dead-letter before the
+          guard. The pull carries a monotonic updatedAt cursor, which is the
+          cleanest in-band way to reconcile per (dataset, hour) across the
+          at-most-once boundary and to detect a gap on the return-channel-less
+          crossing.
+      direct:
+        parse_location: high
+        cribl: >
+          For a high-side instance the Gateway is reachable directly, so the
+          collector can be a light pass-through: authenticate, page on the
+          updatedAt cursor and hand whole alert objects to the pipeline with
+          Persistent Queue backpressure, doing only the details decode and
+          length-capping low enough in the flow to keep the alert body intact.
+          Prefer the pull over the Connect push here only when the triage
+          State or the Gateway's paging semantics are wanted, since the
+          Connect JSON destination is already the stock-integration-supported
+          shape.
+        elastic: >
+          Land the pulled alerts through logs-tanium.threat_response@custom,
+          mapping GUID to event.id, IntelDocId to rule.id (cast to string),
+          AlertedAt to @timestamp, CreatedAt to event.created, and
+          ComputerIpAddress to host.ip rather than source.ip. Normalise the
+          string Severity category to a numeric event.severity via an explicit
+          lookup, and keep the workflow State and numeric Priority in custom
+          fields since ECS has no alert-triage-state model. The details member
+          decode is the same pruning-and-typing work the JSON push route
+          documents, so the two paths should share the @custom pipeline.
+    fields:
+    - vendor: GUID
+      type: string
+      description: >-
+        globally unique identifier of the alert in the customer environment;
+        the same identity the Connect export carries as "Alert Id"
+      ecs: event.id
+      status: mapped
+    - vendor: ID
+      type: integer
+      description: >-
+        numeric database row id of the alert on the Tanium server, distinct
+        from the GUID
+      ecs: null
+      status: unmapped
+      custom: tanium.threat_response.alert_row_id
+      transform: emitted as a JSON number; the GUID, not this, is the stable alert identity
+    - vendor: Type
+      type: string
+      description: alert type / export shape indicator (e.g. "detect.match")
+      ecs: null
+      status: unmapped
+      custom: tanium.threat_response.type
+      notes: >-
+        identifies the alert serialization, not a detection category; do not
+        map to event.category, which is derived from the match type inside
+        details
+    - vendor: Severity
+      type: string
+      description: Threat Response severity category for the alert (e.g. Info, Low, Medium, High)
+      ecs: event.severity
+      status: partial
+      transform: >
+        a string category, not the 0-100 long ECS event.severity expects; map
+        through an explicit label-to-number lookup rather than indexing the
+        raw string, or keep it in a custom field if the ordering is not wanted
+        numerically
+    - vendor: Priority
+      type: string
+      description: Threat Response priority assigned to the alert
+      ecs: null
+      status: unmapped
+      custom: tanium.threat_response.priority
+    - vendor: State
+      type: enum
+      description: >-
+        alert triage workflow state (Unresolved, In Progress, Dismissed,
+        Ignored, Resolved)
+      ecs: null
+      status: unmapped
+      custom: tanium.threat_response.state
+      notes: >
+        the analyst workflow state the Connect push does not carry and the
+        main reason to pull; ECS has no alert-triage-state field, so it must
+        live custom and must not be read as event.outcome
+    - vendor: AlertedAt
+      type: timestamp
+      description: time the alert was generated on the endpoint
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: CreatedAt
+      type: timestamp
+      description: time the Tanium server received and created the alert record
+      ecs: event.created
+      status: mapped
+    - vendor: UpdatedAt
+      type: timestamp
+      description: time of the last state change on the alert
+      ecs: null
+      status: unmapped
+      custom: tanium.threat_response.updated_at
+      notes: >-
+        the monotonic paging cursor for the pull; also the reconciliation key
+        across the guard
+    - vendor: ComputerName
+      type: string
+      description: hostname of the endpoint that generated the alert
+      ecs: host.name
+      status: mapped
+    - vendor: ComputerIpAddress
+      type: ip
+      description: IP address of the endpoint that generated the alert
+      ecs: host.ip
+      status: partial
+      notes: >
+        the alerting endpoint's own address, not a flow source; host.ip is the
+        correct home and any source.ip copy inherited from an ECS CEF
+        convention should be treated as compatibility only, as on the json
+        path
+    - vendor: IntelDocId
+      type: integer
+      description: identifier of the intel document / signal whose match raised the alert
+      ecs: rule.id
+      status: mapped
+      transform: emitted as a JSON number; cast to string for the keyword-typed rule.id
+    - vendor: details
+      type: string
+      description: >-
+        JSON-encoded match body equivalent to the Connect "Match Details"
+        subtree (finding, acting-artifact process lineage, file properties,
+        match type/source)
+      ecs: null
+      status: unmapped
+      custom: tanium.threat_response.details
+      transform: >
+        a serialized JSON string that must be decoded, then pruned and
+        type-cast exactly as the json path handles Match Details -- the
+        acting_artifact lineage nests recursively with repeated key names, so
+        cap depth before indexing and drive event.category and the file.* /
+        process.* fields off the decoded subtree rather than indexing it whole
+- id: discover
+  name: Discover asset finding
+  description: >
+    Tanium Discover interface records for every asset seen on the network,
+    managed or not, with the discovery methods that saw it (ARP, ping, nmap,
+    connected, AWS API) and whether a Tanium client manages it. Exported by a
+    Connect connection whose source is a Discover saved question / interface
+    and whose destination is a Socket Receiver with Format = JSON. The SOC
+    value is the unmanaged and unmanageable rows: assets on the wire with no
+    endpoint telemetry behind them.
+  event_categories:
+  - network
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same path as the Threat Response connection above: Tanium Connect
+        writes to a Cribl source in the worker group nearest the Tanium
+        server, which on this side sits below the boundary, so the feed
+        crosses the Everfox HSG as shown.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-tanium.discover
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Same path as the Threat Response connection above: Tanium Connect
+        writes to a Cribl source in the worker group nearest the Tanium
+        server, which ships straight to the Elastic side with no guard
+        crossing.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-tanium.discover
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: Elastic Tanium integration (discover data stream)
+      notes: >
+        The discover ingest pipeline maps the PascalCase Connect columns into
+        tanium.discover.* and derives event.start/event.end from the record
+        lifecycle timestamps rather than from a discovery event.
+    fields:
+    - vendor: id
+      type: long
+      description: Discover-assigned row identifier for the asset record
+      ecs: event.id
+      status: mapped
+      transform: numeric; cast to string for the keyword-typed event.id
+    - vendor: HostName
+      type: string
+      description: hostname resolved or reported for the discovered asset
+      ecs: host.hostname
+      status: mapped
+    - vendor: IpAddress
+      type: ip
+      description: IP address at which the asset was discovered
+      ecs: host.ip
+      status: partial
+      notes: >
+        the stock pipeline copies this to source.ip; the record describes an
+        asset, not a flow, so host.ip is the honest home and the source.ip
+        copy should be treated as compatibility only
+    - vendor: NatIpAddress
+      type: ip
+      description: address the asset presents through NAT, when Discover can determine it
+      ecs: source.nat.ip
+      status: partial
+      notes: >
+        the stock pipeline uses source.nat.ip, which carries session-NAT
+        semantics ECS does not intend for a static asset row; kept for
+        integration compatibility but a custom asset-scoped field would be
+        more truthful
+    - vendor: MacAddress
+      type: mac
+      description: hardware address of the discovered asset, dash-separated
+      ecs: host.mac
+      status: partial
+      notes: >
+        stock pipeline sets source.mac; host.mac is the asset-scoped field.
+        ECS expects colon-separated uppercase MACs, so the dash-separated
+        vendor form needs normalizing
+    - vendor: MacOrganization
+      type: string
+      description: OUI vendor name resolved from the MAC address (e.g. "VMware, Inc.")
+      ecs: null
+      status: unmapped
+      custom: tanium.discover.mac_organization
+    - vendor: Os
+      type: string
+      description: operating system Discover fingerprinted for the asset
+      ecs: host.os.name
+      status: partial
+      notes: >
+        a fingerprinting guess for unmanaged assets and authoritative only for
+        managed ones; treat as low-confidence and do not let it override
+        host.os.* from an endpoint agent on the same host
+    - vendor: TaniumComputerId
+      type: long
+      description: Tanium client identifier when the asset is managed, absent otherwise
+      ecs: null
+      status: unmapped
+      custom: tanium.discover.tanium_computer_id
+      notes: >
+        the join key back to every other Tanium dataset; not host.id, which
+        should stay reserved for a platform-independent host identifier
+    - vendor: Managed
+      type: integer
+      description: 1 when a Tanium client is installed and reporting on the asset, 0 otherwise
+      ecs: null
+      status: unmapped
+      custom: tanium.discover.managed
+      transform: 0/1 integer; convert to boolean so unmanaged-asset queries are a clean filter
+    - vendor: Unmanageable
+      type: integer
+      description: 1 when the asset cannot host a Tanium client (printer, appliance, IoT device)
+      ecs: null
+      status: unmapped
+      custom: tanium.discover.unmanageable
+      transform: 0/1 integer; convert to boolean
+    - vendor: Ports
+      type: string
+      description: comma-separated list of TCP ports found open on the asset
+      ecs: null
+      status: unmapped
+      custom: tanium.discover.ports
+      transform: >-
+        split on comma into an array of numbers; no ECS field models a
+        per-asset open-port list
+    - vendor: Nmap
+      type: integer
+      description: 1 when an nmap scan was one of the methods that discovered the asset
+      ecs: null
+      status: unmapped
+      custom: tanium.discover.method.nmap
+      notes: >
+        one of a family of sibling 0/1 method flags (Arp, Ping, Connected,
+        AwsApi, CentralizedNmap, SatelliteNmap) that follow the same shape;
+        collapsing them into a single method array is the cleaner target
+    - vendor: Labels
+      type: string
+      description: comma-separated Discover labels applied to the asset
+      ecs: null
+      status: unmapped
+      custom: tanium.discover.labels
+    - vendor: CreatedAt
+      type: timestamp
+      description: time the asset row was first created in Discover
+      ecs: event.start
+      status: partial
+      notes: >
+        record lifecycle, not event duration; event.start/event.end on this
+        dataset describe when Discover first and last knew about the asset
+    - vendor: LastDiscoveredAt
+      type: timestamp
+      description: last time any discovery method saw the asset on the network
+      ecs: event.end
+      status: partial
+      transform: >
+        space-separated with an explicit UTC offset ("2022-11-18 10:10:57
+        +00:00") rather than ISO-8601, and frequently null; needs an explicit
+        date format and a fallback to UpdatedAt
+    - vendor: Profile
+      type: string
+      description: Discover scan profile that produced the record
+      ecs: null
+      status: unmapped
+      custom: tanium.discover.profile
+      notes: >
+        the stock pipeline copies this into observer.ingress.interface.name,
+        which misrepresents a scan profile as a network interface; keep the
+        custom field authoritative
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Pass through to the integration pipeline and keep low-side work to
+          volume shaping and enrichment: Discover re-exports the full
+          interface on every scheduled run, so dedupe or delta-filter on the
+          row id and UpdatedAt in the worker group rather than re-indexing
+          unchanged asset rows, and attach the subnet-to-site /
+          subnet-to-owner lookup here where the network inventory already
+          lives. Persistent Queue backpressure on the Elastic destination;
+          _raw can be dropped on this route once the pipeline is proven since
+          asset state is reconstructable from the next export.
+        elastic: >
+          Use the stock discover pipeline and add a
+          logs-tanium.discover@custom pipeline for the modelling problems this
+          map records: convert the 0/1 integer discovery-method and management
+          flags into booleans so "unmanaged asset" is a clean filter rather
+          than an integer comparison, move the asset address and MAC off
+          source.ip/source.mac onto host.ip/host.mac since these rows describe
+          an asset rather than a flow, and split the comma-separated Ports
+          string into an array of numbers. Map the tanium.discover.* custom
+          fields as keyword explicitly, and reconsider the stock pipeline's
+          copy of the Discover profile name into
+          observer.ingress.interface.name - a scan profile is not a network
+          interface and that copy will mislead anyone reading observer.* as
+          topology.
+        relay: >
+          On the guarded path, note that a Discover export is a complete
+          inventory of the low-side network - hostnames, addresses, MAC
+          vendors, open ports and site labels in one stream - so the crossing
+          decision here is a disclosure decision, not just a parsing one. The
+          JSON is flat and short-keyed already, which makes it the easiest
+          dataset on this technology to constrain for a custom NDJSON content
+          filter; keep it that way by holding the enrichment lookups to scalar
+          values and capping the free-text Labels and Locations columns.
+      direct:
+        parse_location: high
+        cribl: >
+          High-side instances skip the guard: pass through to the integration
+          pipeline and keep the worker group's work to volume shaping and
+          enrichment. Discover re-exports the full interface on every
+          scheduled run, so dedupe or delta-filter on the row id and UpdatedAt
+          in the worker group rather than re-indexing unchanged asset rows,
+          and attach the subnet-to-site / subnet-to-owner lookup here where
+          the network inventory already lives. Persistent Queue backpressure
+          on the Elastic destination; _raw can be dropped on this route once
+          the pipeline is proven since asset state is reconstructable from the
+          next export.
+        elastic: >
+          Use the stock discover pipeline and add a
+          logs-tanium.discover@custom pipeline for the modelling problems this
+          map records: convert the 0/1 integer discovery-method and management
+          flags into booleans so "unmanaged asset" is a clean filter rather
+          than an integer comparison, move the asset address and MAC off
+          source.ip/source.mac onto host.ip/host.mac since these rows describe
+          an asset rather than a flow, and split the comma-separated Ports
+          string into an array of numbers. Map the tanium.discover.* custom
+          fields as keyword explicitly, and reconsider the stock pipeline's
+          copy of the Discover profile name into
+          observer.ingress.interface.name - a scan profile is not a network
+          interface and that copy will mislead anyone reading observer.* as
+          topology.
+  - format: syslog-cef
+    enable: >
+      On the Connect connection whose source is the Discover saved question /
+      interface, change the destination Format to CEF. Connect emits one CEF
+      line per asset row with the standard
+      "CEF:0|<vendor>|<product>|<version>|<signature id>|<name>|<severity>|"
+      header and the Discover columns as the extension; recognized columns
+      (address, MAC, hostname) map to standard CEF dictionary keys and the
+      rest (management flags, discovery-method flags, labels) pass through
+      under their raw column names. The CEF Advanced Settings set the device
+      vendor/product/version, source and end-of-entry separator. Discover rows
+      are already flat, so CEF is a faithful (if verbose) rendering of this
+      dataset rather than the lossy view it is for Threat Response.
+    references:
+    - https://help.tanium.com/bundle/ug_connect_cloud/page/connect/siem.html
+    - https://docs.tanium.com/connect/connect/formats.html
+    - >-
+      https://manuals.plus/m/db1f55993b4a28f5977d71b68810ae3fba64ea82e9c67538b136911d194c747e.pdf
+    parsing:
+      mechanism: elastic-ingest-pipeline
+      artifact: >-
+        generic CEF decode + logs-tanium.discover@custom (no CEF path in the
+        stock Tanium integration)
+      notes: >
+        The stock discover pipeline parses Connect JSON only, so a CEF feed
+        needs a generic CEF decode yielding cef.extensions.* keyed by the raw
+        Discover column names, then a hand-built @custom that re-maps them
+        into tanium.discover.* / ECS. The extension keys are the same columns
+        inventoried on the json format, so the field table is empty rather
+        than a duplicate; the CEF-specific work is resolving the
+        dictionary-mapped address/MAC keys back to the asset-scoped host.ip /
+        host.mac placement the JSON map argues for.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Decode CEF at the low-side edge worker group, resolve the extension
+          keys back to the Discover column names and re-key into
+          tanium.discover.*, and do the same volume shaping the JSON route
+          needs -- Discover re-exports the whole interface each run, so dedupe
+          or delta-filter on the row id and UpdatedAt before the guard rather
+          than crossing an unchanged inventory every schedule tick. Cap the
+          free-text Labels and Locations extensions.
+        elastic: >
+          Land through logs-tanium.discover@custom mapping the resolved keys
+          as the JSON map documents: address and MAC to host.ip / host.mac
+          (not the source.ip / source.mac the CEF dictionary convention
+          suggests, since these rows describe an asset, not a flow), the 0/1
+          management and discovery-method flags to booleans, and the
+          comma-separated Ports string to an array. Keep the Discover profile
+          in a custom field rather than observer.ingress.interface.name.
+        relay: >
+          A CEF asset row is one flat string, and because Discover CEF is not
+          nested it is the easiest of this technology's feeds to constrain for
+          a shallow content filter. The crossing consideration is disclosure,
+          not parsing: a Discover export is a complete inventory of the
+          low-side network -- hostnames, addresses, MAC vendors, open ports
+          and site labels in one stream -- so hold the enrichment to scalar
+          values, cap the free-text label columns, and reconcile row counts
+          per (dataset, hour) across the at-most-once boundary.
+      direct:
+        parse_location: hybrid
+        cribl: >
+          High-side instances skip the guard: decode CEF at the edge worker
+          group, resolve the extension keys back to the Discover column names
+          and re-key into tanium.discover.*, and dedupe or delta-filter on the
+          row id and UpdatedAt so an unchanged inventory is not re-indexed
+          every schedule tick. No guard-driven capping is needed on this path;
+          the JSON destination is the stock-supported shape, so switch this
+          connection to CEF only to feed a CEF-only asset consumer.
+        elastic: >
+          Land through logs-tanium.discover@custom mapping the resolved keys
+          the way the JSON map documents: address and MAC to host.ip /
+          host.mac (not the source.ip / source.mac the CEF dictionary
+          convention suggests, since these rows describe an asset, not a
+          flow), the 0/1 management and discovery-method flags to booleans,
+          and the comma-separated Ports string to an array. Keep the Discover
+          profile in a custom field rather than
+          observer.ingress.interface.name.
+    fields_omitted: >
+      The CEF extension keys are the same Discover asset columns the json
+      entry inventories: address, MAC and hostname folded onto standard CEF
+      dictionary keys, and the management, discovery-method and Ports columns
+      passing through under their raw Discover column names.
+    fields: []
+  - format: syslog-leef
+    enable: >
+      Set the Discover connection's destination Format to LEEF. Connect emits
+      a "LEEF:<version>|Tanium|<product>|<version>|<event id>|" header with
+      the asset columns as tab-delimited attributes; the LEEF Advanced
+      Settings set the version, product name, version, source and separator.
+      As with CEF the attribute keys are the Discover column names, so LEEF is
+      a faithful flat rendering of this already-tabular dataset.
+    references:
+    - https://help.tanium.com/bundle/ug_connect_cloud/page/connect/siem.html
+    - https://docs.tanium.com/connect/connect/formats.html
+    - >-
+      https://manuals.plus/m/db1f55993b4a28f5977d71b68810ae3fba64ea82e9c67538b136911d194c747e.pdf
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom LEEF decode pipeline (no LEEF path in the stock Tanium integration)
+      notes: >
+        No stock LEEF parser exists, so a LEEF feed needs a hand-built decode
+        that splits the header and the tab-delimited attribute list and
+        re-maps the Discover column keys into tanium.discover.* / ECS. The
+        attribute keys are the json columns, so the field table is empty; the
+        work is the tab tokenisation and the same asset-scoped host.ip /
+        host.mac re-placement the JSON map argues for.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Decode LEEF at the low-side edge worker group, rename the
+          tab-delimited attributes to tanium.discover.*, and apply the same
+          per-run dedupe on row id and UpdatedAt before the guard so an
+          unchanged inventory is not re-crossed. Cap the free-text label
+          columns.
+        elastic: >
+          Land through logs-tanium.discover@custom with the same host.ip /
+          host.mac placement, boolean flag conversion and Ports-array split
+          the JSON map documents; LEEF carries the same columns, so the
+          @custom logic is shared with the CEF and JSON paths.
+        relay: >
+          A LEEF asset row is a flat string like CEF and equally friendly to a
+          shallow filter; the same whole-network disclosure consideration
+          applies, so hold enrichment to scalars, cap the label columns and
+          reconcile counts per (dataset, hour).
+      direct:
+        parse_location: hybrid
+        cribl: >
+          High-side instances skip the guard: decode LEEF at the edge worker
+          group, rename the tab-delimited attributes to tanium.discover.*, and
+          dedupe on row id and UpdatedAt so an unchanged inventory is not
+          re-indexed. No guard-driven capping is needed on this path; JSON
+          remains the stock-supported shape, so use LEEF only for a
+          LEEF-native consumer.
+        elastic: >
+          Land through logs-tanium.discover@custom with the same host.ip /
+          host.mac placement, boolean flag conversion and Ports-array split
+          the JSON map documents; LEEF carries the same Discover columns, so
+          the @custom logic is shared with the CEF and JSON paths.
+    fields_omitted: >
+      The LEEF attribute keys are the Discover asset columns the json entry
+      inventories, rendered as a tab-delimited flat list of this
+      already-tabular dataset rather than a distinct attribute set.
+    fields: []
+  - format: syslog-kv
+    enable: >
+      Set the Discover connection's Format to Key-Value Pairs. Connect emits
+      one line of key=value pairs per asset whose keys are the Discover column
+      names (HostName=, IpAddress=, MacAddress=, Managed=, Ports=, ...) -- the
+      same columns the JSON destination carries, without typing. For this flat
+      dataset KV loses only JSON's type information, so it is a close
+      lightweight equivalent; the hazard is the comma-bearing Ports value and
+      any space-bearing label breaking naive tokenisation.
+    references:
+    - https://help.tanium.com/bundle/ug_connect_cloud/page/connect/siem.html
+    - https://docs.tanium.com/connect/connect/formats.html
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: KV-extract pipeline re-keying Discover columns into tanium.discover.*
+      notes: >
+        The key=value keys are the Discover columns already inventoried on the
+        json format, so the field table is empty rather than a duplicate -- a
+        KV extraction recovers the same named fields and the ECS mapping is
+        identical to the JSON path, minus JSON's typing. The work is robust
+        tokenisation of the comma-bearing Ports and free-text label values,
+        and re-applying the numeric/boolean coercions the string-typed KV
+        values lose.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Run a KV extractor at the low-side edge worker group, re-key into
+          tanium.discover.*, and dedupe on row id and UpdatedAt before the
+          guard as on the other Discover paths. Extract the comma-separated
+          Ports with an explicit terminator rather than whitespace so it
+          survives as an array, and cap the free-text label values.
+        elastic: >
+          Decode with a generic KV ingest processor into
+          logs-tanium.discover@custom, applying the boolean-flag conversion,
+          Ports-array split and host.ip / host.mac placement explicitly since
+          the KV form arrives untyped; the recovered keys are the JSON column
+          names, so the @custom logic is shared.
+        relay: >
+          A flat key=value asset row crosses a shallow filter easily and is
+          the simplest Discover serialization to constrain; the whole-network
+          disclosure consideration is unchanged, so hold enrichment to
+          scalars, length-bound the label values, and reconcile per (dataset,
+          hour).
+      direct:
+        parse_location: hybrid
+        cribl: >
+          High-side instances skip the guard: run a KV extractor at the edge
+          worker group, re-key into tanium.discover.*, and dedupe on row id
+          and UpdatedAt so an unchanged inventory is not re-indexed. Extract
+          the comma-separated Ports with an explicit terminator rather than
+          whitespace so it survives as an array, and cap the free-text label
+          values. The JSON destination is preferable where the socket can
+          carry it, since KV only discards typing for no gain here.
+        elastic: >
+          Decode with a generic KV ingest processor into
+          logs-tanium.discover@custom, applying the boolean-flag conversion,
+          Ports-array split and host.ip / host.mac placement explicitly since
+          the KV form arrives untyped; the recovered keys are the JSON column
+          names, so the @custom logic is shared with the CEF and JSON paths.
+    fields_omitted: >
+      The key=value keys are the Discover column names the json entry
+      inventories (HostName=, IpAddress=, MacAddress=, Managed=, Ports=, ...),
+      emitted one line per asset without JSON's typing -- the same columns,
+      minus the numeric and boolean coercions the untyped values lose.
+    fields: []
+- id: action-history
+  name: Action history
+  description: >
+    Console audit trail of Tanium actions - every package deployment issued
+    through the platform, who issued and approved it, the command it ran on
+    the endpoint, and its lifecycle status. This is the accountability record
+    for a tool that can execute arbitrary commands fleet-wide, so it is the
+    dataset a CSOC needs in order to distinguish sanctioned Tanium activity
+    from an operator abusing the platform.
+  event_categories:
+  - configuration
+  - process
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same path as the other Tanium connections: Tanium Connect writes to a
+        Cribl source in the worker group nearest the Tanium server, which on
+        this side sits below the boundary, so the feed crosses the Everfox HSG
+        as shown.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-tanium.action_history
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Same path as the other Tanium connections: Tanium Connect writes to a
+        Cribl source in the worker group nearest the Tanium server, which
+        ships straight to the Elastic side with no guard crossing.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-tanium.action_history
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: Elastic Tanium integration (action_history data stream)
+    fields:
+    - vendor: ActionId
+      type: long
+      description: numeric identifier of the deployed action
+      ecs: event.id
+      status: mapped
+      transform: numeric; cast to string for the keyword-typed event.id
+    - vendor: ActionName
+      type: string
+      description: name of the action as shown in the console, derived from the package
+      ecs: event.action
+      status: partial
+      notes: >
+        high-cardinality operator-facing text rather than a controlled action
+        vocabulary; usable for audit search, not for event.action faceting
+    - vendor: Command
+      type: string
+      description: command line the action executed on the targeted endpoints
+      ecs: process.command_line
+      status: mapped
+      notes: >
+        arbitrary operator-authored shell/PowerShell; the credential-exposure
+        and content-filter hotspot on this dataset
+    - vendor: PackageName
+      type: string
+      description: Tanium package the action deployed
+      ecs: null
+      status: unmapped
+      custom: tanium.action_history.package_name
+    - vendor: Issuer
+      type: string
+      description: Tanium console account that issued the action
+      ecs: user.name
+      status: mapped
+    - vendor: Approver
+      type: string
+      description: >-
+        Tanium console account that approved the action, where action approval
+        is enforced
+      ecs: null
+      status: unmapped
+      custom: tanium.action_history.approver
+      notes: >
+        ECS models one acting user plus user.target/user.changes; there is no
+        approver role, so the two-person-control signal has to live in a
+        custom field
+    - vendor: Status
+      type: enum
+      description: lifecycle state of the action (Open, Closed, Stopped, Expired)
+      ecs: event.outcome
+      status: partial
+      transform: >
+        not a success/failure vocabulary - only Closed implies completion; map
+        Closed to success and leave the rest unknown rather than defaulting,
+        or stopped deployments read as successful ones
+    - vendor: StartTime
+      type: timestamp
+      description: time the action began distributing to endpoints
+      ecs: event.start
+      status: partial
+      transform: >
+        emitted without a timezone designator ("2022-10-04T16:38:42"); parse
+        with the Tanium server's configured timezone rather than assuming UTC
+    - vendor: InsertTime
+      type: timestamp
+      description: time the action row was written to the Tanium database
+      ecs: '@timestamp'
+      status: partial
+      notes: >-
+        same timezone-less format as StartTime; the closest thing this dataset
+        has to an event time
+    - vendor: Expiration
+      type: timestamp
+      description: time after which the action stops being offered to endpoints
+      ecs: event.end
+      status: partial
+      notes: >
+        a scheduled expiry, not an observed completion; event.end here is the
+        deployment window closing rather than the action finishing
+    - vendor: DistributeOver
+      type: string
+      description: window the action was spread across (e.g. "1 minutes")
+      ecs: null
+      status: unmapped
+      custom: tanium.action_history.distribute_over
+      transform: >-
+        human-readable duration string; parse to seconds if it is to be
+        compared or aggregated
+    - vendor: Comment
+      type: string
+      description: free-text justification the operator supplied with the action, often empty
+      ecs: message
+      status: partial
+      notes: >-
+        operator-supplied and frequently blank; do not rely on it as the
+        document's message
+    - vendor: SourceId
+      type: integer
+      description: identifier of the Tanium module or interface that originated the action
+      ecs: null
+      status: unmapped
+      custom: tanium.action_history.source_id
+      notes: >-
+        numeric module reference; needs a lookup table to become a readable
+        event.provider value
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Pass through with Persistent Queue backpressure and do one piece of
+          low-side hygiene the integration will not: mask credential material
+          out of the Command column before it leaves the worker group. Action
+          commands are operator-authored shell and PowerShell, so tokens,
+          connection strings and passwords appear in them in practice, and
+          once indexed they are unmaskable. Keep _raw - this is a low-volume,
+          individually significant audit stream where the original record is
+          worth the bytes.
+        elastic: >
+          Parse with the stock action_history pipeline and add a
+          logs-tanium.action_history@custom pipeline that stops treating the
+          Open/Closed/Stopped/Expired lifecycle status as an outcome: only
+          Closed carries any completion meaning, so map the vocabulary
+          explicitly and leave event.outcome unknown for the rest rather than
+          letting dashboards read stopped deployments as successes. Parse the
+          timezone-less StartTime/InsertTime/Expiration strings with an
+          explicit Tanium-server timezone rather than assuming UTC, split the
+          Command into process.args alongside process.command_line, and map
+          tanium.action_history.* as keyword so package and approver
+          aggregations work.
+        relay: >
+          On the guarded crossing, the Command column is the content filter's
+          problem: arbitrary operator shell with quoting, embedded base64 and
+          non-ASCII, exactly the unbounded free text a simple custom NDJSON
+          filter handles worst. Cap and ASCII-normalize it low-side after
+          masking, hold the envelope to short keys and two levels of nesting,
+          and reconcile counts per (dataset, hour) - this stream is low-volume
+          enough that a silently dropped record is a real audit gap rather
+          than a rounding error.
+      direct:
+        parse_location: high
+        cribl: >
+          High-side instances skip the guard: pass through with Persistent
+          Queue backpressure and do one piece of hygiene the integration will
+          not -- mask credential material out of the Command column before it
+          is indexed. Action commands are operator-authored shell and
+          PowerShell, so tokens, connection strings and passwords appear in
+          them in practice, and once indexed they are unmaskable. Keep _raw -
+          this is a low-volume, individually significant audit stream where
+          the original record is worth the bytes.
+        elastic: >
+          Parse with the stock action_history pipeline and add a
+          logs-tanium.action_history@custom pipeline that stops treating the
+          Open/Closed/Stopped/Expired lifecycle status as an outcome: only
+          Closed carries any completion meaning, so map the vocabulary
+          explicitly and leave event.outcome unknown for the rest rather than
+          letting dashboards read stopped deployments as successes. Parse the
+          timezone-less StartTime/InsertTime/Expiration strings with an
+          explicit Tanium-server timezone rather than assuming UTC, split the
+          Command into process.args alongside process.command_line, and map
+          tanium.action_history.* as keyword so package and approver
+          aggregations work.
+  - format: syslog-cef
+    enable: >
+      On the Connect connection whose source is the Action History saved
+      question, set the destination Format to CEF. Connect emits one CEF line
+      per action with the standard header and the action columns as the
+      extension; the operator-authored Command column rides as a single
+      (large, free-text) extension value. The CEF Advanced Settings set the
+      device vendor/product/version, source and separator. Action history rows
+      are flat, so CEF renders this dataset faithfully -- the caution is not
+      lossiness but that the Command extension carries the same
+      credential-exposure risk it does in JSON.
+    references:
+    - https://help.tanium.com/bundle/ug_connect_cloud/page/connect/siem.html
+    - https://docs.tanium.com/connect/connect/formats.html
+    - >-
+      https://manuals.plus/m/db1f55993b4a28f5977d71b68810ae3fba64ea82e9c67538b136911d194c747e.pdf
+    parsing:
+      mechanism: elastic-ingest-pipeline
+      artifact: >-
+        generic CEF decode + logs-tanium.action_history@custom (no CEF path in
+        the stock Tanium integration)
+      notes: >
+        The stock action_history pipeline parses Connect JSON only, so a CEF
+        feed needs a generic CEF decode into cef.extensions.* keyed by the raw
+        action column names, then a hand-built @custom re-mapping into
+        tanium.action_history.* / ECS. The extension keys are the columns
+        inventoried on the json format, so the field table is empty; the
+        CEF-specific work is recovering the Command extension intact for
+        masking and splitting it into process.command_line / process.args.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Decode CEF at the low-side edge worker group and do the one piece of
+          hygiene the format does not change: mask credential material out of
+          the Command extension before it leaves the worker group, since
+          action commands are operator-authored shell and PowerShell in which
+          tokens, connection strings and passwords appear and, once indexed,
+          are unmaskable. Keep the full line -- this is a low-volume,
+          individually significant audit stream. Re-key the extension into
+          tanium.action_history.* before the guard.
+        elastic: >
+          Land through logs-tanium.action_history@custom mapping the resolved
+          keys as the JSON map documents: map only the Closed lifecycle status
+          to event.outcome success and leave Open/Stopped/Expired unknown,
+          parse the timezone-less StartTime/InsertTime/Expiration with the
+          Tanium server timezone rather than assuming UTC, and split the
+          Command extension into process.args alongside process.command_line.
+          Keep package name and approver as keyword custom fields.
+        relay: >
+          A flat CEF line crosses a shallow filter comfortably, but the
+          content constraint is the Command extension: arbitrary operator
+          shell with quoting, embedded base64 and non-ASCII, exactly the
+          unbounded free text a simple filter handles worst. Cap and
+          ASCII-normalise it low-side after masking, hold the rest of the line
+          to bounded values, and reconcile counts per (dataset, hour) -- this
+          stream is low-volume enough that a silently dropped record is a real
+          audit gap.
+      direct:
+        parse_location: hybrid
+        cribl: >
+          High-side instances skip the guard: decode CEF at the edge worker
+          group and mask credential material out of the Command extension
+          before it is indexed, since action commands are operator-authored
+          shell and PowerShell in which tokens, connection strings and
+          passwords appear and, once indexed, are unmaskable. Re-key the
+          extension into tanium.action_history.* and keep the full low-volume
+          line. The JSON destination is the stock-supported shape, so switch
+          to CEF only for a CEF-only audit consumer.
+        elastic: >
+          Land through logs-tanium.action_history@custom mapping the resolved
+          keys the way the JSON map documents: map only the Closed lifecycle
+          status to event.outcome success and leave Open/Stopped/Expired
+          unknown, parse the timezone-less StartTime/InsertTime/Expiration
+          with the Tanium server timezone rather than assuming UTC, and split
+          the Command extension into process.args alongside
+          process.command_line. Keep package name and approver as keyword
+          custom fields.
+    fields_omitted: >
+      The CEF extension keys are the same Action History columns the json
+      entry inventories, with the operator-authored Command column riding as a
+      single large free-text extension value rather than as its own field
+      inventory.
+    fields: []
+  - format: syslog-leef
+    enable: >
+      Set the Action History connection's Format to LEEF. Connect emits a LEEF
+      header with the action columns as tab-delimited attributes; the Advanced
+      Settings set the LEEF version, product name, version, source and
+      separator. The attribute keys are the action column names, so LEEF is a
+      faithful flat rendering carrying the same Command credential-exposure
+      hotspot as the other formats.
+    references:
+    - https://help.tanium.com/bundle/ug_connect_cloud/page/connect/siem.html
+    - https://docs.tanium.com/connect/connect/formats.html
+    - >-
+      https://manuals.plus/m/db1f55993b4a28f5977d71b68810ae3fba64ea82e9c67538b136911d194c747e.pdf
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom LEEF decode pipeline (no LEEF path in the stock Tanium integration)
+      notes: >
+        No stock LEEF parser exists, so a LEEF feed needs a hand-built decode
+        splitting the header and tab-delimited attributes and re-mapping the
+        action column keys into tanium.action_history.* / ECS. The attribute
+        keys are the json columns, so the field table is empty; the work is
+        tokenising the tab body and recovering the Command attribute intact
+        for masking and process.command_line / process.args split.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Decode LEEF at the low-side edge worker group, mask credential
+          material out of the Command attribute before the guard, and re-key
+          the attributes into tanium.action_history.*. Keep the full
+          low-volume line for audit forensics.
+        elastic: >
+          Land through logs-tanium.action_history@custom with the same
+          Closed-only event.outcome mapping, Tanium-timezone timestamp parsing
+          and Command split the JSON and CEF paths use.
+        relay: >
+          A flat LEEF line crosses a shallow filter comfortably; the same
+          Command masking must run low-side before the guard destination, not
+          after it. Keep the full line for administrative forensics and
+          reconcile per (dataset, hour).
+      direct:
+        parse_location: hybrid
+        cribl: >
+          High-side instances skip the guard: decode LEEF at the edge worker
+          group, mask credential material out of the Command attribute before
+          it is indexed, and re-key the attributes into
+          tanium.action_history.*. Keep the full low-volume line for audit
+          forensics. JSON remains the stock-supported shape, so use LEEF only
+          for a LEEF-native consumer.
+        elastic: >
+          Land through logs-tanium.action_history@custom mapping the resolved
+          attributes the way the JSON path documents: only the Closed
+          lifecycle status to event.outcome success with the rest left
+          unknown, timezone-less StartTime/InsertTime/Expiration parsed with
+          the Tanium server timezone, and the Command split into process.args
+          alongside process.command_line.
+    fields_omitted: >
+      The LEEF attribute keys are the action columns the json entry
+      inventories, tab-delimited behind the pipe header; the operator-authored
+      Command rides as one attribute and carries the same credential-exposure
+      hazard rather than adding new fields.
+    fields: []
+  - format: syslog-kv
+    enable: >
+      Set the Action History connection's Format to Key-Value Pairs. Connect
+      emits one line of key=value pairs per action whose keys are the action
+      column names (ActionId=, ActionName=, Command=, Issuer=, Status=, ...)
+      -- the same columns the JSON destination carries, untyped. The Command
+      value is the tokenisation hazard: operator shell routinely contains
+      spaces, quotes and the separator character.
+    references:
+    - https://help.tanium.com/bundle/ug_connect_cloud/page/connect/siem.html
+    - https://docs.tanium.com/connect/connect/formats.html
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: KV-extract pipeline re-keying action columns into tanium.action_history.*
+      notes: >
+        The key=value keys are the action columns already inventoried on the
+        json format, so the field table is empty -- a KV extraction recovers
+        the same named fields and the ECS mapping is identical to the JSON
+        path, minus typing. The work is robust tokenisation of the space- and
+        quote-bearing Command value and re-applying the timestamp and outcome
+        logic the untyped KV values lose.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Run a KV extractor at the low-side edge worker group, mask
+          credential material out of the Command value before the guard, and
+          re-key into tanium.action_history.*. Extract Command with an
+          explicit terminator rather than whitespace so quoting and embedded
+          separators do not truncate it; keep the full low-volume line.
+        elastic: >
+          Decode with a generic KV ingest processor into
+          logs-tanium.action_history@custom, applying the Closed-only
+          event.outcome mapping, Tanium-timezone timestamp parsing and Command
+          split explicitly since the KV values arrive untyped.
+        relay: >
+          A single flat key=value line crosses a shallow filter easily; the
+          Command value is the constraint, so mask and length-bound it
+          low-side before the guard rather than trusting the filter to
+          tokenise it. Reconcile per (dataset, hour) on this individually
+          significant audit stream.
+      direct:
+        parse_location: hybrid
+        cribl: >
+          High-side instances skip the guard: run a KV extractor at the edge
+          worker group, mask credential material out of the Command value
+          before it is indexed, and re-key into tanium.action_history.*.
+          Extract Command with an explicit terminator rather than whitespace
+          so quoting and embedded separators do not truncate it, and keep the
+          full low-volume line. The JSON destination is preferable where the
+          socket can carry it.
+        elastic: >
+          Decode with a generic KV ingest processor into
+          logs-tanium.action_history@custom, applying the Closed-only
+          event.outcome mapping, Tanium-timezone timestamp parsing and Command
+          split explicitly since the KV values arrive untyped.
+    fields_omitted: >
+      The key=value keys are the action column names the json entry
+      inventories (ActionId=, ActionName=, Command=, Issuer=, Status=, ...),
+      flattened one line per action without JSON's typing. What is
+      format-specific here is tokenising the space- and quote-bearing Command
+      value, not a distinct set of fields.
+    fields: []
+- id: client-status
+  name: Client status
+  description: >
+    Thin starter - per-endpoint Tanium Client registration and health rows
+    exported from a Connect saved question. Not an alerting source in its own
+    right, but the coverage-gap dataset: it is how the CSOC tells "no
+    detections on this host" apart from "this host stopped talking to Tanium",
+    and how a client silently downgraded off TLS or wedged in a non-Normal
+    peering state gets noticed.
+  event_categories:
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same path as the other Tanium connections: Tanium Connect writes to a
+        Cribl source in the worker group nearest the Tanium server, which on
+        this side sits below the boundary, so the feed crosses the Everfox HSG
+        as shown.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-tanium.client_status
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Same path as the other Tanium connections: Tanium Connect writes to a
+        Cribl source in the worker group nearest the Tanium server, which
+        ships straight to the Elastic side with no guard crossing.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-tanium.client_status
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: Elastic Tanium integration (client_status data stream)
+    fields:
+    - vendor: HostName
+      type: string
+      description: hostname reported by the Tanium Client
+      ecs: host.hostname
+      status: mapped
+    - vendor: ComputerId
+      type: string
+      description: Tanium Client identifier for the endpoint
+      ecs: null
+      status: unmapped
+      custom: tanium.client_status.computer_id
+      notes: >-
+        join key to the Discover and Threat Response datasets; kept out of
+        host.id, which should stay a platform-independent identifier
+    - vendor: Status
+      type: enum
+      description: client peering state in the linear chain (Normal, Leader, Blocked, Backup)
+      ecs: null
+      status: unmapped
+      custom: tanium.client_status.status
+      notes: >
+        Tanium peer-chain role, not a health verdict and not an event outcome;
+        service.state models a service lifecycle, which this is not
+    - vendor: LastRegistration
+      type: timestamp
+      description: last time the client registered with a Tanium server or zone server
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        emitted without a timezone designator; parse with the Tanium server
+        timezone. This is the field the endpoint-coverage staleness rule keys
+        on, so a silent timezone error shifts every gap alert
+    - vendor: ClientNetworkLocation
+      type: ip
+      description: address the Tanium Client registered from
+      ecs: host.ip
+      status: mapped
+    - vendor: ServerNetworkLocation
+      type: ip
+      description: address of the Tanium server or zone server the client registered to
+      ecs: server.ip
+      status: partial
+      notes: >
+        Tanium infrastructure rather than a flow destination; server.ip is the
+        least wrong ECS home but observer.* would arguably fit better if the
+        Tanium server were modelled as an observer for this dataset
+    - vendor: FullVersion
+      type: string
+      description: full version string of the Tanium Client installed on the endpoint
+      ecs: null
+      status: unmapped
+      custom: tanium.client_status.full_version
+      notes: >
+        deliberately not agent.version - that field carries the Elastic Agent
+        version for every data stream on this deployment, and overwriting it
+        with the Tanium Client version would corrupt agent-fleet dashboards
+    - vendor: ProtocolVersion
+      type: integer
+      description: Tanium client/server protocol revision the endpoint speaks
+      ecs: null
+      status: unmapped
+      custom: tanium.client_status.protocol_version
+    - vendor: RegisteredWithTLS
+      type: integer
+      description: 1 when the client registered over TLS, 0 when it did not
+      ecs: null
+      status: unmapped
+      custom: tanium.client_status.registered_with_tls
+      transform: >
+        0/1 integer; convert to boolean. Not tls.established, which describes
+        a TLS session observed in the event rather than a persisted property
+        of an endpoint's registration
+    - vendor: ValidKey
+      type: integer
+      description: 1 when the client holds a valid Tanium public key, 0 otherwise
+      ecs: null
+      status: unmapped
+      custom: tanium.client_status.valid_key
+      transform: 0/1 integer; convert to boolean
+    - vendor: SendState
+      type: enum
+      description: 'state of the client''s outbound peer connection (None, Forward, Backward)'
+      ecs: null
+      status: unmapped
+      custom: tanium.client_status.send_state
+    - vendor: ReceiveState
+      type: enum
+      description: 'state of the client''s inbound peer connection (None, Forward, Backward)'
+      ecs: null
+      status: unmapped
+      custom: tanium.client_status.receive_state
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Pass through with Persistent Queue backpressure and drop _raw first
+          on this route - it is a periodic full-fleet state snapshot with no
+          forensic value in the original bytes. Because every export repeats
+          every endpoint, suppress unchanged rows low-side on (ComputerId,
+          Status, LastRegistration) so the index carries state transitions
+          rather than a fresh copy of the fleet on every schedule tick.
+        elastic: >
+          Use the stock client_status pipeline and add a
+          logs-tanium.client_status@custom pipeline that converts the 0/1
+          ValidKey and RegisteredWithTLS integers to booleans and parses the
+          timezone-less LastRegistration with the Tanium server timezone. Map
+          the tanium.client_status.* custom fields as keyword, and keep the
+          Tanium Client version in its own custom field rather than
+          agent.version, which belongs to the Elastic Agent doing the shipping
+          - conflating them breaks agent-version dashboards for every other
+          data stream. The alerting value here is derived, not raw: build the
+          staleness rule off LastRegistration age and alert on transitions out
+          of Normal/Leader rather than on individual rows.
+      direct:
+        parse_location: high
+        cribl: >
+          High-side instances skip the guard: pass through with Persistent
+          Queue backpressure and drop _raw first on this route - it is a
+          periodic full-fleet state snapshot with no forensic value in the
+          original bytes. Because every export repeats every endpoint,
+          suppress unchanged rows on (ComputerId, Status, LastRegistration) so
+          the index carries state transitions rather than a fresh copy of the
+          fleet on every schedule tick.
+        elastic: >
+          Use the stock client_status pipeline and add a
+          logs-tanium.client_status@custom pipeline that converts the 0/1
+          ValidKey and RegisteredWithTLS integers to booleans and parses the
+          timezone-less LastRegistration with the Tanium server timezone. Map
+          the tanium.client_status.* custom fields as keyword, and keep the
+          Tanium Client version in its own custom field rather than
+          agent.version, which belongs to the Elastic Agent doing the shipping
+          - conflating them breaks agent-version dashboards for every other
+          data stream. The alerting value here is derived, not raw: build the
+          staleness rule off LastRegistration age and alert on transitions out
+          of Normal/Leader rather than on individual rows.
+  - format: syslog-cef
+    enable: >
+      On the Connect connection whose source is the Client Status saved
+      question, set the destination Format to CEF. Connect emits one CEF line
+      per endpoint with the standard header and the client-health columns as
+      the extension; recognized address columns map to CEF dictionary keys and
+      the peering-state and flag columns pass through under their raw names.
+      The CEF Advanced Settings set the device vendor/product/version, source
+      and separator. These rows are flat, so CEF renders the dataset
+      faithfully.
+    references:
+    - https://help.tanium.com/bundle/ug_connect_cloud/page/connect/siem.html
+    - https://docs.tanium.com/connect/connect/formats.html
+    - >-
+      https://manuals.plus/m/db1f55993b4a28f5977d71b68810ae3fba64ea82e9c67538b136911d194c747e.pdf
+    parsing:
+      mechanism: elastic-ingest-pipeline
+      artifact: >-
+        generic CEF decode + logs-tanium.client_status@custom (no CEF path in
+        the stock Tanium integration)
+      notes: >
+        The stock client_status pipeline parses Connect JSON only, so a CEF
+        feed needs a generic CEF decode into cef.extensions.* keyed by the raw
+        client-status column names, then a hand-built @custom re-mapping into
+        tanium.client_status.* / ECS. The extension keys are the columns
+        inventoried on the json format, so the field table is empty; the
+        CEF-specific work is keeping the Tanium Client version out of
+        agent.version and converting the 0/1 flags the dictionary passes
+        through as strings.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Decode CEF at the low-side edge worker group and do the same volume
+          shaping the JSON route needs: this is a periodic full-fleet snapshot
+          that repeats every endpoint each run, so suppress unchanged rows on
+          (ComputerId, Status, LastRegistration) before the guard rather than
+          re-crossing the whole fleet every tick. Re-key the extension into
+          tanium.client_status.* and drop the CEF header severity, which is
+          not meaningful for a status row.
+        elastic: >
+          Land through logs-tanium.client_status@custom converting the 0/1
+          ValidKey and RegisteredWithTLS extensions to booleans, parsing the
+          timezone-less LastRegistration with the Tanium server timezone, and
+          keeping the Tanium Client version in a custom field rather than
+          agent.version, which carries the Elastic Agent version for every
+          data stream. Build the staleness alert off LastRegistration age and
+          transitions out of Normal/Leader, not off individual rows.
+        relay: >
+          A flat CEF status line crosses a shallow filter easily; there is no
+          free-text or secret hotspot on this dataset, so the crossing is
+          simple -- the only discipline is suppressing the unchanged-fleet
+          volume low-side so the guard carries state transitions rather than a
+          fresh fleet copy each run, and reconciling counts per (dataset,
+          hour).
+      direct:
+        parse_location: hybrid
+        cribl: >
+          High-side instances skip the guard: decode CEF at the edge worker
+          group, suppress unchanged rows on (ComputerId, Status,
+          LastRegistration) so the index carries state transitions rather than
+          a fresh fleet copy each run, and re-key the extension into
+          tanium.client_status.*, dropping the CEF header severity that is not
+          meaningful for a status row. The JSON destination is the
+          stock-supported shape, so switch to CEF only for a CEF-only
+          consumer.
+        elastic: >
+          Land through logs-tanium.client_status@custom converting the 0/1
+          ValidKey and RegisteredWithTLS extensions to booleans, parsing the
+          timezone-less LastRegistration with the Tanium server timezone, and
+          keeping the Tanium Client version in a custom field rather than
+          agent.version, which carries the Elastic Agent version for every
+          data stream. Build the staleness alert off LastRegistration age and
+          transitions out of Normal/Leader, not off individual rows.
+    fields_omitted: >
+      The CEF extension keys are the same client-health columns the json entry
+      inventories -- recognized address columns folded onto standard CEF
+      dictionary keys, and the peering-state and 0/1 flag columns passing
+      through under their raw Connect column names.
+    fields: []
+  - format: syslog-leef
+    enable: >
+      Set the Client Status connection's Format to LEEF. Connect emits a LEEF
+      header with the client-health columns as tab-delimited attributes; the
+      Advanced Settings set the LEEF version, product name, version, source
+      and separator. The attribute keys are the client-status column names, so
+      LEEF is a faithful flat rendering of this tabular dataset.
+    references:
+    - https://help.tanium.com/bundle/ug_connect_cloud/page/connect/siem.html
+    - https://docs.tanium.com/connect/connect/formats.html
+    - >-
+      https://manuals.plus/m/db1f55993b4a28f5977d71b68810ae3fba64ea82e9c67538b136911d194c747e.pdf
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom LEEF decode pipeline (no LEEF path in the stock Tanium integration)
+      notes: >
+        No stock LEEF parser exists, so a LEEF feed needs a hand-built decode
+        splitting the header and tab-delimited attributes and re-mapping the
+        client-status column keys into tanium.client_status.* / ECS. The
+        attribute keys are the json columns, so the field table is empty; the
+        work is the tab tokenisation plus the same boolean-flag, timezone and
+        agent.version-avoidance handling.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Decode LEEF at the low-side edge worker group, suppress unchanged
+          rows on (ComputerId, Status, LastRegistration) before the guard, and
+          re-key the attributes into tanium.client_status.*.
+        elastic: >
+          Land through logs-tanium.client_status@custom with the same
+          boolean-flag conversion, Tanium-timezone LastRegistration parsing
+          and client-version-kept-custom handling the JSON and CEF paths use.
+        relay: >
+          A flat LEEF status line crosses a shallow filter easily with no
+          free-text hotspot; the only discipline is the unchanged-fleet
+          suppression low-side and reconciling counts per (dataset, hour).
+      direct:
+        parse_location: hybrid
+        cribl: >
+          High-side instances skip the guard: decode LEEF at the edge worker
+          group, suppress unchanged rows on (ComputerId, Status,
+          LastRegistration) so the index carries state transitions rather than
+          a fresh fleet copy each run, and re-key the attributes into
+          tanium.client_status.*. JSON remains the stock-supported shape, so
+          use LEEF only for a LEEF-native consumer.
+        elastic: >
+          Land through logs-tanium.client_status@custom converting the 0/1
+          ValidKey and RegisteredWithTLS attributes to booleans, parsing the
+          timezone-less LastRegistration with the Tanium server timezone, and
+          keeping the Tanium Client version in a custom field rather than
+          agent.version.
+    fields_omitted: >
+      The LEEF attribute keys are the client-health columns the json entry
+      inventories, rendered as a tab-delimited attribute list behind a
+      pipe-delimited header. Only the tokenisation differs from the JSON path,
+      not the column set.
+    fields: []
+  - format: syslog-kv
+    enable: >
+      Set the Client Status connection's Format to Key-Value Pairs. Connect
+      emits one line of key=value pairs per endpoint whose keys are the
+      client-status column names (HostName=, ComputerId=, Status=,
+      LastRegistration=, RegisteredWithTLS=, ...) -- the same columns the JSON
+      destination carries, untyped. This is the lightest-weight rendering of a
+      dataset that has no free-text or nested fields, so it is a close
+      equivalent to the JSON minus typing.
+    references:
+    - https://help.tanium.com/bundle/ug_connect_cloud/page/connect/siem.html
+    - https://docs.tanium.com/connect/connect/formats.html
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: KV-extract pipeline re-keying client-status columns into tanium.client_status.*
+      notes: >
+        The key=value keys are the client-status columns already inventoried
+        on the json format, so the field table is empty -- a KV extraction
+        recovers the same named fields and the ECS mapping is identical to the
+        JSON path, minus typing. The work is re-applying the boolean and
+        timestamp coercions the untyped KV values lose.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Run a KV extractor at the low-side edge worker group, re-key into
+          tanium.client_status.*, and suppress unchanged rows on (ComputerId,
+          Status, LastRegistration) before the guard so the index carries
+          state transitions rather than a fresh fleet copy each run.
+        elastic: >
+          Decode with a generic KV ingest processor into
+          logs-tanium.client_status@custom, applying the 0/1-to-boolean and
+          Tanium-timezone LastRegistration coercions explicitly since the KV
+          values arrive untyped, and keeping the client version out of
+          agent.version.
+        relay: >
+          A flat key=value status line crosses a shallow filter easily with no
+          free-text hotspot; the only discipline is the unchanged-fleet
+          suppression low-side and reconciling counts per (dataset, hour).
+      direct:
+        parse_location: hybrid
+        cribl: >
+          High-side instances skip the guard: run a KV extractor at the edge
+          worker group, re-key into tanium.client_status.*, and suppress
+          unchanged rows on (ComputerId, Status, LastRegistration) so the
+          index carries state transitions rather than a fresh fleet copy each
+          run. The JSON destination is preferable where the socket can carry
+          it, since KV only discards typing here.
+        elastic: >
+          Decode with a generic KV ingest processor into
+          logs-tanium.client_status@custom, applying the 0/1-to-boolean and
+          Tanium-timezone LastRegistration coercions explicitly since the KV
+          values arrive untyped, and keeping the client version out of
+          agent.version.
+    fields_omitted: >
+      The key=value keys are the client-status column names the json entry
+      inventories (HostName=, ComputerId=, Status=, LastRegistration=,
+      RegisteredWithTLS=, ...). This dataset has no nested or free-text
+      columns, so KV carries exactly the same set as JSON, only untyped.
+    fields: []

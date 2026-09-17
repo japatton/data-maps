@@ -1,0 +1,1462 @@
+id: zscaler-zia
+name: Zscaler Internet Access (ZIA)
+vendor: Zscaler
+versions: ZIA cloud service (continuous release); NSS 6.x VM, Cloud NSS
+draft: true
+references:
+- https://help.zscaler.com/zia/nss-feed-output-format-web-logs
+- https://help.zscaler.com/zia/nss-feed-output-format-firewall-logs
+- https://help.zscaler.com/zia/nss-feed-output-format-dns-logs
+- https://help.zscaler.com/zia/general-guidelines-nss-feeds-and-feed-formats
+- https://www.elastic.co/docs/reference/integrations/zscaler_zia
+- https://github.com/elastic/integrations/tree/main/packages/zscaler_zia
+datasets:
+- id: web
+  name: Web log
+  description: >
+    The primary ZIA feed: one transaction record per proxied HTTP/HTTPS
+    request, carrying the policy action and block reason, URL and URL
+    category, cloud application, authenticated user, user agent, request and
+    response sizes, and any malware, sandbox or DLP verdict raised on the
+    transaction. Delivery is via a Nanolog Streaming Service feed — either an
+    on-prem NSS VM that emits over TCP syslog, or Cloud NSS which POSTs over
+    HTTPS to a collector endpoint. The wire format is an admin-authored
+    template of %s{token} / %d{token} placeholders, so the field set below is
+    the template this deployment should standardize on (the Elastic
+    integration's zscalernss-web v11 JSON template) rather than a fixed vendor
+    schema; any token the template omits simply never appears on the wire.
+  event_categories:
+  - web
+  - malware
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        The NSS VM is deployed inside the enclave and emits TCP syslog to a
+        Cribl Syslog source (Cloud NSS instead pushes HTTPS from the Zscaler
+        cloud and needs a reachable HTTP source, which changes which side of
+        the boundary the first Cribl hop can sit on).
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-zscaler_zia.web
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        The NSS VM emits TCP syslog to a Cribl Syslog source in the edge
+        worker group (Cloud NSS instead pushes HTTPS from the Zscaler cloud
+        and needs a reachable HTTP source); records run straight to Elastic
+        with no guard crossing.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-zscaler_zia.web
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: Zscaler ZIA integration (zscaler_zia), web data stream
+      notes: >
+        The integration ships an ingest pipeline keyed to the vendor's
+        published JSON feed template; because the template is admin-editable,
+        the pipeline only populates the tokens the NSS feed was configured to
+        send, so the feed definition is a change-controlled artifact in its
+        own right.
+    fields:
+    - vendor: time
+      type: timestamp
+      description: time and date of the transaction, in the time zone configured on the NSS feed
+      ecs: '@timestamp'
+      status: mapped
+      transform: >
+        the feed's time zone is a per-feed setting, not necessarily UTC;
+        prefer the %d{epochtime} token (seconds since epoch) as the @timestamp
+        source and keep this rendered string only for operator readability
+    - vendor: action
+      type: enum
+      description: action the service took on the transaction (Allowed, Blocked)
+      ecs: event.action
+      status: mapped
+      transform: >
+        copied verbatim to event.action; there is no separate outcome token,
+        so event.outcome must be derived (Allowed to success, Blocked to
+        failure) in a lookup
+    - vendor: reason
+      type: string
+      description: action taken and the policy that was applied when the transaction was blocked
+      ecs: event.reason
+      status: mapped
+    - vendor: cip
+      type: ip
+      description: IP address of the user making the request
+      ecs: source.ip
+      status: mapped
+    - vendor: sip
+      type: ip
+      description: destination server IP address
+      ecs: destination.ip
+      status: mapped
+    - vendor: ehost
+      type: string
+      description: destination hostname, escaped per the feed escape character setting
+      ecs: url.domain
+      status: mapped
+    - vendor: b64url
+      type: string
+      description: base64-encoded destination URL, excluding the protocol identifier
+      ecs: url.original
+      status: partial
+      transform: >
+        base64-decode before assignment, then break out url.path and
+        url.query; the unencoded %s{url} and escaped %s{eurl} tokens are the
+        alternatives, but the base64 form is what the vendor's published JSON
+        template emits and it is what must be decoded before any content
+        inspection or URL-based detection can read it
+    - vendor: urlcat
+      type: string
+      description: category of the destination URL, from the Zscaler URL category taxonomy
+      ecs: null
+      status: unmapped
+      custom: zscaler.zia.url.category
+      notes: >
+        ECS 9.4 has no url.category field, so the vendor taxonomy stays
+        custom; do not park it on threat.* or rule.category, neither of which
+        models a URL classification
+    - vendor: urlclass
+      type: string
+      description: >-
+        class of the destination URL, the coarse grouping above the category
+        (e.g. Business Use, Bandwidth Loss)
+      ecs: null
+      status: unmapped
+      custom: zscaler.zia.url.class
+    - vendor: appname
+      type: string
+      description: name of the cloud application accessed in the transaction
+      ecs: network.application
+      status: mapped
+    - vendor: elogin
+      type: string
+      description: >-
+        user's login name in email address format, escaped per the feed escape
+        character setting
+      ecs: user.name
+      status: mapped
+      transform: >
+        the value is an email address, so populate user.email with the whole
+        string and split it into user.name and user.domain rather than storing
+        the address in user.name alone
+    - vendor: eua
+      type: string
+      description: full user agent string for both known and unknown agents
+      ecs: user_agent.original
+      status: mapped
+    - vendor: reqmethod
+      type: string
+      description: HTTP request method used in the transaction
+      ecs: http.request.method
+      status: mapped
+    - vendor: respcode
+      type: string
+      description: HTTP response code sent to the client
+      ecs: http.response.status_code
+      status: mapped
+      transform: >-
+        emitted as a string token; convert to a numeric type so status-class
+        range queries work
+    - vendor: totalsize
+      type: bytes
+      description: total size of the HTTP transaction in bytes (request plus response)
+      ecs: network.bytes
+      status: mapped
+    - vendor: threatname
+      type: string
+      description: name of the threat detected on the transaction
+      ecs: null
+      status: unmapped
+      custom: zscaler.zia.threat.name
+      notes: >
+        detection-signature identity, not indicator identity: not
+        threat.indicator.name, which models an indicator supplied by a
+        threat-intel provider. Not rule.name either, because rule.name in this
+        dataset already holds the URL-filtering / policy rule label, so
+        pairing a signature name with a policy rule under one rule.* object
+        would mislead any dashboard reading them as a pair
+    - vendor: malwarecat
+      type: string
+      description: category of malware detected on the transaction (e.g. Adware, Spyware, Trojan)
+      ecs: null
+      status: unmapped
+      custom: zscaler.zia.malware.category
+      notes: paired with %s{malwareclass}, which carries the coarser class above the category
+    - vendor: bamd5
+      type: string
+      description: MD5 hash of the malware or sandboxed file detected in the transaction
+      ecs: file.hash.md5
+      status: mapped
+    - vendor: dlprulename
+      type: string
+      description: name of the DLP rule applied to the transaction
+      ecs: null
+      status: unmapped
+      custom: zscaler.zia.dlp.rule_name
+      notes: >
+        a DLP rule is a different object from the URL-filtering rule in
+        rule.name, and both can be present on one transaction, so it is kept
+        custom alongside %s{dlpeng} and %s{dlpdict}
+    - vendor: erulelabel
+      type: string
+      description: >-
+        name of the policy rule applied to the transaction, escaped per the
+        feed escape character setting
+      ecs: rule.name
+      status: mapped
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Keep the core worker group a pass-through for this route — the NSS
+          template already emits JSON, so low-side re-parsing buys nothing —
+          and limit low-side work to a Syslog (or HTTP, for Cloud NSS) source
+          that strips the syslog envelope, Persistent Queue backpressure on
+          the Elastic destination, and location-to-site / device-to-owner
+          enrichment that is cheaper near the source than in an ingest
+          pipeline. Add a low-side guard on feed drift: route records whose
+          JSON key set does not match the change-controlled template to a
+          dead-letter path and alert on its rate, because an admin editing the
+          feed output format in the ZIA console silently changes the schema
+          with no vendor version bump. This is the highest-volume ZIA dataset,
+          so it is the first place to drop _raw once the integration pipeline
+          is proven.
+        elastic: >
+          Let the stock zscaler_zia web ingest pipeline parse, and add a
+          logs-zscaler_zia.web@custom pipeline for the gaps this map records:
+          derive event.outcome from the Allowed/Blocked action vocabulary
+          rather than leaving it unset, base64-decode the b64url/b64referer
+          tokens into url.original and http.request.referrer with url.path and
+          url.query broken out, and cast the string respcode to a numeric
+          http.response.status_code so status-class queries work. Map the
+          custom-namespace fields explicitly as keyword in the index template
+          — zscaler.zia.url.category, .url.class, .threat.name,
+          .malware.category, .dlp.rule_name — so URL-category and DLP
+          dashboards aggregate without relying on dynamic mapping, and keep
+          the URL taxonomy out of any ECS threat.* field that does not model
+          it.
+        relay: >
+          On the low-side crossing this dataset is the one to argue about with
+          the guard owner: b64url, the user agent, filenames and the DLP
+          dictionary hit list are unbounded free text at kilobyte scale, and
+          base64 tokens defeat a content filter that inspects text. Decode and
+          cap those values low-side so the filter sees bounded UTF-8, ship
+          full ECS-shaped NDJSON (LF terminated, compression disabled, nesting
+          depth two, short ASCII keys) rather than the vendor JSON template,
+          and treat the crossing as at-most-once with silent-drop detection by
+          reconciling low-side and high-side record counts per hour. Cloud NSS
+          complicates this further — an HTTPS push from Zscaler's cloud cannot
+          terminate on the low side without an inbound path, so the NSS VM
+          flavor is the one that fits a guarded route.
+      direct:
+        parse_location: high
+        cribl: >
+          Keep the core worker group a pass-through for this route — the NSS
+          template already emits JSON, so re-parsing buys nothing — and limit
+          the edge worker group to a Syslog (or HTTP, for Cloud NSS) source
+          that strips the syslog envelope, Persistent Queue backpressure on
+          the Elastic destination, and location-to-site / device-to-owner
+          enrichment that is cheaper near the source than in an ingest
+          pipeline. Add a feed-drift check: route records whose JSON key set
+          does not match the change-controlled template to a dead-letter path
+          and alert on its rate, because an admin editing the feed output
+          format in the ZIA console silently changes the schema with no vendor
+          version bump. This is the highest-volume ZIA dataset, so it is the
+          first place to drop _raw once the integration pipeline is proven.
+        elastic: >
+          Let the stock zscaler_zia web ingest pipeline parse, and add a
+          logs-zscaler_zia.web@custom pipeline for the gaps this map records:
+          derive event.outcome from the Allowed/Blocked action vocabulary
+          rather than leaving it unset, base64-decode the b64url/b64referer
+          tokens into url.original and http.request.referrer with url.path and
+          url.query broken out, and cast the string respcode to a numeric
+          http.response.status_code so status-class queries work. Map the
+          custom-namespace fields explicitly as keyword in the index template
+          — zscaler.zia.url.category, .url.class, .threat.name,
+          .malware.category, .dlp.rule_name — so URL-category and DLP
+          dashboards aggregate without relying on dynamic mapping, and keep
+          the URL taxonomy out of any ECS threat.* field that does not model
+          it.
+  - format: syslog-cef
+    enable: >
+      In the ZIA Admin Portal go to Administration > Nanolog Streaming Service
+      > NSS Feeds, add or edit the web-log feed, and set Feed Output Type to
+      "ArcSight CEF". The console pre-populates the Feed Output Format box
+      with a CEF template (a CEF:0|Zscaler|NSS| header followed by
+      space-separated key=value extensions) that maps the web-log tokens - the
+      same %s{cip}, %s{sip}, %s{action}, %s{eurl}, %s{eua}, %s{reason},
+      %s{respcode} dictionary the JSON feed draws from - into CEF extension
+      keys; edit the string to add or drop tokens (keep it under ~50 fields
+      for syslog size limits). Set the SIEM destination IP/port/transport, the
+      Feed Escape Character, and Duplicate Logs as needed, then Save and
+      Activate. The output type is one selection per feed, so CEF replaces the
+      JSON template on that feed rather than adding to it.
+    references:
+    - https://help.zscaler.com/zia/nss-feed-output-format-web-logs
+    - https://help.zscaler.com/zia/general-guidelines-nss-feeds-and-feed-formats
+    - https://help.zscaler.com/zia/adding-nss-feeds-web-logs
+    - https://docs.rapid7.com/insightidr/zscaler-nss/
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Zscaler web CEF pipeline
+      notes: >
+        The shipped zscaler_zia Elastic integration parses only the JSON
+        template, so CEF needs its own parse. Cribl receives the NSS feed on a
+        raw TCP (Syslog) source and a pipeline splits the CEF header and the
+        key=value extension body; the extension keys are whatever the admin's
+        CEF template assigned, so the pipeline is coupled to the feed
+        definition and must be revised in lockstep with it. The value
+        semantics are identical to the JSON map (epoch vs rendered time,
+        base64 URL tokens, Allowed/Blocked with no separate outcome), so the
+        same derivations apply. A legacy Filebeat "zscaler" CEF module exists
+        as an Elastic-side alternative but is unmaintained relative to
+        zscaler_zia; a Cribl pipeline emitting ECS is the cleaner path.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Parse CEF on the low-side edge worker group rather than shipping the
+          raw CEF line across the guard: split the header and extension body,
+          map the CEF extension keys back to ECS, and apply the same value
+          work the JSON route needs - base64-decode the URL token, derive
+          event.outcome from the Allowed/Blocked action, cast respcode to a
+          number, and split the email login into user.name/user.domain. Emit
+          LF-terminated ECS NDJSON to the Cribl HTTP Destination with
+          Persistent Queue backpressure, and dead-letter any record whose CEF
+          extension key set drifts from the change-controlled template, since
+          an admin editing the feed output format silently changes the wire
+          schema with no vendor version bump.
+        elastic: >
+          No integration ingests this CEF feed, so stand up a custom
+          logs-zscaler_zia.web ingest pipeline and index template that accept
+          the pre-shaped ECS documents rather than re-parsing CEF, with the
+          same zscaler.zia.* keyword mappings the JSON route needs
+          (url.category, url.class, threat.name, malware.category,
+          dlp.rule_name). Do not point the stock zscaler_zia web pipeline at
+          this feed - it expects the JSON template and will silently drop
+          fields.
+        relay: >
+          This is the same high-friction crossing as the JSON web feed: the
+          URL, user agent, filenames and DLP dictionary hits are unbounded
+          kilobyte free text and the URL token is base64 until decoded, so a
+          content filter over raw CEF sees opaque blobs. Decode and length-cap
+          those values low-side, cross full ECS NDJSON (not the CEF line,
+          compression off, nesting depth two, short ASCII keys), and treat the
+          crossing as at-most-once with low-side/high-side count
+          reconciliation per hour.
+      direct:
+        parse_location: high
+        cribl: >
+          High-side instances with no guard: receive on a raw TCP source and
+          run the same CEF parse and ECS mapping in the core worker group,
+          retaining full url.original and user_agent.original. Pick one
+          authoritative output type per feed - running a CEF feed and a JSON
+          feed to the same collector double-counts every transaction.
+        elastic: >
+          Stand up a custom logs-zscaler_zia.web ingest pipeline and index
+          template that accept the pre-shaped ECS documents rather than
+          re-parsing CEF, with the zscaler.zia.* keyword mappings
+          (url.category, url.class, threat.name, malware.category,
+          dlp.rule_name). With no boundary the reason to prefer CEF over the
+          JSON is a downstream CEF-native consumer; absent one, JSON is the
+          lower-friction choice because the shipped integration already parses
+          it.
+    fields_omitted: >
+      The CEF extension keys are not a vendor-fixed set: the NSS console
+      pre-populates an editable Feed Output Format template and the admin's
+      token selection decides which extensions reach the wire. What they carry
+      is the same web-log token dictionary the json entry inventories — cip,
+      sip, action, ehost, b64url, eua, reason, respcode — flattened into
+      space-separated CEF extension pairs behind a CEF:0|Zscaler|NSS| header.
+    fields: []
+  - format: syslog-leef
+    enable: >
+      Same NSS Feeds path; set Feed Output Type to "QRadar LEEF". The console
+      pre-populates a LEEF template - a LEEF:1.0 (or 2.0) header followed by
+      tab-delimited key=value attributes - drawn from the same web-log token
+      dictionary as the CEF and JSON presets. Edit the token list, set the
+      SIEM destination and Feed Escape Character, and Save and Activate. LEEF
+      is one selection per feed, mutually exclusive with the CEF, CSV and
+      name=value presets.
+    references:
+    - https://help.zscaler.com/zia/nss-feed-output-format-web-logs
+    - https://help.zscaler.com/zia/general-guidelines-nss-feeds-and-feed-formats
+    - https://docs.rapid7.com/insightidr/zscaler-nss/
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Zscaler web LEEF pipeline
+      notes: >
+        No shipped Elastic integration or Cribl pack parses this LEEF stream.
+        A pipeline splits the LEEF header and the tab-delimited attribute body
+        and maps the named attributes to ECS; the attribute names are those
+        the admin's LEEF template assigned, so like CEF the pipeline is bound
+        to the feed definition. Value semantics are identical to the JSON and
+        CEF forms.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Split the LEEF header and tab-delimited body low-side and apply the
+          same ECS mapping and value work as the CEF and JSON routes (URL
+          base64 decode, event.outcome derivation, respcode to numeric, email
+          login split). Emit ECS NDJSON with Persistent Queue backpressure and
+          a dead-letter route for template drift, and drop _raw once the parse
+          is proven - this is the highest-volume ZIA feed.
+        elastic: >
+          Same custom logs-zscaler_zia.web pipeline, index template and
+          zscaler.zia.* keyword mappings as the CEF alternate; the LEEF form
+          carries identical data, only the wrapper differs.
+        relay: >
+          Same crossing profile as the CEF and JSON web feeds - full ECS
+          NDJSON crosses, not the LEEF line; the free-text and base64
+          flashpoints are decoded and length-capped low-side, the document
+          held to two levels of nesting, and the crossing reconciled per
+          (dataset, hour) as at-most-once.
+      direct:
+        parse_location: high
+        cribl: >
+          High-side instances: same LEEF split and ECS mapping in the core
+          worker group. There is little reason to run LEEF here over the JSON
+          unless a QRadar consumer shares the feed, since JSON is parsed by
+          the shipped integration and LEEF is not.
+        elastic: >
+          Same custom logs-zscaler_zia.web pipeline as the CEF alternate.
+    fields_omitted: >
+      The tab-delimited LEEF attribute names are whatever the admin's editable
+      LEEF template assigned, so the name set belongs to the feed definition
+      rather than to a published vendor list. The attributes carry the same
+      web-log values the json entry inventories, wrapped in a LEEF:1.0/2.0
+      header instead of a JSON object.
+    fields: []
+  - format: syslog-csv
+    enable: >
+      Same NSS Feeds path; set Feed Output Type to "CSV" (comma-delimited) or
+      "Tab-Separated" (tab-delimited). The console pre-populates a positional
+      template that lists the web-log tokens in a fixed order with no key
+      names on the wire - the column contract is the template's token order.
+      Edit the token order, set the destination and (for CSV) the Feed Escape
+      Character carefully so embedded delimiters in URLs and user agents do
+      not break columns, then Save and Activate.
+    references:
+    - https://help.zscaler.com/zia/nss-feed-output-format-web-logs
+    - https://help.zscaler.com/zia/general-guidelines-nss-feeds-and-feed-formats
+    - https://docs.cribl.io/stream/usecase-zscaler-logs/
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Zscaler web delimited pipeline
+      notes: >
+        The riskiest alternate to parse: with no keys on the wire, the parser
+        depends entirely on the template's column order, so any admin edit to
+        the feed output format silently shifts every downstream field. Cribl's
+        own Zscaler guidance treats CSV as a fallback and prefers name=value
+        for exactly this reason. Web URLs, user agents and DLP hits routinely
+        contain commas, tabs and quotes, so the Feed Escape Character and
+        quoting must be set precisely or fields split mid-value.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Parse the positional line low-side against the template's declared
+          column order, honouring the configured escape/quote character, then
+          map to ECS with the same value work as the other web routes. Pin the
+          expected column count and dead-letter any record that does not match
+          it - a shifted column is the failure mode here, not a missing key -
+          and emit ECS NDJSON with Persistent Queue backpressure. Prefer
+          name=value or JSON over CSV wherever the SIEM allows, since a
+          keyless line is the most drift-fragile of the presets.
+        elastic: >
+          Same custom logs-zscaler_zia.web pipeline and zscaler.zia.* keyword
+          mappings as the CEF alternate; the delimited feed is reshaped to the
+          same ECS documents before it reaches Elastic.
+        relay: >
+          Free-text URLs and user agents that contain the delimiter are both a
+          parse hazard and a content-filter hazard: length-cap and normalize
+          them to bounded UTF-8 low-side and cross ECS NDJSON rather than the
+          delimited line, so the guard never inspects an ambiguously-delimited
+          record. At-most-once with per-hour count reconciliation as
+          elsewhere.
+      direct:
+        parse_location: high
+        cribl: >
+          High-side instances: same column-order parse and ECS mapping in the
+          core worker group. Choose name=value or JSON over CSV unless a
+          downstream tool specifically needs the flat delimited form, given
+          the column-drift fragility.
+        elastic: >
+          Same custom logs-zscaler_zia.web pipeline as the CEF alternate.
+    fields_omitted: >
+      This preset puts no key names on the wire at all — the record is a
+      positional line whose only contract is the token order of the admin's
+      Feed Output Format template, so there is nothing named to tabulate. The
+      columns are drawn from the same web-log token dictionary the json entry
+      inventories, in whatever order that template sets.
+    fields: []
+  - format: syslog-kv
+    enable: >
+      Same NSS Feeds path; set Feed Output Type to "SPLUNK CIM", which
+      pre-populates a name=value template drawn from the web-log token
+      dictionary (key=%s{token} pairs). Splunk and Cribl auto-extract
+      name=value pairs regardless of order, so this is the vendor-recommended
+      form where the SIEM supports it. Edit the token list, set the
+      destination, and Save and Activate; name=value is one selection per
+      feed, mutually exclusive with CEF, LEEF and CSV.
+    references:
+    - https://help.zscaler.com/zia/nss-feed-output-format-web-logs
+    - https://help.zscaler.com/zia/general-guidelines-nss-feeds-and-feed-formats
+    - https://docs.cribl.io/stream/usecase-zscaler-logs/
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Zscaler web name-value pipeline
+      notes: >
+        The easiest of the text presets to parse: Cribl's published Zscaler
+        example receives the raw TCP feed and uses a Code function to split on
+        tabs and the first equals sign into named fields, then Eval/Serialize
+        to reshape and suppress. Because keys are self-describing, this form
+        tolerates template edits better than CSV (a dropped token just drops
+        its key rather than shifting columns), though the key names are still
+        the admin's choice and should be change-controlled.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Run the name=value split low-side (the Cribl Code function pattern),
+          map the resulting keys to ECS with the standard web value work, and
+          emit ECS NDJSON with Persistent Queue backpressure. Dead-letter on
+          key-set drift as with the JSON route. This is the least fragile text
+          preset, so it is the preferred alternate where a non-JSON wire form
+          is required at all.
+        elastic: >
+          Same custom logs-zscaler_zia.web pipeline and zscaler.zia.* keyword
+          mappings as the CEF alternate.
+        relay: >
+          Same free-text and base64 crossing hazards as the other web presets:
+          decode and length-cap the URL, user agent, filenames and DLP hits
+          low-side, cross bounded ECS NDJSON, and reconcile counts per hour as
+          at-most-once.
+      direct:
+        parse_location: high
+        cribl: >
+          High-side instances: same name=value parse in the core worker group.
+          Of the non-JSON presets this is the one to pick when a downstream
+          consumer needs key=value text, since it is the most edit-tolerant;
+          otherwise the JSON remains the lowest-friction choice.
+        elastic: >
+          Same custom logs-zscaler_zia.web pipeline as the CEF alternate.
+    fields_omitted: >
+      The name=value keys come from the admin's SPLUNK CIM key=%s{token}
+      template, not a fixed vendor schema — a key exists on the wire only
+      while its token stays in the feed definition, and dropping a token drops
+      its key. The pairs carry the same web-log values the json entry
+      inventories, flattened to self-describing key=value text.
+    fields: []
+- id: firewall
+  name: Firewall log
+  description: >
+    Session records from the ZIA cloud firewall for non-web traffic and for
+    traffic forwarded through the firewall module: the client-side and
+    server-side address pairs, the network service and network application
+    that were identified, the policy and IPS rule labels, byte counters in
+    each direction, and session duration. Records may be aggregated — several
+    identical sessions collapse into one record with a session count — which
+    matters for any volume-based reconciliation.
+  event_categories:
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same NSS feed transport as the web dataset, on a separate feed
+        definition and TCP port.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-zscaler_zia.firewall
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Same NSS feed transport as the web dataset, on a separate feed
+        definition and TCP port; records run straight to Elastic with no guard
+        crossing.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-zscaler_zia.firewall
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: Zscaler ZIA integration (zscaler_zia), firewall data stream
+    fields:
+    - vendor: time
+      type: timestamp
+      description: time and date of the session, in the time zone configured on the NSS feed
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: action
+      type: enum
+      description: action the firewall took on the session (Allow, Block, Drop, Reset)
+      ecs: event.action
+      status: mapped
+      transform: >-
+        no outcome token exists; event.outcome must be derived from this
+        vocabulary in a lookup
+    - vendor: csip
+      type: ip
+      description: client source IP address of the session
+      ecs: source.ip
+      status: mapped
+    - vendor: csport
+      type: port
+      description: client source port of the session
+      ecs: source.port
+      status: mapped
+    - vendor: cdip
+      type: ip
+      description: client destination IP address of the session
+      ecs: destination.ip
+      status: mapped
+    - vendor: cdport
+      type: port
+      description: client destination port of the session
+      ecs: destination.port
+      status: mapped
+    - vendor: ssip
+      type: ip
+      description: >-
+        server source IP address, i.e. the address the Zscaler service used
+        toward the destination server
+      ecs: source.nat.ip
+      status: partial
+      notes: >
+        the server-side pair (%s{ssip}/%s{ssport}, %s{sdip}/%s{sdport}) is the
+        post-translation view of the same session; it is treated as the NAT
+        view rather than a second source/destination pair, and the mapping is
+        partial because the vendor documents it as a distinct server-side
+        tuple, not explicitly as NAT
+    - vendor: ipproto
+      type: string
+      description: IP protocol of the session (TCP, UDP, ICMP, ...)
+      ecs: network.transport
+      status: mapped
+    - vendor: nwsvc
+      type: string
+      description: network service identified for the session (e.g. HTTP, DNS, SMTP)
+      ecs: network.protocol
+      status: partial
+      transform: >-
+        vendor values are mixed case service names; lowercase them so they
+        join with the other network datasets
+    - vendor: nwapp
+      type: string
+      description: network application identified for the session
+      ecs: network.application
+      status: mapped
+    - vendor: inbytes
+      type: bytes
+      description: number of bytes sent from the server to the client
+      ecs: destination.bytes
+      status: mapped
+    - vendor: outbytes
+      type: bytes
+      description: number of bytes sent from the client to the server
+      ecs: source.bytes
+      status: mapped
+    - vendor: durationms
+      type: long
+      description: session duration in milliseconds
+      ecs: event.duration
+      status: partial
+      transform: >
+        multiply by 1,000,000 for the nanoseconds ECS expects; the
+        %d{duration} token carries the same value in whole seconds and
+        %d{avgduration} the mean across an aggregated record
+    - vendor: erulelabel
+      type: string
+      description: >-
+        name of the firewall policy rule applied to the session, escaped per
+        the feed escape character setting
+      ecs: rule.name
+      status: mapped
+    - vendor: elogin
+      type: string
+      description: >-
+        user's login name in email address format, escaped per the feed escape
+        character setting
+      ecs: user.name
+      status: mapped
+      transform: >-
+        email-format value; populate user.email whole and split into user.name
+        and user.domain
+    - vendor: ethreatname
+      type: string
+      description: name of the threat the IPS engine detected in the session
+      ecs: null
+      status: unmapped
+      custom: zscaler.zia.threat.name
+      notes: >
+        IPS detection identity, kept custom for the same reason as the web
+        dataset: rule.name holds the firewall policy rule, and this is not a
+        threat-intel indicator
+    - vendor: ipsrulelabel
+      type: string
+      description: name of the IPS policy applied to the session
+      ecs: null
+      status: unmapped
+      custom: zscaler.zia.firewall.ips_rule_label
+      notes: >-
+        a second, independent rule object on the same record; rule.name is
+        already taken by the firewall policy rule
+    - vendor: numsessions
+      type: integer
+      description: number of sessions collapsed into this record when aggregation is in effect
+      ecs: null
+      status: unmapped
+      custom: zscaler.zia.firewall.session_count
+      notes: >
+        paired with %s{aggregate}; without it a single record is
+        indistinguishable from a single session, which breaks both volume
+        dashboards and low-side/high-side count reconciliation
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Pass through unparsed on the core worker group with Persistent Queue
+          backpressure on the Elastic destination, and apply the same
+          template-drift dead-letter check as the web feed since the firewall
+          feed output format is separately editable in the ZIA console. Do the
+          location-to-site enrichment here, and resist any temptation to
+          de-aggregate records low-side: expanding an aggregated session
+          record into %d{numsessions} synthetic events destroys the count that
+          makes volume reconciliation meaningful.
+        elastic: >
+          Parse with the stock zscaler_zia firewall ingest pipeline and layer
+          a logs-zscaler_zia.firewall@custom pipeline for three fixes this map
+          records: derive event.outcome from the action vocabulary, convert
+          durationms from milliseconds to the nanoseconds ECS expects in
+          event.duration, and normalize the network service token to lowercase
+          before it lands in network.protocol so it joins with other network
+          datasets. Assert that the client-side pair populates
+          source/destination and the server-side pair populates the nat.*
+          fields rather than overwriting them, and map
+          zscaler.zia.firewall.ips_rule_label, .session_count and
+          zscaler.zia.threat.name explicitly in the index template.
+        relay: >
+          This dataset is structurally the friendliest crossing of the three —
+          short, bounded, mostly numeric values with no free-text field — so a
+          content filter over full ECS-shaped NDJSON stays simple here. The
+          one crossing hazard is aggregation: because a single record can
+          represent many sessions, low-side versus high-side drop detection
+          must reconcile both record counts and the summed session count per
+          (dataset, hour), or a lost aggregate record looks like a single
+          missing event.
+      direct:
+        parse_location: high
+        cribl: >
+          Pass through unparsed on the core worker group with Persistent Queue
+          backpressure on the Elastic destination, and apply the same
+          template-drift dead-letter check as the web feed since the firewall
+          feed output format is separately editable in the ZIA console. Do the
+          location-to-site enrichment here, and resist any temptation to
+          de-aggregate records: expanding an aggregated session record into
+          %d{numsessions} synthetic events destroys the count that makes
+          volume reconciliation meaningful.
+        elastic: >
+          Parse with the stock zscaler_zia firewall ingest pipeline and layer
+          a logs-zscaler_zia.firewall@custom pipeline for three fixes this map
+          records: derive event.outcome from the action vocabulary, convert
+          durationms from milliseconds to the nanoseconds ECS expects in
+          event.duration, and normalize the network service token to lowercase
+          before it lands in network.protocol so it joins with other network
+          datasets. Assert that the client-side pair populates
+          source/destination and the server-side pair populates the nat.*
+          fields rather than overwriting them, and map
+          zscaler.zia.firewall.ips_rule_label, .session_count and
+          zscaler.zia.threat.name explicitly in the index template.
+  - format: syslog-cef
+    enable: >
+      Administration > Nanolog Streaming Service > NSS Feeds, add or edit the
+      firewall feed, and set Feed Output Type to "ArcSight CEF". The console
+      pre-populates a CEF:0|Zscaler|NSS| template mapping the firewall token
+      dictionary - the same %s{action}, %s{csip}/%d{csport},
+      %s{cdip}/%d{cdport}, %s{ipproto}, %ld{inbytes}/%ld{outbytes},
+      %d{durationms}, %d{numsessions} set the JSON feed uses - into CEF
+      extension keys. Edit the token list, set the destination, and Save and
+      Activate.
+    references:
+    - https://help.zscaler.com/zia/nss-feed-output-format-firewall-logs
+    - https://help.zscaler.com/zia/general-guidelines-nss-feeds-and-feed-formats
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Zscaler firewall CEF pipeline
+      notes: >
+        zscaler_zia parses only the JSON firewall template, so CEF needs a
+        custom Cribl pipeline that splits the CEF header and extensions and
+        maps them to ECS. The firewall value work is unchanged from the JSON
+        map: derive event.outcome from the Allow/Block/Drop/Reset action,
+        convert durationms to nanoseconds, lowercase the network service, and
+        keep the server-side pair as the NAT view. Critically, preserve
+        numsessions - the CEF template must carry it or aggregated records
+        become indistinguishable from single sessions.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Parse CEF low-side into ECS with the firewall value work above, then
+          emit NDJSON with Persistent Queue backpressure and a template-drift
+          dead-letter route. Do not de-aggregate: expanding a record into
+          numsessions synthetic events low-side destroys the count volume
+          reconciliation depends on. Map zscaler.zia.firewall.ips_rule_label,
+          .session_count and zscaler.zia.threat.name into the custom
+          namespace.
+        elastic: >
+          Stand up a custom logs-zscaler_zia.firewall ingest pipeline and
+          index template that accept the pre-shaped ECS documents, with the
+          firewall custom-namespace keyword mappings; do not route this CEF
+          feed to the stock JSON firewall pipeline.
+        relay: >
+          Structurally the friendliest of the three crossings - short,
+          bounded, mostly numeric with no free-text field - so a content
+          filter over ECS NDJSON stays simple. The one hazard is aggregation:
+          reconcile both record counts and the summed session count per
+          (dataset, hour) so a lost aggregate record is not mistaken for a
+          single missing event.
+      direct:
+        parse_location: high
+        cribl: >
+          High-side instances: same CEF parse and ECS mapping in the core
+          worker group, one authoritative output type per feed. Absent a
+          CEF-native consumer, the JSON is lower-friction since the shipped
+          integration parses it.
+        elastic: >
+          Stand up a custom logs-zscaler_zia.firewall ingest pipeline and
+          index template that accept the pre-shaped ECS documents, with the
+          firewall custom-namespace keyword mappings; do not route this CEF
+          feed to the stock JSON firewall pipeline.
+    fields_omitted: >
+      The CEF extension keys are assigned by the admin's editable Feed Output
+      Format template rather than a published vendor list, so the key set
+      tracks the feed definition. They carry the same firewall token
+      dictionary the json entry inventories — the client and server
+      address/port pairs, ipproto, inbytes/outbytes, durationms and the
+      numsessions aggregation count — as flat CEF extension pairs.
+    fields: []
+  - format: syslog-leef
+    enable: >
+      Same NSS Feeds path for the firewall feed; set Feed Output Type to
+      "QRadar LEEF". The console pre-populates a LEEF header plus
+      tab-delimited attribute template over the same firewall token dictionary
+      as the CEF and JSON presets. Edit, set the destination, and Save and
+      Activate.
+    references:
+    - https://help.zscaler.com/zia/nss-feed-output-format-firewall-logs
+    - https://help.zscaler.com/zia/general-guidelines-nss-feeds-and-feed-formats
+    - https://docs.rapid7.com/insightidr/zscaler-nss/
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Zscaler firewall LEEF pipeline
+      notes: >
+        No shipped integration or pack parses the LEEF firewall stream; a
+        Cribl pipeline splits the LEEF header and tab-delimited body and maps
+        to ECS. Same firewall value work and the same numsessions-preservation
+        requirement as the CEF alternate.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Split the LEEF header and body low-side, map to ECS with the
+          firewall value work (outcome derivation, durationms to nanoseconds,
+          service lowercasing, NAT view, session_count preserved), and emit
+          NDJSON with backpressure and a drift dead-letter route.
+        elastic: >
+          Same custom logs-zscaler_zia.firewall pipeline and keyword mappings
+          as the CEF alternate.
+        relay: >
+          Same bounded, numeric-friendly crossing as the CEF firewall feed;
+          reconcile record and summed session counts per (dataset, hour) to
+          catch a lost aggregate.
+      direct:
+        parse_location: high
+        cribl: >
+          High-side instances: same LEEF parse in the core worker group.
+          Prefer JSON unless a QRadar consumer shares the feed.
+        elastic: >
+          Same custom logs-zscaler_zia.firewall pipeline as the CEF alternate.
+    fields_omitted: >
+      The LEEF attribute names are those the admin's LEEF template assigned,
+      so there is no vendor-fixed name set to inventory. The tab-delimited
+      attributes carry the same firewall token dictionary the json entry
+      inventories, including the numsessions count that has to stay in the
+      template or aggregated records read as single sessions.
+    fields: []
+  - format: syslog-csv
+    enable: >
+      Same NSS Feeds path; set Feed Output Type to "CSV" or "Tab-Separated".
+      The console pre-populates a positional template listing the firewall
+      tokens in a fixed order with no keys on the wire. Set the token order
+      and the Feed Escape Character, then Save and Activate.
+    references:
+    - https://help.zscaler.com/zia/nss-feed-output-format-firewall-logs
+    - https://help.zscaler.com/zia/general-guidelines-nss-feeds-and-feed-formats
+    - https://docs.cribl.io/stream/usecase-zscaler-logs/
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Zscaler firewall delimited pipeline
+      notes: >
+        Keyless positional line; the parser is bound to the template column
+        order and drifts silently on any feed edit. The firewall feed is a
+        better CSV candidate than web or DNS because its values are short,
+        bounded and mostly numeric with no free text to collide with the
+        delimiter, but numsessions must stay in the column set or aggregation
+        is lost.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Parse the positional line low-side against the declared column
+          order, pin the expected column count and dead-letter on mismatch,
+          apply the firewall value work, and emit NDJSON with backpressure.
+          Preserve numsessions and do not de-aggregate.
+        elastic: >
+          Same custom logs-zscaler_zia.firewall pipeline and keyword mappings
+          as the CEF alternate.
+        relay: >
+          The bounded numeric values make this an easy content-filter
+          crossing; the only real risk is column drift breaking the parse
+          upstream, so validate column count before the guard. Reconcile
+          record and session counts per (dataset, hour).
+      direct:
+        parse_location: high
+        cribl: >
+          High-side instances: same column-order parse in the core worker
+          group. Prefer name=value or JSON over CSV for edit resilience.
+        elastic: >
+          Same custom logs-zscaler_zia.firewall pipeline as the CEF alternate.
+    fields_omitted: >
+      The delimited preset emits a keyless positional line, so the only
+      contract is the token order of the admin's template and there are no
+      names on the wire to inventory. The columns hold the same short,
+      bounded, mostly numeric firewall values the json entry inventories, and
+      numsessions has to remain in the token order or the aggregation count is
+      lost.
+    fields: []
+  - format: syslog-kv
+    enable: >
+      Same NSS Feeds path; set Feed Output Type to "SPLUNK CIM" to emit
+      name=value pairs over the firewall token dictionary. Cribl and Splunk
+      auto-extract the pairs regardless of order. Edit the token list, set the
+      destination, and Save and Activate.
+    references:
+    - https://help.zscaler.com/zia/nss-feed-output-format-firewall-logs
+    - https://help.zscaler.com/zia/general-guidelines-nss-feeds-and-feed-formats
+    - https://docs.cribl.io/stream/usecase-zscaler-logs/
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Zscaler firewall name-value pipeline
+      notes: >
+        The most edit-tolerant firewall preset: Cribl's Code/Eval/Serialize
+        pattern splits name=value into named fields, so a dropped token drops
+        its key rather than shifting columns. Same firewall value work and
+        numsessions preservation as the other presets.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Split name=value low-side, map to ECS with the firewall value work,
+          preserve session_count, and emit NDJSON with backpressure and a
+          key-set drift dead-letter route. Preferred non-JSON firewall form.
+        elastic: >
+          Same custom logs-zscaler_zia.firewall pipeline and keyword mappings
+          as the CEF alternate.
+        relay: >
+          Bounded numeric crossing as with the other firewall presets;
+          reconcile record and summed session counts per (dataset, hour).
+      direct:
+        parse_location: high
+        cribl: >
+          High-side instances: same name=value parse in the core worker group;
+          the edit-tolerant choice when a non-JSON form is needed, else JSON.
+        elastic: >
+          Same custom logs-zscaler_zia.firewall pipeline as the CEF alternate.
+    fields_omitted: >
+      The name=value keys are the admin's SPLUNK CIM token selection rather
+      than a vendor-fixed set, so a dropped token simply drops its key and the
+      key list has to be read from the feed definition. The pairs carry the
+      same firewall values the json entry inventories, including the
+      numsessions aggregation count.
+    fields: []
+- id: dns
+  name: DNS log
+  description: >
+    One record per DNS transaction handled by the ZIA DNS control / DNS
+    Gateway: the queried FQDN and record type, the response, the category
+    assigned to the queried domain, the DNS tunnel or network application
+    detected, and — distinctively — separate action and rule fields for the
+    request and the response, since ZIA can apply one policy to the query and
+    a different one to the answer.
+  event_categories:
+  - dns
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same NSS feed transport as the web dataset, on a separate feed
+        definition and TCP port.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-zscaler_zia.dns
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Same NSS feed transport as the web dataset, on a separate feed
+        definition and TCP port; records run straight to Elastic with no guard
+        crossing.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-zscaler_zia.dns
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: Zscaler ZIA integration (zscaler_zia), dns data stream
+    fields:
+    - vendor: time
+      type: timestamp
+      description: >-
+        time and date of the DNS transaction, in the time zone configured on
+        the NSS feed
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: cip
+      type: ip
+      description: IP address of the user that issued the DNS request
+      ecs: source.ip
+      status: mapped
+    - vendor: sip
+      type: ip
+      description: server IP address the DNS request was sent to
+      ecs: destination.ip
+      status: mapped
+    - vendor: req
+      type: string
+      description: fully qualified domain name in the DNS request
+      ecs: dns.question.name
+      status: mapped
+    - vendor: reqtype
+      type: string
+      description: DNS request record type (A, AAAA, TXT, ...)
+      ecs: dns.question.type
+      status: mapped
+    - vendor: res
+      type: string
+      description: NAME returned in the DNS response
+      ecs: dns.answers.data
+      status: partial
+      notes: >
+        a single flattened response value, not the per-answer array ECS
+        models; where it holds a resolved address it should also populate
+        dns.resolved_ip, and multi-answer responses are not fully represented
+        by this token
+    - vendor: restype
+      type: string
+      description: record type returned in the DNS response
+      ecs: dns.answers.type
+      status: mapped
+    - vendor: reqaction
+      type: enum
+      description: action applied to the DNS request (e.g. ALLOW, BLOCK, REDIR_REQ)
+      ecs: event.action
+      status: mapped
+      transform: >
+        the request action is the one promoted to event.action; because a
+        separate response action exists, event.outcome must be derived from
+        both together rather than from this field alone
+    - vendor: resaction
+      type: enum
+      description: action applied to the DNS response (e.g. ALLOW, BLOCK, REDIR_RES)
+      ecs: null
+      status: unmapped
+      custom: zscaler.zia.dns.response_action
+      notes: >
+        ZIA evaluates the query and the answer separately, so one record
+        carries two actions; event.action can only hold one, and collapsing
+        them loses the distinction between a blocked query and a blocked
+        answer
+    - vendor: reqrulelabel
+      type: string
+      description: name of the rule applied to the DNS request
+      ecs: rule.name
+      status: mapped
+    - vendor: resrulelabel
+      type: string
+      description: name of the rule applied to the DNS response
+      ecs: null
+      status: unmapped
+      custom: zscaler.zia.dns.response_rule_label
+      notes: >-
+        second rule object on the same record; rule.name is already held by
+        the request rule
+    - vendor: domcat
+      type: string
+      description: URL category assigned to the FQDN in the DNS request
+      ecs: null
+      status: unmapped
+      custom: zscaler.zia.dns.request_category
+      notes: >
+        same taxonomy as the web log's urlcat and the same gap — ECS has no
+        url.category field; %s{respipcat} carries the category of the address
+        in the response
+    - vendor: dnsapp
+      type: string
+      description: DNS tunnel or network application detected on the transaction
+      ecs: null
+      status: unmapped
+      custom: zscaler.zia.dns.tunnel_app
+      notes: >
+        non-empty when ZIA identifies DNS tunneling or a known DNS-borne
+        application; paired with %s{dnsappcat}, and the single most
+        detection-relevant field in this dataset
+    - vendor: error
+      type: string
+      description: DNS error code returned for the transaction
+      ecs: dns.response_code
+      status: partial
+      notes: >
+        vendor error strings only partly overlap the DNS RCODE vocabulary ECS
+        expects; map the genuine RCODEs and keep vendor-specific values in the
+        custom namespace rather than inventing RCODE names
+    - vendor: istcp
+      type: boolean
+      description: indicates whether the DNS transaction used TCP
+      ecs: network.transport
+      status: partial
+      transform: >-
+        emitted as 0/1; translate to the udp/tcp values ECS expects rather
+        than storing the flag
+    - vendor: elogin
+      type: string
+      description: >-
+        user's login name in email address format, escaped per the feed escape
+        character setting
+      ecs: user.name
+      status: mapped
+      transform: >-
+        email-format value; populate user.email whole and split into user.name
+        and user.domain
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Pass through unparsed with Persistent Queue backpressure and the
+          same template-drift dead-letter check as the other two feeds. DNS is
+          second only to web in volume and the lowest per-record forensic
+          value here, so this is where low-side volume shaping belongs if it
+          is needed at all — suppress by request category or by
+          allowed-and-resolved outcome in the NSS feed filter rather than by
+          trimming fields in Cribl, so the records that survive stay
+          schema-complete.
+        elastic: >
+          Use the stock zscaler_zia dns ingest pipeline and add a
+          logs-zscaler_zia.dns@custom pipeline that resolves the two-action
+          problem explicitly: event.action should carry the request action,
+          with the response action and response rule label preserved in the
+          custom namespace and event.outcome derived from whichever of the two
+          actually blocked the transaction, not from the request action alone.
+          Convert istcp into network.transport (udp/tcp), map the vendor DNS
+          error string onto dns.response_code only where it is a real RCODE
+          and leave it custom otherwise, and mark records with a non-empty DNS
+          tunnel application so tunneling detections can key off a single
+          field.
+        relay: >
+          On the low-side crossing the friction is volume and query-name
+          content rather than record size: DNS question names are attacker-
+          controlled, can carry long base32/hex tunneling payloads, and are
+          exactly the free text a simple content filter will choke on. Cap and
+          flag over-length question names low-side rather than letting the
+          guard truncate them silently, hold the NDJSON to two levels of
+          nesting with bounded string lengths, and reconcile counts per
+          (dataset, hour) since the crossing is at-most-once with no return
+          channel.
+      direct:
+        parse_location: high
+        cribl: >
+          Pass through unparsed with Persistent Queue backpressure and the
+          same template-drift dead-letter check as the other two feeds. DNS is
+          second only to web in volume and the lowest per-record forensic
+          value here, so this is where volume shaping belongs if it is needed
+          at all — suppress by request category or by allowed-and-resolved
+          outcome in the NSS feed filter rather than by trimming fields in
+          Cribl, so the records that survive stay schema-complete.
+        elastic: >
+          Use the stock zscaler_zia dns ingest pipeline and add a
+          logs-zscaler_zia.dns@custom pipeline that resolves the two-action
+          problem explicitly: event.action should carry the request action,
+          with the response action and response rule label preserved in the
+          custom namespace and event.outcome derived from whichever of the two
+          actually blocked the transaction, not from the request action alone.
+          Convert istcp into network.transport (udp/tcp), map the vendor DNS
+          error string onto dns.response_code only where it is a real RCODE
+          and leave it custom otherwise, and mark records with a non-empty DNS
+          tunnel application so tunneling detections can key off a single
+          field.
+  - format: syslog-cef
+    enable: >
+      Administration > Nanolog Streaming Service > NSS Feeds, add or edit the
+      DNS feed, and set Feed Output Type to "ArcSight CEF". The console
+      pre-populates a CEF:0|Zscaler|NSS| template over the DNS token
+      dictionary - the same %s{req}, %s{reqtype}, %s{res}, %s{reqaction},
+      %s{resaction}, %s{reqrulelabel}, %s{resrulelabel}, %s{domcat},
+      %s{dnsapp} set the JSON feed uses. Edit the token list, set the
+      destination, and Save and Activate.
+    references:
+    - https://help.zscaler.com/zia/nss-feed-output-format-dns-logs
+    - https://help.zscaler.com/zia/general-guidelines-nss-feeds-and-feed-formats
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Zscaler DNS CEF pipeline
+      notes: >
+        zscaler_zia parses only the JSON DNS template, so CEF needs a custom
+        Cribl pipeline. The DNS value work is unchanged from the JSON map:
+        event.action carries the request action while the response action and
+        response rule label are preserved in the custom namespace and
+        event.outcome is derived from whichever action blocked; istcp becomes
+        network.transport; genuine RCODEs map to dns.response_code and vendor
+        error strings stay custom. The CEF template must carry both action and
+        both rule tokens or the two-action distinction is lost.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Parse CEF low-side into ECS with the two-action handling above, map
+          zscaler.zia.dns.response_action/.response_rule_label/.request_category
+          /.tunnel_app into the custom namespace, and emit NDJSON with
+          Persistent Queue backpressure and a template-drift dead-letter
+          route. DNS is second only to web in volume, so shape volume in the
+          NSS feed filter (suppress by category or allowed-and-resolved
+          outcome) rather than trimming fields here.
+        elastic: >
+          Stand up a custom logs-zscaler_zia.dns ingest pipeline and index
+          template that accept the pre-shaped ECS documents with the DNS
+          custom-namespace keyword mappings; do not route the CEF feed to the
+          stock JSON DNS pipeline.
+        relay: >
+          The crossing friction here is query-name content, not record size:
+          DNS question names are attacker-controlled and can carry long
+          base32/hex tunneling payloads - exactly the free text a simple
+          filter chokes on. Cap and flag over-length question names low-side
+          rather than letting the guard truncate them, hold NDJSON to two
+          levels of nesting, and reconcile counts per (dataset, hour) as
+          at-most-once.
+      direct:
+        parse_location: high
+        cribl: >
+          High-side instances: same CEF parse and two-action ECS mapping in
+          the core worker group. Absent a CEF-native consumer the JSON is
+          lower-friction.
+        elastic: >
+          Stand up a custom logs-zscaler_zia.dns ingest pipeline and index
+          template that accept the pre-shaped ECS documents with the DNS
+          custom-namespace keyword mappings; do not route the CEF feed to the
+          stock JSON DNS pipeline.
+    fields_omitted: >
+      The CEF extension keys come from the admin's editable Feed Output Format
+      template, not a fixed vendor list. They carry the same DNS token
+      dictionary the json entry inventories — req, reqtype, res, domcat,
+      dnsapp and both the request and response actions with both rule labels —
+      as flat CEF extension pairs; the template must keep both action and both
+      rule tokens or the two-action distinction is lost.
+    fields: []
+  - format: syslog-leef
+    enable: >
+      Same NSS Feeds path for the DNS feed; set Feed Output Type to "QRadar
+      LEEF" to emit a LEEF header plus tab-delimited attributes over the DNS
+      token dictionary. Edit, set the destination, and Save and Activate.
+    references:
+    - https://help.zscaler.com/zia/nss-feed-output-format-dns-logs
+    - https://help.zscaler.com/zia/general-guidelines-nss-feeds-and-feed-formats
+    - https://docs.rapid7.com/insightidr/zscaler-nss/
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Zscaler DNS LEEF pipeline
+      notes: >
+        No shipped integration or pack parses the LEEF DNS stream; a Cribl
+        pipeline splits the LEEF header and tab-delimited body and maps to ECS
+        with the same two-action DNS value work as the CEF alternate.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Split the LEEF header and body low-side, apply the two-action DNS
+          mapping (request action to event.action, response action/rule and
+          tunnel app to the custom namespace, istcp to network.transport), and
+          emit NDJSON with backpressure and a drift dead-letter route.
+        elastic: >
+          Same custom logs-zscaler_zia.dns pipeline and keyword mappings as
+          the CEF alternate.
+        relay: >
+          Same query-name content hazard as the CEF DNS feed: cap and flag
+          over-length question names low-side, bound the NDJSON, reconcile per
+          (dataset, hour).
+      direct:
+        parse_location: high
+        cribl: >
+          High-side instances: same LEEF parse in the core worker group;
+          prefer JSON unless a QRadar consumer shares the feed.
+        elastic: >
+          Same custom logs-zscaler_zia.dns pipeline as the CEF alternate.
+    fields_omitted: >
+      The tab-delimited LEEF attribute names are whatever the admin's LEEF
+      template assigned, so the wire names live in the feed definition rather
+      than in a vendor schema. The attributes carry the same DNS token
+      dictionary the json entry inventories, including the paired request and
+      response actions and rule labels.
+    fields: []
+  - format: syslog-csv
+    enable: >
+      Same NSS Feeds path; set Feed Output Type to "CSV" (the vendor default
+      for DNS feeds) or "Tab-Separated". The console pre-populates a
+      positional template listing the DNS tokens in a fixed order with no keys
+      on the wire. Set the token order and the Feed Escape Character - DNS
+      documentation calls out escaping so each record parses as a discrete
+      object - then Save and Activate.
+    references:
+    - https://help.zscaler.com/zia/nss-feed-output-format-dns-logs
+    - https://help.zscaler.com/zia/general-guidelines-nss-feeds-and-feed-formats
+    - https://docs.cribl.io/stream/usecase-zscaler-logs/
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Zscaler DNS delimited pipeline
+      notes: >
+        Keyless positional line bound to the template column order. DNS
+        question names are the collision risk: an attacker-controlled name can
+        contain the delimiter, so the escape character must be set precisely
+        or columns split mid-value. This is CSV's weakest log type for that
+        reason, despite being the vendor default output type for DNS.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Parse the positional line low-side against the declared column order
+          with the escape character honoured, pin the column count and
+          dead-letter on mismatch, apply the two-action DNS mapping, and emit
+          NDJSON with backpressure. Prefer name=value or JSON over CSV here,
+          since a delimiter-bearing question name is both a parse and a filter
+          hazard.
+        elastic: >
+          Same custom logs-zscaler_zia.dns pipeline and keyword mappings as
+          the CEF alternate.
+        relay: >
+          Over-length and delimiter-bearing question names are the crossing
+          risk: cap and flag them low-side, normalize to bounded UTF-8, cross
+          NDJSON rather than the delimited line, and reconcile per (dataset,
+          hour).
+      direct:
+        parse_location: high
+        cribl: >
+          High-side instances: same column-order parse in the core worker
+          group. Prefer name=value or JSON over CSV for edit and delimiter
+          resilience.
+        elastic: >
+          Same custom logs-zscaler_zia.dns pipeline as the CEF alternate.
+    fields_omitted: >
+      CSV — the vendor's default output type for DNS feeds — writes a keyless
+      positional line, so the only contract is the token order of the admin's
+      template and there are no field names on the wire to inventory. The
+      columns hold the same DNS values the json entry inventories, with the
+      attacker-influenced question name as the delimiter-collision risk the
+      Feed Escape Character has to cover.
+    fields: []
+  - format: syslog-kv
+    enable: >
+      Same NSS Feeds path; set Feed Output Type to "SPLUNK CIM" (Name-Value
+      Pairs) to emit name=value pairs over the DNS token dictionary. Cribl and
+      Splunk auto-extract the pairs regardless of order. Edit the token list,
+      set the destination, and Save and Activate.
+    references:
+    - https://help.zscaler.com/zia/nss-feed-output-format-dns-logs
+    - https://help.zscaler.com/zia/general-guidelines-nss-feeds-and-feed-formats
+    - https://docs.cribl.io/stream/usecase-zscaler-logs/
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Zscaler DNS name-value pipeline
+      notes: >
+        The most robust non-JSON DNS preset: self-describing keys survive both
+        template edits and delimiter-bearing question names better than CSV.
+        Cribl's Code/Eval/Serialize pattern splits the pairs into named fields
+        for the two-action DNS mapping.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Split name=value low-side, apply the two-action DNS mapping, and
+          emit NDJSON with backpressure and a key-set drift dead-letter route.
+          Preferred non-JSON DNS form, since the question name cannot corrupt
+          a keyed record the way it can a positional one.
+        elastic: >
+          Same custom logs-zscaler_zia.dns pipeline and keyword mappings as
+          the CEF alternate.
+        relay: >
+          Same query-name content hazard: cap and flag over-length question
+          names low-side, bound the NDJSON, reconcile per (dataset, hour).
+      direct:
+        parse_location: high
+        cribl: >
+          High-side instances: same name=value parse in the core worker group;
+          the edit-tolerant choice when a non-JSON form is needed, else JSON.
+        elastic: >
+          Same custom logs-zscaler_zia.dns pipeline as the CEF alternate.
+    fields_omitted: >
+      The name=value keys are the admin's SPLUNK CIM token selection rather
+      than a vendor-fixed set, so the key list has to be read from the feed
+      definition. The self-describing pairs carry the same DNS values the json
+      entry inventories, including both the request and response actions that
+      the two-action mapping depends on.
+    fields: []

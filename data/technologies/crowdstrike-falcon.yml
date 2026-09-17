@@ -1,0 +1,1522 @@
+id: crowdstrike-falcon
+name: CrowdStrike Falcon
+vendor: CrowdStrike
+versions: Falcon sensor 7.x, Event Streams API v2, SIEM Connector 2.x
+draft: true
+references:
+- https://www.elastic.co/docs/reference/integrations/crowdstrike
+- >-
+  https://github.com/elastic/integrations/blob/main/packages/crowdstrike/data_stream/falcon/fields/fields.yml
+- >-
+  https://www.elastic.co/guide/en/beats/filebeat/current/filebeat-module-crowdstrike.html
+- https://developer.crowdstrike.com/sdks/python/configuration/
+- >-
+  https://www.crowdstrike.com/wp-content/brochures/falcon-connector/falcon-SIEM-connector-datasheet.pdf
+- https://docs.cribl.io/stream/sources-crowdstrike/
+- https://github.com/criblpacks/cribl_crowdstrike
+- >-
+  https://docs.panther.com/data-onboarding/supported-logs/crowdstrike/falcon-data-replicator
+datasets:
+- id: detection-summary
+  name: Detection summary event
+  description: >
+    Endpoint detections and preventions delivered over the Falcon Event
+    Streams API (eventType DetectionSummaryEvent / EppDetectionSummaryEvent),
+    normally collected by the Falcon SIEM Connector, which writes newline-
+    delimited JSON to /var/log/crowdstrike/falconhoseclient/output. The
+    connector can also emit syslog key=value, CEF or LEEF via output_format,
+    but only the JSON form carries the full field set and only JSON is
+    supported by the Elastic integration - so JSON is the configuration to
+    standardise on. On Falcon GovCloud the connector's api_url points at the
+    us-gov-1 (api.laggar.gcw.crowdstrike.com) or us-gov-2
+    (api.us-gov-2.crowdstrike.mil) endpoint, neither of which supports the
+    cloud auto-discovery the commercial regions use; the record schema is
+    identical.
+  event_categories:
+  - malware
+  - process
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        The SIEM Connector host tails its JSON output file into Cribl (Cribl
+        Edge/file source), so the connector and the worker group it feeds sit
+        in the same enclave - the low-side enclave on this guarded path, where
+        the recommendations below shift from high to hybrid for the alternate
+        formats.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-crowdstrike.falcon
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        The SIEM Connector host tails its JSON output file into Cribl (Cribl
+        Edge/file source), so the connector and the worker group it feeds sit
+        in the same enclave as the Elastic stack and hand off straight to the
+        core worker group.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-crowdstrike.falcon
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: CrowdStrike integration, falcon data stream
+      notes: >
+        The falcon data stream's ingest pipeline is purpose-built for SIEM
+        Connector / Event Streams JSON and fans out per crowdstrike.metadata
+        eventType. It keeps most of the detection payload under the
+        crowdstrike.event.* namespace rather than promoting it to ECS, so the
+        useful work is a @custom pipeline on top, not a replacement parser.
+    fields:
+    - vendor: metadata.eventType
+      type: string
+      description: name of the Event Streams record type carried in this message
+      ecs: null
+      status: unmapped
+      custom: crowdstrike.falcon.metadata.event_type
+      notes: >
+        DetectionSummaryEvent, EppDetectionSummaryEvent, IncidentSummaryEvent,
+        FirewallMatchEvent, AuthActivityAuditEvent, UserActivityAuditEvent and
+        others share one stream; this value determines which event fields are
+        present and is what the ingest pipeline fans out on
+    - vendor: metadata.offset
+      type: integer
+      description: 'monotonically increasing position of this event within the customer''s stream'
+      ecs: null
+      status: unmapped
+      custom: crowdstrike.falcon.metadata.offset
+      notes: >
+        stream cursor used by the connector to resume after a restart; keep it
+        queryable because it is the only in-band way to detect a gap (dropped
+        or replayed events) after the fact
+    - vendor: UTCTimestamp
+      type: timestamp
+      description: time the detection occurred, as recorded by the sensor
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        epoch integer, but the unit is not consistent across the stream -
+        detection records emit seconds while several audit and incident record
+        types emit milliseconds, so the converter must branch on the value's
+        magnitude rather than assume one unit
+    - vendor: DetectId
+      type: string
+      description: >-
+        unique identifier of this detection instance (ldt:<sensor
+        id>:<detection id> form)
+      ecs: event.id
+      status: mapped
+      notes: >
+        identifies the detection occurrence, not the pattern that fired;
+        CompositeId is the newer global alert identifier and should be carried
+        alongside once the tenant emits it
+    - vendor: DetectName
+      type: string
+      description: name of the detection pattern that fired, e.g. "Credential Theft"
+      ecs: rule.name
+      status: mapped
+      notes: >
+        rule.name and rule.id describe the same object on this dataset - the
+        detection pattern - so the repo's rule.* convention applies. Custom
+        IOA detections put their own name in IOARuleName instead, which must
+        be coalesced into rule.name so the two detection sources are queryable
+        as one
+    - vendor: PatternId
+      type: string
+      description: numeric identifier of the detection pattern associated with the detection
+      ecs: rule.id
+      status: mapped
+      notes: >
+        the pattern is the same object DetectName names, which is what makes
+        this a legitimate rule.name/rule.id pair. Deliberately not
+        threat.indicator.id - that field models an identifier issued by a
+        threat-intel provider for an indicator document, whereas this is
+        vendor detection-rule identity
+    - vendor: Severity
+      type: integer
+      description: 'severity of the detection on CrowdStrike''s own 1-5 scale'
+      ecs: event.severity
+      status: partial
+      notes: >
+        the vendor scale runs 1 (Informational) to 5 (Critical), but the stock
+        Elastic integration derives event.severity from SeverityName on a
+        21/47/73/99 scale instead; the two never agree, so one source must be
+        chosen explicitly or CSOC severity thresholds will be wrong for
+        whichever half of the corpus took the other path
+    - vendor: SeverityName
+      type: enum
+      description: >-
+        severity of the detection as a string - Informational, Low, Medium,
+        High, Critical
+      ecs: null
+      status: partial
+      custom: crowdstrike.falcon.severity_name
+      notes: >
+        kept custom rather than mapped so the numeric event.severity has a
+        single owner; retain it as the human-readable label the console shows
+        and as the audit trail for whichever numeric scale is chosen
+    - vendor: Tactic
+      type: string
+      description: MITRE ATT&CK tactic the detection was attributed to
+      ecs: threat.tactic.name
+      status: mapped
+      notes: >
+        newer records carry the MitreAttack array (Tactic/TacticID/
+        Technique/TechniqueID) instead of these scalars; the pipeline must
+        read both shapes and also set threat.framework to "MITRE ATT&CK",
+        which no vendor field supplies
+    - vendor: Technique
+      type: string
+      description: MITRE ATT&CK technique the detection was attributed to
+      ecs: threat.technique.name
+      status: mapped
+      notes: >
+        the matching numeric technique id (Txxxx) is only present in the
+        MitreAttack array, so threat.technique.id is unpopulated on records
+        that carry only the scalar form
+    - vendor: CommandLine
+      type: string
+      description: full command line of the process that triggered the detection
+      ecs: process.command_line
+      status: mapped
+      notes: >
+        unbounded free text and the single largest field on this dataset; the
+        stock pipeline also splits it into process.args and derives
+        process.executable from it, which is unreliable for quoted paths
+    - vendor: FileName
+      type: string
+      description: file name of the executable image that triggered the detection
+      ecs: process.name
+      status: mapped
+    - vendor: FilePath
+      type: string
+      description: >-
+        directory containing the triggering executable, in
+        \Device\HarddiskVolumeN form on Windows
+      ecs: process.executable
+      status: partial
+      transform: >
+        the vendor supplies only the containing directory, so join it with
+        FileName and rewrite the \Device\HarddiskVolumeN prefix to the
+        corresponding drive letter to produce a process.executable that
+        matches what Windows and Sysmon documents carry
+    - vendor: SHA256String
+      type: string
+      description: SHA-256 hash of the executable associated with the detection
+      ecs: process.hash.sha256
+      status: mapped
+    - vendor: ComputerName
+      type: string
+      description: hostname of the endpoint where the detection occurred
+      ecs: host.name
+      status: mapped
+    - vendor: UserName
+      type: string
+      description: account name the triggering process was running as
+      ecs: user.name
+      status: mapped
+      notes: >
+        the account's domain arrives separately in LogonDomain (user context)
+        and MachineDomain (host context); do not conflate the two when
+        populating user.domain
+    - vendor: LocalIP
+      type: string
+      description: IP address of the endpoint associated with the detection
+      ecs: host.ip
+      status: partial
+      notes: >
+        declared as a string rather than an ip by the vendor and populated
+        with a single sensor-local address, so it is not the full interface
+        list host.ip normally implies; LocalIPv6 carries the v6 address in a
+        separate field that must be merged in
+    - vendor: SensorId
+      type: string
+      description: unique identifier of the Falcon sensor installation that reported the detection
+      ecs: agent.id
+      status: mapped
+      notes: >
+        the sensor id (aid) changes when the sensor is reinstalled, so a
+        single physical host accumulates several agent.id values over time and
+        host-level correlation must key on host.name or host.id instead
+    - vendor: PatternDispositionValue
+      type: integer
+      description: bitmask encoding every action the sensor took in response to the detection
+      ecs: null
+      status: unmapped
+      custom: crowdstrike.falcon.pattern_disposition.value
+      transform: >
+        decode against the PatternDispositionFlags object (Detect,
+        ProcessBlocked, KillProcess, KillParent, QuarantineFile,
+        QuarantineMachine, OperationBlocked, PolicyDisabled, SensorOnly,
+        KillActionFailed, ...) to derive event.outcome - any blocking or kill
+        flag set means the activity was prevented, Detect alone means it was
+        observed and allowed to run
+    - vendor: PatternDispositionDescription
+      type: string
+      description: free-text rendering of the disposition, e.g. "Prevention, process killed."
+      ecs: event.action
+      status: partial
+      notes: >
+        a prose sentence rather than a stable enum, so it is usable as a
+        display value but must not be the source of event.outcome - decode
+        PatternDispositionValue for that
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Keep the core worker group a pass-through for this route: the
+          connector already emits one JSON object per line, so there is
+          nothing to parse low-side and re-serialising would only risk
+          breaking the integration's eventType fan-out. Limit low-side work to
+          Persistent Queue backpressure on the Elastic destination,
+          host-to-site/owner enrichment that is cheaper near the source than
+          in an ingest pipeline, and a guard on the connector's output_format
+          so a host reconfigured to CEF or LEEF is detected and dead-lettered
+          instead of silently arriving unparseable.
+        elastic: >
+          Let the stock CrowdStrike falcon ingest pipeline parse, and add a
+          logs-crowdstrike.falcon@custom pipeline for the gaps this map
+          records: reconcile the two competing severity scales so
+          event.severity is driven by one of them deliberately rather than by
+          whichever field the stock pipeline reached last, decode
+          PatternDispositionValue's flag bits into an explicit event.outcome
+          (prevented versus detected-only) instead of leaving analysts to read
+          the free-text disposition description, and assemble
+          process.executable by joining FilePath with FileName and rewriting
+          the \Device\HarddiskVolumeN prefix to a drive letter so endpoint
+          joins against Windows and Sysmon documents resolve. Add
+          custom-namespace keyword mappings for
+          crowdstrike.falcon.severity_name, .pattern_disposition.value and the
+          metadata event_type and offset fields so detection dashboards and
+          stream-gap queries work without dynamic mapping.
+        relay: >
+          Low-side instances cross the guard, and this route needs no format
+          change to cross - it is already NDJSON, and the thin-envelope hybrid
+          applies (_dataId keyed to logs-crowdstrike.falcon, @timestamp, host,
+          _raw) because the Elastic integration is the parser and should stay
+          so. The content-filter friction is CommandLine, which is unbounded
+          free text that routinely carries base64 blobs, kilobyte-scale
+          PowerShell and non-ASCII characters: cap and flag its length
+          low-side and normalise the encoding before the guard destination
+          rather than relying on the filter. The crossing is at-most-once with
+          no return channel, so exploit the stream's own
+          crowdstrike.metadata.offset - reconciling low-side and high-side
+          offset ranges per (dataset, hour) detects silent drops far more
+          precisely than a bare count comparison.
+      direct:
+        parse_location: high
+        cribl: >
+          Keep the core worker group a pass-through for this route: the
+          connector already emits one JSON object per line, so there is
+          nothing to parse at the edge and re-serialising would only risk
+          breaking the integration's eventType fan-out. Limit edge work to
+          Persistent Queue backpressure on the Elastic destination,
+          host-to-site/owner enrichment that is cheaper near the source than
+          in an ingest pipeline, and a guard on the connector's output_format
+          so a host reconfigured to CEF or LEEF is detected and dead-lettered
+          instead of silently arriving unparseable.
+        elastic: >
+          Let the stock CrowdStrike falcon ingest pipeline parse, and add a
+          logs-crowdstrike.falcon@custom pipeline for the gaps this map
+          records: reconcile the two competing severity scales so
+          event.severity is driven by one of them deliberately rather than by
+          whichever field the stock pipeline reached last, decode
+          PatternDispositionValue's flag bits into an explicit event.outcome
+          (prevented versus detected-only) instead of leaving analysts to read
+          the free-text disposition description, and assemble
+          process.executable by joining FilePath with FileName and rewriting
+          the \Device\HarddiskVolumeN prefix to a drive letter so endpoint
+          joins against Windows and Sysmon documents resolve. Add
+          custom-namespace keyword mappings for
+          crowdstrike.falcon.severity_name, .pattern_disposition.value and the
+          metadata event_type and offset fields so detection dashboards and
+          stream-gap queries work without dynamic mapping.
+  - format: syslog-cef
+    enable: >
+      On the SIEM Connector host copy the preset CEF config over the live one
+      -- cp /opt/crowdstrike/etc/cs.falconhoseclient.cef.cfg
+      /opt/crowdstrike/etc/cs.falconhoseclient.cfg -- then set the [Streaming]
+      output_format to cef and, under the syslog section, point
+      send_to_syslog_server=true at the collector with host, port and protocol
+      (tcp or udp); restart cs.falconhoseclientd. The connector then renders
+      each DetectionSummaryEvent (and its mobile/DNS/network subtypes, keyed
+      by the "EventType" and "EventType_EventSubType" sections of the cef.cfg)
+      as a single CEF line. The header is
+      "CEF:0|CrowdStrike|FalconHost|1.0|<eventType>|<name>|<sev>|" with the
+      detection payload carried in the extension. Custom fields ride in the
+      numbered CEF slots (cn1..cn3 for integers, cs5/cs6 for strings) each
+      paired with a cnNLabel/csNLabel that names it, so a parser must resolve
+      the label pairs rather than trust slot position. This CEF template is a
+      curated subset of the JSON record and is materially lossy: it omits
+      Severity's numeric value (only the CEF header severity survives),
+      SeverityName, the MitreAttack id array, LocalIPv6 and LogonDomain, and
+      it renders the disposition only as the free-text description rather than
+      the actionable bitmask -- so JSON remains the richer feed and CEF should
+      be adopted only for a downstream that demands it. It does carry both
+      executable hashes: fileHash holds the MD5 (event.MD5String) and
+      sha256fileHash holds the SHA256 (event.SHA256String).
+    references:
+    - https://docs.rapid7.com/insightidr/crowdstrike-falcon-event-source/
+    - >-
+      https://github.com/mitespsoc/siem/blob/main/crowdstrike_falcon_siem_connector_configuration.md
+    - >-
+      https://archive-docs.guardsix.com/docs/crowdstrike/en/latest/CEF%20Sample%20Configuration.html
+    - >-
+      https://www.crowdstrike.com/wp-content/brochures/falcon-connector/falcon-SIEM-connector-datasheet.pdf
+    parsing:
+      mechanism: elastic-ingest-pipeline
+      artifact: >-
+        generic CEF decode + logs-crowdstrike.falcon@custom (no stock CEF path
+        in the CrowdStrike integration)
+      notes: >
+        The Elastic CrowdStrike integration's falcon data stream parses only
+        SIEM Connector / Event Streams JSON; it has no CEF ingest pipeline, so
+        a CEF feed cannot ride the stock integration's eventType fan-out. A
+        generic CEF decoder yields cef.extensions.* keyed by the raw CEF names
+        (externalId, detectionId, cn1/cn2, cs5, dhost, duser, fileHash,
+        sha256fileHash) plus opaque cnNLabel/csNLabel pairs, not the
+        crowdstrike.* namespace, so a hand-built pipeline must decode the
+        header, resolve each label pair to a stable key, and re-map into the
+        same fields the JSON path targets so CEF-sourced and JSON-sourced
+        detections are queryable as one corpus.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Do the CEF-to-structure work at the low-side edge worker group that
+          tails the connector, because the label indirection must not cross
+          the guard unresolved. Split the header on "|" to recover the CEF
+          version, device vendor/product, the eventType signature and the
+          header severity, extract the extension into fields, then resolve
+          every cnNLabel/csNLabel pair by name so ProcessId, ParentProcessId,
+          CommandLine, FalconHostLink and Offset become self-describing keys
+          rather than positional cn2/cn1/cs5/cs6/cn3 slots. Convert rt from
+          CEF epoch-milliseconds to the event time, cap and encoding-normalise
+          the CommandLine (cs5) value exactly as on the JSON path since it
+          remains the largest and most free-text field, and dead-letter any
+          line whose header eventType is unrecognised so a template change
+          surfaces instead of arriving unparseable.
+        elastic: >
+          There is no crowdstrike.falcon CEF pipeline to inherit, so land
+          these records through a dedicated generic-CEF decode feeding
+          logs-crowdstrike.falcon@custom that maps detectionId to event.id
+          (the detection instance) and externalId to agent.id (externalId
+          carries the SensorId, not the detection id), dhost to host.name,
+          duser to user.name, fname to process.name, cs5 to
+          process.command_line, cat/act to threat.tactic.name and
+          threat.technique.name, and msg to message. The CEF-specific detail
+          that matters: the template carries both hashes, so write fileHash
+          (event.MD5String) to process.hash.md5 and sha256fileHash
+          (event.SHA256String) to process.hash.sha256; and the disposition
+          arrives only as the free-text CSMTRPatternDisposition description,
+          so event.outcome must be derived from that string here rather than
+          from the numeric PatternDispositionValue bitmask the JSON stream
+          carries. Add keyword mappings for crowdstrike.falcon.metadata.offset
+          (from cn3) so stream-gap queries still work.
+        relay: >
+          A CEF line is one flat string, which is friendlier to a
+          shallow-nesting content filter than the JSON record -- that is CEF's
+          one crossing advantage. The friction is the cnNLabel/csNLabel
+          indirection: an allowlisted-key filter sees opaque cn1/cn2/cs5/cs6
+          slots whose meaning lives in the paired label field, so resolve
+          those to named keys low-side before the guard rather than asking the
+          filter to reason about positional custom columns. Cap the cs5
+          CommandLine extension length and normalise its encoding before the
+          guard destination. With no return channel, reconcile low-side and
+          high-side counts per (eventType, hour) using the cn3 Offset range as
+          the in-band cursor, since CEF carries the same stream offset the
+          JSON feed relies on for silent-drop detection.
+      direct:
+        parse_location: hybrid
+        cribl: >
+          For a high-side tenant whose Elastic stack is on the same side,
+          decode CEF at the edge worker group: split the header on "|" to
+          recover the CEF version, device vendor/product, the eventType
+          signature and the header severity, extract the extension into
+          fields, resolve every cnNLabel/csNLabel pair by name so ProcessId,
+          ParentProcessId, CommandLine, FalconHostLink and Offset become
+          self-describing keys rather than positional slots, and convert rt to
+          the event time. The decision that matters is whether to switch the
+          connector to CEF at all -- the json path with the stock integration
+          is strictly richer and lower effort, so CEF is justified only when
+          an existing CEF collector must be reused, in which case shape toward
+          the crowdstrike.falcon.* names in Cribl so CEF-sourced detections
+          line up with any JSON-sourced Falcon data already indexed.
+        elastic: >
+          Land these records through a dedicated generic-CEF decode feeding
+          logs-crowdstrike.falcon@custom that maps detectionId to event.id,
+          externalId to agent.id, dhost to host.name, duser to user.name,
+          fname to process.name, cs5 to process.command_line, cat/act to
+          threat.tactic.name and threat.technique.name, and msg to message.
+          The template carries both hashes, so write fileHash
+          (event.MD5String) to process.hash.md5 and sha256fileHash
+          (event.SHA256String) to process.hash.sha256, and derive
+          event.outcome from the free-text CSMTRPatternDisposition
+          description. Because the CEF template drops SeverityName and the
+          numeric Severity, the two-competing-severity-scales problem the JSON
+          map documents does not arise here -- but neither does the
+          granularity, so event.severity can only be derived from the coarse
+          CEF header severity, which is a further argument against migrating
+          this dataset off JSON.
+    fields:
+    - vendor: externalId
+      type: string
+      description: >-
+        Falcon sensor installation identifier (event.SensorId, the aid GUID)
+        carried in the CEF externalId extension -- NOT the detection id
+      ecs: agent.id
+      status: mapped
+      notes: >-
+        the cef.cfg assigns externalId = event.SensorId, so this is agent/host
+        identity; the aid changes on sensor reinstall, so host-level
+        correlation must key on host.name or host.id. The detection instance
+        id is carried separately in detectionId
+    - vendor: detectionId
+      type: string
+      description: >-
+        unique identifier of this detection instance (event.DetectId,
+        ldt:<sensor id>:<detection id> form), carried in its own CEF extension
+      ecs: event.id
+      status: mapped
+      notes: >-
+        this, not externalId, is the detection-occurrence identifier; the
+        cef.cfg assigns detectionId = event.DetectId
+    - vendor: cn2
+      type: integer
+      description: >-
+        operating-system process id of the process that triggered the
+        detection; the paired cn2Label is the literal 'ProcessId'
+      ecs: process.pid
+      status: mapped
+      notes: >-
+        carried as a CEF custom-number slot whose meaning is only
+        self-describing via cn2Label; a parser must key on the label, not the
+        cn2 position
+    - vendor: cn1
+      type: integer
+      description: >-
+        operating-system process id of the parent process; the paired cn1Label
+        is the literal 'ParentProcessId'
+      ecs: process.parent.pid
+      status: mapped
+    - vendor: cn3
+      type: integer
+      description: >-
+        position of this event within the customer's Event Streams cursor; the
+        paired cn3Label is the literal 'Offset'
+      ecs: null
+      status: unmapped
+      custom: crowdstrike.falcon.metadata.offset
+      notes: >-
+        the same stream offset the JSON metadata.offset carries; keep it
+        queryable as the only in-band way to detect a dropped or replayed
+        event after the fact
+    - vendor: rt
+      type: timestamp
+      description: >-
+        time the detection occurred, rendered by the connector into the CEF
+        receipt-time extension
+      ecs: '@timestamp'
+      status: partial
+      transform: >-
+        CEF rt is epoch milliseconds (the connector normalises the JSON
+        UTCTimestamp into rt), so it is parsed as ms rather than needing the
+        seconds/milliseconds magnitude branch the raw JSON stream requires
+    - vendor: dhost
+      type: string
+      description: hostname of the endpoint where the detection occurred (ComputerName)
+      ecs: host.name
+      status: mapped
+    - vendor: duser
+      type: string
+      description: >-
+        account the triggering process ran as (UserName); rendered as the
+        literal 'N/A' when the sensor could not attribute a user
+      ecs: user.name
+      status: partial
+      notes: >-
+        the connector emits the string N/A rather than omitting the key when
+        no user is known, so the parser must treat N/A as null instead of a
+        literal username
+    - vendor: dntdom
+      type: string
+      description: >-
+        domain of the endpoint (MachineDomain), carried in the CEF
+        destination-NT-domain extension
+      ecs: host.domain
+      status: partial
+      notes: >-
+        this is the host/machine domain, not the user's logon domain; do not
+        populate user.domain from it, and it too is emitted as N/A when
+        unknown
+    - vendor: fname
+      type: string
+      description: file name of the executable image that triggered the detection (FileName)
+      ecs: process.name
+      status: mapped
+    - vendor: filePath
+      type: string
+      description: >-
+        directory containing the triggering executable (FilePath), in
+        \Device\HarddiskVolumeN form on Windows
+      ecs: process.executable
+      status: partial
+      transform: >-
+        the vendor supplies only the containing directory, so join it with
+        fname and rewrite the \Device\HarddiskVolumeN prefix to a drive letter
+        to produce a process.executable that matches Windows and Sysmon
+        documents
+    - vendor: fileHash
+      type: string
+      description: >-
+        MD5 hash of the triggering executable (event.MD5String), carried in
+        the CEF fileHash extension
+      ecs: process.hash.md5
+      status: mapped
+      notes: >-
+        the cef.cfg assigns fileHash = event.MD5String, so this is the MD5 (32
+        hex chars in the sample); the SHA256 is carried separately in
+        sha256fileHash
+    - vendor: sha256fileHash
+      type: string
+      description: >-
+        SHA-256 hash of the triggering executable (event.SHA256String),
+        carried in its own CEF sha256fileHash extension
+      ecs: process.hash.sha256
+      status: mapped
+      notes: >-
+        the cef.cfg assigns sha256fileHash = event.SHA256String, so this
+        format carries both hashes -- populate process.hash.sha256 from here,
+        not just the MD5
+    - vendor: cs5
+      type: string
+      description: >-
+        full command line of the triggering process (CommandLine); the paired
+        cs5Label is the literal 'CommandLine'
+      ecs: process.command_line
+      status: mapped
+      notes: >-
+        unbounded free text and the single largest field on the CEF line; cap
+        and encoding-normalise it low-side as on the JSON path
+    - vendor: cs6
+      type: string
+      description: >-
+        deep link into the Falcon console for this detection (FalconHostLink);
+        the paired cs6Label is the literal 'FalconHostLink'
+      ecs: null
+      status: unmapped
+      custom: crowdstrike.falcon.falcon_host_link
+      notes: >-
+        a console URL rather than event data; kept custom as an analyst pivot
+        rather than promoted to url.full, which models the URL a detected
+        artifact acted on
+    - vendor: src
+      type: string
+      description: >-
+        endpoint IP address associated with the detection (LocalIP), in the
+        CEF source-address extension
+      ecs: host.ip
+      status: partial
+      notes: >-
+        a single sensor-local address rather than the full interface list
+        host.ip normally implies, and the CEF template has no LocalIPv6
+        counterpart, so the v6 address the JSON feed merges in is unavailable
+        here
+    - vendor: smac
+      type: string
+      description: MAC address of the endpoint, in the CEF source-MAC extension
+      ecs: host.mac
+      status: mapped
+    - vendor: cat
+      type: string
+      description: >-
+        MITRE ATT&CK tactic the detection was attributed to (Tactic), in the
+        CEF device-event-category extension
+      ecs: threat.tactic.name
+      status: mapped
+      notes: >-
+        threat.framework must be set to 'MITRE ATT&CK' by the pipeline; no CEF
+        extension supplies it, and the numeric TacticID is not in this
+        template so threat.tactic.id is unpopulated
+    - vendor: act
+      type: string
+      description: >-
+        MITRE ATT&CK technique the detection was attributed to (Technique), in
+        the CEF device-action extension
+      ecs: threat.technique.name
+      status: mapped
+      notes: >-
+        the matching technique id (Txxxx) is absent from the CEF template, so
+        threat.technique.id cannot be populated from this format
+    - vendor: msg
+      type: string
+      description: >-
+        free-text detection/disposition description, e.g. 'Detected and
+        blocked a heap spray attempt'
+      ecs: message
+      status: mapped
+      notes: >-
+        usable as the human-readable summary of what happened; for
+        event.outcome, parse the CSMTRPatternDisposition description string
+        rather than msg
+    - vendor: CSMTRPatternDisposition
+      type: string
+      description: >-
+        free-text disposition rendering (event.PatternDispositionDescription),
+        e.g. 'Prevention, process killed.', carried as a named CEF extension
+      ecs: event.action
+      status: partial
+      notes: >-
+        the cef.cfg assigns CSMTRPatternDisposition =
+        event.PatternDispositionDescription -- a prose sentence, NOT the
+        numeric PatternDispositionValue bitmask (that value is not emitted in
+        this CEF template). event.outcome must be inferred from this
+        description string here, which is coarser than decoding the bitmask
+        the JSON stream carries
+  - format: syslog-leef
+    enable: >
+      Swap the preset LEEF config into place -- cp
+      /opt/crowdstrike/etc/cs.falconhoseclient.leef.cfg
+      /opt/crowdstrike/etc/cs.falconhoseclient.cfg -- point the syslog section
+      at the collector (host/port/protocol) and restart the daemon. The
+      connector then renders each DetectionSummaryEvent as a LEEF 1.0 event: a
+      "LEEF:1.0|CrowdStrike|FalconHost|<ver>|<eventType>|" header followed by
+      tab-delimited key=value attributes drawn from the same JSON record. LEEF
+      is the format to choose only for a QRadar-style consumer that ingests
+      LEEF natively; like CEF it is a curated subset of the JSON payload
+      rather than the full field set.
+    references:
+    - >-
+      https://github.com/mitespsoc/siem/blob/main/crowdstrike_falcon_siem_connector_configuration.md
+    - >-
+      https://www.crowdstrike.com/wp-content/brochures/falcon-connector/falcon-SIEM-connector-datasheet.pdf
+    - https://www.elastic.co/docs/reference/integrations/crowdstrike
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom LEEF unroll pipeline (no stock LEEF path in the CrowdStrike integration)
+      notes: >
+        As with CEF, the Elastic CrowdStrike integration has no LEEF parser,
+        so a LEEF feed needs a hand-built decode that splits the
+        pipe-delimited header and the tab-delimited attribute list and re-maps
+        the attribute keys into the crowdstrike.falcon.* / ECS shape the JSON
+        path targets. The connector's leef.cfg is the authoritative attribute
+        map, but its per-attribute key inventory is not published in any
+        vendor field reference reachable here, so the attribute table is left
+        empty pending a read of the on-host leef.cfg -- the format is real and
+        configurable, only its field list is unsourced.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Decode LEEF at the low-side edge worker group before the guard:
+          split the header on "|" to recover the eventType, then split the
+          tab-delimited body into key=value attributes and rename them to the
+          crowdstrike.falcon.* keys the JSON path uses so LEEF-sourced and
+          JSON-sourced detections converge. Apply the same CommandLine
+          length-cap and encoding normalisation, and dead-letter unrecognised
+          eventType headers.
+        elastic: >
+          Land LEEF through a dedicated logs-crowdstrike.falcon@custom decode
+          rather than the stock integration, mapping the LEEF attributes to
+          the same targets the CEF and JSON paths use. Because LEEF, like CEF,
+          is a curated subset, prefer keeping the connector on JSON and
+          reserve LEEF for a genuinely LEEF-only downstream.
+        relay: >
+          A LEEF line is a single flat string like CEF, so it crosses a
+          shallow-nesting content filter more comfortably than the nested JSON
+          record. Resolve the tab-delimited attribute keys to named fields
+          low-side before the guard, cap the free-text command line, and
+          reconcile counts per (eventType, hour) using the stream offset the
+          connector still carries in the LEEF attributes.
+      direct:
+        parse_location: hybrid
+        cribl: >
+          For a same-side Elastic stack, decode LEEF at the edge worker group:
+          split the header on "|" to recover the eventType, split the
+          tab-delimited body into key=value attributes, rename them to the
+          crowdstrike.falcon.* keys the JSON path uses, and apply the
+          CommandLine length-cap and encoding normalisation. The operative
+          decision remains whether to leave the connector on the richer JSON
+          output rather than switch it to LEEF at all.
+        elastic: >
+          Land LEEF through a dedicated logs-crowdstrike.falcon@custom decode,
+          mapping the LEEF attributes to the same ECS targets the JSON path
+          uses. Because the LEEF template drops the numeric severity and the
+          MITRE id array, event.severity can only come from the coarse header
+          severity -- the same granularity loss the CEF format carries, and a
+          further argument for keeping the connector on JSON.
+    fields_omitted: >
+      The LEEF attribute names for DetectionSummaryEvent are assigned by the
+      connector's on-host cs.falconhoseclient.leef.cfg template, and no public
+      CrowdStrike field reference for that preset could be located, so the
+      authoritative per-attribute inventory is the config file on the SIEM
+      Connector host — where LEEF renders a curated subset of the JSON record
+      rather than the full field set.
+    fields: []
+  - format: syslog-kv
+    enable: >
+      Leave the default cs.falconhoseclient.cfg in place but set
+      output_format=syslog (rather than json) and enable the syslog section
+      (send_to_syslog_server=true, host/port/protocol); restart the daemon.
+      The connector then flattens each Event Streams record into a single
+      syslog line of space-separated key=value pairs whose keys are the JSON
+      field names (ComputerName=, UserName=, DetectName=, CommandLine=, ...).
+      This is the lightest-weight alternate transport but carries the same
+      curated set the connector chooses to flatten, and quoting of values that
+      contain spaces (notably CommandLine) is the parser's main hazard.
+    references:
+    - >-
+      https://github.com/mitespsoc/siem/blob/main/crowdstrike_falcon_siem_connector_configuration.md
+    - https://docs.rapid7.com/insightidr/crowdstrike-falcon-event-source/
+    - >-
+      https://www.crowdstrike.com/wp-content/brochures/falcon-connector/falcon-SIEM-connector-datasheet.pdf
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: KV-extract pipeline mapping flattened JSON keys into crowdstrike.falcon.*
+      notes: >
+        The syslog key=value keys are the flattened JSON field names already
+        inventoried on the json format, so no separate attribute reference
+        exists to reproduce -- a KV extraction recovers the same named fields,
+        and the mapping into ECS is identical to the JSON path. The attribute
+        table is therefore intentionally empty: it would merely duplicate the
+        json field list under the same names. The real work is robust KV
+        tokenisation given unquoted/space-bearing values, not a new field
+        mapping.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Run a KV extractor at the low-side edge worker group and re-key the
+          flattened names into the crowdstrike.falcon.* namespace so the
+          output converges with the JSON path. The specific risk is
+          CommandLine, whose spaces and embedded quotes break naive whitespace
+          tokenisation, so extract it with an explicit terminator and cap its
+          length before the guard exactly as on the JSON feed.
+        elastic: >
+          Decode with a generic KV ingest processor feeding
+          logs-crowdstrike.falcon@custom, mapping the recovered keys to the
+          same ECS targets as the JSON path; because the keys are identical to
+          the JSON field names, the @custom logic is shared, but the KV form
+          loses JSON's type information (everything arrives as a string) so
+          numeric coercions must be explicit.
+        relay: >
+          A single flat key=value line crosses a shallow-nesting filter
+          easily, which is the format's one advantage; the friction is that
+          unquoted free-text values (CommandLine) can smuggle delimiter
+          characters, so normalise and length-bound those low-side before the
+          guard rather than trusting the filter to tokenise them. Reconcile
+          per (eventType, hour) using the flattened offset key.
+      direct:
+        parse_location: hybrid
+        cribl: >
+          Same-side stacks run a KV extractor at the edge worker group,
+          re-keying the flattened names into the crowdstrike.falcon.*
+          namespace and extracting CommandLine with an explicit terminator so
+          its spaces and embedded quotes do not break tokenisation. The json
+          output is preferable wherever a structured collector is available,
+          since KV discards JSON's typing and nesting for no gain here.
+        elastic: >
+          Decode with a generic KV ingest processor into
+          logs-crowdstrike.falcon@custom, mapping the recovered keys to the
+          same ECS targets as the JSON path; because the KV form loses JSON's
+          type information, numeric coercions must be explicit.
+    fields_omitted: >
+      The key=value keys are the flattened JSON field names -- ComputerName,
+      UserName, DetectName, CommandLine and the rest -- that the json entry on
+      this dataset already inventories under identical names, so a table here
+      would restate that entry's field list with the nesting and typing
+      removed.
+    fields: []
+- id: audit-activity
+  name: Falcon platform audit activity
+  description: >
+    Console and API administrative activity delivered on the same Event
+    Streams feed under eventType AuthActivityAuditEvent (Falcon console
+    authentication - userAuthenticate, twoFactorAuthenticate) and
+    UserActivityAuditEvent (analyst and administrator actions such as
+    detection_update, reveal_token, sensor policy changes). These are the
+    records that answer "who changed the EDR" and "who logged into the
+    tenant", which a government SOC needs independently of endpoint telemetry.
+  event_categories:
+  - authentication
+  - iam
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same SIEM Connector output file and same path as the detection dataset
+        above - one connector emits both record types on one stream, so both
+        datasets move together because they cannot be separated before the
+        connector's output.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-crowdstrike.falcon
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Same SIEM Connector output file and same path as the detection dataset
+        above - one connector emits both record types on one stream, so both
+        datasets move together because they cannot be separated before the
+        connector's output.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-crowdstrike.falcon
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: CrowdStrike integration, falcon data stream
+      notes: >
+        The falcon data stream handles the audit event types on the same
+        pipeline as detections, branching on crowdstrike.metadata.eventType;
+        both datasets therefore land in logs-crowdstrike.falcon and are
+        separated at query time by event type, not by index.
+    fields:
+    - vendor: metadata.eventType
+      type: string
+      description: >-
+        distinguishes AuthActivityAuditEvent from UserActivityAuditEvent on
+        the shared stream
+      ecs: null
+      status: unmapped
+      custom: crowdstrike.falcon.metadata.event_type
+      notes: >-
+        the only reliable discriminator between console authentication and
+        administrative-action records
+    - vendor: metadata.customerIDString
+      type: string
+      description: CrowdStrike customer identifier (CID) the event belongs to
+      ecs: organization.id
+      status: mapped
+      notes: >-
+        matters for multi-CID tenants, where one connector aggregates several
+        child CIDs onto one stream
+    - vendor: UTCTimestamp
+      type: timestamp
+      description: time the audited operation took place
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        epoch integer whose unit differs from the detection records on the
+        same stream - audit records commonly emit milliseconds where
+        detections emit seconds, so branch on magnitude rather than
+        configuring one unit per source
+    - vendor: OperationName
+      type: string
+      description: >-
+        name of the audited operation, e.g. userAuthenticate,
+        twoFactorAuthenticate, activateUser, detection_update, reveal_token
+      ecs: event.action
+      status: mapped
+      notes: >
+        vendor-specific camelCase and snake_case vocabulary with no
+        normalisation; it also carries the only signal of whether the record
+        is an authentication or an administrative change, so the
+        event.category assignment depends on a lookup over these values
+    - vendor: ServiceName
+      type: string
+      description: >-
+        Falcon service that handled the operation, e.g. "CrowdStrike
+        Authentication", detections, sensor_update_policy
+      ecs: service.name
+      status: mapped
+    - vendor: UserId
+      type: string
+      description: >-
+        identity that performed the operation - an email address for humans,
+        an API client identifier for automation
+      ecs: user.name
+      status: partial
+      transform: >
+        populate user.name verbatim and additionally copy to user.email when
+        the value parses as an address; API-client identifiers are UUIDs and
+        must not be written to user.email
+    - vendor: UserIp
+      type: ip
+      description: source IP address the operation was performed from
+      ecs: source.ip
+      status: mapped
+      notes: >
+        for console operations this is the analyst's address; for API-driven
+        operations it is the calling system's, so it is not a reliable proxy
+        for human presence
+    - vendor: Success
+      type: boolean
+      description: whether the audited operation succeeded
+      ecs: event.outcome
+      status: mapped
+      transform: boolean true/false translated to the ECS success/failure enum
+    - vendor: AuditKeyValues
+      type: string
+      description: >-
+        array of Key/ValueString pairs carrying the operation-specific detail
+        (what was changed, from what, to what)
+      ecs: null
+      status: unmapped
+      custom: crowdstrike.falcon.audit.key_values
+      transform: >
+        flatten the nested Key/ValueString array into an explicitly mapped
+        object so individual settings are filterable; mask values on the
+        token-bearing operations before indexing
+    - vendor: metadata.offset
+      type: integer
+      description: 'position of this record within the customer''s event stream'
+      ecs: null
+      status: unmapped
+      custom: crowdstrike.falcon.metadata.offset
+      notes: >-
+        gap detection for a feed where a missing record means an unaudited
+        administrative change
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Pass through unparsed alongside the detection stream, but add one
+          low-side rule this dataset needs and the other does not: mask the
+          AuditKeyValues payload for the token-bearing operations
+          (reveal_token and API key management) before the events leave the
+          worker group, since those key/value pairs can carry secret material
+          that must not be indexed. Keep Persistent Queue backpressure on the
+          Elastic destination and do not sample or aggregate this feed - it is
+          low-volume and every record is individually significant.
+        elastic: >
+          Parse with the stock falcon pipeline and add the audit-specific
+          fixes to the logs-crowdstrike.falcon@custom pipeline: derive
+          event.outcome from the boolean Success rather than leaving it unset,
+          copy UserId into both user.name and user.email since the vendor
+          emits an email address in a generic identifier field, and set
+          event.category to authentication for the AuthActivityAuditEvent
+          operations and iam for the UserActivityAuditEvent ones so the two
+          audit shapes are separable without a free-text match on
+          OperationName. Flatten AuditKeyValues into an explicitly mapped
+          custom-namespace object so admin-change dashboards can filter on the
+          changed setting instead of scanning a nested array.
+        relay: >
+          Low-side instances cross the guard: the thin NDJSON envelope crosses
+          exactly as for the detection dataset - same envelope keys, different
+          _dataId is unnecessary since both land in logs-crowdstrike.falcon.
+          The specific constraint here is content rather than size:
+          AuditKeyValues is an open-ended key/value array whose values can
+          include API tokens and arbitrary policy JSON, so the low-side
+          masking must run before the guard destination, not after it. Volume
+          is low enough that carrying _raw across is cheap and worth keeping
+          indefinitely for administrative forensics.
+      direct:
+        parse_location: high
+        cribl: >
+          Pass through unparsed alongside the detection stream, but add one
+          rule this dataset needs and the other does not: mask the
+          AuditKeyValues payload for the token-bearing operations
+          (reveal_token and API key management) before the events leave the
+          worker group, since those key/value pairs can carry secret material
+          that must not be indexed. Keep Persistent Queue backpressure on the
+          Elastic destination and do not sample or aggregate this feed - it is
+          low-volume and every record is individually significant.
+        elastic: >
+          Parse with the stock falcon pipeline and add the audit-specific
+          fixes to the logs-crowdstrike.falcon@custom pipeline: derive
+          event.outcome from the boolean Success rather than leaving it unset,
+          copy UserId into both user.name and user.email since the vendor
+          emits an email address in a generic identifier field, and set
+          event.category to authentication for the AuthActivityAuditEvent
+          operations and iam for the UserActivityAuditEvent ones so the two
+          audit shapes are separable without a free-text match on
+          OperationName. Flatten AuditKeyValues into an explicitly mapped
+          custom-namespace object so admin-change dashboards can filter on the
+          changed setting instead of scanning a nested array.
+  - format: syslog-cef
+    enable: >
+      The same CEF preset (cs.falconhoseclient.cef.cfg) that renders
+      detections also renders the audit event types on the shared stream: the
+      cef.cfg carries dedicated AuthActivityAuditEvent and
+      UserActivityAuditEvent sections, so switching output_format to cef emits
+      these console-authentication and administrative-action records as CEF
+      lines too -- one connector reconfiguration changes both datasets at once
+      because they cannot be separated before the connector's output. The
+      audit CEF templates map the operation into the header and carry UserId,
+      UserIp, ServiceName, OperationName and the Success flag in the
+      extension.
+    references:
+    - >-
+      https://archive-docs.guardsix.com/docs/crowdstrike/en/latest/CEF%20Sample%20Configuration.html
+    - >-
+      https://github.com/mitespsoc/siem/blob/main/crowdstrike_falcon_siem_connector_configuration.md
+    - >-
+      https://www.crowdstrike.com/wp-content/brochures/falcon-connector/falcon-SIEM-connector-datasheet.pdf
+    parsing:
+      mechanism: elastic-ingest-pipeline
+      artifact: generic CEF decode + logs-crowdstrike.falcon@custom (audit event sections)
+      notes: >
+        The stock integration has no CEF parser, so audit CEF needs the same
+        generic-CEF decode as the detection dataset, branching on the header
+        eventType to apply the audit-specific mapping (derive event.category
+        authentication vs iam from OperationName, event.outcome from Success,
+        user.name/user.email from UserId, source.ip from UserIp). The exact
+        CEF extension keys the audit sections use (which cs#/label slots carry
+        OperationName, ServiceName and the AuditKeyValues detail) are defined
+        in the on-host cef.cfg but are not reproduced in any vendor field
+        reference reachable here, so the attribute table is left empty pending
+        a read of that file -- the format and its section names are sourced,
+        the per-key slot assignments are not.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Decode audit CEF at the low-side edge worker group alongside the
+          detection stream, resolving the cnNLabel/csNLabel pairs to named
+          keys before the guard. Add the audit-only masking rule this dataset
+          needs: redact the token-bearing operations (reveal_token, API key
+          management) whose detail rides in the CEF extension before the
+          events leave the worker group, since those values can carry secret
+          material that must not cross or be indexed. Do not sample -- the
+          feed is low-volume and every record is individually significant.
+        elastic: >
+          Land audit CEF through logs-crowdstrike.falcon@custom, branching on
+          the header eventType: set event.category to authentication for the
+          AuthActivityAuditEvent operations and iam for the
+          UserActivityAuditEvent ones, derive event.outcome from the Success
+          flag, and copy UserId into both user.name and user.email when it
+          parses as an address. Because the CEF template flattens the
+          AuditKeyValues detail into extension slots, map those explicitly so
+          admin-change dashboards can filter on the changed setting.
+        relay: >
+          A flat CEF line crosses a shallow-nesting filter comfortably, but
+          the content constraint here is the same as on the JSON audit feed:
+          the operation-detail extension (the CEF rendering of AuditKeyValues)
+          can carry API tokens and arbitrary policy values, so the low-side
+          masking must run before the guard destination, not after it. Volume
+          is low enough to keep the full line across indefinitely for
+          administrative forensics; reconcile per (eventType, hour) on the
+          offset extension.
+      direct:
+        parse_location: hybrid
+        cribl: >
+          Same-side stacks decode audit CEF at the edge worker group,
+          resolving the cnNLabel/csNLabel pairs to named keys and applying the
+          reveal_token / API-key masking before indexing. The json audit feed
+          is richer (it preserves the full AuditKeyValues array structure that
+          CEF flattens), so CEF is justified only for a CEF-only downstream.
+        elastic: >
+          Land audit CEF through logs-crowdstrike.falcon@custom, branching on
+          the header eventType to set event.category (authentication for
+          AuthActivityAuditEvent, iam for UserActivityAuditEvent), derive
+          event.outcome from the Success flag, copy UserId into both user.name
+          and user.email when it parses as an address, and map the flattened
+          AuditKeyValues extension slots explicitly, with the reveal_token
+          masking applied before indexing.
+    fields_omitted: >
+      Which CEF extension slots carry OperationName, ServiceName and the
+      flattened AuditKeyValues detail is decided by the AuthActivityAuditEvent
+      and UserActivityAuditEvent sections of the on-host
+      cs.falconhoseclient.cef.cfg; the section names are sourced, but no
+      public field reference for the cs#/csNLabel slot assignments could be
+      located, so that mapping has to be read from the config file itself.
+    fields: []
+  - format: syslog-leef
+    enable: >
+      The LEEF preset (cs.falconhoseclient.leef.cfg) likewise renders the
+      AuthActivityAuditEvent and UserActivityAuditEvent types as LEEF 1.0
+      lines on the shared stream when output_format is leef, carrying the
+      audited operation, actor and outcome as tab-delimited attributes. As
+      with the detection dataset the connector switch is stream-wide, so both
+      audit and detection records take LEEF form together.
+    references:
+    - >-
+      https://github.com/mitespsoc/siem/blob/main/crowdstrike_falcon_siem_connector_configuration.md
+    - >-
+      https://www.crowdstrike.com/wp-content/brochures/falcon-connector/falcon-SIEM-connector-datasheet.pdf
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom LEEF unroll pipeline (audit event sections)
+      notes: >
+        No stock LEEF parser exists in the CrowdStrike integration, so audit
+        LEEF needs a hand-built decode branching on the header eventType. The
+        leef.cfg audit sections are the authoritative attribute map but their
+        per-attribute keys are not published in a reachable vendor field
+        reference, so the attribute table is empty pending an on-host read;
+        the format itself is real and configurable.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Decode audit LEEF at the low-side edge worker group, resolve the
+          tab-delimited attributes to named keys, and apply the same
+          reveal_token / API-key masking before the guard that the JSON and
+          CEF audit paths require. Do not sample this low-volume feed.
+        elastic: >
+          Land audit LEEF through logs-crowdstrike.falcon@custom, deriving
+          event.category (authentication vs iam) from the operation attribute
+          and event.outcome from the success attribute, mirroring the JSON
+          audit mapping.
+        relay: >
+          A flat LEEF line crosses a shallow filter comfortably; the same
+          secret-bearing operation detail must be masked low-side before the
+          guard destination. Keep the full line for forensics and reconcile
+          per (eventType, hour).
+      direct:
+        parse_location: hybrid
+        cribl: >
+          Same-side stacks decode audit LEEF at the edge worker group,
+          resolving the tab-delimited attributes to named keys and applying
+          the reveal_token / API-key masking before indexing. The richer json
+          audit feed is preferable unless a LEEF-only consumer forces the
+          switch.
+        elastic: >
+          Land audit LEEF through logs-crowdstrike.falcon@custom, deriving
+          event.category (authentication vs iam) from the operation attribute
+          and event.outcome from the success attribute, with reveal_token
+          masking before indexing.
+    fields_omitted: >
+      The attributes naming the audited operation, actor and outcome come from
+      the AuthActivityAuditEvent and UserActivityAuditEvent sections of the
+      on-host cs.falconhoseclient.leef.cfg template; no public field reference
+      for those attribute keys could be located, so they are readable only
+      from the config file on the SIEM Connector host.
+    fields: []
+  - format: syslog-kv
+    enable: >
+      With the default config and output_format=syslog the connector flattens
+      the audit event types into the same space-separated key=value syslog
+      lines it uses for detections, with keys matching the JSON field names
+      (OperationName=, ServiceName=, UserId=, UserIp=, Success=, ...). One
+      output_format setting governs the whole stream, so audit and detection
+      records are flattened together.
+    references:
+    - >-
+      https://github.com/mitespsoc/siem/blob/main/crowdstrike_falcon_siem_connector_configuration.md
+    - >-
+      https://www.crowdstrike.com/wp-content/brochures/falcon-connector/falcon-SIEM-connector-datasheet.pdf
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: KV-extract pipeline mapping flattened audit JSON keys into crowdstrike.falcon.*
+      notes: >
+        The syslog key=value keys are the flattened JSON audit field names
+        already inventoried on the json format, so no separate attribute
+        reference exists -- KV extraction recovers the same named fields and
+        the ECS mapping is identical to the JSON audit path. The attribute
+        table is intentionally empty rather than duplicating the json field
+        list; the real work is robust KV tokenisation of the AuditKeyValues
+        detail, whose values can contain spaces and secrets.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Run a KV extractor at the low-side edge worker group and re-key into
+          crowdstrike.falcon.*; mask the token-bearing operation detail before
+          the guard exactly as on the JSON and CEF paths. The flattened
+          AuditKeyValues values are the tokenisation hazard, so extract them
+          with explicit terminators rather than naive whitespace splitting.
+        elastic: >
+          Decode with a generic KV ingest processor into
+          logs-crowdstrike.falcon@custom, deriving event.category and
+          event.outcome as on the JSON audit path; the KV form loses JSON's
+          array structure for AuditKeyValues, so the flattened pairs must be
+          reassembled into the mapped object explicitly.
+        relay: >
+          A single flat key=value line crosses a shallow filter easily; the
+          secret-bearing audit values must be masked and length-bounded
+          low-side before the guard. Reconcile per (eventType, hour) on the
+          flattened offset key.
+      direct:
+        parse_location: hybrid
+        cribl: >
+          Same-side stacks run a KV extractor at the edge worker group,
+          re-keying into crowdstrike.falcon.* and masking the token-bearing
+          operation detail before indexing, extracting the AuditKeyValues
+          values with explicit terminators. The json audit feed is preferable
+          since KV discards the AuditKeyValues array structure.
+        elastic: >
+          Decode with a generic KV ingest processor into
+          logs-crowdstrike.falcon@custom, deriving event.category and
+          event.outcome as on the JSON audit path and rebuilding the
+          AuditKeyValues object from the flattened pairs.
+    fields_omitted: >
+      The key=value keys are the flattened JSON audit field names --
+      OperationName, ServiceName, UserId, UserIp, Success -- that the json
+      entry on this dataset already inventories under the same names;
+      flattening only unrolls the AuditKeyValues array into pairs, it
+      introduces no keys of its own.
+    fields: []
+- id: fdr
+  name: Falcon Data Replicator telemetry
+  description: >
+    Thin starter for the raw sensor telemetry feed. FDR replicates gzipped
+    NDJSON batches into a CrowdStrike-managed (or customer-managed) S3 bucket
+    with SQS notifications; every record is one of several hundred
+    event_simpleName schemas (ProcessRollup2, DnsRequest, NetworkConnectIP4,
+    UserLogon, ...), each with its own field set. This map documents only the
+    envelope fields common to all FDR events plus the ProcessRollup2 subset,
+    because the remaining schemas are versioned per sensor release and are
+    only reliably enumerable from the tenant's own FDR schema API rather than
+    from public documentation. Treat volume as the dominant design constraint:
+    FDR is orders of magnitude larger than the detection stream.
+  event_categories:
+  - process
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Cribl's CrowdStrike FDR source polls the SQS queue and pulls the
+        gzipped NDJSON objects from S3, so the pull happens wherever the
+        worker group has AWS reachability. On this guarded path those
+        endpoints are reached low-side and the volume problem below becomes a
+        boundary-capacity problem.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-crowdstrike.fdr
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Cribl's CrowdStrike FDR source polls the SQS queue and pulls the
+        gzipped NDJSON objects from S3, so the pull happens wherever the
+        worker group has AWS reachability. Volume is the dominant design
+        constraint on this path.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-crowdstrike.fdr
+  formats:
+  - format: json
+    parsing:
+      mechanism: cribl-pack
+      artifact: Cribl Pack for CrowdStrike
+      notes: >
+        The pack exists specifically to cut FDR volume - dropping process
+        events by hash or name, dropping whole event_simpleName classes,
+        sampling ExternalApiEvent, aggregating network events and hex-decoding
+        ScriptContentBytes - and the vendor claims up to 80% reduction. The
+        Elastic integration's fdr data stream is the alternative and would put
+        this on elastic-integration instead, but it does no volume shaping, so
+        the pack is the realistic choice while the reduction ruleset is the
+        thing under active tuning.
+    fields:
+    - vendor: event_simpleName
+      type: string
+      description: >-
+        name of the FDR telemetry schema this record conforms to, e.g.
+        ProcessRollup2, DnsRequest, NetworkConnectIP4
+      ecs: null
+      status: unmapped
+      custom: crowdstrike.fdr.event_simple_name
+      notes: >
+        determines every other field on the record; there are several hundred
+        values and new ones appear with sensor releases, so it is both the
+        parsing discriminator and the correct dimension for volume accounting
+    - vendor: aid
+      type: string
+      description: sensor identifier, unique to each installation of the Falcon sensor
+      ecs: agent.id
+      status: mapped
+      notes: >-
+        reinstalling the sensor issues a new aid, so one host maps to several
+        agent.id values over its life
+    - vendor: aip
+      type: ip
+      description: 'the sensor''s IP address as seen from the CrowdStrike cloud'
+      ecs: host.ip
+      status: partial
+      notes: >
+        this is the egress/public address the cloud observed, not necessarily
+        an address configured on the host, so it will disagree with host.ip
+        from any on-host collector behind NAT; kept on host.ip as the closest
+        fit but consumers must not treat it as a local interface address
+    - vendor: cid
+      type: string
+      description: CrowdStrike customer identifier the sensor is enrolled under
+      ecs: organization.id
+      status: mapped
+    - vendor: ContextTimeStamp
+      type: timestamp
+      description: time the event occurred on the endpoint, as seen by the sensor
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        epoch value emitted with a fractional component in some schema
+        versions and as whole milliseconds in others; normalise before
+        indexing and prefer this over the cloud receipt time so endpoint event
+        ordering survives replication delay
+    - vendor: timestamp
+      type: timestamp
+      description: time the CrowdStrike cloud received the event from the sensor
+      ecs: event.ingested
+      status: mapped
+      notes: >
+        the gap between this and ContextTimeStamp is the sensor-to-cloud delay
+        and is worth keeping as a health signal, not as the event time
+    - vendor: ComputerName
+      type: string
+      description: hostname of the endpoint the sensor is installed on
+      ecs: host.name
+      status: mapped
+      notes: >
+        not present on every FDR schema - many records carry only aid, which
+        is why the aid-to-host lookup has to run somewhere in the pipeline
+    - vendor: ImageFileName
+      type: string
+      description: full path to the executable (PE) file, on ProcessRollup2 records
+      ecs: process.executable
+      status: mapped
+      transform: >-
+        emitted in \Device\HarddiskVolumeN form on Windows; rewrite to a drive
+        letter to match Windows and Sysmon documents
+    - vendor: CommandLine
+      type: string
+      description: command line used to create the process, on ProcessRollup2 records
+      ecs: process.command_line
+      status: mapped
+    - vendor: RawProcessId
+      type: long
+      description: 'the operating system''s internal PID, on ProcessRollup2 records'
+      ecs: process.pid
+      status: mapped
+      notes: >-
+        this, not TargetProcessId, is the value that matches a Windows or
+        Sysmon process.pid
+    - vendor: TargetProcessId
+      type: string
+      description: 'CrowdStrike''s unique identifier for the process, on ProcessRollup2 records'
+      ecs: process.entity_id
+      status: mapped
+      notes: >
+        a sensor-assigned 64-bit handle that stays unique across PID reuse; it
+        is the correct join key within FDR and the correct occupant of
+        process.entity_id, but it is not an OS PID
+    - vendor: ParentProcessId
+      type: string
+      description: >-
+        CrowdStrike's unique identifier for the parent process, on
+        ProcessRollup2 records
+      ecs: process.parent.entity_id
+      status: mapped
+    - vendor: UserSid
+      type: string
+      description: >-
+        security identifier of the user that executed the command, on
+        ProcessRollup2 records
+      ecs: user.id
+      status: mapped
+      notes: >-
+        a raw SID; resolving it to an account name needs an enrich policy fed
+        from directory data
+    - vendor: SHA256HashData
+      type: string
+      description: SHA-256 hash of the process image file, on ProcessRollup2 records
+      ecs: process.hash.sha256
+      status: mapped
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Do the volume work on the worker group before anything reaches
+          Elastic: run the pack's drop and sample rules keyed on
+          event_simpleName, process hash and process name, aggregate the
+          network events, and hex-decode the script-content events so the
+          reduction is measurable per event class rather than as one aggregate
+          number. Emit full ECS-shaped JSON here rather than a passthrough,
+          because the per-schema field extraction is already happening as part
+          of the reduction pass, and attach the aid-to-host and ComputerName
+          enrichment from the lookup the pack provides so downstream joins do
+          not depend on a second lookup at index time. Gate the Elastic
+          destination with schema validation plus a dead-letter route, and
+          alert on the dead-letter rate specifically - a new sensor release
+          adding an unrecognised event_simpleName is the expected failure
+          mode.
+        elastic: >
+          Land the pre-shaped documents in logs-crowdstrike.fdr and keep
+          high-side work to what the low side cannot do: resolve UserSid to an
+          account name through an enrich policy, and reconcile process
+          identity so TargetProcessId populates process.entity_id while
+          RawProcessId populates process.pid, which is what makes FDR joinable
+          against Windows and Sysmon documents. Add explicit custom-namespace
+          mappings for crowdstrike.fdr.event_simple_name as keyword so
+          per-schema volume queries stay cheap, and size the index template
+          and ILM policy for this data stream separately from the detection
+          stream - the two differ by orders of magnitude and sharing a policy
+          will starve one of them.
+        relay: >
+          This is the hardest crossing on the technology, and the answer is to
+          shrink before the boundary rather than after it: run the pack's
+          reduction low-side so only the retained subset is offered to the
+          guard, and drop _raw here first - FDR records are machine telemetry
+          with low per-record forensic value and the raw gzipped batch is
+          exactly what the boundary cannot afford. Full ECS-shaped NDJSON
+          crosses (envelope mode B) with nesting held to two levels and
+          bounded string lengths, since the free-text exposure is CommandLine
+          and decoded script content. At-most-once with no return channel:
+          reconcile counts per (event_simpleName, hour), not per dataset, or a
+          single schema silently disappearing will hide inside the total.
+      direct:
+        parse_location: low
+        cribl: >
+          Do the volume work on the worker group before anything reaches
+          Elastic: run the pack's drop and sample rules keyed on
+          event_simpleName, process hash and process name, aggregate the
+          network events, and hex-decode the script-content events so the
+          reduction is measurable per event class rather than as one aggregate
+          number. Emit full ECS-shaped JSON here rather than a passthrough,
+          because the per-schema field extraction is already happening as part
+          of the reduction pass, and attach the aid-to-host and ComputerName
+          enrichment from the lookup the pack provides so downstream joins do
+          not depend on a second lookup at index time. Gate the Elastic
+          destination with schema validation plus a dead-letter route, and
+          alert on the dead-letter rate specifically - a new sensor release
+          adding an unrecognised event_simpleName is the expected failure
+          mode.
+        elastic: >
+          Land the pre-shaped documents in logs-crowdstrike.fdr and keep
+          high-side work to what the low side cannot do: resolve UserSid to an
+          account name through an enrich policy, and reconcile process
+          identity so TargetProcessId populates process.entity_id while
+          RawProcessId populates process.pid, which is what makes FDR joinable
+          against Windows and Sysmon documents. Add explicit custom-namespace
+          mappings for crowdstrike.fdr.event_simple_name as keyword so
+          per-schema volume queries stay cheap, and size the index template
+          and ILM policy for this data stream separately from the detection
+          stream - the two differ by orders of magnitude and sharing a policy
+          will starve one of them.

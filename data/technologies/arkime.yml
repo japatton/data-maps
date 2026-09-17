@@ -1,0 +1,926 @@
+id: arkime
+name: Arkime full-packet capture
+vendor: Arkime
+versions: Arkime 5.x, 6.x (sessions3 / arkimeDbVersion 8x)
+draft: true
+references:
+- https://arkime.com/faq
+- https://arkime.com/settings
+- https://github.com/arkime/arkime/blob/main/db/db.pl
+- https://github.com/arkime/arkime/blob/main/capture/db.c
+- https://github.com/arkime/arkime/blob/main/viewer/viewer.js
+- https://github.com/arkime/arkime/blob/main/viewer/apiHistory.js
+datasets:
+- id: sessions
+  name: Session (SPI) records
+  description: >
+    One document per network session written by an Arkime capture node into
+    arkime_sessions3-* — the session metadata (SPI, "session profile
+    information") extracted from the packets, plus the node/file/offset
+    pointers the viewer uses to retrieve the matching PCAP. This technology
+    deviates from the org's log doctrine on purpose: capture speaks the
+    Elasticsearch/OpenSearch _bulk API directly, so there is no syslog, no CEF
+    and no Cribl Stream hop on the write path, and Arkime owns the index
+    schema end to end. Since sessions3, that schema is partly ECS already —
+    capture emits source.*, destination.*, client.bytes, server.bytes,
+    network.* and @timestamp as real nested ECS objects (db.pl's sessions3
+    template is a trimmed ECS 1.10 template) while keeping Arkime-native names
+    for everything else. The data-map value here is therefore not a parsing
+    strategy but the schema itself and the join to the SIEM: an alert carries
+    the session id and node, and the analyst pivots to
+    /api/session/<node>/<id>/packets for the packets.
+  event_categories:
+  - network
+  - dns
+  - web
+  route:
+    direct:
+    - hop: other
+      name: Arkime capture node (SPI writer)
+      notes: >
+        capture builds each session document as JSON in-process and POSTs it
+        with the Elasticsearch/OpenSearch _bulk API to Arkime's own cluster.
+        There is no Cribl Stream hop and no vendor-side syslog option that
+        would create one; this is a deliberate, documented deviation from the
+        ArcSight -> Cribl -> Elastic doctrine rather than an oversight,
+        because the viewer can only serve PCAP if the arkime_sessions3-*
+        documents keep their native node/fileId/packetPos pointers. Each
+        enclave runs its OWN capture nodes and its own Arkime cluster, and
+        session documents do NOT cross the Everfox HSG in either direction —
+        there is no guard hop on this route by design, and an analyst's pivot
+        resolves only against the viewer in the same enclave.
+    - hop: elastic
+      data_stream: >-
+        arkime_sessions3-* (Arkime-owned cluster; time-rotated classic
+        indices, not a data stream)
+      notes: >
+        the SIEM consumes this data by cross-cluster search and by the
+        session-id hyperlink pivot from alerts, not by re-ingesting it, and it
+        does so within one enclave: this cluster is the one that sits beside
+        its own capture nodes. If a thinned session summary is additionally
+        copied into the SIEM's own logs-* stream for correlation, that copy —
+        and only that copy — is the part of this technology that would ever
+        traverse Cribl and the guard; the session documents themselves do not.
+  formats:
+  - format: json
+    parsing:
+      mechanism: none
+      artifact: Arkime capture + db.pl index templates
+      notes: >
+        Arkime capture IS the parser: it turns packets into ECS-shaped SPI
+        documents itself and installs its own index templates via db.pl. No
+        Elastic integration and no Cribl pack exists for Arkime, and there is
+        no ingest pipeline in the write path — anything that reshapes these
+        documents has to run as a reindex, a runtime field, or in the pipeline
+        that builds the optional SIEM-side copy.
+    fields:
+    - vendor: _id
+      type: string
+      description: >-
+        Elasticsearch document id for the session, queryable in Arkime
+        expressions as "id"
+      ecs: event.id
+      status: mapped
+      notes: >
+        not a stored field but the session identifier itself, formed as
+        <index-prefix>-<url-safe base64 of pid+uuid> (or
+        <prefix>-<node>-<fileNum>-<filePos> under autoGenerateId=2). Together
+        with node it is the entire join from a SIEM alert to the packets:
+        /api/session/<node>/<id>/packets
+    - vendor: firstPacket
+      type: timestamp
+      description: time of the first packet in the session, milliseconds since epoch
+      ecs: event.start
+      status: mapped
+      transform: >-
+        epoch milliseconds to a date; this is the Arkime viewer's default time
+        field and the real event time for the session
+    - vendor: lastPacket
+      type: timestamp
+      description: time of the last packet in the session, milliseconds since epoch
+      ecs: event.end
+      status: mapped
+      transform: epoch milliseconds to a date
+    - vendor: '@timestamp'
+      type: timestamp
+      description: milliseconds since epoch at the moment capture serialized the session document
+      ecs: '@timestamp'
+      status: partial
+      notes: >
+        Arkime writes the document-creation time here, NOT the session start;
+        on a long-lived or timed-out session it trails firstPacket by up to
+        the session timeout, and on a mid-session save it is written again.
+        Time-based dashboards and retention must key off
+        firstPacket/lastPacket, and any SIEM-side copy should overwrite
+        @timestamp from firstPacket
+    - vendor: source.ip
+      type: ip
+      description: >-
+        IPv4/IPv6 address of the session initiator (Arkime expression ip.src,
+        sessions2 field srcIp)
+      ecs: source.ip
+      status: mapped
+      notes: >-
+        sessions3 stores this as a real nested ECS field; the legacy flat
+        srcIp name survives only in the fields index as dbField2
+    - vendor: source.port
+      type: port
+      description: transport source port of the session initiator (Arkime expression port.src)
+      ecs: source.port
+      status: mapped
+    - vendor: destination.ip
+      type: ip
+      description: >-
+        IPv4/IPv6 address of the session responder (Arkime expression ip.dst,
+        sessions2 field dstIp)
+      ecs: destination.ip
+      status: mapped
+    - vendor: destination.port
+      type: port
+      description: transport destination port of the session responder (Arkime expression port.dst)
+      ecs: destination.port
+      status: mapped
+    - vendor: ipProtocol
+      type: integer
+      description: >-
+        IANA IP protocol number for the session (6 TCP, 17 UDP, 1 ICMP, 58
+        ICMPv6, 132 SCTP)
+      ecs: network.iana_number
+      status: partial
+      transform: >
+        stored as a number, while ECS network.iana_number is a keyword string
+        — convert on write, and derive network.transport (tcp/udp/icmp/sctp)
+        from the same value, because the network alerting profile requires
+        network.transport and Arkime never emits a transport name
+    - vendor: network.bytes
+      type: long
+      description: >-
+        total bytes in both directions for the session, including headers
+        (source.bytes plus destination.bytes)
+      ecs: network.bytes
+      status: mapped
+      notes: >
+        the payload-only counterparts are client.bytes/server.bytes (Arkime
+        srcDataBytes/dstDataBytes) and their sum totDataBytes, which has no
+        ECS home
+    - vendor: network.community_id
+      type: string
+      description: Community ID v1 flow hash computed by capture for every non-OTHER session
+      ecs: network.community_id
+      status: mapped
+      notes: >
+        the highest-value cross-tool join on this technology — it is the field
+        that lines an Arkime session up with a Zeek conn.log or a Suricata
+        alert without depending on Arkime's own session id. Not emitted for
+        SESSION_OTHER (non-IP) sessions
+    - vendor: node
+      type: string
+      description: name of the Arkime capture node that recorded the session
+      ecs: observer.name
+      status: mapped
+      notes: >
+        load-bearing beyond naming the sensor - the PCAP retrieval URL is
+        keyed on it, so an alert that loses node cannot be pivoted back to
+        packets
+    - vendor: protocol
+      type: string
+      description: >-
+        set of every protocol capture classified on the session (Arkime
+        expression "protocols")
+      ecs: network.protocol
+      status: partial
+      notes: >
+        a multi-valued set mixing tunnel, transport and application protocols
+        on one session - e.g. ["gre","tcp","http","tls"] - whereas ECS
+        network.protocol models a single application-layer protocol. Select
+        the application-layer member for network.protocol and keep the full
+        set in a custom field rather than dropping the tunnel evidence
+    - vendor: rootId
+      type: string
+      description: >-
+        session id of the first session in a chain, linking the segments of a
+        session that exceeded the save interval
+      ecs: null
+      status: unmapped
+      custom: arkime.session.root_id
+      notes: >
+        long sessions are written as multiple documents; rootId is what
+        reassembles them. Without it, byte and duration aggregations silently
+        count one conversation several times
+    - vendor: fileId
+      type: long
+      description: >-
+        array of Arkime PCAP file numbers (from the arkime_files index)
+        holding this session's packets
+      ecs: null
+      status: unmapped
+      custom: arkime.session.file_id
+      notes: >-
+        node-local file numbers, meaningless outside the owning capture node's
+        arkime_files index; required for PCAP retrieval
+    - vendor: packetPos
+      type: long
+      description: >-
+        array of byte offsets of each of the session's packets within the PCAP
+        files, optionally gap-encoded
+      ecs: null
+      status: unmapped
+      custom: arkime.session.packet_pos
+      transform: >
+        with gapPacketPos enabled the array is delta-encoded (a repeated gap
+        is written as 0), so it must be decoded before use; it is mapped
+        index:false in Arkime's own template and should never be indexed in a
+        copy
+      notes: >
+        the single largest field on a busy session - thousands of longs - and
+        pure node-local pointer data; strip it from anything copied off the
+        Arkime cluster
+    - vendor: http.uri
+      type: string
+      description: >-
+        array of request URIs seen in the session, each the Host header
+        concatenated with the request path
+      ecs: url.original
+      status: partial
+      notes: >
+        not a URL in the ECS sense - there is no scheme, the value is
+        host+path (or "host;url" when the Host header and the request line
+        disagree), it is truncated at Arkime's max URL length with a
+        truncation tag, and it is multi-valued across every request in the
+        session. Split off url.domain/url.path rather than treating the raw
+        value as url.original
+    - vendor: http.method
+      type: string
+      description: array of HTTP request methods observed in the session
+      ecs: http.request.method
+      status: mapped
+      notes: >-
+        multi-valued per session; a session carrying several requests yields
+        several methods with no ordering relative to http.uri
+    - vendor: dns.host
+      type: string
+      description: array of lowercased DNS query names seen in the session
+      ecs: dns.question.name
+      status: mapped
+      notes: >
+        companion fields dns.puny (punycode form), dns.opcode, dns.status
+        (rcode) and dns.ip (answer addresses) carry the rest of the
+        transaction; multi-valued, so one document can hold many queries
+    - vendor: tls.ja4
+      type: string
+      description: JA4 TLS client fingerprint computed by capture from the ClientHello
+      ecs: null
+      status: unmapped
+      custom: arkime.session.tls.ja4
+      notes: >
+        ECS 9.4 has tls.client.ja3 and tls.server.ja3s but no JA4 field at
+        all, not even beta, so the JA4/JA4S/JA4H/JA4L family stays custom.
+        tls.ja3 on the same document does map cleanly to tls.client.ja3; adopt
+        tls.client.ja4 if and when ECS ships it
+    recommendations:
+      direct:
+        parse_location: low
+        cribl: >
+          Cribl is not in this path and should not be inserted into it — a
+          proxy between capture and its cluster would break the bulk writer
+          and the PCAP pointers. Confine Cribl to the optional SIEM-side
+          summary copy, driven by a collector reading arkime_sessions3-*
+          rather than by a second capture output, and project only the join
+          columns (session _id, node, firstPacket, lastPacket, source and
+          destination ip/port, network.bytes, network.community_id, protocol,
+          http.uri, dns.host) while dropping packetPos, packetLen and the
+          payload8 hex previews, which are node-local pointers with no meaning
+          off the Arkime cluster. Put Persistent Queue backpressure on that
+          destination and reconcile counts per (index, hour), because capture
+          discards SPI silently when the cluster falls behind and there is no
+          acknowledgement to detect it.
+        elastic: >
+          The high-side work is index-template and query work, not parsing:
+          keep Arkime's own template under db.pl's control and add the
+          cross-cluster search entry plus a saved pivot that builds
+          /api/session/<node>/<id>/packets from observer.name and event.id,
+          since node + session id is the only durable join to the packets. On
+          the copied summary, run a logs-arkime.session@custom pipeline that
+          derives network.transport from the numeric ipProtocol (the network
+          alerting profile requires it and Arkime stores only the IANA
+          number), sets event.start/event.end from firstPacket and lastPacket,
+          and stops any dashboard from treating @timestamp as event time —
+          capture sets it to the moment the document was written, which drifts
+          by the session-timeout on long sessions. Map arkime.session.root_id,
+          .file_id, .packet_pos and .tls.ja4 explicitly in the custom
+          namespace (keyword for the ids and the JA4 fingerprint, long for the
+          pointer arrays) so they survive without dynamic mapping.
+  - format: api-pull
+    enable: >
+      Beside the _bulk write path, the Arkime viewer serves the same SPI
+      session records over its REST API, so a collector can pull them rather
+      than depending on cross-cluster search. GET or POST /api/sessions
+      returns the records as JSON and /api/sessions/csv (legacy /sessions.json
+      and /sessions.csv) returns them as CSV; both honor the same query
+      parameters. Scope the pull with expression (an Arkime search expression,
+      e.g. "protocols == http"), bound it with startTime/stopTime or date
+      (hours back, date=-1 for all), page with length plus start, and — most
+      important for a data map — pass fields as a comma-separated list of DB
+      field names to pin exactly which columns come back. Omitting fields
+      yields the viewer's default export set: ipProtocol, rootId,
+      totDataBytes, client.bytes, server.bytes, firstPacket, lastPacket,
+      source.ip, source.port, destination.ip, destination.port,
+      network.packets, source.packets, destination.packets, network.bytes,
+      source.bytes, destination.bytes, node, http.uri,
+      source.geo.country_iso_code, destination.geo.country_iso_code,
+      email.subject, email.src, email.dst, email.filename, dns.host, cert,
+      irc.channel and http.xffGEO. DB field names are not the same tokens as
+      the search expression aliases (the owl menu > Fields > "display the
+      database fields" is the authoritative map); the API's fields parameter
+      wants the DB name. Authenticate the collector as an Arkime user with an
+      API token — an admin-role account so per-user forced expressions do not
+      silently narrow the result set — and note the export inherits any
+      forcedExpression bound to that account.
+    references:
+    - https://arkime.com/apiv3
+    - https://arkime.com/api
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        Cribl REST Collector against /api/sessions(.csv) + reshape pipeline
+        feeding an optional logs-arkime.session summary copy
+      notes: >
+        No Elastic integration and no Cribl pack exists for Arkime, so the
+        handler is a scheduled REST collector plus a hand-built pipeline.
+        Prefer the JSON endpoint over CSV: Arkime's multi-valued session
+        fields (http.uri, dns.host, protocols, the cert array) survive as real
+        arrays in /api/sessions but are flattened into a single quoted cell in
+        /api/sessions/csv, and the CSV header carries the DB field names
+        rather than ECS names. The export is a within-enclave read of the
+        enclave's own Arkime cluster feeding an optional SIEM-side summary
+        copy — it is never a substitute for the viewer's PCAP pivot, which
+        still resolves against node + session id on the same cluster. One
+        structural gap drives the reshape: the default export set carries
+        firstPacket/lastPacket but no @timestamp column, so the copy must
+        synthesize event time itself rather than expecting the
+        document-creation timestamp the _bulk documents carry.
+    recommendations:
+      direct:
+        parse_location: hybrid
+        cribl: >
+          Do not pull the default field set on a schedule — it drags
+          totDataBytes, the per-direction packet counts and the cert array
+          across for no summary value. Pass an explicit fields list holding
+          only the join and summary columns (firstPacket, lastPacket,
+          source.ip, source.port, destination.ip, destination.port,
+          ipProtocol, network.bytes, node, http.uri, dns.host) and add
+          network.community_id to that list even though it is absent from the
+          viewer default, because it is the durable cross-tool join to Zeek
+          and Suricata and the one column worth the extra width. Run the
+          collector against /api/sessions (JSON) so the multi-valued columns
+          stay arrays, authenticate as an admin-role Arkime user so
+          forcedExpression does not silently truncate the pull, and cap the
+          free-text arrays (http.uri holds Host+path per request, truncated at
+          Arkime's max URL length; dns.host is an array of query names) before
+          forwarding. Put Persistent Queue backpressure on the destination and
+          reconcile pulled counts per (node, hour) against the cluster, since
+          a REST pull that quietly returns a short page under load has no
+          acknowledgement to flag the gap.
+        elastic: >
+          The high-side work is a logs-arkime.session@custom ingest pipeline
+          that repairs three things the export leaves raw. First, synthesize
+          @timestamp from firstPacket and set event.start/ event.end from
+          firstPacket/lastPacket (epoch-millisecond values); the export
+          carries no document timestamp, so without this every record floats
+          to ingest time. Second, derive network.transport (tcp/udp/icmp/sctp)
+          from the numeric ipProtocol and write network.iana_number as the
+          keyword string ECS expects, because the network alerting profile
+          needs the transport name and Arkime only ships the IANA number.
+          Third, keep the payload-byte columns distinct from the wire-byte
+          columns: client.bytes/server.bytes are Arkime's
+          srcDataBytes/dstDataBytes (payload only) while
+          source.bytes/destination.bytes include headers, and totDataBytes
+          (their sum) has no ECS home. Map arkime.session.root_id,
+          .irc_channel, the cert array and the http.xffGEO geo blob into the
+          custom namespace as keyword so they survive without dynamic mapping,
+          and treat http.uri as host+path arrays to be split into
+          url.domain/url.path rather than trusted as url.original.
+    fields:
+    - vendor: ipProtocol
+      type: integer
+      description: IANA IP protocol number for the session (6 TCP, 17 UDP, 1 ICMP, 132 SCTP)
+      ecs: network.iana_number
+      status: partial
+      transform: >
+        exported as a number while ECS network.iana_number is a keyword string
+        — convert on write, and derive network.transport from the same value
+        since the API never emits a transport name
+    - vendor: rootId
+      type: string
+      description: >-
+        session id of the first session in a chain, linking segments of a
+        session that exceeded the save interval
+      ecs: null
+      status: unmapped
+      custom: arkime.session.root_id
+      notes: >-
+        without it, byte and duration aggregations count one long conversation
+        several times
+    - vendor: totDataBytes
+      type: long
+      description: >-
+        total application-payload bytes in both directions (client.bytes plus
+        server.bytes), excluding headers
+      ecs: null
+      status: unmapped
+      custom: arkime.session.data_bytes
+      notes: >-
+        the payload-only total has no ECS home; the header-inclusive
+        counterpart network.bytes maps cleanly
+    - vendor: client.bytes
+      type: long
+      description: >-
+        application-payload bytes sent by the session initiator (Arkime
+        srcDataBytes), excluding headers
+      ecs: client.bytes
+      status: mapped
+      notes: payload-only, so it is smaller than source.bytes, which includes packet headers
+    - vendor: server.bytes
+      type: long
+      description: >-
+        application-payload bytes sent by the session responder (Arkime
+        dstDataBytes), excluding headers
+      ecs: server.bytes
+      status: mapped
+    - vendor: firstPacket
+      type: timestamp
+      description: time of the first packet in the session, milliseconds since epoch
+      ecs: event.start
+      status: mapped
+      transform: >
+        epoch milliseconds to a date; this is the real event time and, because
+        the export carries no @timestamp column, the value any summary copy
+        must synthesize @timestamp from
+    - vendor: lastPacket
+      type: timestamp
+      description: time of the last packet in the session, milliseconds since epoch
+      ecs: event.end
+      status: mapped
+      transform: epoch milliseconds to a date
+    - vendor: source.ip
+      type: ip
+      description: IPv4/IPv6 address of the session initiator (Arkime expression ip.src)
+      ecs: source.ip
+      status: mapped
+    - vendor: source.port
+      type: port
+      description: transport source port of the session initiator (Arkime expression port.src)
+      ecs: source.port
+      status: mapped
+    - vendor: destination.ip
+      type: ip
+      description: IPv4/IPv6 address of the session responder (Arkime expression ip.dst)
+      ecs: destination.ip
+      status: mapped
+    - vendor: destination.port
+      type: port
+      description: transport destination port of the session responder (Arkime expression port.dst)
+      ecs: destination.port
+      status: mapped
+    - vendor: network.packets
+      type: long
+      description: total packet count in both directions for the session
+      ecs: network.packets
+      status: mapped
+    - vendor: source.packets
+      type: long
+      description: packet count sent by the session initiator
+      ecs: source.packets
+      status: mapped
+    - vendor: destination.packets
+      type: long
+      description: packet count sent by the session responder
+      ecs: destination.packets
+      status: mapped
+    - vendor: network.bytes
+      type: long
+      description: >-
+        total bytes in both directions including headers (source.bytes plus
+        destination.bytes)
+      ecs: network.bytes
+      status: mapped
+    - vendor: source.bytes
+      type: long
+      description: total bytes sent by the initiator including packet headers
+      ecs: source.bytes
+      status: mapped
+      notes: header-inclusive, unlike the payload-only client.bytes on the same record
+    - vendor: destination.bytes
+      type: long
+      description: total bytes sent by the responder including packet headers
+      ecs: destination.bytes
+      status: mapped
+    - vendor: node
+      type: string
+      description: name of the Arkime capture node that recorded the session
+      ecs: observer.name
+      status: mapped
+      notes: >-
+        the PCAP retrieval URL is keyed on it, so it is load-bearing for the
+        pivot back to packets, not just sensor naming
+    - vendor: http.uri
+      type: string
+      description: >-
+        array of request URIs seen in the session, each the Host header
+        concatenated with the request path
+      ecs: url.original
+      status: partial
+      notes: >
+        host+path rather than a scheme-qualified URL, truncated at Arkime's
+        max URL length and multi-valued across every request in the session;
+        in /api/sessions/csv the array is flattened into one quoted cell, so
+        pull JSON and split off url.domain/url.path rather than treating the
+        raw value as url.original
+    - vendor: source.geo.country_iso_code
+      type: string
+      description: ISO country code geolocated for the source address
+      ecs: source.geo.country_iso_code
+      status: mapped
+    - vendor: destination.geo.country_iso_code
+      type: string
+      description: ISO country code geolocated for the destination address
+      ecs: destination.geo.country_iso_code
+      status: mapped
+    - vendor: email.subject
+      type: string
+      description: array of subject lines from SMTP messages carried in the session
+      ecs: email.subject
+      status: mapped
+      notes: >-
+        multi-valued and user-controlled free text; present only on sessions
+        Arkime classified as email
+    - vendor: email.src
+      type: string
+      description: array of envelope/sender addresses from SMTP messages in the session
+      ecs: email.from.address
+      status: partial
+      notes: >-
+        multi-valued across messages in the session; spoofable, so pair with
+        the mail gateway's own auth results before alerting
+    - vendor: email.dst
+      type: string
+      description: array of recipient addresses from SMTP messages in the session
+      ecs: email.to.address
+      status: partial
+      notes: multi-valued; one session can carry several messages and recipients
+    - vendor: email.filename
+      type: string
+      description: array of attachment filenames from SMTP messages in the session
+      ecs: email.attachments.file.name
+      status: partial
+      notes: >-
+        user-controlled free text; ECS models attachments as nested objects,
+        so the flat filename array must be reshaped if attachment hash/size
+        correlation is needed
+    - vendor: dns.host
+      type: string
+      description: array of lowercased DNS query names seen in the session
+      ecs: dns.question.name
+      status: mapped
+      notes: >-
+        multi-valued, so one document can hold many queries; flattened into a
+        single cell under /api/sessions/csv
+    - vendor: cert
+      type: string
+      description: >-
+        array of TLS certificate objects observed in the session
+        (issuer/subject CN and OU, serial, notBefore/notAfter, hashes)
+      ecs: null
+      status: unmapped
+      custom: arkime.session.cert
+      notes: >
+        a nested-object array in the JSON export and an opaque flattened
+        string under CSV; the individual members map to x509.* and
+        tls.server.* but only after the array is unpacked, so keep the raw
+        array in the custom namespace and derive the ECS x509 fields in a
+        later step rather than mapping the column wholesale
+    - vendor: irc.channel
+      type: string
+      description: array of IRC channel names seen in the session
+      ecs: null
+      status: unmapped
+      custom: arkime.session.irc_channel
+      notes: no ECS field models IRC channels; multi-valued
+    - vendor: http.xffGEO
+      type: string
+      description: 'geolocation of the X-Forwarded-For addresses seen in the session''s HTTP requests'
+      ecs: null
+      status: unmapped
+      custom: arkime.session.http.xff_geo
+      notes: >
+        a geo blob keyed off the XFF header, not a client address itself; the
+        forwarded IPs live in http.xff (not in the default export set) and
+        would map to network.forwarded_ip if pulled explicitly
+- id: viewer-history
+  name: Viewer request history (audit)
+  description: >
+    One document per authenticated Arkime viewer API request, written by the
+    viewer's logAction middleware into arkime_history_v1-*. This is the
+    insider-threat record for a full-packet-capture deployment: who searched,
+    what Arkime expression they ran, over what time range, how many sessions
+    came back, and which export or PCAP endpoint they called. Coverage is
+    deliberate but not total — the middleware is attached per route, so the
+    aggregate export endpoints (/api/sessions.csv, /api/sessions.pcap,
+    /api/session/<node>/<id>/packets) are recorded while the proxied per-node
+    fetches (/api/session/<node>/<id>.pcap and the /body/ raw-file extraction
+    routes) carry no logAction and appear only as the request that initiated
+    them.
+  event_categories:
+  - iam
+  - configuration
+  route:
+    guarded:
+    - hop: other
+      name: Arkime viewer (history writer)
+      notes: >
+        the viewer writes each audit document straight into
+        arkime_history_v1-* in Arkime's own cluster on response finish; like
+        the session data it reaches storage without touching Cribl, and there
+        is no syslog or webhook emitter for it.
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        unlike the session data this dataset earns a second copy in the SIEM,
+        so Cribl does appear here - a scheduled REST collector against
+        /api/histories (or a direct query of arkime_history_v1-*) pulls the
+        records and forwards them.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-arkime.history
+    direct:
+    - hop: other
+      name: Arkime viewer (history writer)
+      notes: >
+        the viewer writes each audit document straight into
+        arkime_history_v1-* in Arkime's own cluster on response finish; like
+        the session data it reaches storage without touching Cribl, and there
+        is no syslog or webhook emitter for it.
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        unlike the session data this dataset earns a second copy in the SIEM,
+        so Cribl does appear here - a scheduled REST collector against
+        /api/histories (or a direct query of arkime_history_v1-*) pulls the
+        records and forwards them.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-arkime.history
+  formats:
+  - format: api-pull
+    parsing:
+      mechanism: elastic-ingest-pipeline
+      artifact: custom logs-arkime.history ingest pipeline
+      notes: >
+        No Elastic integration and no Cribl pack exists for Arkime. The
+        history documents are already flat JSON with short ASCII keys and a
+        strict mapping, so a hand-built ingest pipeline doing ECS renames and
+        two unit conversions is cheaper and easier to review than a Cribl
+        pack; the only structural work is bounding the two free-text values
+        before they leave the enclave.
+    fields:
+    - vendor: timestamp
+      type: timestamp
+      description: time the request was made, in SECONDS since epoch
+      ecs: '@timestamp'
+      status: mapped
+      transform: >
+        the index mapping declares format epoch_second - multiply by 1000 (or
+        parse explicitly as seconds) before writing a millisecond @timestamp,
+        or every record dates to 1970
+    - vendor: userId
+      type: string
+      description: Arkime user id of the account that made the request
+      ecs: user.name
+      status: mapped
+      notes: >-
+        the Arkime local/OIDC user id; enrich to the directory identity so it
+        correlates with authentication events elsewhere
+    - vendor: method
+      type: string
+      description: HTTP method of the request (GET, POST, PUT, DELETE)
+      ecs: http.request.method
+      status: mapped
+    - vendor: api
+      type: string
+      description: >-
+        API endpoint path of the request, e.g. /api/sessions.pcap or
+        /api/session/<node>/<id>/packets
+      ecs: url.path
+      status: mapped
+      notes: >
+        the field that separates a search from an export - the PCAP, CSV and
+        packet endpoints are the exfil-relevant values and deserve their own
+        detection rather than being aggregated with ordinary session searches
+    - vendor: uiPage
+      type: string
+      description: >-
+        viewer page or action label the request came from (sessions, spiview,
+        spigraph, sessions.csv, addTags, removeTags, query, unique)
+      ecs: event.action
+      status: partial
+      notes: >
+        only set where the route registered logAction with a page argument;
+        many audited endpoints - including the single-session detail and
+        packets routes - call logAction() with no argument and leave this
+        absent, so event.action must fall back to the api path
+    - vendor: query
+      type: string
+      description: reassembled query-string of the request as key=value pairs joined by ampersands
+      ecs: url.query
+      status: mapped
+      transform: >
+        rebuilt by the viewer from the parsed query object (so it also
+        captures parameters that arrived in a POST body), with password-like
+        properties removed; it is not the verbatim request query string
+    - vendor: expression
+      type: string
+      description: Arkime session search expression submitted with the request
+      ecs: null
+      status: unmapped
+      custom: arkime.history.expression
+      notes: >
+        the single most investigation-relevant value in the dataset - the
+        analyst's own words for what they were looking for. No ECS field
+        models a vendor query language; do not force it into url.query, which
+        already holds the raw parameters
+    - vendor: forcedExpression
+      type: string
+      description: >-
+        expression the platform silently ANDed onto the user's search because
+        of a per-user forced expression
+      ecs: null
+      status: unmapped
+      custom: arkime.history.forced_expression
+      notes: >
+        records the restriction actually applied to the query; only returned
+        to admin-role callers, so a collector authenticating as a normal user
+        will never see it and the audit trail will understate what was scoped
+    - vendor: view.name
+      type: string
+      description: name of the saved view applied to the request
+      ecs: null
+      status: unmapped
+      custom: arkime.history.view.name
+      notes: >-
+        resolved from the views index at log time; view.expression carries the
+        view's own filter and belongs alongside it
+    - vendor: range
+      type: integer
+      description: >-
+        date range of the request in hours, or the request timestamp when the
+        user asked for all data (date=-1)
+      ecs: null
+      status: unmapped
+      custom: arkime.history.range
+      notes: >
+        overloaded - it is a duration in hours for a bounded search but the
+        epoch-second timestamp for an all-time search, so a detection on
+        "unusually wide search window" has to test for the date=-1 case
+        separately
+    - vendor: queryTime
+      type: integer
+      description: milliseconds the viewer took to return the response
+      ecs: event.duration
+      status: partial
+      transform: milliseconds to nanoseconds for ECS event.duration (multiply by 1,000,000)
+    - vendor: recordsReturned
+      type: integer
+      description: number of items actually returned in the response after paging
+      ecs: null
+      status: unmapped
+      custom: arkime.history.records_returned
+      notes: >-
+        the exfil-volume signal for CSV and PCAP exports; no ECS field models
+        result-set size
+    - vendor: recordsTotal
+      type: long
+      description: total number of items in the underlying dataset the query ran against
+      ecs: null
+      status: unmapped
+      custom: arkime.history.records_total
+    - vendor: esQuery
+      type: string
+      description: the Elasticsearch/OpenSearch query the viewer generated for the request
+      ecs: null
+      status: unmapped
+      custom: arkime.history.es_query
+      notes: >
+        stored as unindexed text in Arkime and unbounded in size; keep it only
+        if query reconstruction matters, and cap it before it crosses a
+        content filter - the human-readable expression field covers most
+        investigative need
+    - vendor: esQueryIndices
+      type: string
+      description: the concrete session indices the generated query was executed against
+      ecs: null
+      status: unmapped
+      custom: arkime.history.es_query_indices
+      notes: >-
+        unindexed text; useful only for reproducing a historical query against
+        rolled-over indices
+    - vendor: body
+      type: string
+      description: the request body, with password-like properties stripped
+      ecs: null
+      status: unmapped
+      custom: arkime.history.body
+      notes: >
+        mapped as a disabled object in Arkime (stored but neither indexed nor
+        searchable) and arbitrary in shape and size; the least bounded value
+        in the dataset and the first thing to cap or drop before a guard
+        crossing
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Run the collector with an admin-role token so forcedExpression is
+          present - normal users cannot see their own forced expressions, and
+          a non-admin pull silently omits the field that proves what
+          restriction was actually in force. Ship the thin envelope (_dataId
+          set to the logs-arkime.history route key, @timestamp, host, _raw)
+          and keep the low-side work to bounding rather than parsing: body is
+          an arbitrary request body and esQuery is a raw Elasticsearch query
+          string, both unbounded free text, so cap both, drop esQueryIndices,
+          and gate the destination with a Schema Library schema plus a
+          dead-letter route and Persistent Queue backpressure. Attach the
+          directory-identity lookup for userId here where the inventory
+          already lives.
+        elastic: >
+          In the custom logs-arkime.history pipeline, fix the two unit traps
+          first: timestamp is epoch SECONDS (the mapping declares format
+          epoch_second), so a straight copy into a millisecond @timestamp
+          lands every audit record in 1970, and queryTime is milliseconds
+          while ECS event.duration is nanoseconds. Then rename userId, method,
+          api and query to user.name, http.request.method, url.path and
+          url.query, and set event.action from uiPage where it is present,
+          falling back to the api path where the route registered logAction
+          with no page argument. Two gaps the SIEM must close from outside
+          Arkime, because the record simply does not carry them: there is no
+          client address and no response status, so join the reverse proxy or
+          load balancer access log to supply source.ip and event.outcome
+          before building any iam alert on this dataset. Map
+          arkime.history.expression, .forced_expression and .view.name as
+          keyword and .records_returned/.records_total as long so "who
+          exported how much" aggregates without dynamic mapping.
+        relay: >
+          The thin envelope crosses as NDJSON - UTF-8, LF-terminated,
+          compression disabled - and the payload is already shallow JSON with
+          short ASCII keys, so the custom content filter has an easy job apart
+          from the two unbounded values: cap body and esQuery low-side, or
+          drop esQuery entirely and keep the human-readable Arkime expression,
+          which is the field an investigator actually reads. Nothing
+          CEF-shaped exists here. Reconcile counts per (userId, hour) rather
+          than per hour alone: this is an audit trail crossing an at-most-once
+          boundary with no acknowledgement, so a silently dropped record is an
+          analyst query that was never reviewed, and a per-user reconciliation
+          is the only way to notice that the missing records all belong to one
+          account.
+      direct:
+        parse_location: hybrid
+        cribl: >
+          Run the collector with an admin-role token so forcedExpression is
+          present - normal users cannot see their own forced expressions, and
+          a non-admin pull silently omits the field that proves what
+          restriction was actually in force. body is an arbitrary request body
+          and esQuery is a raw Elasticsearch query string, both unbounded free
+          text, so cap both and drop esQueryIndices before forwarding, and
+          gate the destination with a Schema Library schema plus a dead-letter
+          route and Persistent Queue backpressure. Attach the
+          directory-identity lookup for userId here where the inventory
+          already lives.
+        elastic: >
+          In the custom logs-arkime.history pipeline, fix the two unit traps
+          first: timestamp is epoch SECONDS (the mapping declares format
+          epoch_second), so a straight copy into a millisecond @timestamp
+          lands every audit record in 1970, and queryTime is milliseconds
+          while ECS event.duration is nanoseconds. Then rename userId, method,
+          api and query to user.name, http.request.method, url.path and
+          url.query, and set event.action from uiPage where it is present,
+          falling back to the api path where the route registered logAction
+          with no page argument. Two gaps the SIEM must close from outside
+          Arkime, because the record simply does not carry them: there is no
+          client address and no response status, so join the reverse proxy or
+          load balancer access log to supply source.ip and event.outcome
+          before building any iam alert on this dataset. Map
+          arkime.history.expression, .forced_expression and .view.name as
+          keyword and .records_returned/.records_total as long so "who
+          exported how much" aggregates without dynamic mapping.

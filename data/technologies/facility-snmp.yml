@@ -1,0 +1,1873 @@
+id: facility-snmp
+name: Facility UPS/Environmental SNMP
+vendor: Multiple
+versions: >-
+  RFC 1628 UPS-MIB; APC PowerNet-MIB 3.x/4.x on NMC2 (AOS 6.x) and NMC3 (AOS
+  2.x); Vertiv/Liebert LIEBERT-GP-* on IS-UNITY/UNITY-DP
+draft: true
+references:
+- https://www.rfc-editor.org/rfc/rfc1628.txt
+- https://networkupstools.org/protocols/snmp/APC-Powernet.pdf
+- https://github.com/simonjj/SnmpMibs/blob/master/PowerNet-MIB.mib
+- https://docs.cribl.io/stream/sources-snmp-traps/
+- https://packs.cribl.io/packs/cribl-snmp-trap-varbind-translation
+- >-
+  https://www.vertiv.com/globalassets/products/critical-power/power-distribution/rpc2---snmp-oid_user-guide.pdf
+- https://docs.nxlog.co/integrate/apc.html
+datasets:
+- id: ups-trap
+  name: UPS power and battery traps
+  description: >
+    SNMP notifications raised by a UPS network management card when utility
+    power, battery, or UPS hardware state changes: the RFC 1628 UPS-MIB
+    standard traps (upsTrapOnBattery, upsTrapAlarmEntryAdded /
+    upsTrapAlarmEntryRemoved carrying a well-known alarm identity such as
+    upsAlarmOnBattery, upsAlarmLowBattery, upsAlarmDepletedBattery,
+    upsAlarmInputBad, upsAlarmOutputOverload, upsAlarmChargerFailed,
+    upsAlarmCommunicationsLost) plus the vendor trap families layered on top
+    of them - APC PowerNet-MIB communicationLost(1), upsOverload(2),
+    upsDischarged(4), upsOnBattery(5), lowBattery(7),
+    communicationEstablished(8), powerRestored(9), and
+    upsBatteryNeedsReplacement(13) as the class exemplar, with
+    Vertiv/Liebert's lgpEventConditionEntryAdded /
+    lgpEventConditionEntryRemoved pair (enterprise 476) following the same
+    alarm-added/alarm-removed shape. This is a binary SNMP feed, not text:
+    nothing is human-readable until the trap receiver resolves numeric OIDs
+    against compiled MIBs, so the receiver - not the device - is the parser.
+    For a CSOC the value is dual: loss of facility power is an availability
+    precursor for everything downstream of the UPS, and a UPS that goes to
+    battery with no corresponding maintenance window is physical-security
+    context.
+  event_categories:
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge Cribl worker group, facility/OT enclave
+      notes: >
+        Cribl Stream SNMP Trap source bound to UDP/162, one source per SNMP
+        version because v1, v2c and v3 decode differently; the worker group is
+        the trap receiver and therefore the parser. The binary PDU is decoded
+        here — it can never reach the guard, so low-side resolution is forced
+        by the transport.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-facility_snmp.ups_trap
+    direct:
+    - hop: cribl
+      location: edge Cribl worker group
+      notes: >
+        Cribl Stream SNMP Trap source bound to UDP/162, one source per SNMP
+        version because v1, v2c and v3 decode differently; the worker group is
+        the trap receiver and therefore the parser. The binary PDU is decoded
+        here at the edge and the resolved ECS events flow straight to Elastic.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-facility_snmp.ups_trap
+  formats:
+  - format: other
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom SNMP trap pipeline
+      notes: >
+        No Elastic integration parses UPS-MIB or PowerNet-MIB traps, so this
+        is a hand-built pipeline on the Cribl SNMP Trap source. The Cribl SNMP
+        Trap Varbind Translation pack supplies the OID-to-name lookup (a CSV
+        built from compiled MIBs) and is used as a lookup table underneath
+        this pipeline rather than as the pipeline itself, because the generic
+        pack resolves names but does not shape ECS.
+    fields:
+    - vendor: snmpTrapOID
+      type: string
+      description: >-
+        OID naming which notification fired, carried as the second varbind
+        (1.3.6.1.6.3.1.1.4.1.0) on v2c/v3 traps
+      ecs: event.code
+      status: partial
+      transform: >
+        resolve the numeric OID against the compiled MIB set to the
+        notification name (upsTrapOnBattery, upsTrapAlarmEntryAdded, or the
+        vendor equivalents such as APC upsOnBattery under 1.3.6.1.4.1.318); on
+        SNMPv1 there is no snmpTrapOID varbind at all and the equivalent must
+        be composed from the PDU's enterprise OID plus
+        generic-trap/specific-trap numbers
+      notes: >
+        the single most important field on the route and the one that carries
+        the whole OID-resolution burden - unresolved it is a dotted integer
+        string that no analyst or detection rule can use
+    - vendor: sysUpTime
+      type: long
+      description: >-
+        TimeTicks since the management card last restarted, carried as the
+        first varbind (1.3.6.1.2.1.1.3.0) on v2c/v3 traps
+      ecs: null
+      status: unmapped
+      custom: snmp.trap.sys_uptime
+      notes: >
+        hundredths of a second since agent restart; the only in-band clock on
+        the trap, and a sudden reset to near zero is itself the signal that
+        the card rebooted
+    - vendor: agent-addr
+      type: ip
+      description: address of the management card that emitted the trap (SNMPv1 PDU field)
+      ecs: observer.ip
+      status: partial
+      notes: >
+        present only in the SNMPv1 PDU; on v2c/v3 there is no agent-addr and
+        the receiver must fall back to the UDP source address, which differs
+        whenever the card is behind NAT or a trap forwarder
+    - vendor: community
+      type: string
+      description: SNMPv1/v2c community string presented with the trap
+      ecs: null
+      status: unmapped
+      custom: snmp.trap.community
+      notes: >
+        cleartext shared secret that is the only authentication on v1/v2c
+        traps; drop or mask it low-side rather than indexing it, but keep a
+        boolean of which version was used - facility gear still running v1/v2c
+        is a control finding in its own right
+    - vendor: upsAlarmDescr
+      type: string
+      description: >-
+        OID of the well-known alarm identity that was added to or removed from
+        the alarm table
+      ecs: event.action
+      status: partial
+      transform: >
+        resolve to the alarm name from the upsAlarmsWellKnown branch
+        (upsAlarmOnBattery, upsAlarmLowBattery, upsAlarmDepletedBattery,
+        upsAlarmInputBad, upsAlarmOutputOverload, upsAlarmOnBypass,
+        upsAlarmChargerFailed, upsAlarmFanFailure, upsAlarmGeneralFault,
+        upsAlarmCommunicationsLost, ...)
+      notes: >
+        an AutonomousType, i.e. an OID rather than text, so it needs the same
+        MIB resolution as snmpTrapOID; the raise-vs-clear sense is not in this
+        field but in the enclosing upsTrapAlarmEntryAdded /
+        upsTrapAlarmEntryRemoved notification
+    - vendor: upsAlarmId
+      type: integer
+      description: alarm table index uniquely identifying this alarm instance
+      ecs: null
+      status: unmapped
+      custom: ups.alarm.id
+      notes: >
+        the join key that pairs an upsTrapAlarmEntryAdded with its later
+        upsTrapAlarmEntryRemoved; without it an alarm has no measurable
+        duration and no way to be closed
+    - vendor: upsAlarmTime
+      type: long
+      description: TimeStamp (sysUpTime value) at which the alarm condition began
+      ecs: null
+      status: partial
+      custom: ups.alarm.time_ticks
+      notes: >
+        relative to the agent's sysUpTime, not wall clock; an absolute time
+        only exists after combining receiver arrival time, sysUpTime and this
+        value, so it must not be used as @timestamp directly
+    - vendor: upsEstimatedMinutesRemaining
+      type: integer
+      description: estimated UPS runtime remaining before battery exhaustion, in minutes
+      ecs: null
+      status: unmapped
+      custom: ups.battery.minutes_remaining
+      notes: >
+        bound to upsTrapOnBattery and the operationally decisive number on
+        this route - it is what determines whether an outage is a blip or a
+        shutdown sequence
+    - vendor: upsSecondsOnBattery
+      type: integer
+      description: >-
+        elapsed time the UPS has been drawing power from batteries, in seconds
+        (zero when on utility power)
+      ecs: null
+      status: unmapped
+      custom: ups.battery.seconds_on_battery
+    - vendor: upsConfigLowBattTime
+      type: integer
+      description: >-
+        configured runtime threshold, in minutes, at which the low-battery
+        condition is declared
+      ecs: null
+      status: unmapped
+      custom: ups.config.low_batt_time
+      notes: >
+        bound to upsTrapOnBattery; without it upsEstimatedMinutesRemaining
+        cannot be judged, because "low" is a per-site configured value
+    - vendor: upsBatteryStatus
+      type: enum
+      description: >-
+        overall battery condition - unknown(1), batteryNormal(2),
+        batteryLow(3), batteryDepleted(4)
+      ecs: null
+      status: partial
+      custom: ups.battery.status
+      transform: >
+        decode the numeric enum to its label and use the decoded value to
+        drive a derived event.severity, since the trap itself carries no
+        severity field
+    - vendor: upsEstimatedChargeRemaining
+      type: integer
+      description: remaining battery charge as a percentage of full capacity (0..100)
+      ecs: null
+      status: unmapped
+      custom: ups.battery.charge_percent
+    - vendor: upsBatteryTemperature
+      type: integer
+      description: ambient temperature at or near the UPS battery casing, in degrees Centigrade
+      ecs: null
+      status: unmapped
+      custom: ups.battery.temperature_c
+      notes: >
+        UPS-MIB fixes this in Centigrade, unlike the environmental probe
+        readings in the env-trap dataset which carry their own unit selector
+    - vendor: upsOutputPercentLoad
+      type: integer
+      description: >-
+        percentage of rated capacity currently in use on the output, per
+        output line (0..200)
+      ecs: null
+      status: unmapped
+      custom: ups.output.percent_load
+      notes: >
+        range extends past 100 by design so overload magnitude survives;
+        clamping it to 100 anywhere in the pipeline destroys the signal
+    - vendor: upsIdentManufacturer
+      type: string
+      description: name of the UPS manufacturer, up to 31 characters
+      ecs: observer.vendor
+      status: mapped
+    - vendor: upsIdentModel
+      type: string
+      description: UPS model designation, up to 63 characters
+      ecs: observer.product
+      status: mapped
+    - vendor: upsIdentName
+      type: string
+      description: administrator-assigned name for the UPS, up to 63 characters
+      ecs: observer.name
+      status: mapped
+      notes: >
+        operator-authored and frequently the only thing tying the trap to a
+        room or rack, so it is worth enriching against a facility inventory
+        rather than trusting the string alone
+    - vendor: upsIdentAttachedDevices
+      type: string
+      description: >-
+        administrator-maintained description of the devices drawing power from
+        the UPS, up to 63 characters
+      ecs: null
+      status: unmapped
+      custom: ups.attached_devices
+      notes: >
+        the only in-band blast-radius hint on the feed - free text, often
+        stale, but it is what turns "a UPS went to battery" into "these
+        services are about to go down"
+    - vendor: upsAdvBatteryRunTimeRemaining
+      type: long
+      description: >-
+        APC PowerNet equivalent of the runtime estimate
+        (1.3.6.1.4.1.318.1.1.1.2.2.3), expressed as TimeTicks
+      ecs: null
+      status: partial
+      custom: apc.ups.battery.run_time_remaining
+      transform: >
+        convert TimeTicks (hundredths of a second) to minutes and fold onto
+        ups.battery.minutes_remaining, so one alerting threshold covers both
+        standard-MIB and APC-MIB devices instead of two thresholds in
+        different units
+    - vendor: mtrapargsString
+      type: string
+      description: >-
+        APC PowerNet generic octet-string trap argument
+        (1.3.6.1.4.1.318.2.3.3) carrying the human-readable event text
+      ecs: message
+      status: mapped
+      notes: >
+        APC binds this to nearly every PowerNet trap and it is the only
+        natively readable part of the PDU; useful as a fallback message but
+        not a substitute for OID resolution, since its wording is not stable
+        across AOS versions
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Do the OID resolution at the edge and emit full ECS-shaped JSON:
+          join snmpTrapOID and every varbind OID against the compiled-MIB
+          lookup, then promote the named objects into flat short-key fields so
+          no downstream consumer ever has to hold a MIB. Reconstruct an
+          absolute @timestamp from arrival time, sysUpTime and upsAlarmTime
+          rather than trusting the sysUpTime-relative TimeTicks, normalize the
+          two runtime-remaining representations (minutes vs TimeTicks) onto
+          one field, and decode the upsBatteryStatus enum here. Drop the
+          v1/v2c community string before anything leaves the enclave - it is a
+          shared secret in cleartext - and gate the egress destination with
+          C.Schema(...).validate plus a dead-letter route, on Persistent Queue
+          backpressure, because a dropped upsTrapAlarmEntryRemoved leaves a
+          stuck open alarm nobody can clear.
+        elastic: >
+          Own a custom logs-facility_snmp.ups_trap ingest pipeline that
+          correlates upsTrapAlarmEntryAdded with its matching
+          upsTrapAlarmEntryRemoved on upsAlarmId to derive alarm duration, and
+          that sets event.severity from the resolved alarm identity through an
+          explicit lookup - the wire carries no severity field at all, only
+          APC's MIB-comment SEVERE/WARNING/INFORMATIONAL annotations, which
+          are not transmitted. Map the custom namespaces explicitly in the
+          index template: ups.alarm.id as long, ups.battery.minutes_remaining,
+          .seconds_on_battery, .charge_percent and ups.output.percent_load as
+          long, ups.battery.temperature_c as float, and ups.attached_devices
+          and snmp.trap.* as keyword, so runtime-headroom dashboards aggregate
+          correctly instead of inheriting dynamic string mappings.
+        relay: >
+          Full ECS-shaped NDJSON crosses the guard (envelope mode B) - never
+          the raw binary PDU, which no content filter can inspect and which
+          the guard would have to pass or drop blind. That makes low-side
+          resolution mandatory rather than merely preferred: the decision to
+          parse low is forced by the transport, not chosen for efficiency.
+          Content-filter friction is modest and worth keeping that way -
+          mtrapargsString and upsIdentAttachedDevices are operator-authored
+          free text and should be length-capped and stripped of control and
+          non-UTF-8 bytes low-side, and the JSON held to two levels with short
+          ASCII keys so a custom NDJSON filter rule stays simple. Crossing is
+          at-most-once with no return channel; reconcile counts per (dataset,
+          hour), and note that trap volume is normally near zero, so a
+          reconciliation gap here is meaningful rather than statistical noise.
+      direct:
+        parse_location: low
+        cribl: >
+          Do the OID resolution at the edge and emit full ECS-shaped JSON:
+          join snmpTrapOID and every varbind OID against the compiled-MIB
+          lookup, then promote the named objects into flat short-key fields so
+          no downstream consumer ever has to hold a MIB. Reconstruct an
+          absolute @timestamp from arrival time, sysUpTime and upsAlarmTime
+          rather than trusting the sysUpTime-relative TimeTicks, normalize the
+          two runtime-remaining representations (minutes vs TimeTicks) onto
+          one field, and decode the upsBatteryStatus enum here. Drop the
+          v1/v2c community string before anything leaves the enclave - it is a
+          shared secret in cleartext - and gate the egress destination with
+          C.Schema(...).validate plus a dead-letter route, on Persistent Queue
+          backpressure, because a dropped upsTrapAlarmEntryRemoved leaves a
+          stuck open alarm nobody can clear.
+        elastic: >
+          Own a custom logs-facility_snmp.ups_trap ingest pipeline that
+          correlates upsTrapAlarmEntryAdded with its matching
+          upsTrapAlarmEntryRemoved on upsAlarmId to derive alarm duration, and
+          that sets event.severity from the resolved alarm identity through an
+          explicit lookup - the wire carries no severity field at all, only
+          APC's MIB-comment SEVERE/WARNING/INFORMATIONAL annotations, which
+          are not transmitted. Map the custom namespaces explicitly in the
+          index template: ups.alarm.id as long, ups.battery.minutes_remaining,
+          .seconds_on_battery, .charge_percent and ups.output.percent_load as
+          long, ups.battery.temperature_c as float, and ups.attached_devices
+          and snmp.trap.* as keyword, so runtime-headroom dashboards aggregate
+          correctly instead of inheriting dynamic string mappings.
+  - format: snmp-poll
+    enable: >
+      No device-side event configuration is needed - the objects are always
+      readable. Point an SNMP poller (net-snmp/Telegraf snmp input, or an
+      equivalent OT-safe collector) at the management card's read community on
+      UDP/161, or an SNMPv3 USM user where the card supports it, and walk the
+      upsBattery, upsInput, upsOutput and upsAlarm groups of RFC 1628 plus the
+      APC PowerNet upsAdv* / upsBasic* subtrees (1.3.6.1.4.1.318) or the
+      Liebert-GP objects (1.3.6.1.4.1.476). Poll interval is the design
+      decision: state changes are only detected at the sample boundary, so a
+      30-60s cadence is the floor for an availability signal, and the poller -
+      not the card - must diff successive samples to synthesize an on-battery
+      / low-battery event. Prefer SNMPv3 and scope a dedicated read-only
+      community/user, since a poller reaching every card is a broad read
+      surface into the facility enclave.
+    references:
+    - https://www.rfc-editor.org/rfc/rfc1628.txt
+    - https://datatracker.ietf.org/doc/html/rfc1628
+    - https://networkupstools.org/protocols/snmp/APC-Powernet.pdf
+    - https://github.com/simonjj/SnmpMibs/blob/master/PowerNet-MIB.mib
+    - https://docs.nxlog.co/integrate/apc.html
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom SNMP poll normalization pipeline
+      notes: >
+        No Elastic integration and no Cribl source polls SNMP GET (the Cribl
+        SNMP source is trap-only), so the poll runs in an external collector
+        whose JSON/line output is shaped by a Cribl pipeline. The Cribl SNMP
+        Trap Varbind Translation pack's compiled-MIB lookup is reused here as
+        a name/enum table, but the pipeline's real work is stateful: it must
+        hold the previous sample per (observer, object) to emit an event only
+        on transition, decode the upsBatteryStatus enum, normalize the APC
+        TimeTicks runtime against the standard-MIB minutes field, and stamp
+        @timestamp from collection time because a GET carries no event clock.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Run the poller and the diff-to-event logic on the facility/OT worker
+          group and cross only synthesized ECS events, not raw sample rows - a
+          periodic full-scalar dump crossing the guard every minute is volume
+          the trap feed never produces. Decode upsBatteryStatus and derive
+          event.severity from it here, fold upsAdvBatteryRunTimeRemaining
+          (TimeTicks) onto ups.battery.minutes_remaining so one threshold
+          covers standard-MIB and APC devices, and carry upsConfigLowBattTime
+          alongside the runtime estimate so "low" stays a per-site judgment.
+          Drop the read community before egress and gate the destination with
+          C.Schema(...).validate plus a dead-letter route under Persistent
+          Queue backpressure.
+        elastic: >
+          Own a custom logs-facility_snmp.ups_trap ingest pipeline shared with
+          the trap feed and mark poll-sourced records with a distinct
+          event.provider so a synthesized on-battery event is never counted
+          twice against a real trap when both transports run. Type the custom
+          namespace explicitly - ups.battery.minutes_remaining,
+          .seconds_on_battery, .charge_percent, ups.output.percent_load,
+          ups.input.voltage as long and ups.battery.temperature_c as float -
+          and set event.severity from the decoded battery status through the
+          same lookup the trap pipeline uses, since a poll carries no severity
+          either.
+        relay: >
+          The poll must originate low-side: the guard is one-way and cannot
+          reach back into the enclave to issue a GET, which makes low-side
+          synthesis mandatory rather than merely efficient. Cross full
+          ECS-shaped NDJSON (envelope mode B); never cross raw scalar dumps,
+          whose per-minute volume and lack of an event boundary make them
+          hostile to a content filter. The only free-text exposure is
+          upsIdentName and upsIdentAttachedDevices - length-cap and sanitize
+          them low-side and hold the JSON to two shallow levels. Crossing is
+          at-most-once; because the transport is a poll, a dropped record
+          self-heals on the next sample, so reconcile per (dataset, hour) but
+          treat gaps here as less critical than a lost trap.
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side card with no guard, run the same poller against the
+          core worker group and keep the diff-to-event logic - the decision
+          that matters is not double-counting against a co-running trap feed
+          for the same UPS, so pick one authoritative transport per device and
+          key de-duplication on (observer.ip, resolved alarm, minute) if both
+          run briefly during cutover.
+        elastic: >
+          Own the shared logs-facility_snmp.ups_trap ingest pipeline and mark
+          poll-sourced records with a distinct event.provider so a synthesized
+          on-battery event is never counted twice against a real trap, typing
+          ups.battery.minutes_remaining, .seconds_on_battery, .charge_percent,
+          ups.output.percent_load and ups.input.voltage as long and
+          ups.battery.temperature_c as float. With no boundary you may also
+          retain a slow-cadence measurement sample (runtime headroom, output
+          load) for trend dashboards rather than only transition events,
+          keeping it in a separate event.provider so it never inflates the
+          alarm count.
+    fields:
+    - vendor: upsBatteryStatus
+      type: enum
+      description: >-
+        overall battery condition polled from the scalar - unknown(1),
+        batteryNormal(2), batteryLow(3), batteryDepleted(4).
+      ecs: null
+      status: partial
+      custom: ups.battery.status
+      transform: >
+        decode the enum and use the decoded value to drive a synthesized
+        event.severity, and diff it against the prior sample to raise an
+        on-battery/low-battery event, since a poll delivers state not events
+    - vendor: upsSecondsOnBattery
+      type: integer
+      description: elapsed time the UPS has been on battery, in seconds (zero on utility power).
+      ecs: null
+      status: unmapped
+      custom: ups.battery.seconds_on_battery
+      notes: >-
+        a transition of this scalar from zero to non-zero is the poll-mode
+        equivalent of the upsTrapOnBattery notification
+    - vendor: upsEstimatedMinutesRemaining
+      type: integer
+      description: estimated runtime remaining before battery exhaustion, in minutes.
+      ecs: null
+      status: unmapped
+      custom: ups.battery.minutes_remaining
+    - vendor: upsEstimatedChargeRemaining
+      type: integer
+      description: remaining battery charge as a percentage of full capacity (0..100).
+      ecs: null
+      status: unmapped
+      custom: ups.battery.charge_percent
+    - vendor: upsBatteryVoltage
+      type: integer
+      description: measured DC battery bus voltage, in units of 0.1 volt per RFC 1628.
+      ecs: null
+      status: partial
+      custom: ups.battery.voltage
+      transform: scale by 0.1 to volts before storage, per the UPS-MIB unit definition
+    - vendor: upsBatteryTemperature
+      type: integer
+      description: ambient temperature at or near the UPS battery, in degrees Centigrade.
+      ecs: null
+      status: unmapped
+      custom: ups.battery.temperature_c
+    - vendor: upsInputVoltage
+      type: integer
+      description: measured input line voltage per input line entry (upsInputTable), in RMS volts.
+      ecs: null
+      status: unmapped
+      custom: ups.input.voltage
+    - vendor: upsInputFrequency
+      type: integer
+      description: measured input line frequency per input line entry, in units of 0.1 hertz.
+      ecs: null
+      status: partial
+      custom: ups.input.frequency_hz
+      transform: scale by 0.1 to hertz, per the UPS-MIB unit definition
+    - vendor: upsOutputPercentLoad
+      type: integer
+      description: percentage of rated capacity in use per output line (upsOutputTable), 0..200.
+      ecs: null
+      status: unmapped
+      custom: ups.output.percent_load
+      notes: >-
+        range extends past 100 by design so overload magnitude survives; never
+        clamp it to 100 in the pipeline
+    - vendor: upsAlarmDescr
+      type: string
+      description: >-
+        OID of a well-known alarm currently present, read from the
+        upsAlarmTable rather than delivered as a notification.
+      ecs: event.action
+      status: partial
+      transform: >
+        resolve to the alarm name from the upsAlarmsWellKnown branch
+        (upsAlarmOnBattery, upsAlarmLowBattery, upsAlarmDepletedBattery,
+        upsAlarmInputBad, upsAlarmOutputOverload, ...); on a poll the alarm is
+        present for as long as the row exists, so raise/clear is derived from
+        the row appearing and disappearing between samples
+    - vendor: upsAlarmTime
+      type: long
+      description: sysUpTime value at which the alarm in this upsAlarmTable row was declared.
+      ecs: null
+      status: partial
+      custom: ups.alarm.time_ticks
+      notes: >-
+        relative to the agent's sysUpTime, so an absolute time only exists
+        after combining it with the poller's collection time
+    - vendor: upsAdvBatteryRunTimeRemaining
+      type: long
+      description: >-
+        APC PowerNet runtime estimate (1.3.6.1.4.1.318.1.1.1.2.2.3), expressed
+        as TimeTicks.
+      ecs: null
+      status: partial
+      custom: apc.ups.battery.run_time_remaining
+      transform: >-
+        convert TimeTicks (hundredths of a second) to minutes and fold onto
+        ups.battery.minutes_remaining so one threshold covers standard-MIB and
+        APC devices
+    - vendor: upsIdentManufacturer
+      type: string
+      description: UPS manufacturer name scalar.
+      ecs: observer.vendor
+      status: mapped
+    - vendor: upsIdentModel
+      type: string
+      description: UPS model designation scalar.
+      ecs: observer.product
+      status: mapped
+    - vendor: upsIdentName
+      type: string
+      description: administrator-assigned UPS name scalar.
+      ecs: observer.name
+      status: mapped
+    - vendor: poll collection time
+      type: timestamp
+      description: >-
+        wall-clock instant the poller issued the GET, supplied by the
+        collector rather than the device.
+      ecs: '@timestamp'
+      status: partial
+      notes: >
+        a GET carries no event clock, so @timestamp is collection time and the
+        true state-change instant is bounded by the poll interval - the
+        structural cost of choosing poll over trap
+  - format: csv-file
+    enable: >
+      No emission to configure - the card always writes the event log. Fetch
+      event.txt with FTP (unencrypted) or SCP (when the card runs
+      encryption-based security), or export it from Logs > Event > Log in the
+      web UI. The file is tab-delimited: a version/header block records the
+      format version, the retrieval date and time, and the card's Name,
+      Contact, Location and IP, after which each event row carries a
+      four-digit-year Date, a Time, the event description text, and - unlike
+      the syslog push - a unique Event Code per event. Retrieval is a pull
+      into the card, so per-site reachability into the facility enclave and a
+      read-capable device account are required, and the account creation is
+      itself an event that appears in this log.
+    references:
+    - https://www.apc.com/us/en/faqs/FA156131/
+    - https://www.apc.com/us/en/faqs/FA156977/
+    - https://mans.io/files/viewer/1288823/146
+    - https://iportal.se.com/Contents/docs/UPS-PMAR-9LLM9N_R1_EN.PDF
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom NMC event-log file pipeline
+      notes: >
+        No Elastic integration or Cribl pack parses the NMC event log. An
+        external scheduled FTP/SCP fetch drops event.txt and a Cribl pipeline
+        splits the tab-delimited rows, restores the four-digit year onto
+        @timestamp, keys de-duplication on the per-row Event Code (which the
+        syslog form omits), and leaves the event description as free text
+        until per-event patterns are written - the same body wording the
+        nmc-syslog dataset carries, so the two feeds share event grammar.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Run the fetch and the row split on the facility worker group and
+          checkpoint on the Event Code so an unchanged log re-pulled on the
+          next interval does not re-cross rows already sent - the file is
+          cumulative and a naive re-read re-delivers the whole log. Prefer the
+          body Date/Time over the file's retrieval timestamp, resolve the
+          card's IP against the facility inventory low-side where the lookup
+          lives, and gate the guard destination with C.Schema(...).validate
+          and a dead-letter route. Because the event description is
+          firmware-authored free text, cap and sanitize it before egress.
+        elastic: >
+          Own the shared logs-facility_snmp.ups_trap pipeline and treat the
+          Event Code as event.code - it is the one field this transport adds
+          over both the trap varbinds and the syslog body, so it is the
+          natural stable join key across all three feeds. Grow per-event grok
+          for the description body incrementally and, until then, keep message
+          searchable rather than pretending it is structured, marking the file
+          source with its own event.provider so a spreadsheet-style backfill
+          of historical rows is distinguishable from live traps.
+        relay: >
+          The fetch must originate low-side: the guard cannot FTP/SCP back
+          into the enclave, so the file is pulled and shaped low and full
+          ECS-shaped NDJSON crosses (envelope mode B), never the raw file. The
+          single content-filter exposure is the event description text -
+          length-cap and strip control/non-UTF-8 bytes low-side and hold the
+          JSON to two shallow levels. Crossing is at-most-once; since the log
+          is cumulative on the card, a dropped row is recoverable on the next
+          fetch by Event Code, so reconcile per (dataset, hour) but treat this
+          feed as more forgiving of a gap than the trap.
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side card with no guard, run the same scheduled fetch
+          against the core worker group. The decision that matters is not
+          double-counting against a co-running trap or poll feed for the same
+          UPS - pick one authoritative transport per device and key
+          de-duplication on the Event Code if the file is read alongside
+          another feed during cutover.
+        elastic: >
+          Own the shared logs-facility_snmp.ups_trap ingest pipeline and treat
+          the Event Code as event.code, the stable join key across the feeds.
+          With no boundary retain the full event description for forensics
+          rather than capping it, and use the cumulative log as an
+          authoritative backfill source to close gaps in the live trap stream,
+          keyed on Event Code.
+    fields:
+    - vendor: Date
+      type: string
+      description: >-
+        calendar date of the event with a four-digit year, first tab-delimited
+        column of the event row.
+      ecs: '@timestamp'
+      status: partial
+      transform: >-
+        combine with the Time column into @timestamp; the log uses a
+        four-digit year, so no century reconciliation is needed unlike the RFC
+        3164 syslog header
+    - vendor: Time
+      type: string
+      description: time-of-day of the event, second tab-delimited column.
+      ecs: '@timestamp'
+      status: partial
+      notes: >-
+        composed with Date into @timestamp; carries no timezone, so it is
+        interpreted in the card's configured local zone
+    - vendor: Event
+      type: string
+      description: >-
+        human-readable event description text, matching the card's internal
+        event-log wording such as an
+        on-battery-in-response-to-an-input-power-problem message.
+      ecs: message
+      status: mapped
+      notes: >-
+        same wording as the nmc-syslog message body, so detections written
+        against exact phrasing are equally fragile across firmware versions
+    - vendor: Event Code
+      type: string
+      description: >-
+        unique code identifying the event type, present in the FTP/SCP file
+        but not shown in the web log view.
+      ecs: event.code
+      status: mapped
+      notes: >
+        the one field this transport adds over the trap and syslog forms; a
+        stable identifier that survives firmware wording changes, so it is the
+        preferred join key and de-duplication key across all three feeds
+    - vendor: card Name
+      type: string
+      description: administrator-assigned card name from the file header block.
+      ecs: observer.name
+      status: mapped
+    - vendor: card IP
+      type: ip
+      description: IP address of the management card from the file header block.
+      ecs: observer.ip
+      status: mapped
+      notes: header metadata that applies to every row in the file, not a per-event value
+    - vendor: card Location
+      type: string
+      description: administrator-assigned physical location string from the file header block.
+      ecs: null
+      status: unmapped
+      custom: apc.nmc.location
+      notes: >-
+        operator-authored and frequently the only tie to a room or rack, so it
+        is worth enriching against a facility inventory
+- id: env-trap
+  name: Environmental monitor traps
+  description: >
+    Temperature, humidity, and dry-contact notifications from the
+    environmental monitoring probes attached to a UPS management card or rack
+    PDU - APC's Integrated Environmental Monitor trap family
+    (iemHighTempThresholdViolation and its Cleared counterpart,
+    iemLowTempThresholdViolation, iemHighHumidThresholdViolation,
+    iemLowHumidThresholdViolation, iemProbeDisconnected, iemProbeConnected,
+    iemContactFault, iemContactFaultCleared) as the class exemplar, with
+    Vertiv/Liebert's lgpConditionHighTemperature / lgpConditionLowTemperature
+    conditions (1.3.6.1.4.1.476.1.42.3.2.1) delivered through the same
+    condition-added/condition-removed notifications. Unlike the UPS power
+    traps, several of these bind real measurement varbinds, so the feed
+    carries values and not just state changes. The dry-contact traps are the
+    physical-security half of this technology: the contacts are wired to door
+    switches, water sensors, and smoke-relay outputs, and iemStatusContactName
+    is the only place the wiring's meaning is recorded.
+  event_categories:
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge Cribl worker group, facility/OT enclave
+      notes: >
+        Same SNMP Trap source and worker group as the ups-trap dataset -
+        environmental probes hang off the same management card and share its
+        trap destination list.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-facility_snmp.env_trap
+    direct:
+    - hop: cribl
+      location: edge Cribl worker group
+      notes: >
+        Same SNMP Trap source and worker group as the ups-trap dataset -
+        environmental probes hang off the same management card and share its
+        trap destination list.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-facility_snmp.env_trap
+  formats:
+  - format: other
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom SNMP trap pipeline
+      notes: >
+        Shares the ups-trap pipeline and the same compiled-MIB OID lookup from
+        the Cribl SNMP Trap Varbind Translation pack, branching on the
+        resolved trap OID; no Elastic integration covers PowerNet IEM or
+        Liebert GP conditions.
+    fields:
+    - vendor: snmpTrapOID
+      type: string
+      description: >-
+        OID naming which environmental notification fired, carried as the
+        second varbind on v2c/v3 traps
+      ecs: event.code
+      status: partial
+      transform: >
+        resolve against the compiled MIB set to the notification name
+        (iemHighTempThresholdViolation, iemContactFault, iemProbeDisconnected,
+        or the Liebert lgpEventConditionEntryAdded/Removed equivalents)
+      notes: >
+        the raise-vs-clear distinction lives only in the trap name - the
+        Cleared variants bind fewer varbinds than the violations they close,
+        so the pipeline cannot rely on a consistent varbind list
+    - vendor: sysUpTime
+      type: long
+      description: >-
+        TimeTicks since the management card last restarted, carried as the
+        first varbind on v2c/v3 traps
+      ecs: null
+      status: unmapped
+      custom: snmp.trap.sys_uptime
+    - vendor: agent-addr
+      type: ip
+      description: >-
+        address of the management card hosting the environmental probe (SNMPv1
+        PDU field)
+      ecs: observer.ip
+      status: partial
+      notes: absent on v2c/v3, where the UDP source address is the only available substitute
+    - vendor: iemStatusProbeNumber
+      type: integer
+      description: index of the environmental probe that raised the condition
+      ecs: null
+      status: unmapped
+      custom: apc.iem.probe.number
+      notes: >
+        the join key between a threshold violation and its later Cleared trap;
+        unique only within one management card, so it must be qualified by
+        observer identity before it is used for correlation
+    - vendor: iemStatusProbeName
+      type: string
+      description: >-
+        operator-assigned descriptive name for the probe, denoting its
+        location or purpose
+      ecs: null
+      status: unmapped
+      custom: apc.iem.probe.name
+      notes: >
+        free text such as "Row 4 cold aisle" - the only thing tying a reading
+        to a physical place, so preserve it verbatim and use it as the join
+        key to a rack/room inventory lookup
+    - vendor: iemStatusProbeCurrentTemp
+      type: integer
+      description: >-
+        current temperature reading from the probe, in the scale given by
+        iemStatusProbeTempUnits
+      ecs: null
+      status: partial
+      custom: apc.iem.probe.temperature
+      transform: >
+        unitless on the wire - convert to Celsius using
+        iemStatusProbeTempUnits from the same varbind list before storage, or
+        a single threshold rule will behave differently per site
+    - vendor: iemStatusProbeTempUnits
+      type: enum
+      description: temperature scale for this probe - celsius(1) or fahrenheit(2)
+      ecs: null
+      status: partial
+      custom: apc.iem.probe.temperature_units
+      transform: >
+        decode the enum and retain it for provenance even after the
+        temperature has been normalized to Celsius
+    - vendor: iemStatusProbeCurrentHumid
+      type: integer
+      description: current humidity reading from the probe, in percent relative humidity
+      ecs: null
+      status: unmapped
+      custom: apc.iem.probe.humidity
+    - vendor: iemStatusProbeStatus
+      type: enum
+      description: probe connection state - disconnected(1) or connected(2)
+      ecs: null
+      status: partial
+      custom: apc.iem.probe.status
+      transform: >
+        decode the enum; a transition to disconnected(1) is the tamper-ish
+        case worth alerting on, because it silences every threshold trap from
+        that probe
+    - vendor: iemConfigProbeHighTempThreshold
+      type: integer
+      description: configured high-temperature threshold the violation trap fired against
+      ecs: null
+      status: unmapped
+      custom: apc.iem.probe.high_temp_threshold
+      notes: >
+        a polled configuration object, not a trap varbind - it must be joined
+        from a lookup or an SNMP poll, so a violation event on its own never
+        says how far past the limit the reading actually was
+    - vendor: iemStatusContactNumber
+      type: integer
+      description: index of the Environmental Monitor dry-contact input
+      ecs: null
+      status: unmapped
+      custom: apc.iem.contact.number
+    - vendor: iemStatusContactName
+      type: string
+      description: >-
+        operator-assigned descriptive name for the contact, denoting its
+        location or purpose
+      ecs: null
+      status: unmapped
+      custom: apc.iem.contact.name
+      notes: >
+        the dry contact is wired to a door switch, water sensor or smoke relay
+        and this label is the only record of which - it is where the
+        physical-security value of the whole technology actually lives, and a
+        blank or default value makes the trap uninterpretable
+    - vendor: iemStatusContactStatus
+      type: enum
+      description: contact state - noFault(1), fault(2), or disabled(3)
+      ecs: null
+      status: partial
+      custom: apc.iem.contact.status
+      transform: >
+        decode the enum; note that disabled(3) is not a healthy state but a
+        monitoring gap, and must not be collapsed into noFault(1)
+    - vendor: mtrapargsString
+      type: string
+      description: >-
+        APC PowerNet generic octet-string trap argument carrying the
+        human-readable event text
+      ecs: message
+      status: mapped
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Resolve OIDs and normalize units at the edge:
+          iemStatusProbeCurrentTemp is unitless on the wire and only
+          meaningful alongside iemStatusProbeTempUnits in the same varbind
+          list, so convert to Celsius once here rather than leaving every
+          consumer to re-derive it - a mixed-unit index makes a single
+          threshold rule impossible. Decode the probe-status and
+          contact-status enums, and enrich iemStatusProbeName and
+          iemStatusContactName against the facility inventory low-side where
+          the rack/room lookup already lives. Validate against a Schema
+          Library schema with a dead-letter route and Persistent Queue
+          backpressure on the egress destination; keep _raw for the contact
+          traps, which are physical-security evidence, and drop it first on
+          the high-cadence threshold-violation traps.
+        elastic: >
+          Own a custom logs-facility_snmp.env_trap ingest pipeline that pairs
+          each violation trap with its Cleared counterpart on probe or contact
+          number to produce a duration, and that derives event.severity from
+          the resolved trap identity, since the PDU carries none. Type the
+          custom namespace explicitly in the index template -
+          apc.iem.probe.temperature and .humidity as float,
+          apc.iem.probe.number and .contact.number as long, and
+          apc.iem.probe.name, .status, .temperature_units, .contact.name and
+          .contact.status as keyword - so aisle-level temperature dashboards
+          and door-contact queries both work without dynamic mapping. Treat
+          iemConfigProbeHighTempThreshold as enrichment rather than event
+          data: it is a polled config value, so join it from a lookup instead
+          of expecting it in the trap.
+        relay: >
+          Full ECS-shaped NDJSON crosses the guard; the binary PDU cannot be
+          content-inspected and must not reach the boundary. The filter
+          friction here is entirely operator-authored labels -
+          iemStatusProbeName and iemStatusContactName are free text on
+          physical equipment and routinely contain punctuation, room numbers
+          and occasional non-ASCII - so cap and transliterate them low-side
+          and hold the JSON to two shallow levels with short ASCII keys.
+          Contact traps are individually significant and very low volume,
+          which makes silent drops disproportionately costly: reconcile per
+          (dataset, hour) and alert on any gap rather than on a rate
+          threshold.
+      direct:
+        parse_location: low
+        cribl: >
+          Resolve OIDs and normalize units at the edge:
+          iemStatusProbeCurrentTemp is unitless on the wire and only
+          meaningful alongside iemStatusProbeTempUnits in the same varbind
+          list, so convert to Celsius once here rather than leaving every
+          consumer to re-derive it - a mixed-unit index makes a single
+          threshold rule impossible. Decode the probe-status and
+          contact-status enums, and enrich iemStatusProbeName and
+          iemStatusContactName against the facility inventory where the
+          rack/room lookup already lives. Validate against a Schema Library
+          schema with a dead-letter route and Persistent Queue backpressure on
+          the egress destination; keep _raw for the contact traps, which are
+          physical-security evidence, and drop it first on the high-cadence
+          threshold-violation traps.
+        elastic: >
+          Own a custom logs-facility_snmp.env_trap ingest pipeline that pairs
+          each violation trap with its Cleared counterpart on probe or contact
+          number to produce a duration, and that derives event.severity from
+          the resolved trap identity, since the PDU carries none. Type the
+          custom namespace explicitly in the index template -
+          apc.iem.probe.temperature and .humidity as float,
+          apc.iem.probe.number and .contact.number as long, and
+          apc.iem.probe.name, .status, .temperature_units, .contact.name and
+          .contact.status as keyword - so aisle-level temperature dashboards
+          and door-contact queries both work without dynamic mapping. Treat
+          iemConfigProbeHighTempThreshold as enrichment rather than event
+          data: it is a polled config value, so join it from a lookup instead
+          of expecting it in the trap.
+  - format: snmp-poll
+    enable: >
+      The IEM objects are always readable, so nothing on the device is
+      configured. Point an SNMP poller at the card's read community on UDP/161
+      (or an SNMPv3 user) and walk the PowerNet iemStatusProbeTable
+      (1.3.6.1.4.1.318.1.1.10.2.3.2) and iemStatusContactTable, or the
+      Liebert-GP lgpEnv sensor subtree (1.3.6.1.4.1.476.1.42) on IS-UNITY.
+      Because these are measurement objects, polling additionally yields the
+      continuous temperature/humidity trend the trap feed never sends - the
+      trap only fires on a threshold crossing - but a threshold event still
+      has to be synthesized by the poller diffing the reading against
+      iemConfigProbeHighTempThreshold. Prefer SNMPv3 and a read-only scope,
+      since a poller reaching the probes is a broad enclave read surface.
+    references:
+    - https://networkupstools.org/protocols/snmp/APC-Powernet.pdf
+    - https://github.com/simonjj/SnmpMibs/blob/master/PowerNet-MIB.mib
+    - >-
+      https://www.vertiv.com/4a2068/globalassets/shared/Liebert-IntelliSlot-Unity-Card-UM-EN-NA-SL-52645.pdf
+    - https://docs.nxlog.co/integrate/apc.html
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom SNMP poll normalization pipeline
+      notes: >
+        Shares the ups-trap poll pipeline and the compiled-MIB lookup,
+        branching on the IEM table walked. The poller emits both a measurement
+        sample stream and, by diffing against the polled
+        iemConfigProbeHighTempThreshold, synthesized threshold-violation and
+        probe-disconnected events; the pipeline converts
+        iemStatusProbeCurrentTemp to Celsius using iemStatusProbeTempUnits
+        from the same row and decodes the probe/contact status enums, exactly
+        as the trap pipeline does.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Poll on the facility worker group and decide low-side what crosses:
+          synthesized threshold and contact-state-change events always, and a
+          decimated temperature/humidity sample only if aisle-trend dashboards
+          need it, since a full per-probe sample every interval is volume the
+          trap feed never produces. Convert to Celsius once here using
+          iemStatusProbeTempUnits, decode the probe and contact status enums,
+          and enrich iemStatusProbeName/iemStatusContactName against the
+          facility inventory where the rack/room lookup lives. Gate the guard
+          destination with C.Schema(...).validate and a dead-letter route
+          under Persistent Queue backpressure.
+        elastic: >
+          Own the shared logs-facility_snmp.env_trap pipeline and mark
+          poll-sourced records with a distinct event.provider so a synthesized
+          high-temp event never double-counts against a real IEM trap when
+          both run. Type apc.iem.probe.temperature and .humidity as float,
+          apc.iem.probe.number and .contact.number as long, and .name,
+          .status, .temperature_units, .contact.name and .contact.status as
+          keyword, and derive event.severity from the resolved threshold
+          breach since neither the sample nor the synthesized event carries
+          one.
+        relay: >
+          The poll must originate low-side - the guard cannot reach in to
+          issue a GET - so synthesis is mandatory low-side and full ECS-shaped
+          NDJSON crosses (envelope mode B), never raw sample rows. The
+          content-filter friction is the operator-authored probe and contact
+          labels: free text on physical equipment with room numbers and
+          occasional non-ASCII, so cap and transliterate them low-side and
+          hold the JSON to two shallow levels. Crossing is at-most-once;
+          contact-state changes are individually significant and very low
+          volume, so reconcile per (dataset, hour) and alert on any gap rather
+          than on a rate.
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side card with no guard, run the same poller against the
+          core worker group. Pick one authoritative transport per probe so a
+          synthesized threshold event is not double-counted against a
+          co-running IEM trap, keying de-duplication on (observer.ip, probe
+          number, resolved condition, minute) during any parallel run.
+        elastic: >
+          Own the shared logs-facility_snmp.env_trap ingest pipeline and type
+          apc.iem.probe.temperature and .humidity as float,
+          apc.iem.probe.number and .contact.number as long, and .name,
+          .status, .temperature_units, .contact.name and .contact.status as
+          keyword. With no boundary retain the continuous temperature/humidity
+          sample for aisle-level trend and capacity dashboards rather than
+          only threshold events, in its own event.provider so it never
+          inflates the threshold-violation count.
+    fields:
+    - vendor: iemStatusProbeNumber
+      type: integer
+      description: index of the environmental probe row in iemStatusProbeTable.
+      ecs: null
+      status: unmapped
+      custom: apc.iem.probe.number
+      notes: >-
+        unique only within one management card, so qualify it by observer
+        identity before using it for correlation
+    - vendor: iemStatusProbeName
+      type: string
+      description: operator-assigned probe name denoting its location or purpose.
+      ecs: null
+      status: unmapped
+      custom: apc.iem.probe.name
+      notes: >-
+        free text such as "Row 4 cold aisle" - the only tie to a physical
+        place, so preserve it verbatim and use it as the join key to a
+        rack/room inventory
+    - vendor: iemStatusProbeStatus
+      type: enum
+      description: probe connection state polled from the row - disconnected(1) or connected(2).
+      ecs: null
+      status: partial
+      custom: apc.iem.probe.status
+      transform: >-
+        decode the enum; a transition to disconnected(1) between samples is
+        the poll-mode equivalent of the iemProbeDisconnected trap and silences
+        every reading from that probe
+    - vendor: iemStatusProbeCurrentTemp
+      type: integer
+      description: >-
+        current temperature reading from the probe, in the scale given by
+        iemStatusProbeTempUnits.
+      ecs: null
+      status: partial
+      custom: apc.iem.probe.temperature
+      transform: >-
+        unitless on the wire - convert to Celsius using
+        iemStatusProbeTempUnits from the same row before storage, or a single
+        threshold rule behaves differently per site
+    - vendor: iemStatusProbeTempUnits
+      type: enum
+      description: temperature scale for this probe - celsius(1) or fahrenheit(2).
+      ecs: null
+      status: partial
+      custom: apc.iem.probe.temperature_units
+      transform: >-
+        decode the enum and retain it for provenance even after the
+        temperature is normalized to Celsius
+    - vendor: iemStatusProbeCurrentHumid
+      type: integer
+      description: current humidity reading from the probe, in percent relative humidity.
+      ecs: null
+      status: unmapped
+      custom: apc.iem.probe.humidity
+    - vendor: iemConfigProbeHighTempThreshold
+      type: integer
+      description: >-
+        configured high-temperature threshold, polled from the config table
+        rather than delivered in a trap.
+      ecs: null
+      status: unmapped
+      custom: apc.iem.probe.high_temp_threshold
+      notes: >-
+        on the poll transport this is directly readable, so a synthesized
+        violation event can carry how far past the limit the reading was -
+        context the trap feed has to join from a lookup
+    - vendor: iemStatusContactNumber
+      type: integer
+      description: index of the dry-contact input row in iemStatusContactTable.
+      ecs: null
+      status: unmapped
+      custom: apc.iem.contact.number
+    - vendor: iemStatusContactName
+      type: string
+      description: 'operator-assigned contact name denoting the wired sensor''s location or purpose.'
+      ecs: null
+      status: unmapped
+      custom: apc.iem.contact.name
+      notes: >-
+        the dry contact is wired to a door switch, water sensor or smoke relay
+        and this label is the only record of which - where the
+        physical-security value of the feed lives
+    - vendor: iemStatusContactStatus
+      type: enum
+      description: contact state polled from the row - noFault(1), fault(2), or disabled(3).
+      ecs: null
+      status: partial
+      custom: apc.iem.contact.status
+      transform: >-
+        decode the enum; disabled(3) is a monitoring gap, not a healthy state,
+        and must not be collapsed into noFault(1)
+    - vendor: poll collection time
+      type: timestamp
+      description: wall-clock instant the poller issued the GET, supplied by the collector.
+      ecs: '@timestamp'
+      status: partial
+      notes: >-
+        a GET carries no event clock, so @timestamp is collection time and a
+        threshold crossing is detected only at the sample boundary
+  - format: csv-file
+    enable: >
+      Set the data-log sample interval in Logs > Data > Configuration (the
+      card writes one row per interval), then fetch data.txt with FTP or SCP,
+      or export it from the web Data log view. The file is tab-delimited with
+      the same version/Name/Contact/Location/IP header block as the event log;
+      each sample row carries a four-digit-year Date and a Time followed by
+      the measurement columns the device supports - commonly minimum and
+      maximum input voltage, output voltage, output load percentage, input
+      frequency, battery voltage and UPS temperature, plus environmental probe
+      temperature and humidity columns when a probe is present. The exact
+      column set varies by device model and firmware. Retrieval is a pull into
+      the card, so enclave reachability and a read-capable account are
+      required.
+    references:
+    - https://www.apc.com/us/en/faqs/FA156131/
+    - >-
+      https://community.splunk.com/t5/Archive/APC-UPS-log-field-identification/m-p/61417
+    - https://mans.io/files/viewer/1288823/146
+    - https://iportal.se.com/Contents/docs/UPS-PMAR-9LLM9N_R1_EN.PDF
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom NMC data-log file pipeline
+      notes: >
+        No Elastic integration or Cribl pack parses the NMC data log. An
+        external scheduled FTP/SCP fetch drops data.txt and a Cribl pipeline
+        splits the tab-delimited rows against a per-model column map (the
+        header order is not self-describing beyond mnemonic labels), restores
+        the four-digit year onto @timestamp, and treats every row as a
+        measurement sample rather than an event - threshold logic, if wanted,
+        is synthesized downstream exactly as on the poll transport. Because
+        the column set differs by device, the pipeline must key on the model
+        from the header block, not assume a fixed positional layout.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Run the fetch and row split on the facility worker group, checkpoint
+          on the row timestamp so a cumulative re-pull does not re-cross old
+          samples, and decimate low-side - a per-interval sample of every
+          measurement column is high-volume telemetry the guard should not see
+          at full rate. Normalize the probe temperature to Celsius and map the
+          mnemonic columns to the ups.*/apc.iem.* namespaces here so no
+          downstream consumer holds the per-model column map, and gate the
+          destination with C.Schema(...).validate and a dead-letter route.
+        elastic: >
+          Own the shared logs-facility_snmp.env_trap pipeline and type the
+          measurement columns numerically - apc.iem.probe.temperature and
+          .humidity as float, ups.output.percent_load and ups.battery.voltage
+          as long - so trend and capacity dashboards aggregate instead of
+          inheriting dynamic string mappings, and mark the file source with
+          its own event.provider so a measurement backfill is distinguishable
+          from live threshold traps.
+        relay: >
+          The fetch must originate low-side; full ECS-shaped NDJSON crosses
+          (envelope mode B), never the raw file, and the sample rate is
+          decimated before the boundary. The measurement rows carry no free
+          text beyond the header labels, so content-filter friction is low -
+          the real concern is volume, so cross summarized or decimated samples
+          and hold the JSON to two shallow levels. Crossing is at-most-once; a
+          dropped measurement self-heals on the next sample, so reconcile per
+          (dataset, hour) but treat this as the most gap-tolerant feed on the
+          technology.
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side card with no guard, run the same scheduled fetch
+          against the core worker group and pick one authoritative measurement
+          transport per device so the data log is not double-counted against a
+          co-running SNMP poll of the same probes.
+        elastic: >
+          Own the shared logs-facility_snmp.env_trap ingest pipeline and type
+          the measurement columns numerically - apc.iem.probe.temperature and
+          .humidity as float, ups.output.percent_load and ups.battery.voltage
+          as long - and mark the file source with its own event.provider. With
+          no boundary retain the full-rate sample for aisle-level trend and
+          capacity planning rather than decimating it.
+    fields:
+    - vendor: Date
+      type: string
+      description: calendar date of the sample with a four-digit year, first tab-delimited column.
+      ecs: '@timestamp'
+      status: partial
+      transform: combine with the Time column into @timestamp; the log uses a four-digit year
+    - vendor: Time
+      type: string
+      description: time-of-day of the sample, second tab-delimited column.
+      ecs: '@timestamp'
+      status: partial
+      notes: >-
+        composed with Date into @timestamp; carries no timezone and is
+        interpreted in the card's configured local zone
+    - vendor: probe temperature column
+      type: number
+      description: >-
+        environmental probe temperature sampled at the log interval, present
+        when a probe is attached.
+      ecs: null
+      status: partial
+      custom: apc.iem.probe.temperature
+      transform: >-
+        convert to Celsius using the card's configured probe unit before
+        storage, as the column is emitted in the card's display scale
+    - vendor: probe humidity column
+      type: number
+      description: >-
+        environmental probe relative-humidity percentage sampled at the log
+        interval, present when a probe is attached.
+      ecs: null
+      status: unmapped
+      custom: apc.iem.probe.humidity
+    - vendor: TupsC
+      type: number
+      description: internal UPS temperature sample column, in degrees Centigrade.
+      ecs: null
+      status: unmapped
+      custom: ups.battery.temperature_c
+    - vendor: Vout
+      type: number
+      description: output voltage sample column, in RMS volts.
+      ecs: null
+      status: unmapped
+      custom: ups.output.voltage
+    - vendor: '%Wout'
+      type: number
+      description: output load as a percentage of rated capacity, sample column.
+      ecs: null
+      status: unmapped
+      custom: ups.output.percent_load
+    - vendor: Vbat
+      type: number
+      description: battery bus voltage sample column, in volts.
+      ecs: null
+      status: unmapped
+      custom: ups.battery.voltage
+    - vendor: Freq
+      type: number
+      description: input line frequency sample column, in hertz.
+      ecs: null
+      status: unmapped
+      custom: ups.input.frequency_hz
+    - vendor: card IP
+      type: ip
+      description: IP address of the management card from the file header block.
+      ecs: observer.ip
+      status: mapped
+      notes: header metadata that applies to every sample row, not a per-row value
+- id: nmc-syslog
+  name: Management card syslog
+  description: >
+    Secondary text feed from the same UPS/PDU network management card. APC
+    NMC2/NMC3 cards can mirror their internal event log to up to four syslog
+    servers with a configurable facility and an administrator-set mapping from
+    the card's three severities (Severe, Warning, Informational) onto syslog
+    severity levels. Messages are RFC 3164 with a subsystem tag before the
+    colon ("APC:", "UPS:", "Environment:", "System:", "Automatic Transfer
+    Switch:") and the event text after it. This dataset earns its place for
+    the events that have no useful trap representation -
+    accessViolationConsole, accessViolationHTTP and passwordChange are
+    card-administration security events whose PowerNet traps carry only
+    mtrapargsString - and because it is the fallback when a site cannot open
+    UDP/162 through the guard.
+  event_categories:
+  - authentication
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge Cribl worker group, facility/OT enclave
+      notes: >
+        Cribl Syslog source on UDP/514 alongside the SNMP Trap source;
+        deployment must still confirm whether the site runs syslog instead of
+        or in addition to traps - running both duplicates every event and
+        needs de-duplication, and that de-duplication has to happen before the
+        crossing.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-facility_snmp.nmc_syslog
+    direct:
+    - hop: cribl
+      location: edge Cribl worker group
+      notes: >
+        Cribl Syslog source on UDP/514 alongside the SNMP Trap source;
+        deployment must still confirm whether the site runs syslog instead of
+        or in addition to traps - running both duplicates every event and
+        needs de-duplication before indexing.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-facility_snmp.nmc_syslog
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom NMC syslog pipeline
+      notes: >
+        Thin starter. No vendor pack or Elastic integration parses APC NMC
+        event text; the pipeline splits the RFC 3164 header and the subsystem
+        tag, and everything past the colon stays free text until per-event
+        patterns are written.
+    fields:
+    - vendor: PRI
+      type: integer
+      description: RFC 3164 priority value, facility multiplied by eight plus severity, e.g. <176>
+      ecs: log.syslog.priority
+      status: mapped
+      transform: >-
+        divide by eight for the facility code and take the remainder for the
+        severity code
+    - vendor: FACILITY
+      type: integer
+      description: >-
+        syslog facility selected in the card's syslog configuration, commonly
+        a local0-local7 value
+      ecs: log.syslog.facility.code
+      status: mapped
+    - vendor: SEVERITY
+      type: integer
+      description: >-
+        syslog severity carried in PRI, derived from the card's
+        Severe/Warning/Informational level through the administrator-set
+        mapping
+      ecs: log.syslog.severity.code
+      status: mapped
+    - vendor: TIMESTAMP
+      type: timestamp
+      description: RFC 3164 timestamp written by the card, e.g. "Dec 5 14:28:12"
+      ecs: '@timestamp'
+      status: partial
+      notes: >
+        no year and no timezone offset, so it must be reconciled against
+        receiver arrival time; facility cards are also common NTP stragglers,
+        making clock drift a real correctness problem on this route
+    - vendor: HOSTNAME
+      type: string
+      description: >-
+        RFC 3164 hostname field, which NMC cards populate with their IP
+        address by default
+      ecs: observer.hostname
+      status: partial
+      notes: >
+        usually an IP rather than a name, so it needs an inventory lookup to
+        become a usable device identity; some AOS versions omit it entirely,
+        which shifts the field offsets for any positional parser
+    - vendor: TAG
+      type: string
+      description: >-
+        subsystem tag preceding the colon - "APC", "UPS", "Environment",
+        "System", "Automatic Transfer Switch"
+      ecs: log.syslog.appname
+      status: mapped
+      notes: >
+        the only structured routing hint in the message and the natural branch
+        key for per-subsystem parsing; the tag string contains spaces on some
+        device classes, so it cannot be split on whitespace
+    - vendor: MSG
+      type: string
+      description: >-
+        event text following the subsystem tag, matching the card's internal
+        event-log wording
+      ecs: message
+      status: mapped
+      notes: >
+        unparsed free text whose wording changes across AOS releases, so
+        detections written against exact phrasing are fragile
+    - vendor: APC event severity
+      type: enum
+      description: 'the card''s own event severity - Severe, Warning, or Informational'
+      ecs: event.severity
+      status: partial
+      transform: >
+        not transmitted as its own field - it survives only as whatever syslog
+        severity the administrator mapped it to, so recovering it needs a
+        per-card mapping lookup before it can be converted to the numeric ECS
+        scale
+    - vendor: account name (event text)
+      type: string
+      description: >-
+        account named in card-administration events such as password change
+        and console/HTTP access violation
+      ecs: user.name
+      status: partial
+      notes: >
+        embedded in the free-text message with no delimiter; extracting it
+        requires a per-event-type pattern, and the access-violation text does
+        not always name the account at all
+    - vendor: outcome (event text)
+      type: string
+      description: >-
+        success or failure sense embedded in the event text for login, logout,
+        and configuration-change events
+      ecs: event.outcome
+      status: partial
+      notes: >
+        no dedicated result token - outcome has to be inferred from wording
+        that varies by subsystem and firmware version, so leave it unset
+        rather than guessing for messages that do not clearly state it
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Split PRI into facility and severity codes and lift the subsystem
+          tag out of the message at the edge, then normalize the card's own
+          Severe/Warning/Informational severity - which arrives only as
+          whatever syslog level the administrator mapped it to - into a stable
+          event.severity through a per-site mapping lookup, because that
+          mapping is configurable and differs between cards. Resolve the RFC
+          3164 HOSTNAME, which NMC cards populate with an IP by default,
+          against the facility inventory here where the lookup lives, and
+          de-duplicate against the trap feed if the site emits both.
+          Schema-validate with a dead-letter route on the egress destination
+          under Persistent Queue backpressure, and keep _raw on this route -
+          the unparsed event text is currently carrying more meaning than the
+          extracted fields.
+        elastic: >
+          Own a custom logs-facility_snmp.nmc_syslog ingest pipeline that
+          grows per-subsystem grok patterns for the message body, starting
+          with the card-administration events that justify this dataset: pull
+          the account name and success/failure sense out of the
+          accessViolationConsole, accessViolationHTTP and passwordChange text
+          so user.name and event.outcome stop being partial. Map
+          log.syslog.appname and the derived event.code as keyword in the
+          index template, and until the patterns exist, keep message
+          searchable rather than pretending the free text is structured - this
+          dataset should not leave draft on the strength of its header fields
+          alone.
+        relay: >
+          Text crosses far more easily than the binary PDUs on the other two
+          datasets, so on the guarded crossing a thin envelope (_dataId,
+          @timestamp, host, _raw) is viable here while low-side extraction is
+          not yet worth the effort. The single content-filter exposure is the
+          unbounded event text after the subsystem tag, which is operator- and
+          firmware-authored: cap its length and strip control and non-UTF-8
+          characters low-side. Nothing CEF-shaped is involved. Volume is low
+          and crossing is at-most-once, so reconcile counts per (dataset,
+          hour) rather than sampling.
+      direct:
+        parse_location: low
+        cribl: >
+          Split PRI into facility and severity codes and lift the subsystem
+          tag out of the message at the edge, then normalize the card's own
+          Severe/Warning/Informational severity - which arrives only as
+          whatever syslog level the administrator mapped it to - into a stable
+          event.severity through a per-site mapping lookup, because that
+          mapping is configurable and differs between cards. Resolve the RFC
+          3164 HOSTNAME, which NMC cards populate with an IP by default,
+          against the facility inventory here where the lookup lives, and
+          de-duplicate against the trap feed if the site emits both.
+          Schema-validate with a dead-letter route on the egress destination
+          under Persistent Queue backpressure, and keep _raw on this route -
+          the unparsed event text is currently carrying more meaning than the
+          extracted fields.
+        elastic: >
+          Own a custom logs-facility_snmp.nmc_syslog ingest pipeline that
+          grows per-subsystem grok patterns for the message body, starting
+          with the card-administration events that justify this dataset: pull
+          the account name and success/failure sense out of the
+          accessViolationConsole, accessViolationHTTP and passwordChange text
+          so user.name and event.outcome stop being partial. Map
+          log.syslog.appname and the derived event.code as keyword in the
+          index template, and until the patterns exist, keep message
+          searchable rather than pretending the free text is structured - this
+          dataset should not leave draft on the strength of its header fields
+          alone.
+  - format: csv-file
+    enable: >
+      No emission to configure; the card always writes the event log. Fetch
+      event.txt over FTP or SCP (get event.txt), or export it from Logs >
+      Event > Log. After the version/Name/Contact/Location/IP header block,
+      each row carries a four-digit-year Date, a Time, the event description
+      text and a unique Event Code. The card-administration and security
+      events this dataset exists for - console and HTTP access violations,
+      password changes, log-in/log-out - appear here with the same wording as
+      the syslog body, so this is the fallback when a site cannot open UDP/514
+      through the guard. Retrieval is a pull into the card, so enclave
+      reachability and a read-capable device account are required.
+    references:
+    - https://www.apc.com/us/en/faqs/FA156131/
+    - https://mans.io/files/viewer/1288823/146
+    - https://iportal.se.com/Contents/docs/UPS-PMAR-9LLM9N_R1_EN.PDF
+    - https://docs.nxlog.co/integrate/apc.html
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom NMC event-log file pipeline
+      notes: >
+        Shares the event-log file pipeline used on the ups-trap side: an
+        external FTP/SCP fetch drops event.txt, the pipeline splits the
+        tab-delimited rows, restores the four-digit year onto @timestamp, and
+        keys de-duplication on the Event Code. The security-event bodies
+        (accessViolationConsole, accessViolationHTTP, passwordChange) are the
+        same free text the syslog form leaves unparsed, so the per-subsystem
+        grok this dataset needs is written once and applied to both feeds; the
+        file has no PRI, so the RFC 3164 facility/severity fields the syslog
+        form maps are simply absent here and event.severity comes from the
+        Event Code instead.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Run the fetch and row split on the facility worker group and
+          checkpoint on the Event Code so a cumulative re-pull does not
+          re-cross rows already sent. Prefer the body Date/Time over the
+          file's retrieval timestamp, resolve the card IP against the facility
+          inventory low-side, and de-duplicate against the pushed syslog feed
+          on Event Code if the site emits both - running the file pull and the
+          syslog push together duplicates every event, and that reconciliation
+          must happen before the crossing. Gate the destination with
+          C.Schema(...).validate and a dead-letter route, and cap the event
+          description text before egress.
+        elastic: >
+          Own the custom logs-facility_snmp.nmc_syslog ingest pipeline and
+          treat the Event Code as event.code - the stable identifier the
+          syslog body lacks, and the right join key between the pushed and
+          pulled forms. Grow the per-event grok for the card-administration
+          bodies first so user.name and event.outcome stop being partial, and
+          until the patterns exist keep message searchable rather than
+          pretending the free text is structured. Mark the file source with
+          its own event.provider so a historical backfill is distinguishable
+          from the live syslog stream.
+        relay: >
+          The fetch must originate low-side: the guard cannot FTP/SCP into the
+          enclave, so the file is pulled and shaped low and full ECS-shaped
+          NDJSON crosses (envelope mode B). The single content-filter exposure
+          is the unbounded, firmware-authored event description after the
+          structured columns - cap its length and strip control and non-UTF-8
+          characters low-side, and hold the JSON to two shallow levels.
+          Crossing is at-most-once; the log is cumulative on the card, so a
+          dropped row is recoverable on the next fetch by Event Code -
+          reconcile per (dataset, hour).
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side card with no guard, run the same scheduled fetch
+          against the core worker group and pick one authoritative transport
+          per card, de-duplicating on Event Code if the file pull runs
+          alongside the syslog push during cutover.
+        elastic: >
+          Own the custom logs-facility_snmp.nmc_syslog ingest pipeline and
+          treat the Event Code as event.code, the stable join key the syslog
+          body lacks. With no boundary retain the full event description for
+          forensics rather than capping it, and use the cumulative file as an
+          authoritative backfill for any events the lossy syslog push dropped,
+          keyed on Event Code.
+    fields:
+    - vendor: Date
+      type: string
+      description: calendar date of the event with a four-digit year, first tab-delimited column.
+      ecs: '@timestamp'
+      status: partial
+      transform: >-
+        combine with the Time column into @timestamp; the four-digit year
+        removes the century reconciliation the RFC 3164 syslog header forces
+    - vendor: Time
+      type: string
+      description: time-of-day of the event, second tab-delimited column.
+      ecs: '@timestamp'
+      status: partial
+      notes: >-
+        composed with Date into @timestamp; carries no timezone, interpreted
+        in the card's configured local zone
+    - vendor: Event
+      type: string
+      description: >-
+        human-readable event description text, matching the card's internal
+        event-log wording including the card-administration and security
+        events.
+      ecs: message
+      status: mapped
+      notes: >-
+        identical wording to the syslog message body, so the per-event grok
+        written for one feed applies to the other
+    - vendor: Event Code
+      type: string
+      description: >-
+        unique code identifying the event type, present in the FTP/SCP file
+        but absent from the syslog frame.
+      ecs: event.code
+      status: mapped
+      notes: >-
+        the field this transport adds over the syslog push; a stable
+        identifier that outlives firmware wording changes and drives a
+        reliable derived event.severity
+    - vendor: account name (event text)
+      type: string
+      description: >-
+        account named in card-administration events such as password change
+        and console/HTTP access violation, embedded in the description text.
+      ecs: user.name
+      status: partial
+      notes: >-
+        embedded in the free-text description with no delimiter; extraction
+        needs a per-event pattern, and the access-violation text does not
+        always name the account
+    - vendor: outcome (event text)
+      type: string
+      description: >-
+        success or failure sense embedded in the event description for login,
+        logout and configuration-change events.
+      ecs: event.outcome
+      status: partial
+      notes: >-
+        no dedicated result token - outcome is inferred from wording that
+        varies by subsystem and firmware, so leave it unset rather than
+        guessing when the text is not clear
+    - vendor: card Name
+      type: string
+      description: administrator-assigned card name from the file header block.
+      ecs: observer.name
+      status: mapped
+    - vendor: card IP
+      type: ip
+      description: IP address of the management card from the file header block.
+      ecs: observer.ip
+      status: mapped
+      notes: header metadata that applies to every row, not a per-event value
+  - format: snmp-trap
+    enable: >
+      Add the trap receiver to the card's SNMP trap recipient list (SNMP >
+      Trap Receivers) and enable the relevant trap categories; the
+      card-administration and security events are then delivered as SNMPv1 or
+      v2c/v3 PowerNet-MIB traps to UDP/162 alongside the UPS and environmental
+      traps. For these events the trap's readable content is confined to the
+      mtrapargsString argument (1.3.6.1.4.1.318.2.3.3), the generic octet
+      string APC binds to nearly every PowerNet trap; there is no dedicated
+      account, source-address or outcome varbind, so the trap carries
+      materially less than the event-log text. Delivery is a push, so it needs
+      no reachability back into the card, only an open UDP/162 path to the
+      receiver.
+    references:
+    - https://networkupstools.org/protocols/snmp/APC-Powernet.pdf
+    - https://github.com/simonjj/SnmpMibs/blob/master/PowerNet-MIB.mib
+    - https://docs.cribl.io/stream/sources-snmp-traps/
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom SNMP trap pipeline
+      notes: >
+        Received on the same Cribl SNMP Trap source and OID-resolution lookup
+        as the ups-trap and env-trap datasets, branching on the resolved trap
+        OID. The pipeline resolves snmpTrapOID to the event identity and lifts
+        mtrapargsString as the message, but because the account name, source
+        address and outcome live only inside that free-text argument, the same
+        per-event extraction the syslog and event-log feeds need must run
+        against mtrapargsString here too - and the result is strictly poorer,
+        since the trap text is terser than the event-log wording.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Decode the binary PDU on the facility worker group - it can never
+          reach the guard - resolve snmpTrapOID against the compiled-MIB
+          lookup, and lift mtrapargsString as the message. Drop the v1/v2c
+          community string before egress, and where the account or source can
+          be pulled from mtrapargsString do it low-side so the crossing
+          carries structured fields rather than an opaque argument string.
+          Gate the destination with C.Schema(...).validate and a dead-letter
+          route.
+        elastic: >
+          Own the shared logs-facility_snmp.nmc_syslog pipeline and set
+          event.severity from the resolved trap identity, since the PDU
+          carries no severity field. Prefer the event-log or syslog form as
+          the authoritative record for these security events and treat the
+          trap as corroboration - map event.code from the resolved trap OID so
+          a trap and its event-log counterpart join, and accept that user.name
+          and event.outcome stay partial on the trap because the wire never
+          carried them as fields.
+        relay: >
+          Full ECS-shaped NDJSON crosses (envelope mode B); the raw binary PDU
+          cannot be content-inspected and must not reach the boundary, which
+          forces low-side resolution by the transport. The content-filter
+          exposure is mtrapargsString - operator- and firmware-authored free
+          text - so length-cap it and strip control and non-UTF-8 bytes
+          low-side and hold the JSON to two shallow levels. Crossing is
+          at-most-once with no return channel; trap volume for these
+          administration events is near zero, so a reconciliation gap per
+          (dataset, hour) is meaningful rather than statistical noise.
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side card with no guard, receive the traps on the core
+          worker group's SNMP Trap source. The decision that matters is not
+          treating the trap as authoritative when the richer event-log or
+          syslog form is also present - pick the text feed as the record of
+          record for these security events and use the trap only to fill gaps.
+        elastic: >
+          Own the shared logs-facility_snmp.nmc_syslog ingest pipeline and map
+          event.code from the resolved trap OID. With no boundary keep the
+          full mtrapargsString for forensics, and join the trap to its
+          event-log counterpart on event.code so the terser trap text never
+          overwrites the fuller event-log description.
+    fields:
+    - vendor: snmpTrapOID
+      type: string
+      description: >-
+        OID naming which PowerNet notification fired, carried as the second
+        varbind on v2c/v3 traps.
+      ecs: event.code
+      status: partial
+      transform: >-
+        resolve the numeric OID against the compiled MIB set to the
+        notification name; on SNMPv1 there is no snmpTrapOID varbind and the
+        equivalent is composed from the enterprise OID plus
+        generic/specific-trap numbers
+      notes: >-
+        for the card-administration events this is the only structured
+        identity on the trap - everything else is inside mtrapargsString
+    - vendor: mtrapargsString
+      type: string
+      description: >-
+        APC PowerNet generic octet-string trap argument
+        (1.3.6.1.4.1.318.2.3.3) carrying the human-readable event text.
+      ecs: message
+      status: mapped
+      notes: >-
+        the only natively readable part of the PDU and, for these events, the
+        only place the account and outcome appear - so it must be
+        pattern-extracted exactly as the syslog/event-log body is
+    - vendor: agent-addr
+      type: ip
+      description: address of the management card that emitted the trap (SNMPv1 PDU field).
+      ecs: observer.ip
+      status: partial
+      notes: >-
+        present only in the SNMPv1 PDU; on v2c/v3 there is no agent-addr and
+        the receiver falls back to the UDP source address, which differs
+        behind NAT or a forwarder
+    - vendor: sysUpTime
+      type: long
+      description: >-
+        TimeTicks since the management card last restarted, carried as the
+        first varbind on v2c/v3 traps.
+      ecs: null
+      status: unmapped
+      custom: snmp.trap.sys_uptime
+      notes: >-
+        the only in-band clock on the trap; an absolute event time exists only
+        after combining it with receiver arrival time
+    - vendor: community
+      type: string
+      description: SNMPv1/v2c community string presented with the trap.
+      ecs: null
+      status: unmapped
+      custom: snmp.trap.community
+      notes: >-
+        cleartext shared secret that is the only authentication on v1/v2c
+        traps; drop or mask it low-side, but keep a boolean of which version
+        was used since v1/v2c on facility gear is itself a control finding
+    - vendor: account name (mtrapargsString)
+      type: string
+      description: >-
+        account named in the card-administration event, embedded in the
+        mtrapargsString text rather than a dedicated varbind.
+      ecs: user.name
+      status: partial
+      notes: >-
+        the trap defines no user object, so user.name depends entirely on
+        parsing the free-text argument, and the terser trap wording names the
+        account less reliably than the event-log text
+    - vendor: outcome (mtrapargsString)
+      type: string
+      description: >-
+        success or failure sense of the administration event, embedded in the
+        mtrapargsString text.
+      ecs: event.outcome
+      status: partial
+      notes: >-
+        no outcome varbind exists; outcome is inferred from the argument
+        wording and is often absent, so leave it unset rather than guessing

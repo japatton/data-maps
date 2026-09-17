@@ -1,0 +1,1593 @@
+id: netapp-ontap
+name: NetApp ONTAP Audit
+vendor: NetApp
+versions: ONTAP 9.11.1, 9.13.1, 9.15.1, 9.16.1
+draft: true
+references:
+- >-
+  https://docs.netapp.com/us-en/ontap/system-admin/ontap-implements-audit-logging-concept.html
+- >-
+  https://docs.netapp.com/us-en/ontap/system-admin/audit-display-log-contents-task.html
+- >-
+  https://docs.netapp.com/us-en/ontap/system-admin/forward-command-history-log-file-destination-task.html
+- https://docs.netapp.com/us-en/ontap-cli/security-audit-log-show.html
+- https://docs.netapp.com/p/ontap/9x/Auditing-Schema-Reference.pdf
+- https://docs.netapp.com/us-en/ontap/nas-audit/smb-events-audit-concept.html
+- >-
+  https://docs.netapp.com/us-en/ontap/error-messages/configure-ems-events-notifications-syslog-task.html
+- https://kb.netapp.com/on-prem/ontap/Ontap_OS/OS-KBs/Overview_of_ONTAP_Logs
+datasets:
+- id: management-audit
+  name: Management audit log (audit.log)
+  description: >
+    Administrative command auditing from /mroot/etc/log/mlog/audit.log — every
+    clustershell, nodeshell, non-interactive systemshell, ONTAPI/ZAPI and REST
+    request, with the invoking user, the access method
+    (ssh/http/ontapi/console/service-processor), the remote location and the
+    success/failure state. Set requests are logged by default; get requests
+    are only logged when `security audit modify -cliget`/`-ontapiget` is
+    turned on. Forwarded off-box with `cluster log-forwarding create`, which
+    emits either the legacy-netapp RFC-3164 variant (<PRIVAL>TIMESTAMP
+    HOSTNAME: MSG) or RFC-5424, over UDP, TCP or TCP-with-TLS. The forwarded
+    MSG is the raw ` :: `-delimited kern_audit record, not a structured
+    payload.
+  event_categories:
+  - configuration
+  - authentication
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Receives the cluster log-forwarding stream (prefer tcp-encrypted on
+        6514 over the default unencrypted UDP/514, since the command text
+        carries administrative detail).
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-netapp_ontap.audit
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Receives the cluster log-forwarding stream (prefer tcp-encrypted on
+        6514 over the default unencrypted UDP/514, since the command text
+        carries administrative detail).
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-netapp_ontap.audit
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom NetApp ONTAP audit pipeline
+      notes: >
+        There is no Elastic integration for NetApp ONTAP in
+        github.com/elastic/integrations and no NetApp pack in the Cribl Packs
+        Dispensary, so the ` :: `-delimited record has to be parsed by a
+        hand-built pipeline. Both forwarding message formats have to be
+        handled, because the format is a per-destination setting and mixed
+        estates are common.
+    fields:
+    - vendor: timestamp
+      type: timestamp
+      description: 'log entry timestamp of the audit record, rendered in the node''s local timezone'
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: node
+      type: string
+      description: name of the cluster node that recorded the audit entry
+      ecs: observer.hostname
+      status: mapped
+      notes: >-
+        also copy to observer.name so the audit, EMS and NAS file-audit
+        datasets join on the same ONTAP identity
+    - vendor: vserver
+      type: string
+      description: name of the storage VM (SVM) through which the user connected
+      ecs: null
+      status: unmapped
+      custom: netapp.ontap.svm
+      notes: >-
+        ONTAP tenancy unit; no ECS field models a storage tenant, and
+        organization.name is the wrong altitude for it
+    - vendor: scope
+      type: enum
+      description: shows svm when the request targets a data storage VM, otherwise cluster
+      ecs: null
+      status: unmapped
+      custom: netapp.ontap.audit.scope
+      notes: >-
+        distinguishes cluster-wide administration from SVM-delegated
+        administration — the main blast-radius signal on this dataset
+    - vendor: application
+      type: enum
+      description: >-
+        the access method used to connect to the cluster: internal, console,
+        ssh, http, ontapi, snmp, rsh, telnet, service-processor
+      ecs: null
+      status: partial
+      custom: netapp.ontap.audit.application
+      notes: >
+        ssh/http/snmp/telnet/rsh would map cleanly to network.protocol, but
+        console, internal and service-processor are not network protocols at
+        all, so the enum is kept whole in the custom namespace and
+        network.protocol is populated only for the protocol-valued subset
+    - vendor: location
+      type: string
+      description: remote IP address or remote access point the request came from
+      ecs: source.address
+      status: mapped
+      transform: >
+        copy to source.ip only when the value parses as an IPv4/IPv6 address;
+        console, internal and service-processor sessions put a non-address
+        token here, which a strict ip field would reject
+    - vendor: username
+      type: string
+      description: username of the remote administrator issuing the request
+      ecs: user.name
+      status: mapped
+    - vendor: role
+      type: string
+      description: ONTAP RBAC role in effect for the user issuing the command
+      ecs: user.roles
+      status: mapped
+      transform: single scalar role name is wrapped into the ECS user.roles array
+    - vendor: input
+      type: string
+      description: >-
+        the CLI command or API operation being attempted, as typed or as named
+        by the API
+      ecs: null
+      status: partial
+      custom: netapp.ontap.audit.input
+      notes: >
+        full administrative command text; ECS has no field for an
+        administrative command that is not a process, and process.command_line
+        would falsely imply one, so the string stays custom and only its
+        leading verb is copied into event.action
+    - vendor: state
+      type: enum
+      description: 'current state of the audit request: Pending, Success, or Error'
+      ecs: event.outcome
+      status: mapped
+      transform: >
+        Success maps to success and Error maps to failure; Pending is the
+        request half of a request/response pair and should either be joined to
+        its terminal record by session-id + command-id or carried as unknown,
+        never counted as an executed command
+    - vendor: message
+      type: string
+      description: optional error or informational text about the status of the command
+      ecs: error.message
+      status: partial
+      notes: >-
+        only populated on Error records (rendered as "-" otherwise), so it is
+        a failure-reason field rather than a general message field
+    - vendor: session-id
+      type: string
+      description: identifier of the session on which the request was received
+      ecs: null
+      status: unmapped
+      custom: netapp.ontap.audit.session_id
+      notes: >
+        each ssh/console session gets one id and each HTTP/ONTAPI/SNMP request
+        gets a unique one; ECS 9.4 has no generic session identifier (only
+        process.session_leader.*), so this stays custom — it is the key that
+        reconstructs an administrator's whole session
+    - vendor: command-id
+      type: string
+      description: identifier assigned to each command received on a CLI session
+      ecs: null
+      status: unmapped
+      custom: netapp.ontap.audit.command_id
+      notes: >-
+        pairs the Pending request record with its Success/Error response
+        record; ZAPI, HTTP and SNMP requests have no command id
+    - vendor: entry
+      type: string
+      description: the complete raw audit log message entry as written to audit.log
+      ecs: event.original
+      status: mapped
+      notes: >
+        the ` :: `-delimited kern_audit line including the
+        [kern_audit:severity:sequence] tag; retain until the hand-built parser
+        is proven
+    - vendor: facility
+      type: enum
+      description: syslog facility configured on the cluster log-forwarding destination
+      ecs: log.syslog.facility.name
+      status: mapped
+      notes: >-
+        set per destination by `cluster log-forwarding create -facility`; it
+        is a transport setting, not a property of the audited command
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Parse the ` :: `-delimited kern_audit record low-side behind a
+          framing detector that handles both the legacy-netapp RFC-3164
+          variant and RFC-5424, and reduce the request/response pair into one
+          event: ONTAP emits a Pending record when the command is accepted and
+          a Success/Error record when it completes, so join on session-id +
+          command-id and emit the terminal state rather than shipping two
+          half-events and asking the SIEM to correlate them. Derive
+          event.outcome from state, split the leading verb of `input` into
+          event.action while keeping the full command string, and mask
+          credential-bearing command text (`security login password`,
+          `-password`, `-passphrase`, key material pasted into `security
+          certificate install`) before it leaves the enclave. Gate the
+          destination with C.Schema(...).validate plus a dead-letter route,
+          and run it on Persistent Queue backpressure, never Block.
+        elastic: >
+          No integration exists, so own a custom logs-netapp_ontap.audit
+          ingest pipeline that finishes only what the low side cannot: copy
+          observer.hostname to observer.name so audit, EMS and file-audit
+          datasets join on one appliance identity, and populate source.ip from
+          `location` only when it parses as an address, leaving
+          console/internal/ service-processor values in source.address rather
+          than dropping them into a strict ip field and failing the document.
+          Add explicit custom-namespace index-template mappings —
+          netapp.ontap.audit.session_id, .command_id, .scope, .application and
+          netapp.ontap.svm as keyword, netapp.ontap.audit.input as text with a
+          keyword subfield — so session-scoped hunting works without dynamic
+          mapping, and assert event.outcome is populated for every state value
+          including the unknown/Pending case.
+        relay: >
+          Low-side clusters cross with full ECS-shaped NDJSON (envelope mode
+          B) — one completed command per line, UTF-8, LF-terminated,
+          compression disabled, nesting depth ≤2 — because the pairing and
+          credential masking must both happen before the boundary on an
+          at-most-once path. The friction to settle with the guard owner is
+          the `input` command string and the `message` error text: both are
+          unbounded operator free-text that can carry pasted certificates and
+          non-ASCII, so cap and flag them low-side to a length the custom
+          content filter accepts. ONTAP emits syslog rather than CEF, so
+          nothing CEF-shaped crosses; with no return channel, detect silent
+          drops by reconciling low-side and high-side command counts per
+          (cluster, hour).
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side cluster with no guard, parse the ` :: `-delimited
+          kern_audit record in the core worker group behind a framing detector
+          that handles both the legacy-netapp RFC-3164 variant and RFC-5424,
+          and reduce the request/response pair into one event: ONTAP emits a
+          Pending record when the command is accepted and a Success/Error
+          record when it completes, so join on session-id + command-id and
+          emit the terminal state rather than shipping two half-events and
+          asking the SIEM to correlate them. Derive event.outcome from state,
+          split the leading verb of `input` into event.action while keeping
+          the full command string, and mask credential-bearing command text
+          (`security login password`, `-password`, `-passphrase`, key material
+          pasted into `security certificate install`) regardless, since the
+          command text still carries secrets even without a boundary. Gate the
+          destination with C.Schema(...).validate plus a dead-letter route,
+          and run it on Persistent Queue backpressure, never Block.
+        elastic: >
+          No integration exists, so own a custom logs-netapp_ontap.audit
+          ingest pipeline that completes the ECS shaping: copy
+          observer.hostname to observer.name so audit, EMS and file-audit
+          datasets join on one appliance identity, and populate source.ip from
+          `location` only when it parses as an address, leaving
+          console/internal/ service-processor values in source.address rather
+          than dropping them into a strict ip field and failing the document.
+          Add explicit custom-namespace index-template mappings —
+          netapp.ontap.audit.session_id, .command_id, .scope, .application and
+          netapp.ontap.svm as keyword, netapp.ontap.audit.input as text with a
+          keyword subfield — so session-scoped hunting works without dynamic
+          mapping, and assert event.outcome is populated for every state value
+          including the unknown/Pending case.
+  - format: api-pull
+    enable: >
+      No forwarding configuration is required; the records are read on demand
+      from the cluster. Poll `GET /api/security/audit/messages` against a
+      cluster management LIF with an account holding a role that can read the
+      security audit log (a custom read-only role scoped to the
+      `/api/security/audit` command directory, or admin). Constrain each poll
+      with the documented query parameters - `timestamp=>=<last-watermark>`,
+      `node`, `max_records`, and `fields=` to return only the needed keys -
+      and page with the `next` link ONTAP returns. To make get/read requests
+      visible in the result at all, they must first be captured into the log
+      with `security audit modify -cliget on -ontapiget on` (set/write
+      requests are logged by default). The endpoint is cluster-scope and
+      cannot be queried through an SVM management LIF, so one poller per
+      cluster covers every SVM's administrative activity.
+    references:
+    - >-
+      https://library.netapp.com/ecmdocs/ECMLP2885777/html/resources/security_audit_log.html
+    - >-
+      https://docs.netapp.com/us-en/ontap-restapi-98/security_audit_messages_endpoint_overview.html
+    - >-
+      https://docs.netapp.com/us-en/ontap/system-admin/ontap-implements-audit-logging-concept.html
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom NetApp ONTAP audit REST-collector pipeline
+      notes: >
+        There is no Elastic integration and no Cribl pack for ONTAP, so the
+        collection is a Cribl REST Collector (or an Elastic httpjson custom
+        input) that polls the endpoint and hands the JSON array to a
+        hand-built pipeline. The advantage over the syslog feed is that the
+        request/response halves the syslog form ships as two lines arrive here
+        already reduced by ONTAP to a single record per command with its
+        terminal `state`, so no session-id + command-id join is needed on the
+        wire; the pipeline's job is watermarking (not re-polling the same
+        records), credential masking of `input`, and mapping the JSON keys to
+        ECS. Because it is a poll it inherits a collection lag and its own gap
+        mode (records missed if the poll interval exceeds the audit-log
+        retention window under load).
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Run the REST Collector low-side against the cluster management LIF
+          and fully shape the record before the crossing, exactly as for the
+          mode-B syslog path: derive event.outcome from `state` (success ->
+          success, error -> failure, pending -> unknown), split the leading
+          verb of `input` into event.action while keeping the full command
+          string, and mask credential-bearing command text (`security login
+          password`, `-password`, `-passphrase`, pasted key material) before
+          it leaves the enclave. Persist the last-seen (timestamp,index)
+          watermark in a Cribl state file / KV so a restart does not re-ship
+          the window, and run the Collector on a schedule tight enough that
+          the audit log does not rotate past the watermark. Poll with
+          `fields=` so only the needed keys cross.
+        elastic: >
+          Own a custom logs-netapp_ontap.audit ingest pipeline shared with the
+          syslog form so both transports land in one data stream: copy
+          observer.hostname to observer.name, populate source.ip from
+          `location` only when it parses as an address (leaving
+          console/internal tokens in source.address), and add the
+          netapp.ontap.audit.* and netapp.ontap.svm keyword mappings. Assert
+          event.outcome is populated for every `state` value including
+          pending. Because the REST form already emits one completed record
+          per command, do not run the syslog pairing logic on these documents
+          - detect the source by presence of the `index` key.
+        relay: >
+          Low-side clusters cross with full ECS-shaped NDJSON (envelope mode
+          B) - one completed command per line, UTF-8, LF-terminated,
+          compression disabled, nesting depth <=2 - because the credential
+          masking must happen before the boundary on an at-most-once path. The
+          friction to settle with the guard owner is the `input` command
+          string and the `message` error text: both are unbounded operator
+          free-text that can carry pasted certificates and non-ASCII, so cap
+          and flag them low-side to a length the custom content filter
+          accepts. This form emits JSON, not CEF, so nothing CEF-shaped
+          crosses; with no return channel, detect silent drops by reconciling
+          the collector's fetched-record count against the high-side ingested
+          count per (cluster, hour).
+      direct:
+        parse_location: high
+        cribl: >
+          For a high-side cluster with no guard, point the REST Collector
+          straight at the core worker group and let it poll the management
+          LIF; there is no need to shape low-side. Keep the watermarking and
+          the credential masking regardless, since the command text still
+          carries secrets even without a boundary. Pick either the REST poll
+          OR the syslog stream as the authoritative audit feed per cluster to
+          avoid double-counting the same commands.
+        elastic: >
+          Own a custom logs-netapp_ontap.audit ingest pipeline shared with the
+          syslog form so both transports land in one data stream: copy
+          observer.hostname to observer.name, populate source.ip from
+          `location` only when it parses as an address (leaving
+          console/internal tokens in source.address), and add the
+          netapp.ontap.audit.* and netapp.ontap.svm keyword mappings. With no
+          boundary, retain the full `input` command string and rely on the
+          REST form's single-record-per-command shape to skip the pairing
+          logic entirely - detect the source by presence of the `index` key.
+          The main reason to prefer this transport high-side is that ONTAP has
+          already collapsed the pending/terminal pair for you.
+    fields:
+    - vendor: timestamp
+      type: timestamp
+      description: log entry timestamp of the audit record
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: node
+      type: string
+      description: >-
+        cluster node that recorded the audit entry (returned as a node object
+        with name and uuid)
+      ecs: observer.hostname
+      status: mapped
+      notes: >-
+        also copy to observer.name so the audit, EMS and NAS file-audit
+        datasets join on the same ONTAP identity
+    - vendor: index
+      type: integer
+      description: >-
+        internal index used to order audit records that share the same
+        timestamp on the same node
+      ecs: event.sequence
+      status: partial
+      notes: >
+        not a cluster-wide monotonic counter - it only disambiguates records
+        with an identical (time,node) key - so it is a within-timestamp
+        tie-breaker rather than a true sequence; it has no equivalent in the
+        syslog-raw form, which is why the source can be detected by its
+        presence
+    - vendor: application
+      type: enum
+      description: >-
+        the access method that processed the request: internal, console, rsh,
+        telnet, ssh, ontapi, http, system
+      ecs: null
+      status: partial
+      custom: netapp.ontap.audit.application
+      notes: >
+        ssh/http/rsh/telnet map cleanly to network.protocol, but console,
+        internal and system are not network protocols, so the enum is kept
+        whole in the custom namespace and network.protocol is populated only
+        for the protocol-valued subset
+    - vendor: input
+      type: string
+      description: >-
+        the request - the CLI command or API operation being attempted, as
+        typed or as named by the API
+      ecs: null
+      status: partial
+      custom: netapp.ontap.audit.input
+      notes: >
+        full administrative command text; ECS has no field for an
+        administrative command that is not a process, so the string stays
+        custom and only its leading verb is copied into event.action - the
+        same handling as the syslog form
+    - vendor: state
+      type: enum
+      description: 'state of this request: pending, success, or error'
+      ecs: event.outcome
+      status: mapped
+      transform: >
+        success maps to success and error maps to failure; pending is the
+        request half of a request/response pair and should be carried as
+        unknown, never counted as an executed command
+    - vendor: scope
+      type: enum
+      description: set to svm when the request targets a data storage VM, otherwise cluster
+      ecs: null
+      status: unmapped
+      custom: netapp.ontap.audit.scope
+      notes: >-
+        distinguishes cluster-wide administration from SVM-delegated
+        administration - the main blast-radius signal on this dataset
+    - vendor: user
+      type: string
+      description: username of the remote user issuing the request
+      ecs: user.name
+      status: mapped
+    - vendor: location
+      type: string
+      description: >-
+        location of the remote user - an IP address, or a token such as
+        console for a non-network session
+      ecs: source.address
+      status: mapped
+      transform: >
+        copy to source.ip only when the value parses as an IPv4/IPv6 address;
+        console and internal sessions put a non-address token here, which a
+        strict ip field would reject
+    - vendor: session_id
+      type: string
+      description: session ID on which the request was received
+      ecs: null
+      status: unmapped
+      custom: netapp.ontap.audit.session_id
+      notes: >
+        each ssh/console session gets one id and each http/ontapi/snmp request
+        gets a unique one; ECS 9.4 has no generic session identifier, so this
+        stays custom - it is the key that reconstructs an administrator's
+        whole session
+    - vendor: command_id
+      type: string
+      description: command ID assigned to this request
+      ecs: null
+      status: unmapped
+      custom: netapp.ontap.audit.command_id
+      notes: >
+        in the REST form the pending/terminal halves are already collapsed to
+        one record, so command_id is not needed as a join key here; it is
+        retained for cross-referencing against the syslog feed during a
+        cutover
+    - vendor: message
+      type: string
+      description: >-
+        optional field that may contain error text or additional information
+        about the request
+      ecs: error.message
+      status: partial
+      notes: >-
+        only populated when the state is error, so it is a failure-reason
+        field rather than a general message field
+    - vendor: svm
+      type: string
+      description: >-
+        storage VM (SVM) through which the request was made (returned as an
+        svm object with name and uuid)
+      ecs: null
+      status: unmapped
+      custom: netapp.ontap.svm
+      notes: >-
+        ONTAP tenancy unit; the same custom field as the syslog form so the
+        two transports join on tenancy
+- id: nas-file-audit
+  name: SVM NAS file access audit
+  description: >
+    Per-SVM auditing of end-user SMB and NFS access to files and directories,
+    plus CIFS logon/logoff, file-share, user-account, security-group and
+    audit-policy-change categories. ONTAP writes binary staging files on each
+    node and converts them into EVTX (default) or XML files on a destination
+    volume inside the SVM — this feed does NOT go to syslog, so collection
+    means reading rotated files off a share, and the -rotate-limit /
+    destination volume capacity settings decide how long a record survives
+    before it is overwritten. Records carry the NetApp-Security-Auditing
+    provider and reuse Microsoft event IDs (4656/4663/4659/4660/4664/4670,
+    4624/4625/4634) plus the ONTAP-specific 9999 (rename) and 9998 (unlink).
+  event_categories:
+  - file
+  - authentication
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Not a push feed: a Cribl Collector job pulls rotated EVTX/XML files
+        from the SVM's audit destination volume over an SMB or NFS mount, so
+        the "source" is a scheduled file collection with its own lag and its
+        own gap mode (records lost when the volume fills or rotates before the
+        next run). For low-side SVMs the collector runs in that enclave, so
+        the file staging and decode happen before the crossing.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-netapp_ontap.file_audit
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Not a push feed: a Cribl Collector job pulls rotated EVTX/XML files
+        from the SVM's audit destination volume over an SMB or NFS mount, so
+        the "source" is a scheduled file collection with its own lag and its
+        own gap mode (records lost when the volume fills or rotates before the
+        next run).
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-netapp_ontap.file_audit
+  formats:
+  - format: windows-event
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom NetApp ONTAP NAS audit pipeline
+      notes: >
+        No Elastic integration and no Cribl pack exists for NetApp ONTAP. The
+        events borrow Microsoft event IDs but are emitted by the
+        NetApp-Security-Auditing provider with ONTAP-specific EventData
+        (SubjectUnix, HandleId, ObjectName carrying a volume prefix), so the
+        Windows integration's security ingest pipeline does not apply and
+        pointing it at this feed produces silently wrong documents. Prefer
+        `vserver audit create -format xml` over the EVTX default so the
+        pipeline parses text instead of decoding a binary container.
+    fields:
+    - vendor: EventID
+      type: integer
+      description: >-
+        numeric event identifier, reusing Microsoft security event IDs plus
+        ONTAP-specific 9998/9999
+      ecs: event.code
+      status: mapped
+      transform: >-
+        stored as a keyword string in ECS; 9999 = rename object and 9998 =
+        unlink object are ONTAP-only and have no Windows equivalent
+    - vendor: Event Name
+      type: string
+      description: >-
+        exact operation behind the event ID, e.g. Open Object, Create Object,
+        Read Object, Write Object, Get Object Attributes
+      ecs: event.action
+      status: mapped
+      notes: >-
+        a single event ID maps to several event names (4656 is both Open
+        Object and Create Object), so this is the field that actually
+        discriminates the operation
+    - vendor: Source
+      type: enum
+      description: 'access protocol that generated the event: SMB/CIFS, NFSv3, or NFSv4'
+      ecs: network.protocol
+      status: mapped
+      transform: >-
+        SMB/CIFS is lowercased to smb and NFSv3/NFSv4 to nfs, with the version
+        retained in the custom namespace
+    - vendor: Result
+      type: enum
+      description: audit event type, Audit Success or Audit Failure, mirroring the Keywords bitmask
+      ecs: event.outcome
+      status: mapped
+      transform: >
+        Audit Success (0x8020000000000000) maps to success and Audit Failure
+        (0x8010000000000000) to failure; Audit Failure here specifically means
+        the operation was denied, not that the audit subsystem failed
+    - vendor: TimeCreated SystemTime
+      type: timestamp
+      description: >-
+        time the event was generated, as YYYY-MM-DDThh:mm:ss.sZ with a
+        trailing Z for UTC
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: Computer
+      type: string
+      description: name of the system generating the event, formatted as <cluster_name>/<SVM_name>
+      ecs: observer.hostname
+      status: partial
+      transform: >-
+        split on / — the cluster name becomes observer.hostname/observer.name
+        and the SVM name becomes netapp.ontap.svm, so this dataset joins the
+        management audit log
+    - vendor: ComputerUUID
+      type: string
+      description: UUID identifier of the generating system, formatted as <cluster_uuid>/<svm_uuid>
+      ecs: null
+      status: unmapped
+      custom: netapp.ontap.audit.computer_uuid
+      notes: >-
+        stable identity that survives cluster and SVM renames; keep it as the
+        join key when hostnames change
+    - vendor: Provider Name
+      type: string
+      description: provider subsystem generating the event, always NetApp-Security-Auditing
+      ecs: event.provider
+      status: mapped
+    - vendor: SubjectIP
+      type: ip
+      description: IPv4/IPv6 address of the client that initiated the event
+      ecs: source.ip
+      status: mapped
+    - vendor: SubjectHostName
+      type: string
+      description: hostname of the client that initiated the event
+      ecs: source.domain
+      status: partial
+      notes: >-
+        ECS source.domain is the closest home for a client hostname, but it is
+        frequently empty for NFS clients, so it cannot be relied on as the
+        client identity
+    - vendor: SubjectUserName
+      type: string
+      description: username of the user performing the access
+      ecs: user.name
+      status: mapped
+    - vendor: SubjectDomainName
+      type: string
+      description: >-
+        domain the user belongs to; for a local user it contains the SMB/CIFS
+        server name
+      ecs: user.domain
+      status: mapped
+      notes: >-
+        the value silently changes meaning for local users, so pair it with
+        SubjectUserSid before treating it as a directory domain
+    - vendor: SubjectUserSid
+      type: string
+      description: 'the user''s Windows SID as resolved by ONTAP user mapping'
+      ecs: user.id
+      status: mapped
+      notes: >-
+        takes user.id because the SID is the canonical identity for SMB access
+        and for multiprotocol-mapped NFS access
+    - vendor: SubjectUnix
+      type: string
+      description: UNIX credentials of the user, a composite of UID, GID and a Local flag
+      ecs: null
+      status: partial
+      custom: netapp.ontap.audit.subject_unix
+      notes: >
+        must be split into its three parts; the GID can go to group.id, but
+        user.id is already occupied by the Windows SID, so the UNIX UID has no
+        ECS home and stays in the custom namespace — this is the main identity
+        gap on the dataset for pure-NFS estates
+    - vendor: ObjectName
+      type: string
+      description: >-
+        full path of the accessed object relative to the volume, e.g.
+        (Vol1);/dir1/file.txt
+      ecs: file.path
+      status: partial
+      transform: >
+        strip the leading "(volume);" prefix into netapp.ontap.volume and keep
+        the remainder as file.path; on 4656 the path is the alternate data
+        stream itself, while on 4663 it is the base file, so the two event IDs
+        describe different objects under the same field name
+    - vendor: ObjectType
+      type: enum
+      description: 'type of object accessed: File, Directory, Symbolic Link, Stream, or Unknown'
+      ecs: file.type
+      status: partial
+      notes: >-
+        ECS file.type covers file, dir and symlink; Stream (an NTFS alternate
+        data stream) and Unknown have no ECS value and must be carried in the
+        custom namespace
+    - vendor: HandleId
+      type: string
+      description: >-
+        object handle, formatted
+        <volume_identifier>;00;<file_identifier>;;<file_identifier_extended>
+      ecs: null
+      status: unmapped
+      custom: netapp.ontap.audit.handle_id
+      notes: >
+        identifies the object, not a session or user, and is the only way to
+        correlate open/read/write/close events on the same file; it is empty
+        on a create because the 4656 open is audited before the object exists,
+        and the file_identifier component can also be surfaced as file.inode
+    - vendor: AccessMask
+      type: integer
+      description: bitmask of rights requested or granted on the object, emitted in decimal
+      ecs: null
+      status: partial
+      custom: netapp.ontap.audit.access_mask
+      notes: >-
+        decimal OR of the individual right masks (0x1 read data, 0x2 write
+        data, 0x200 delete, 0x4000 write ACL, ...); needs bit decoding before
+        any "who deleted this" query works
+    - vendor: AccessList
+      type: string
+      description: list of rights requested or granted, rendered as Microsoft schema values
+      ecs: null
+      status: partial
+      custom: netapp.ontap.audit.access_list
+      notes: >-
+        values are opaque %%NNNN codes (%%4416 read data, %%4417 write data,
+        %%1537 delete, %%1539 write ACL, ...) and need a lookup table to
+        become readable
+    - vendor: LogonType
+      type: integer
+      description: type of logon performed, on the 4624/4625 CIFS logon events
+      ecs: null
+      status: unmapped
+      custom: netapp.ontap.audit.logon_type
+      notes: >-
+        mirrors the Windows logon-type enum; ECS has no logon-type field, and
+        the same gap exists on the Windows data map
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Run the Collector against the audit destination volume and do the
+          ONTAP-specific decoding at the edge: strip the "(volume);" prefix
+          off ObjectName into a volume field plus a clean file.path, expand
+          the decimal AccessMask bitmask and the %%4416-style AccessList
+          schema values through a lookup table shipped with the pipeline, and
+          resolve the identity duality so the Windows SID and the UNIX UID/GID
+          from SubjectUnix land in distinct fields instead of fighting over
+          user.id. Because this is the highest-volume dataset here (4663 fires
+          on reads, writes, getattr and setattr), shape it low-side with an
+          event-ID/volume allowlist rather than in Elastic, and instrument the
+          collector: alert on collection lag and on rotate-limit overwrites,
+          since a file-staged feed drops records silently when the destination
+          volume fills.
+        elastic: >
+          Own a custom logs-netapp_ontap.file_audit ingest pipeline that sets
+          event.kind/event.category/event.type per event ID — the Microsoft
+          IDs are reused but the provider is NetApp-Security-Auditing, so no
+          stock Windows pipeline can be reused — and derive event.outcome from
+          the Audit Success/Audit Failure keyword rather than any single
+          column, remembering that Audit Failure here means the operation was
+          denied. Populate related.user and related.ip so SMB and NFS access
+          to the same object joins across the SID and UID identities, and add
+          custom-namespace index-template mappings for
+          netapp.ontap.audit.handle_id, .computer_uuid, .subject_unix,
+          .access_list and .logon_type as keyword and .access_mask as long, so
+          handle-based object correlation stays queryable.
+        relay: >
+          Low-side SVMs cross with full ECS-shaped NDJSON (envelope mode B)
+          rather than raw EVTX — a binary event container is exactly the
+          payload a content filter cannot inspect, and the custom NDJSON
+          filter the guard will need should see decoded, allowlisted keys. The
+          friction to settle with the guard owner is ObjectName: end-user file
+          paths are unbounded free-text carrying arbitrary unicode,
+          alternate-data-stream names after a colon, and occasional
+          kilobyte-scale values, so normalize to UTF-8 NFC and cap with an
+          explicit truncation flag low-side. This is also the first dataset on
+          which to drop _raw once the parser is proven, because the 4663
+          read/write volume dominates the crossing budget and the decoded
+          record retains everything forensically useful.
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side SVM with no guard, run the Collector against the
+          audit destination volume in the core worker group and do the
+          ONTAP-specific decoding near the collection point: strip the
+          "(volume);" prefix off ObjectName into a volume field plus a clean
+          file.path, expand the decimal AccessMask bitmask and the
+          %%4416-style AccessList schema values through a lookup table shipped
+          with the pipeline, and resolve the identity duality so the Windows
+          SID and the UNIX UID/GID from SubjectUnix land in distinct fields
+          instead of fighting over user.id. Because this is the highest-volume
+          dataset here (4663 fires on reads, writes, getattr and setattr),
+          shape it at collection with an event-ID/volume allowlist rather than
+          in Elastic, and instrument the collector: alert on collection lag
+          and on rotate-limit overwrites, since a file-staged feed drops
+          records silently when the destination volume fills.
+        elastic: >
+          Own a custom logs-netapp_ontap.file_audit ingest pipeline that sets
+          event.kind/event.category/event.type per event ID — the Microsoft
+          IDs are reused but the provider is NetApp-Security-Auditing, so no
+          stock Windows pipeline can be reused — and derive event.outcome from
+          the Audit Success/Audit Failure keyword rather than any single
+          column, remembering that Audit Failure here means the operation was
+          denied. Populate related.user and related.ip so SMB and NFS access
+          to the same object joins across the SID and UID identities, and add
+          custom-namespace index-template mappings for
+          netapp.ontap.audit.handle_id, .computer_uuid, .subject_unix,
+          .access_list and .logon_type as keyword and .access_mask as long, so
+          handle-based object correlation stays queryable.
+  - format: xml-file
+    enable: >
+      Create the SVM audit configuration with the XML format explicitly rather
+      than accepting the EVTX default: `vserver audit create -vserver <svm>
+      -destination <path> -format xml [-rotate-size <n>MB] [-rotate-limit
+      <n>]`, then `vserver audit enable -vserver <svm>`. An existing EVTX
+      configuration can be switched with `vserver audit modify -vserver <svm>
+      -format xml` (the audit config must be disabled to change the format).
+      The audited event categories (file-ops, cifs-logon-logoff, file-share,
+      audit-policy-change, user-account, security-group) and the
+      SACL/audit-ACE policy setup on the files and directories are identical
+      to the EVTX form - only the converted output encoding changes. Rotated
+      .xml files land in the same destination volume inside the SVM and are
+      still governed by -rotate-size / -rotate-limit, so the same
+      volume-capacity gap mode applies.
+    references:
+    - https://docs.aws.amazon.com/fsx/latest/ONTAPGuide/file-access-auditing.html
+    - https://docs.netapp.com/us-en/ontap-cli/vserver-audit-create.html
+    - https://pubs.lenovo.com/command_reference_9-9-1/vserver__audit__create
+    - https://docs.netapp.com/p/ontap/9x/Auditing-Schema-Reference.pdf
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom NetApp ONTAP NAS audit XML pipeline
+      notes: >
+        Same absence of an Elastic integration or Cribl pack, and the same
+        reason the Windows security ingest pipeline does not apply (the
+        provider is NetApp-Security-Auditing with ONTAP-specific EventData).
+        The XML form is easier to parse than EVTX - a Collector reads text and
+        an XML/XPath or regex extraction pulls the <System> and <Data
+        Name="..."> values directly, with no evtx binary decoder in the chain
+        - which is why the EVTX dataset's own parsing note already prefers
+        `vserver audit create -format xml`. The ONTAP-specific decoding is
+        otherwise identical to the EVTX pipeline: strip the "(volume);" prefix
+        off ObjectName, expand the decimal AccessMask bitmask and the %%NNNN
+        AccessList schema codes through a shipped lookup, and split the
+        Windows SID from the UNIX SubjectUnix identity.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Run the Collector against the audit destination volume and do the
+          ONTAP-specific decoding at the edge on the parsed XML: strip the
+          "(volume);" prefix off ObjectName into a volume field plus a clean
+          file.path, expand the decimal AccessMask bitmask and the
+          %%4416-style AccessList codes through a lookup table shipped with
+          the pipeline, and resolve the identity duality so the Windows SID
+          and the UNIX UID/GID from SubjectUnix land in distinct fields
+          instead of fighting over user.id. This is the highest-volume dataset
+          here (4663 fires on reads, writes, getattr and setattr), so shape it
+          low-side with an event-ID/volume allowlist, and instrument the
+          collector: alert on collection lag and on rotate-limit overwrites,
+          since a file-staged feed drops records silently when the destination
+          volume fills. XML removes the binary-decode step but not the
+          volume-capacity gap mode.
+        elastic: >
+          Own a custom logs-netapp_ontap.file_audit ingest pipeline shared
+          with the EVTX form (the decoded records are identical) that sets
+          event.kind/event.category/event.type per event ID and derives
+          event.outcome from the Audit Success/Audit Failure result,
+          remembering Audit Failure here means the operation was denied.
+          Populate related.user and related.ip so SMB and NFS access to the
+          same object joins across the SID and UID identities, and add
+          custom-namespace index-template mappings for
+          netapp.ontap.audit.handle_id, .computer_uuid, .subject_unix,
+          .access_list and .logon_type as keyword and .access_mask as long.
+        relay: >
+          Low-side SVMs cross with full ECS-shaped NDJSON (envelope mode B)
+          rather than raw XML - even though text XML is inspectable, the
+          parsed NDJSON is the allowlisted, decoded shape the guard's custom
+          filter should see, and it is far smaller than the verbose XML. The
+          friction to settle with the guard owner is ObjectName: end-user file
+          paths are unbounded free-text carrying arbitrary unicode,
+          alternate-data-stream names after a colon, and occasional
+          kilobyte-scale values, so normalize to UTF-8 NFC and cap with an
+          explicit truncation flag low-side. This is the first dataset on
+          which to drop _raw once the parser is proven, because the 4663
+          read/write volume dominates the crossing budget.
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side SVM with no guard, the Collector and the same XML
+          extraction run in the core worker group; parse near the collection
+          point regardless, because the ONTAP-specific AccessMask/AccessList/
+          ObjectName decoding is what makes the record usable and it is
+          cheapest done once at read time. Choose XML over EVTX here
+          specifically to drop the binary decoder from the pipeline.
+        elastic: >
+          Own a custom logs-netapp_ontap.file_audit ingest pipeline shared
+          with the EVTX form (the decoded records are identical) that sets
+          event.kind/event.category/event.type per event ID and derives
+          event.outcome from the Audit Success/Audit Failure result,
+          remembering Audit Failure here means the operation was denied.
+          Populate related.user and related.ip so SMB and NFS access to the
+          same object joins across the SID and UID identities, and add
+          custom-namespace index-template mappings for
+          netapp.ontap.audit.handle_id, .computer_uuid, .subject_unix,
+          .access_list and .logon_type as keyword and .access_mask as long.
+          With no boundary, retain full ObjectName paths; the decoded XML
+          record is byte-for-byte equivalent to the decoded EVTX record, so
+          the two formats can share one data stream and one set of detections
+          without discriminating the source encoding.
+    fields:
+    - vendor: EventID
+      type: integer
+      description: >-
+        numeric event identifier, reusing Microsoft security event IDs plus
+        ONTAP-specific 9998/9999, carried as an <EventID> element in the XML
+        <System> block
+      ecs: event.code
+      status: mapped
+      transform: >-
+        stored as a keyword string in ECS; 9999 = rename object and 9998 =
+        unlink object are ONTAP-only and have no Windows equivalent
+    - vendor: EventName
+      type: string
+      description: >-
+        exact operation behind the event ID, e.g. Open Object, Create Object,
+        Read Object, Write Object, Get Object Attributes
+      ecs: event.action
+      status: mapped
+      notes: >-
+        a single event ID maps to several event names (4656 is both Open
+        Object and Create Object), so this is the field that actually
+        discriminates the operation
+    - vendor: Source
+      type: enum
+      description: 'access protocol that generated the event: SMB/CIFS, NFSv3, or NFSv4'
+      ecs: network.protocol
+      status: mapped
+      transform: >-
+        SMB/CIFS is lowercased to smb and NFSv3/NFSv4 to nfs, with the version
+        retained in the custom namespace
+    - vendor: Result
+      type: enum
+      description: audit event type, Audit Success or Audit Failure, mirroring the Keywords bitmask
+      ecs: event.outcome
+      status: mapped
+      transform: >
+        Audit Success maps to success and Audit Failure to failure; Audit
+        Failure here specifically means the operation was denied, not that the
+        audit subsystem failed
+    - vendor: TimeCreated SystemTime
+      type: timestamp
+      description: >-
+        time the event was generated, carried as the SystemTime attribute of
+        the <TimeCreated> element, YYYY-MM-DDThh:mm:ss.sZ in UTC
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: Computer
+      type: string
+      description: >-
+        name of the generating system, formatted as <cluster_name>/<SVM_name>,
+        in the <Computer> element
+      ecs: observer.hostname
+      status: partial
+      transform: >-
+        split on / - the cluster name becomes observer.hostname/observer.name
+        and the SVM name becomes netapp.ontap.svm, so this dataset joins the
+        management audit log
+    - vendor: ComputerUUID
+      type: string
+      description: UUID identifier of the generating system, formatted as <cluster_uuid>/<svm_uuid>
+      ecs: null
+      status: unmapped
+      custom: netapp.ontap.audit.computer_uuid
+      notes: >-
+        stable identity that survives cluster and SVM renames; keep it as the
+        join key when hostnames change
+    - vendor: Provider Name
+      type: string
+      description: >-
+        provider subsystem generating the event, always
+        NetApp-Security-Auditing, carried as the Name attribute of the
+        <Provider> element
+      ecs: event.provider
+      status: mapped
+    - vendor: SubjectIP
+      type: ip
+      description: IPv4/IPv6 address of the client that initiated the event
+      ecs: source.ip
+      status: mapped
+    - vendor: SubjectUserName
+      type: string
+      description: username of the user performing the access
+      ecs: user.name
+      status: mapped
+    - vendor: SubjectDomainName
+      type: string
+      description: >-
+        domain the user belongs to; for a local user it contains the SMB/CIFS
+        server name
+      ecs: user.domain
+      status: mapped
+      notes: >-
+        the value silently changes meaning for local users, so pair it with
+        SubjectUserSid before treating it as a directory domain
+    - vendor: SubjectUserSid
+      type: string
+      description: 'the user''s Windows SID as resolved by ONTAP user mapping'
+      ecs: user.id
+      status: mapped
+      notes: >-
+        takes user.id because the SID is the canonical identity for SMB access
+        and for multiprotocol-mapped NFS access
+    - vendor: SubjectUnix
+      type: string
+      description: UNIX credentials of the user, a composite of UID, GID and a Local flag
+      ecs: null
+      status: partial
+      custom: netapp.ontap.audit.subject_unix
+      notes: >
+        must be split into its three parts; the GID can go to group.id, but
+        user.id is already occupied by the Windows SID, so the UNIX UID has no
+        ECS home and stays in the custom namespace - the main identity gap for
+        pure-NFS estates
+    - vendor: ObjectName
+      type: string
+      description: >-
+        full path of the accessed object relative to the volume, e.g.
+        (Vol1);/dir1/file.txt
+      ecs: file.path
+      status: partial
+      transform: >
+        strip the leading "(volume);" prefix into netapp.ontap.volume and keep
+        the remainder as file.path; on 4656 the path is the alternate data
+        stream itself, while on 4663 it is the base file
+    - vendor: ObjectType
+      type: enum
+      description: 'type of object accessed: File, Directory, Symbolic Link, Stream, or Unknown'
+      ecs: file.type
+      status: partial
+      notes: >-
+        ECS file.type covers file, dir and symlink; Stream and Unknown have no
+        ECS value and must be carried in the custom namespace
+    - vendor: HandleId
+      type: string
+      description: >-
+        object handle, formatted
+        <volume_identifier>;00;<file_identifier>;;<file_identifier_extended>
+      ecs: null
+      status: unmapped
+      custom: netapp.ontap.audit.handle_id
+      notes: >
+        identifies the object, not a session or user, and is the only way to
+        correlate open/read/write/close events on the same file; it is empty
+        on a create because the 4656 open is audited before the object exists,
+        and the file_identifier component can also be surfaced as file.inode
+    - vendor: AccessMask
+      type: integer
+      description: bitmask of rights requested or granted on the object, emitted in decimal
+      ecs: null
+      status: partial
+      custom: netapp.ontap.audit.access_mask
+      notes: >-
+        decimal OR of the individual right masks (0x1 read data, 0x2 write
+        data, 0x200 delete, 0x4000 write ACL, ...); needs bit decoding before
+        any "who deleted this" query works
+    - vendor: AccessList
+      type: string
+      description: list of rights requested or granted, rendered as Microsoft schema values
+      ecs: null
+      status: partial
+      custom: netapp.ontap.audit.access_list
+      notes: >-
+        values are opaque %%NNNN codes (%%4416 read data, %%4417 write data,
+        %%1537 delete, %%1539 write ACL, ...) and need a lookup table to
+        become readable
+    - vendor: LogonType
+      type: integer
+      description: type of logon performed, on the 4624/4625 CIFS logon events
+      ecs: null
+      status: unmapped
+      custom: netapp.ontap.audit.logon_type
+      notes: >-
+        mirrors the Windows logon-type enum; ECS has no logon-type field, and
+        the same gap exists on the Windows data map
+- id: ems
+  name: EMS event notifications
+  description: >
+    Event Management System notifications — ONTAP's cataloged, syslog-based
+    messaging facility for system events (hardware, protocol stack,
+    replication, and the secd security daemon). Forwarded with `event
+    notification destination create -syslog` over UDP, TCP, or from 9.12.1
+    TLS. Message names follow a dot-separated tree (kern.uptime.filer,
+    secd.auth.noAuthEntry, wafl.vol.full) and the payload is a set of quoted
+    key="value" parameters whose keys differ per message definition. EMS
+    explicitly does NOT carry command history or administrative auditing —
+    that is the audit.log dataset — so this feed is the system-state
+    complement, not a substitute.
+  event_categories:
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Receives the EMS notification destination stream.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-netapp_ontap.ems
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Receives the EMS notification destination stream.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-netapp_ontap.ems
+  formats:
+  - format: syslog-kv
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom NetApp ONTAP EMS pipeline
+      notes: >
+        No Elastic integration and no Cribl pack exists. Two syslog framings
+        must be handled — legacy-netapp (<PRIVAL>TIMESTAMP
+        [HOSTNAME:Event-name:Event-severity]: MSG) and RFC-5424
+        (<PRIVAL>VERSION TIMESTAMP HOSTNAME Event-source - Event-name - MSG) —
+        because the format is a per-destination setting.
+    fields:
+    - vendor: Event-name
+      type: string
+      description: >-
+        dot-separated EMS message name identifying the event definition, e.g.
+        secd.auth.noAuthEntry
+      ecs: event.code
+      status: mapped
+      notes: >-
+        the stable catalog identifier for the event; the tree prefix (secd.,
+        wafl., cifs.) is what should drive event.category assignment
+    - vendor: Event-severity
+      type: enum
+      description: >-
+        EMS severity: EMERGENCY, ALERT, CRITICAL, ERROR, WARNING, NOTICE,
+        INFORMATIONAL, DEBUG
+      ecs: log.level
+      status: mapped
+      transform: >-
+        the eight-value word scale needs an explicit lookup to reach ECS's
+        numeric event.severity; the raw word is kept in log.level
+    - vendor: node
+      type: string
+      description: cluster node that generated the event
+      ecs: observer.hostname
+      status: mapped
+      notes: >-
+        also copy to observer.name to match the management audit and NAS
+        file-audit datasets
+    - vendor: time
+      type: timestamp
+      description: time the event was generated on the node
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: index
+      type: integer
+      description: per-node monotonically increasing index assigned to each EMS event
+      ecs: event.sequence
+      status: mapped
+      notes: >-
+        only monotonic within a node and resets on reboot, so gap detection
+        has to be scoped per node rather than per cluster
+    - vendor: MSG
+      type: string
+      description: rendered human-readable event text
+      ecs: message
+      status: mapped
+    - vendor: Event-source
+      type: string
+      description: >-
+        ONTAP subsystem or process that raised the event, carried as the
+        RFC-5424 APP-NAME
+      ecs: null
+      status: partial
+      custom: netapp.ontap.ems.source
+      notes: >-
+        only present in the RFC-5424 framing; the legacy-netapp framing omits
+        it entirely, so it cannot be a required field
+    - vendor: parameters
+      type: string
+      description: >-
+        quoted key="value" pairs specific to the message definition, e.g.
+        replStatus="8", lineNumber="738"
+      ecs: null
+      status: partial
+      custom: netapp.ontap.ems.parameters
+      notes: >-
+        the key set differs per EMS message definition across thousands of
+        definitions, so it must be held as a bounded flattened object rather
+        than promoted to top-level fields
+    - vendor: PRIVAL
+      type: integer
+      description: syslog priority value encoding facility and severity in the message header
+      ecs: log.syslog.priority
+      status: mapped
+      transform: >-
+        decompose into facility (PRIVAL div 8) and severity (PRIVAL mod 8);
+        the syslog severity is a transport artifact and does not always agree
+        with the EMS Event-severity
+    - vendor: facility
+      type: enum
+      description: syslog facility configured on the EMS notification destination
+      ecs: log.syslog.facility.name
+      status: mapped
+    - vendor: vserver
+      type: string
+      description: storage VM the event is scoped to, on SVM-scoped EMS events
+      ecs: null
+      status: unmapped
+      custom: netapp.ontap.svm
+      notes: >-
+        only cluster-scoped events omit it; the same custom field as the
+        management audit dataset so the two join on tenancy
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Detect the framing before parsing, since legacy-netapp buries the
+          message name and severity inside the bracketed tag while RFC-5424
+          carries them as distinct header fields, then extract the quoted
+          key="value" parameter bag. EMS ships thousands of message
+          definitions with per-definition parameter keys, so allowlist both
+          the message-name prefixes worth forwarding at all (secd., cifs.,
+          nblade., audit., wafl.vol., cluster.) and the parameter keys that
+          survive extraction — an unbounded key space here becomes an
+          unbounded field space in Elastic. Run the destination on Persistent
+          Queue backpressure.
+        elastic: >
+          Own a custom logs-netapp_ontap.ems ingest pipeline that converts the
+          EMS severity words (EMERGENCY through DEBUG) into ECS's numeric
+          event.severity through an explicit lookup instead of leaving the
+          label alone, and assigns event.kind/event.category from the
+          message-name prefix so secd.* authentication failures are
+          categorized differently from wafl.* capacity events. Map
+          netapp.ontap.ems.source and netapp.ontap.svm as keyword and hold the
+          parameter bag as a flattened object in the index template, so a new
+          message definition cannot cause a mapping explosion, and copy
+          observer.hostname to observer.name to match the other two datasets.
+        relay: >
+          Low-side clusters cross with full ECS-shaped NDJSON (envelope mode
+          B) with the parameter bag already flattened and key-allowlisted
+          low-side — the guard's NDJSON filtering is likely custom work, and a
+          per-message-definition key space is precisely what makes such a
+          filter unmaintainable. Keep nesting to two levels, bound the
+          rendered message text (EMS event text embeds paths, WWNs and vendor
+          strings of unpredictable length), and note that the vendor emits
+          syslog rather than CEF so no CEF conversion is involved. Drop _raw
+          on this route before the file-audit route only if the parameter
+          extraction is proven, since EMS text is the fallback when a new
+          message definition is not yet modeled.
+      direct:
+        parse_location: low
+        cribl: >
+          Detect the framing before parsing, since legacy-netapp buries the
+          message name and severity inside the bracketed tag while RFC-5424
+          carries them as distinct header fields, then extract the quoted
+          key="value" parameter bag. EMS ships thousands of message
+          definitions with per-definition parameter keys, so allowlist both
+          the message-name prefixes worth forwarding at all (secd., cifs.,
+          nblade., audit., wafl.vol., cluster.) and the parameter keys that
+          survive extraction — an unbounded key space here becomes an
+          unbounded field space in Elastic. Run the destination on Persistent
+          Queue backpressure.
+        elastic: >
+          Own a custom logs-netapp_ontap.ems ingest pipeline that converts the
+          EMS severity words (EMERGENCY through DEBUG) into ECS's numeric
+          event.severity through an explicit lookup instead of leaving the
+          label alone, and assigns event.kind/event.category from the
+          message-name prefix so secd.* authentication failures are
+          categorized differently from wafl.* capacity events. Map
+          netapp.ontap.ems.source and netapp.ontap.svm as keyword and hold the
+          parameter bag as a flattened object in the index template, so a new
+          message definition cannot cause a mapping explosion, and copy
+          observer.hostname to observer.name to match the other two datasets.
+  - format: api-pull
+    enable: >
+      No notification destination is required; poll `GET
+      /api/support/ems/events` against a cluster management LIF with a
+      read-only role scoped to the /api/support/ems command directory. Filter
+      server-side with the documented query parameters -
+      `message.severity=alert|error|...`, `message.name=<prefix>*`,
+      `log_message=*<substring>*`, `time=>=<watermark>`, `max_records`, and
+      `fields=` to return only the needed keys - and page with the returned
+      `next` link. EMS ships thousands of message definitions, so scope the
+      poll by message-name prefix (secd.*, cifs.*, nblade.*, audit.*,
+      wafl.vol.*, cluster.*) at the API rather than pulling every event. This
+      is a distinct control from `event notification destination create
+      -syslog`; the two can run concurrently against the same catalog.
+    references:
+    - https://library.netapp.com/ecmdocs/ECMLP2870387/html/resources/ems_event.html
+    - >-
+      https://docs.netapp.com/us-en/ontap-restapi/support_ems_events_endpoint_overview.html
+    - >-
+      https://docs.netapp.com/us-en/ontap-automation/workflows/wf_ems_list_log_events.html
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom NetApp ONTAP EMS REST-collector pipeline
+      notes: >
+        No Elastic integration and no Cribl pack, so a Cribl REST Collector
+        (or Elastic httpjson custom input) polls the endpoint and a hand-built
+        pipeline maps the JSON. The framing-detection work the syslog form
+        needs disappears - there is no legacy-netapp vs RFC-5424 header to
+        disambiguate - because message name, severity and node arrive as typed
+        JSON keys and the per-message parameters arrive as a structured
+        {name,value} array rather than a quoted key="value" string that has to
+        be tokenized. The remaining work is watermarking on the per-node
+        index/time, allowlisting which parameter names survive (an unbounded
+        key space is still unbounded in JSON), and the
+        severity-word-to-numeric lookup.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Run the REST Collector low-side and allowlist at the API and again
+          in the pipeline: scope the poll to the message-name prefixes worth
+          forwarding (secd., cifs., nblade., audit., wafl.vol., cluster.) and
+          flatten the parameters array to a bounded set of keys, because a
+          per-message-definition key space becomes an unbounded field space in
+          Elastic. Watermark on (node,index) so a restart does not re-ship,
+          and run the Collector on Persistent Queue backpressure. Bound the
+          log_message text low-side (EMS text embeds paths, WWNs and vendor
+          strings of unpredictable length).
+        elastic: >
+          Own a custom logs-netapp_ontap.ems ingest pipeline shared with the
+          syslog form: convert the EMS severity words (emergency through
+          debug) to ECS's numeric event.severity through an explicit lookup,
+          and assign event.kind/event.category from the message-name prefix so
+          secd.* authentication failures categorize differently from wafl.*
+          capacity events. Map netapp.ontap.ems.source and netapp.ontap.svm as
+          keyword and hold the parameter bag as a flattened object so a new
+          message definition cannot cause a mapping explosion, and copy
+          observer.hostname to observer.name to match the other datasets.
+        relay: >
+          Low-side clusters cross with full ECS-shaped NDJSON (envelope mode
+          B) with the parameter array already flattened and key-allowlisted
+          low-side - the guard's NDJSON filtering is likely custom work, and a
+          per-message-definition key space is exactly what makes such a filter
+          unmaintainable. Keep nesting to two levels, bound the rendered
+          log_message text, and note the vendor emits JSON here (not CEF) so
+          no CEF conversion is involved. With no return channel, reconcile the
+          collector's fetched-record count against the high-side ingested
+          count per (cluster, hour).
+      direct:
+        parse_location: high
+        cribl: >
+          For a high-side cluster, point the REST Collector at the core worker
+          group and poll the management LIF directly; keep the message-name
+          allowlist so the field space stays bounded even without a boundary.
+          Choose the REST poll OR the syslog destination as the authoritative
+          EMS feed per cluster to avoid ingesting each event twice.
+        elastic: >
+          Own a custom logs-netapp_ontap.ems ingest pipeline shared with the
+          syslog form: convert the EMS severity words (emergency through
+          debug) to ECS's numeric event.severity through an explicit lookup,
+          and assign event.kind/event.category from the message-name prefix so
+          secd.* authentication failures categorize differently from wafl.*
+          capacity events. Map netapp.ontap.ems.source and netapp.ontap.svm as
+          keyword and hold the parameter bag as a flattened object so a new
+          message definition cannot cause a mapping explosion, and copy
+          observer.hostname to observer.name to match the other datasets. The
+          advantage of this transport is the structured parameters array and
+          the node uuid, which the syslog form does not carry - keep both so
+          EMS events survive node renames and stay queryable by parameter
+          without re-tokenizing a string.
+    fields:
+    - vendor: index
+      type: integer
+      description: per-node index assigned to each EMS event
+      ecs: event.sequence
+      status: mapped
+      notes: >-
+        monotonic within a node and resets on reboot, so gap detection has to
+        be scoped per node rather than per cluster - the same semantics as the
+        syslog form
+    - vendor: time
+      type: timestamp
+      description: timestamp of the event
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: node.name
+      type: string
+      description: name of the node on which the event occurred
+      ecs: observer.hostname
+      status: mapped
+      notes: >-
+        also copy to observer.name to match the management audit and NAS
+        file-audit datasets
+    - vendor: node.uuid
+      type: string
+      description: UUID of the node on which the event occurred
+      ecs: null
+      status: unmapped
+      custom: netapp.ontap.node_uuid
+      notes: >-
+        stable node identity that survives a rename; not carried in the syslog
+        form, so it is a reason to prefer this transport for long-term node
+        correlation
+    - vendor: message.name
+      type: string
+      description: >-
+        dot-separated EMS message name identifying the event definition, e.g.
+        secd.auth.noAuthEntry
+      ecs: event.code
+      status: mapped
+      notes: >-
+        the stable catalog identifier; the tree prefix (secd., wafl., cifs.)
+        is what should drive event.category assignment
+    - vendor: message.severity
+      type: enum
+      description: >-
+        severity of the message, as a lowercase word: emergency, alert, error,
+        notice, informational, debug
+      ecs: log.level
+      status: mapped
+      transform: >-
+        the word scale needs an explicit lookup to reach ECS's numeric
+        event.severity; the raw word is kept in log.level
+    - vendor: log_message
+      type: string
+      description: 'formatted human-readable text populated with the event''s parameter details'
+      ecs: message
+      status: mapped
+    - vendor: source
+      type: string
+      description: ONTAP subsystem or process that raised the event
+      ecs: null
+      status: partial
+      custom: netapp.ontap.ems.source
+      notes: >-
+        the structured equivalent of the RFC-5424 APP-NAME the syslog form
+        carries; kept in the custom namespace alongside the syslog dataset's
+        field
+    - vendor: parameters
+      type: array
+      description: >-
+        list of {name,value} parameter objects specific to the message
+        definition, e.g. name=repl_status value=8
+      ecs: null
+      status: partial
+      custom: netapp.ontap.ems.parameters
+      notes: >
+        a typed array rather than the syslog form's quoted key="value" string,
+        so no tokenizing is needed, but the key set still differs per message
+        definition across thousands of definitions - hold it as a bounded
+        flattened object rather than promoting to top-level fields
+  - format: webhook
+    enable: >
+      Create a REST-API (webhook) destination and route events to it with a
+      filter: `event notification destination create -name <name>
+      -rest-api-url https://<receiver>/<path> [-certificate-authority <ca>
+      -certificate-serial <serial>]`, then `event notification create
+      -filter-name <filter> -destination <name>` where the filter selects the
+      message names/severities to forward. ONTAP sends an HTTP POST to that
+      URL with the event notification details formatted in XML. Use an
+      https:// URL so ONTAP validates the receiver's certificate (and, if OCSP
+      is enabled for EMS, checks revocation); a client certificate is
+      presented when -certificate-authority/-certificate-serial are set. The
+      POST body is XML only - per NetApp KB, the webhook destination does not
+      emit JSON - so the receiver must accept and parse XML.
+    references:
+    - >-
+      https://docs.netapp.com/us-en/ontap/error-messages/configure-webhooks-event-notifications-task.html
+    - >-
+      https://kb.netapp.com/on-prem/ontap/Ontap_OS/OS-KBs/Can_events_be_sent_to_a_webhook_application_in_JSON_format
+    - >-
+      https://docs.netapp.com/us-en/ontap-cli-9111/event-notification-destination-create.html
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom NetApp ONTAP EMS webhook pipeline
+      notes: >
+        A Cribl HTTP source (or any HTTPS listener) terminates the POST and a
+        hand-built pipeline parses the XML body, then maps the EMS event
+        content to the same ECS shape as the pull API and the syslog form. The
+        value over the pull API is that it is push, not poll, so there is no
+        watermarking and no collection lag - but it is fire-and-forget over
+        HTTP, so a receiver outage drops events with no retry, and the XML
+        element names of the body are not publicly documented, so the
+        extraction has to be built against a captured sample. Prefer the pull
+        API where a documented field contract matters and the webhook where
+        near-real-time push is the requirement.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Terminate the POST on a low-side Cribl HTTP source, parse the XML
+          body, and shape to the same ECS record as the EMS pull/syslog forms
+          before the crossing. Because the push is fire-and-forget, instrument
+          the receiver for gaps (a receiver outage silently drops events -
+          there is no ONTAP-side retry queue) and, where completeness matters
+          more than latency, back the webhook with the pull API as the
+          authoritative feed. Allowlist the message-name prefixes at the ONTAP
+          filter so only wanted events are POSTed at all, and bound the
+          rendered message text low-side.
+        elastic: >
+          Reuse the custom logs-netapp_ontap.ems ingest pipeline and its
+          severity-to-event.severity lookup and flattened-parameter mapping;
+          the decoded webhook event is the same EMS record as the pull API, so
+          it shares the data stream and mappings. Detect the transport by its
+          envelope, not by re-parsing, so all three EMS transports normalize
+          to one document shape.
+        relay: >
+          Cross full ECS-shaped NDJSON (envelope mode B), never the raw XML
+          POST body - the parsed, allowlisted record is the shape the guard's
+          custom NDJSON filter should inspect and is smaller than the verbose
+          XML. Bound the rendered message text and the per-message parameter
+          set low-side, keep nesting to two levels, and note the payload is
+          XML (not CEF) so no CEF conversion is involved. With no return
+          channel and a fire-and-forget source, reconcile per-hour counts
+          across the guard and alert on receiver downtime as a collection gap.
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side cluster, terminate the POST on a receiver in the
+          core worker group and parse the XML there; parse near the receiver
+          because the body is fire-and-forget and cheapest normalized once at
+          ingest. Still allowlist at the ONTAP filter and choose one
+          authoritative EMS transport per cluster (webhook, pull, or syslog)
+          to avoid triple-counting the same event.
+        elastic: >
+          Reuse the custom logs-netapp_ontap.ems ingest pipeline and its
+          severity-to-event.severity lookup and flattened-parameter mapping;
+          the decoded webhook event is the same EMS record as the pull API, so
+          it shares the data stream and mappings, and all three EMS transports
+          normalize to one document shape. With no boundary the webhook's only
+          real tradeoff versus the pull API is reliability (no retry) for
+          latency (immediate push), so adopt it where near-real-time EMS
+          alerting is the driver and keep the pull API as the gap-filling
+          reconciliation feed.
+    fields_omitted: >
+      NetApp documents that the webhook destination POSTs the event
+      notification as XML but does not publish the element names of that body,
+      so the only sourceable inventory is the EMS event content the syslog-kv
+      and api-pull entries on this dataset already cover; the XML element
+      names themselves have to be read off a captured POST from the cluster.
+    fields: []

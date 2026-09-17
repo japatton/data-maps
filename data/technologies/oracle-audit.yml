@@ -1,0 +1,1172 @@
+id: oracle-audit
+name: Oracle Database Audit
+vendor: Oracle
+versions: Oracle Database 12c R2, 18c, 19c, 21c, 23ai (unified auditing)
+draft: true
+references:
+- >-
+  https://docs.oracle.com/en/database/oracle/oracle-database/19/refrn/UNIFIED_AUDIT_TRAIL.html
+- >-
+  https://docs.oracle.com/en/database/oracle/oracle-database/19/dbseg/managing-unified-audit-trail.html
+- >-
+  https://docs.oracle.com/en/database/oracle/oracle-database/19/refrn/UNIFIED_AUDIT_SYSTEMLOG.html
+- >-
+  https://docs.oracle.com/en/database/oracle/oracle-database/26/netag/analyzing-listener-logs.html
+- https://www.elastic.co/docs/reference/integrations/oracle
+- https://docs.cribl.io/stream/collectors-database/
+datasets:
+- id: unified-audit-trail
+  name: Unified audit trail (UNIFIED_AUDIT_TRAIL)
+  description: >
+    Full-fidelity unified audit records read directly from the
+    UNIFIED_AUDIT_TRAIL data dictionary view. Unified auditing (12c+)
+    consolidates standard audit, fine-grained audit, Database Vault, Label
+    Security, RMAN and Data Pump records into one normalized view, and this is
+    the ONLY export path that carries the whole record - the syslog path below
+    is a key-field summary. Realistic collection is a scheduled JDBC query
+    (Cribl Database Collector supports Oracle 12.1+ with State Tracking on an
+    incrementing column), not an agent.
+  event_categories:
+  - authentication
+  - iam
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge Cribl worker group, database enclave
+      notes: >
+        Cribl Database Collector runs a scheduled SELECT against
+        UNIFIED_AUDIT_TRAIL over JDBC with State Tracking on the incrementing
+        entry column. The collector runs in the same enclave as the database
+        it queries.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-oracle.unified_audit
+      notes: >
+        Custom data stream. The stock Elastic Oracle integration ships a
+        database_audit dataset that parses legacy *.aud OS audit files; it
+        does not read unified audit records, so this route does not inherit
+        its ingest pipeline or field set.
+    direct:
+    - hop: cribl
+      location: edge Cribl worker group, database enclave
+      notes: >
+        Cribl Database Collector runs a scheduled SELECT against
+        UNIFIED_AUDIT_TRAIL over JDBC with State Tracking on the incrementing
+        entry column. The collector runs in the same enclave as the database
+        it queries.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-oracle.unified_audit
+      notes: >
+        Custom data stream. The stock Elastic Oracle integration ships a
+        database_audit dataset that parses legacy *.aud OS audit files; it
+        does not read unified audit records, so this route does not inherit
+        its ingest pipeline or field set.
+  formats:
+  - format: api-pull
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Oracle unified audit pipeline
+      notes: >
+        No Elastic integration and no Cribl pack covers unified auditing. The
+        Elastic Oracle integration's only log dataset (database_audit) targets
+        the pre-12c *.aud file format with a different field vocabulary
+        (ACTION, SES_ACTIONS, PRIVILEGE), so its pipeline cannot be reused
+        here.
+    fields:
+    - vendor: EVENT_TIMESTAMP_UTC
+      type: timestamp
+      description: 'timestamp of the audit record''s creation in UTC'
+      ecs: '@timestamp'
+      status: mapped
+      notes: >
+        canonical time source for this dataset; present from 12.2 onward and
+        preferred over EVENT_TIMESTAMP because it needs no time-zone
+        reconstruction
+    - vendor: EVENT_TIMESTAMP
+      type: timestamp
+      description: >-
+        timestamp of the audit record's creation in the database server's
+        local time zone
+      ecs: null
+      status: unmapped
+      custom: oracle.audit.event_timestamp_local
+      notes: >
+        same instant as EVENT_TIMESTAMP_UTC but with no offset recorded, so it
+        is ambiguous across a DST change; retained only for correlating with
+        DBA-side queries that use the local column
+    - vendor: DBUSERNAME
+      type: string
+      description: database user name of the user whose actions were audited
+      ecs: user.name
+      status: mapped
+    - vendor: CURRENT_USER
+      type: string
+      description: effective user under which the statement executed
+      ecs: user.effective.name
+      status: mapped
+      notes: >
+        diverges from DBUSERNAME under definer's-rights PL/SQL and proxy
+        authentication; the divergence is itself an alerting signal
+    - vendor: OS_USERNAME
+      type: string
+      description: operating system user that owns the client process for the database session
+      ecs: client.user.name
+      status: mapped
+    - vendor: USERHOST
+      type: string
+      description: name of the host machine from which the session was spawned
+      ecs: source.address
+      status: mapped
+      notes: >
+        client-asserted hostname, not resolved by the database and not the
+        database server's own host; unreliable for attribution on its own
+    - vendor: CLIENT_PROGRAM_NAME
+      type: string
+      description: name of the program used for the database session
+      ecs: process.name
+      status: partial
+      transform: >
+        arrives as "sqlplus@dbhost (TNS V1-V3)" - the @host and TNS version
+        suffix must be stripped before the value is a usable process name
+      notes: truncated by Oracle at 48 characters, so long client program paths arrive cut
+    - vendor: TERMINAL
+      type: string
+      description: operating system terminal of the user session
+      ecs: null
+      status: unmapped
+      custom: oracle.audit.terminal
+      notes: >-
+        client-reported tty or Windows terminal name; frequently "unknown" for
+        pooled application connections
+    - vendor: ACTION_NAME
+      type: string
+      description: >-
+        name of the action executed by the user (CONNECT, LOGON, CREATE USER,
+        SELECT, ...)
+      ecs: event.action
+      status: mapped
+      notes: >
+        must be read together with AUDIT_TYPE - the same action name means
+        different things for a Standard record versus a FineGrainedAudit,
+        Datapump or Database Vault record
+    - vendor: AUDIT_TYPE
+      type: enum
+      description: >-
+        type of auditing that produced the record - Standard,
+        FineGrainedAudit, XS, Database Vault, Label Security, RMAN_AUDIT,
+        Datapump, Protocol, Direct path API
+      ecs: null
+      status: unmapped
+      custom: oracle.audit.audit_type
+      notes: >-
+        the discriminator column - it determines which of the other columns
+        are populated at all
+    - vendor: RETURN_CODE
+      type: integer
+      description: Oracle error code generated by the action; zero if the action succeeded
+      ecs: error.code
+      status: partial
+      transform: >
+        0 translates to event.outcome success and any non-zero value to
+        failure; the non-zero value is the ORA- error number and needs the
+        Oracle error catalogue to become a readable error.message
+    - vendor: SQL_TEXT
+      type: string
+      description: the SQL statement associated with the audited event
+      ecs: null
+      status: unmapped
+      custom: oracle.audit.sql_text
+      notes: >
+        CLOB with no length ceiling; ECS 9.4 has no SQL or database namespace
+        at all, so statement text has no standard home and stays custom.
+        Populated only when the audit policy is configured to record SQL text
+    - vendor: SQL_BINDS
+      type: string
+      description: list of bind variable values associated with SQL_TEXT
+      ecs: null
+      status: unmapped
+      custom: oracle.audit.sql_binds
+      notes: >
+        carries the literal parameter values of the statement, so it is the
+        most likely field on this map to exfiltrate PII or credentials; mask
+        or drop before forwarding
+    - vendor: OBJECT_SCHEMA
+      type: string
+      description: schema name of the object affected by the action
+      ecs: null
+      status: unmapped
+      custom: oracle.audit.object_schema
+    - vendor: OBJECT_NAME
+      type: string
+      description: name of the object affected by the action
+      ecs: null
+      status: unmapped
+      custom: oracle.audit.object_name
+      notes: >
+        table, view or procedure name; ECS models no database object, so
+        schema plus name stay custom and together are the main pivot for
+        data-access alerting
+    - vendor: UNIFIED_AUDIT_POLICIES
+      type: string
+      description: comma-separated list of the unified audit policies that caused this record
+      ecs: rule.name
+      status: partial
+      transform: >-
+        comma-separated list must be split into an array before it is usable
+        as rule.name
+      notes: >
+        a unified audit policy is the closest thing this dataset has to a
+        detection rule and Oracle exposes no policy id, so rule.id stays empty
+        rather than being filled with a substitute. A NULL means a mandatory
+        (non-policy) audit record, not missing data
+    - vendor: AUTHENTICATION_TYPE
+      type: string
+      description: composite authentication descriptor for the session user
+      ecs: null
+      status: partial
+      custom: oracle.audit.authentication_type
+      transform: >
+        parse (TYPE=(DATABASE|OS|PROXY|NETWORK SERVICE|DIRECTORY PASSWORD))
+        into the auth method and (CLIENT ADDRESS=((PROTOCOL=..)(HOST=..)
+        (PORT=..))) into network.transport, source.ip and source.port - this
+        column is the ONLY place the client's network address appears in the
+        unified audit trail
+    - vendor: SESSIONID
+      type: long
+      description: audit session identifier shared by every record of one database session
+      ecs: null
+      status: unmapped
+      custom: oracle.audit.session_id
+      notes: >
+        ECS 9.4 has no session.id field, so the session join key stays custom;
+        it must be mapped as keyword rather than long or session
+        reconstruction queries degrade
+    - vendor: ENTRY_ID
+      type: long
+      description: numeric id of each audit trail entry within the session
+      ecs: event.sequence
+      status: mapped
+      notes: >
+        with SESSIONID this pair is the natural dedupe key for an at-most-once
+        pull and the natural State Tracking column for incremental collection
+    - vendor: SYSTEM_PRIVILEGE_USED
+      type: string
+      description: comma-separated list of system privileges used to execute the action
+      ecs: null
+      status: unmapped
+      custom: oracle.audit.system_privilege_used
+      notes: >
+        populated only when AUDIT_TYPE is Standard; the highest-signal column
+        for privilege-escalation alerting, and lost entirely on the syslog
+        path
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Run the Database Collector with State Tracking on a monotonic column
+          and dedupe downstream on the (SESSIONID, ENTRY_ID) pair, so an
+          overlapping re-query after a collector restart cannot double-count.
+          Do the expensive shaping here: parse AUTHENTICATION_TYPE into the
+          auth method plus source.ip/source.port (it is the only column
+          carrying the client network address), resolve RETURN_CODE into
+          event.outcome, strip the "@host (TNS V1-V3)" suffix off
+          CLIENT_PROGRAM_NAME, and split UNIFIED_AUDIT_POLICIES into an array.
+          Cap and flag the SQL_TEXT and SQL_BINDS CLOBs at an explicit byte
+          length and mask credential and PII patterns in SQL_BINDS before
+          anything leaves the enclave, then gate the egress destination with
+          C.Schema(...).validate plus a dead-letter route and Persistent Queue
+          backpressure, never Block.
+        elastic: >
+          Own a custom logs-oracle.unified_audit ingest pipeline - there is no
+          integration to inherit. It should enrich the non-zero RETURN_CODE
+          into a readable error.message through an ORA- error catalogue
+          lookup, assert event.outcome is the derived success/failure enum
+          rather than the raw number, and hydrate ACTION_NAME against
+          AUDIT_TYPE so a Standard "SELECT" and a FineGrainedAudit "SELECT" do
+          not collapse into one meaning. Add explicit index-template mappings
+          for the oracle.audit.* namespace: session_id, dbid and statement_id
+          as keyword (not long, so they stay join keys), object_schema and
+          object_name as keyword, audit_type and system_privilege_used as
+          keyword, and sql_text / sql_binds as unindexed or wildcard so
+          unbounded statement text cannot blow up the inverted index.
+        relay: >
+          Full ECS-shaped NDJSON crosses (envelope mode B) - one audit record
+          per line, UTF-8, LF-terminated, compression disabled, nesting depth
+          <=2 - because no Elastic integration exists to finish the parse on
+          the high side. The friction to settle with the guard owner is
+          SQL_TEXT and SQL_BINDS: unbounded CLOBs that can reach megabytes and
+          carry arbitrary user-supplied unicode, which is the single worst
+          input on this map for a custom NDJSON content filter and must be
+          length-capped, charset- restricted and truncation-flagged low-side.
+          The feed is a database query rather than CEF, so nothing CEF-shaped
+          crosses; the crossing is at-most-once, so advance the collector
+          state cursor only after low-side commit and reconcile low-side and
+          high-side counts per (dataset, hour) to detect silent drops.
+      direct:
+        parse_location: low
+        cribl: >
+          Run the Database Collector with State Tracking on a monotonic column
+          and dedupe downstream on the (SESSIONID, ENTRY_ID) pair, so an
+          overlapping re-query after a collector restart cannot double-count.
+          Do the expensive shaping here: parse AUTHENTICATION_TYPE into the
+          auth method plus source.ip/source.port (it is the only column
+          carrying the client network address), resolve RETURN_CODE into
+          event.outcome, strip the "@host (TNS V1-V3)" suffix off
+          CLIENT_PROGRAM_NAME, and split UNIFIED_AUDIT_POLICIES into an array.
+          Cap and flag the SQL_TEXT and SQL_BINDS CLOBs at an explicit byte
+          length and mask credential and PII patterns in SQL_BINDS before
+          anything leaves the enclave, then gate the egress destination with
+          C.Schema(...).validate plus a dead-letter route and Persistent Queue
+          backpressure, never Block.
+        elastic: >
+          Own a custom logs-oracle.unified_audit ingest pipeline - there is no
+          integration to inherit. It should enrich the non-zero RETURN_CODE
+          into a readable error.message through an ORA- error catalogue
+          lookup, assert event.outcome is the derived success/failure enum
+          rather than the raw number, and hydrate ACTION_NAME against
+          AUDIT_TYPE so a Standard "SELECT" and a FineGrainedAudit "SELECT" do
+          not collapse into one meaning. Add explicit index-template mappings
+          for the oracle.audit.* namespace: session_id, dbid and statement_id
+          as keyword (not long, so they stay join keys), object_schema and
+          object_name as keyword, audit_type and system_privilege_used as
+          keyword, and sql_text / sql_binds as unindexed or wildcard so
+          unbounded statement text cannot blow up the inverted index.
+- id: unified-audit-syslog
+  name: Unified audit key fields via SYSLOG
+  description: >
+    Summary audit records written to SYSLOG (UNIX) or the Windows Event Viewer
+    when the UNIFIED_AUDIT_SYSTEMLOG initialization parameter is set, tagged
+    "Oracle Unified Audit[pid]". This is the honest caveat on this technology
+    - Oracle copies only KEY fields, not whole records, to keep each entry
+    inside the ~1024-byte syslog maximum. OS_USERNAME, USERHOST, TERMINAL,
+    SYSTEM_PRIVILEGE_USED, SQL_TEXT and SQL_BINDS are all absent, ACTION
+    arrives as a bare numeric code rather than ACTION_NAME, and the record
+    carries no event timestamp of its own - the syslog header time is the only
+    clock. Treat it as an attestation and pointer stream back into
+    UNIFIED_AUDIT_TRAIL, not as the audit feed.
+  event_categories:
+  - authentication
+  - iam
+  route:
+    guarded:
+    - hop: cribl
+      location: edge Cribl worker group, database enclave
+      notes: >
+        rsyslog on the database host forwards the "Oracle Unified Audit"
+        facility to a Cribl Syslog source.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-oracle.unified_audit_syslog
+      notes: >
+        kept as a separate data stream from the trail pull because the field
+        set is a strict, differently-named subset; merging them into one
+        stream would make every trail-only field look intermittently null
+    direct:
+    - hop: cribl
+      location: edge Cribl worker group, database enclave
+      notes: >
+        rsyslog on the database host forwards the "Oracle Unified Audit"
+        facility to a Cribl Syslog source.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-oracle.unified_audit_syslog
+      notes: >
+        kept as a separate data stream from the trail pull because the field
+        set is a strict, differently-named subset; merging them into one
+        stream would make every trail-only field look intermittently null
+  formats:
+  - format: syslog-kv
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Oracle unified audit syslog pipeline
+      notes: >
+        No pack or integration parses this format. The line is a flat sequence
+        of KEY:"value" pairs (with LENGTH:'nnn' single-quoted), which a
+        generic key-value extractor handles once the quoting inconsistency is
+        accounted for.
+    fields:
+    - vendor: LENGTH
+      type: integer
+      description: byte length of the audit record as written to syslog
+      ecs: null
+      status: unmapped
+      custom: oracle.audit.record_length
+      notes: >-
+        single-quoted in the raw line (LENGTH:'212') unlike every other pair,
+        which breaks naive key-value extraction
+    - vendor: TYPE
+      type: integer
+      description: 'numeric audit type code - the syslog form of the view''s AUDIT_TYPE column'
+      ecs: null
+      status: partial
+      custom: oracle.audit.audit_type_code
+      transform: >
+        numeric code needs a lookup to the AUDIT_TYPE string (Standard,
+        FineGrainedAudit, Database Vault, Datapump, ...) that
+        UNIFIED_AUDIT_TRAIL spells out in words
+    - vendor: DBID
+      type: long
+      description: database identifier of the audited database
+      ecs: null
+      status: unmapped
+      custom: oracle.audit.dbid
+      notes: >
+        identifies which database emitted the record; with SESID and ENTRYID
+        it is the join key back into UNIFIED_AUDIT_TRAIL for the detail this
+        stream omits
+    - vendor: SESID
+      type: long
+      description: audit session identifier of the database session
+      ecs: null
+      status: unmapped
+      custom: oracle.audit.session_id
+    - vendor: CLIENTID
+      type: string
+      description: client identifier set on the Oracle session
+      ecs: null
+      status: unmapped
+      custom: oracle.audit.client_identifier
+      notes: >
+        empty in most deployments - only populated when the application calls
+        DBMS_SESSION.SET_IDENTIFIER, but where an app tier shares one database
+        account this is the only carrier of the real end user
+    - vendor: ENTRYID
+      type: long
+      description: numeric id of the audit entry within the session
+      ecs: event.sequence
+      status: mapped
+    - vendor: STMTID
+      type: long
+      description: identifier of the statement run in the session
+      ecs: null
+      status: unmapped
+      custom: oracle.audit.statement_id
+    - vendor: DBUSER
+      type: string
+      description: database session user whose action was audited
+      ecs: user.name
+      status: mapped
+    - vendor: CURUSER
+      type: string
+      description: effective user for the audited event
+      ecs: user.effective.name
+      status: mapped
+    - vendor: ACTION
+      type: integer
+      description: numeric action code of the audited event
+      ecs: event.code
+      status: mapped
+      notes: >
+        numeric only on this path - the view's readable ACTION_NAME is not
+        copied to syslog, so an AUDIT_ACTIONS lookup (51 = CREATE USER, 100 =
+        LOGON) is required before event.action can be populated at all
+    - vendor: RETCODE
+      type: integer
+      description: Oracle return code for the audited event; zero on success
+      ecs: error.code
+      status: partial
+      transform: >
+        0 translates to event.outcome success and non-zero to failure; the
+        value is the ORA- error number (1031 = ORA-01031 insufficient
+        privileges) and needs the error catalogue for error.message
+    - vendor: SCHEMA
+      type: string
+      description: schema name of the object affected by the action
+      ecs: null
+      status: unmapped
+      custom: oracle.audit.object_schema
+      notes: >-
+        present only on records that touch a database object; absent on logon
+        and session events
+    - vendor: OBJNAME
+      type: string
+      description: name of the object affected by the action
+      ecs: null
+      status: unmapped
+      custom: oracle.audit.object_name
+    - vendor: PDB_GUID
+      type: string
+      description: GUID of the pluggable database container in which the audit record was generated
+      ecs: null
+      status: unmapped
+      custom: oracle.audit.pdb_guid
+      notes: >
+        has no counterpart column in UNIFIED_AUDIT_TRAIL - it exists only on
+        the syslog path - and needs a GUID to PDB-name lookup before it means
+        anything to an analyst
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Extract the KEY:"value" pairs with an explicit rule that also
+          catches the single-quoted LENGTH:'nnn', then hydrate the two numeric
+          codes near the source: ACTION through an AUDIT_ACTIONS lookup into
+          event.action, and TYPE into the AUDIT_TYPE string the view spells
+          out. Pin @timestamp from the syslog header - the payload carries no
+          event time - and stamp collector receipt time separately so
+          forwarding delay stays measurable. Emit (DBID, SESID, ENTRYID) as
+          the correlation key back to the trail pull, and apply Persistent
+          Queue backpressure on the egress destination.
+        elastic: >
+          Own a custom logs-oracle.unified_audit_syslog ingest pipeline that
+          shares the ORA- error catalogue enrichment with the trail dataset so
+          RETCODE resolves to the same error.message and event.outcome on both
+          streams. Map the oracle.audit.* correlation keys - dbid, session_id,
+          statement_id, pdb_guid - as keyword in the index template, add a
+          pdb_guid to PDB-name enrich policy (that column exists only on this
+          path and is unreadable raw), and document in the CSOC's rules that
+          alerting must not depend on this stream where the trail pull exists,
+          because it is structurally missing SQL text, OS user and host.
+        relay: >
+          These records are bounded by construction - Oracle caps them to fit
+          a 1024-byte syslog entry - with a fixed, short, ASCII key vocabulary
+          and no free-text columns at all, which makes them by far the
+          friendliest dataset on this map for a custom NDJSON content filter
+          and the obvious pilot for the guard's filter rules before the harder
+          feeds follow. Full ECS-shaped NDJSON crosses (envelope mode B) since
+          no integration exists high-side; the feed is syslog key-value rather
+          than CEF, so nothing CEF-shaped crosses. Drop _raw on this route
+          first - the parsed record is the whole record - and reconcile
+          low-side and high-side counts per (dataset, hour) since the crossing
+          is at-most-once with no return channel.
+      direct:
+        parse_location: low
+        cribl: >
+          Extract the KEY:"value" pairs with an explicit rule that also
+          catches the single-quoted LENGTH:'nnn', then hydrate the two numeric
+          codes near the source: ACTION through an AUDIT_ACTIONS lookup into
+          event.action, and TYPE into the AUDIT_TYPE string the view spells
+          out. Pin @timestamp from the syslog header - the payload carries no
+          event time - and stamp collector receipt time separately so
+          forwarding delay stays measurable. Emit (DBID, SESID, ENTRYID) as
+          the correlation key back to the trail pull, and apply Persistent
+          Queue backpressure on the egress destination.
+        elastic: >
+          Own a custom logs-oracle.unified_audit_syslog ingest pipeline that
+          shares the ORA- error catalogue enrichment with the trail dataset so
+          RETCODE resolves to the same error.message and event.outcome on both
+          streams. Map the oracle.audit.* correlation keys - dbid, session_id,
+          statement_id, pdb_guid - as keyword in the index template, add a
+          pdb_guid to PDB-name enrich policy (that column exists only on this
+          path and is unreadable raw), and document in the CSOC's rules that
+          alerting must not depend on this stream where the trail pull exists,
+          because it is structurally missing SQL text, OS user and host.
+  - format: windows-event
+    enable: >
+      On a Windows database host, set the same UNIFIED_AUDIT_SYSTEMLOG
+      initialization parameter that drives the UNIX syslog feed to TRUE (ALTER
+      SYSTEM SET UNIFIED_AUDIT_SYSTEMLOG=TRUE SCOPE=SPFILE in the container,
+      then restart the instance; in a CDB it is a per-PDB static parameter and
+      the Windows default is FALSE). Where the UNIX form hands the key fields
+      to SYSLOG, the Windows form writes the identical key-field record to the
+      Windows Event Viewer Application log with the event Source
+      "Oracle.<SID>" (Oracle.instance), one event per audit record. The record
+      body is the same flat KEY:"value" sequence the syslog form emits (with
+      the single-quoted LENGTH:'nnn'), so only the container and the
+      collection path differ; the Windows envelope adds an event id, an
+      EventRecordID and a real TimeCreated.
+    references:
+    - >-
+      https://docs.oracle.com/en/database/oracle/oracle-database/19/refrn/UNIFIED_AUDIT_SYSTEMLOG.html
+    - >-
+      https://docs.oracle.com/en/database/oracle/oracle-database/18/ntqrf/about-event-viewer.html
+    - https://docs.oracle.com/database/121/NTQRF/monitor.htm
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Oracle unified audit syslog pipeline (Windows-event branch)
+      notes: >
+        No pack or integration parses the Oracle payload in either container.
+        A Windows event collector (Elastic Agent / Winlogbeat Windows event
+        log input, or a Cribl Windows Event source) parses the event ENVELOPE
+        - Provider, EventID, Level, TimeCreated, Computer, EventRecordID - but
+        the audit content lives in the rendered message body as the same
+        KEY:"value" line the syslog dataset carries (LENGTH, TYPE, DBID,
+        SESID, CLIENTID, ENTRYID, STMTID, DBUSER, CURUSER, ACTION, RETCODE,
+        SCHEMA, OBJNAME, PDB_GUID). So the body is handed to the exact same
+        key-value extraction and the ACTION /TYPE numeric-code lookups the
+        syslog pipeline runs; this is that pipeline's Windows branch, not a
+        new parser.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Collect off the Windows Application log with an Elastic Agent /
+          Winlogbeat event input (or a Cribl Windows Event source) filtered to
+          the Oracle.<SID> provider, in the same enclave as the database
+          exactly as the syslog form requires. Take the two signals the UNIX
+          syslog form is missing straight from the envelope: pin @timestamp
+          from TimeCreated (a structured, timezone-qualified write time rather
+          than a free-text syslog header) and set host.name from Computer,
+          which the syslog payload never carries. Then branch - do not fork -
+          the syslog pipeline: reuse the identical KEY:"value" extraction
+          including the single-quoted LENGTH, the AUDIT_ACTIONS lookup that
+          turns ACTION into event.action and the TYPE-code lookup, and carry
+          EventRecordID as the per-record collection cursor and dedupe key.
+          Apply Persistent Queue backpressure on the egress destination, never
+          Block.
+        elastic: >
+          Land in the same custom logs-oracle.unified_audit_syslog ingest
+          pipeline and data stream as the UNIX syslog feed so the container a
+          site runs on does not fork the schema: share the ORA- error
+          catalogue enrichment so RETCODE resolves to the same error.message
+          and event.outcome, and share the pdb_guid to PDB-name enrich policy.
+          Map event.provider and the oracle.audit.win_* envelope keys as
+          keyword in the index template. This record set is the same bounded
+          key subset as the syslog form - structurally missing SQL text, OS
+          user, terminal and host - so carry the same note in the CSOC rules
+          that alerting must not depend on this stream where the trail pull
+          exists.
+        relay: >
+          As friendly a crossing as the UNIX syslog form and an equally good
+          guard pilot: the records are bounded by construction, use a fixed
+          short ASCII key vocabulary and carry no free-text columns, so a
+          custom NDJSON content filter has little to reason about. Full
+          ECS-shaped NDJSON crosses (envelope mode B) since no integration
+          finishes the parse high-side; the feed is a Windows event rather
+          than CEF, so nothing CEF-shaped crosses. Drop the raw rendered event
+          after the parse - the parsed record is the whole record. The one
+          improvement over syslog is that the Windows envelope gives a real
+          per-record id (EventRecordID) and write time, which lets the
+          low-/high-side per-(dataset, hour) reconciliation on this
+          at-most-once, no-return-channel path be exact rather than
+          approximate.
+      direct:
+        parse_location: low
+        cribl: >
+          High-side Windows instances collect off the Windows Application log
+          with an Elastic Agent / Winlogbeat event input (or a Cribl Windows
+          Event source) filtered to the Oracle.<SID> provider and land direct
+          to Elastic (cribl -> elastic direct). Pin @timestamp from the
+          envelope TimeCreated and set host.name from Computer, then run the
+          KEY:"value" extraction including the single-quoted LENGTH, the
+          AUDIT_ACTIONS lookup that turns ACTION into event.action and the
+          TYPE-code lookup, carrying EventRecordID as the per-record cursor
+          and dedupe key. The operational decision is only which container the
+          host writes to: UNIX hosts feed syslog, Windows hosts feed the Event
+          Viewer, and a site cannot mix them on one host, so standardize the
+          pipeline on the input type and let either land in one data stream
+          rather than pinning collection to one platform.
+        elastic: >
+          Land in the same custom logs-oracle.unified_audit_syslog ingest
+          pipeline and data stream as the UNIX syslog feed so the container a
+          site runs on does not fork the schema: share the ORA- error
+          catalogue enrichment so RETCODE resolves to the same error.message
+          and event.outcome, and share the pdb_guid to PDB-name enrich policy.
+          Map event.provider and the oracle.audit.win_* envelope keys as
+          keyword in the index template, tag the input so
+          Windows-event-sourced records stay separable from syslog-sourced
+          ones, and keep the ACTION/TYPE lookups and the ORA- enrichment
+          identical across both containers so dashboards do not shift when a
+          host platform changes. Carry the note in the CSOC rules that
+          alerting must not depend on this stream where the trail pull exists,
+          since it is the same bounded key subset structurally missing SQL
+          text, OS user, terminal and host.
+    fields:
+    - vendor: Provider Name
+      type: string
+      description: >-
+        Windows event Source that identifies the emitting Oracle instance,
+        rendered as Oracle.<SID>
+      ecs: event.provider
+      status: mapped
+      notes: >
+        the Windows-container equivalent of the "Oracle Unified Audit[pid]"
+        tag the UNIX syslog form carries in its header; identifies the
+        instance, not the audited action
+    - vendor: TimeCreated
+      type: timestamp
+      description: >-
+        time the Windows Event Log wrote the audit event, timezone-qualified
+        in the event envelope
+      ecs: '@timestamp'
+      status: mapped
+      notes: >
+        the audit payload itself carries no event time on this path just as on
+        syslog, so this is the log-write time, not the action time - but
+        unlike the free-text syslog header it is a structured field, so it
+        needs no header reconstruction
+    - vendor: Computer
+      type: string
+      description: hostname of the Windows database server that generated the event
+      ecs: host.name
+      status: mapped
+      notes: >
+        server host identity that the UNIX syslog payload never carries; new
+        to this container and worth mapping because the record is otherwise
+        anonymous as to which host emitted it
+    - vendor: Level
+      type: enum
+      description: Windows event severity - Information, Warning or Error
+      ecs: log.level
+      status: partial
+      transform: >
+        Oracle writes most audit records at the Information level regardless
+        of RETCODE, so derive event.outcome from RETCODE in the body, not from
+        this envelope level; map the Windows level string to the ECS log.level
+        vocabulary only for the log-severity field
+    - vendor: EventID
+      type: integer
+      description: numeric Windows event id Oracle assigns to the unified audit event
+      ecs: null
+      status: unmapped
+      custom: oracle.audit.win_event_id
+      notes: >
+        the envelope event id, distinct from the payload ACTION code that
+        becomes event.code/event.action - keep it on its own custom key so the
+        two numeric identifiers do not collide
+    - vendor: EventRecordID
+      type: long
+      description: monotonic record number of the entry within the Windows Application log
+      ecs: null
+      status: unmapped
+      custom: oracle.audit.win_record_id
+      notes: >
+        a per-container sequence with no counterpart on the syslog path; the
+        natural collection cursor and dedupe key for an at-most-once pull off
+        the Windows event log
+- id: listener
+  name: Oracle Net listener log
+  description: >
+    Connection-establishment records written by the Oracle Net listener to
+    listener.log, one line per connection attempt or listener operation, in
+    the asterisk-delimited format "Timestamp * Connect Data [* Protocol Info]
+    * Event [* SID|Service] * Return Code" with nested TNS keyword-value
+    groups. It is the only Oracle log that records the observed client IP and
+    port for every connection attempt, including attempts that never reach a
+    successful database logon, which makes it complementary to the audit trail
+    rather than redundant with it.
+  event_categories:
+  - network
+  - authentication
+  route:
+    guarded:
+    - hop: cribl
+      location: edge Cribl worker group, database enclave
+      notes: >
+        listener.log is tailed off the database host (rsyslog imfile or an
+        Elastic Agent custom-logs input) into a Cribl source; the listener
+        does not emit syslog natively.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-oracle.listener
+    direct:
+    - hop: cribl
+      location: edge Cribl worker group, database enclave
+      notes: >
+        listener.log is tailed off the database host (rsyslog imfile or an
+        Elastic Agent custom-logs input) into a Cribl source; the listener
+        does not emit syslog natively.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-oracle.listener
+  formats:
+  - format: other
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Oracle listener pipeline
+      notes: >
+        The Elastic Oracle integration has no listener dataset (its log data
+        stream is database_audit only), so this needs a hand-built two-stage
+        parser: split on the asterisk delimiters, then walk the nested
+        (key=(key=value)) TNS groups inside CONNECT_DATA and ADDRESS.
+    fields:
+    - vendor: TIMESTAMP
+      type: timestamp
+      description: date and time the listener recorded the entry, formatted DD-MON-YYYY HH24:MI:SS
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        written in the database server's local time with no offset or zone
+        name, so the collector must attach the host's time zone; the MON
+        component is also locale-dependent on non-English hosts
+    - vendor: CONNECT_DATA.SERVICE_NAME
+      type: string
+      description: database service the client requested a connection to
+      ecs: service.name
+      status: mapped
+    - vendor: CONNECT_DATA.SID
+      type: string
+      description: instance SID the client requested, used by older clients instead of SERVICE_NAME
+      ecs: null
+      status: unmapped
+      custom: oracle.listener.sid
+      notes: >-
+        mutually exclusive with SERVICE_NAME on a given line; its continued
+        appearance is itself a legacy-client indicator
+    - vendor: CONNECT_DATA.CID.PROGRAM
+      type: string
+      description: client program name asserted by the connecting client
+      ecs: process.name
+      status: partial
+      notes: >
+        self-reported and unverified; JDBC thin clients send an empty PROGRAM,
+        so absence is normal and presence is triage-grade only
+    - vendor: CONNECT_DATA.CID.HOST
+      type: string
+      description: client host name asserted by the connecting client
+      ecs: null
+      status: partial
+      custom: oracle.listener.client_asserted_host
+      notes: >
+        self-reported by the client (JDBC thin sends the literal __jdbc__) and
+        deliberately NOT mapped to source.address, because the observed
+        ADDRESS HOST on the same line is authoritative and would be silently
+        overwritten by this claim
+    - vendor: CONNECT_DATA.CID.USER
+      type: string
+      description: operating system user name asserted by the connecting client
+      ecs: client.user.name
+      status: partial
+      notes: >-
+        client-asserted and never authenticated by the listener; usable as a
+        pivot, not as attribution
+    - vendor: ADDRESS.PROTOCOL
+      type: enum
+      description: transport protocol of the client connection - tcp, tcps, ipc
+      ecs: network.transport
+      status: partial
+      transform: >
+        tcps means TLS-wrapped TNS and should set network.protocol to a
+        tls-aware value rather than being carried through as the literal
+        string tcps
+    - vendor: ADDRESS.HOST
+      type: ip
+      description: observed IP address of the connecting client
+      ecs: source.ip
+      status: mapped
+    - vendor: ADDRESS.PORT
+      type: port
+      description: observed source port of the client connection
+      ecs: source.port
+      status: mapped
+    - vendor: EVENT
+      type: enum
+      description: >-
+        listener operation recorded on the line - establish, service_register,
+        service_update, reload, status, stop
+      ecs: event.action
+      status: mapped
+      notes: >
+        only establish records a client connection attempt; the
+        service_register/service_update/reload housekeeping events dominate
+        the line count and are the first thing to suppress for volume
+    - vendor: RETURN_CODE
+      type: integer
+      description: zero on a successful connection or command, otherwise the TNS error number
+      ecs: error.code
+      status: partial
+      transform: >
+        0 translates to event.outcome success and non-zero to failure; the
+        value is a TNS- error number (12514 = listener does not currently know
+        of service requested) needing the TNS error catalogue for
+        error.message
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Build the two-stage parser at the edge - asterisk split, then a
+          recursive walk of the nested TNS parenthetical groups - and resolve
+          the conflict between the two host values explicitly: the observed
+          ADDRESS HOST becomes source.ip and the client-asserted CID HOST is
+          kept only as a claim. Attach the database host's time zone to the
+          offset-less DD-MON-YYYY timestamp here, where the host context is
+          known. Suppress or aggregate the service_register, service_update
+          and reload housekeeping events, which dominate listener volume and
+          carry no security value, so that only establish records and non-zero
+          return codes are forwarded at full fidelity.
+        elastic: >
+          Own a custom logs-oracle.listener ingest pipeline that resolves the
+          non-zero return code through a TNS error lookup into error.message
+          (12514 = listener does not currently know of service requested) and
+          derives event.outcome from it, and that sets event.category to
+          network plus authentication consistently so failed connection
+          attempts join logon-failure alerting from the audit trail. Map
+          oracle.listener.sid as keyword in the index template and mark the
+          client-asserted program/host/user fields clearly in the field docs,
+          so analysts do not build attribution rules on values the listener
+          never verified.
+        relay: >
+          Full ECS-shaped NDJSON crosses (envelope mode B) - one connection
+          record per line, bounded and short once the housekeeping events are
+          suppressed. The content-filter friction here is that CID PROGRAM,
+          CID HOST and CID USER are supplied verbatim by the connecting client
+          and are therefore attacker-controlled free text that can carry
+          arbitrary bytes into the crossing, so they must be length-capped and
+          charset-restricted low-side before a custom NDJSON filter has to
+          reason about them. The feed is a plain text file rather than CEF, so
+          nothing CEF-shaped crosses; carry _raw across until the hand-built
+          TNS parser is proven, since a mis-parsed connection record cannot be
+          re-requested over an at-most-once, no-return-channel path.
+      direct:
+        parse_location: low
+        cribl: >
+          Build the two-stage parser at the edge - asterisk split, then a
+          recursive walk of the nested TNS parenthetical groups - and resolve
+          the conflict between the two host values explicitly: the observed
+          ADDRESS HOST becomes source.ip and the client-asserted CID HOST is
+          kept only as a claim. Attach the database host's time zone to the
+          offset-less DD-MON-YYYY timestamp here, where the host context is
+          known. Suppress or aggregate the service_register, service_update
+          and reload housekeeping events, which dominate listener volume and
+          carry no security value, so that only establish records and non-zero
+          return codes are forwarded at full fidelity.
+        elastic: >
+          Own a custom logs-oracle.listener ingest pipeline that resolves the
+          non-zero return code through a TNS error lookup into error.message
+          (12514 = listener does not currently know of service requested) and
+          derives event.outcome from it, and that sets event.category to
+          network plus authentication consistently so failed connection
+          attempts join logon-failure alerting from the audit trail. Map
+          oracle.listener.sid as keyword in the index template and mark the
+          client-asserted program/host/user fields clearly in the field docs,
+          so analysts do not build attribution rules on values the listener
+          never verified.
+  - format: xml-file
+    enable: >
+      The listener writes a structured ADR XML log, log.xml, whenever ADR
+      logging is on, which is the default: DIAG_ADR_ENABLED_<listener_name>
+      defaults to on, so log.xml is produced alongside the asterisk- delimited
+      text log without any extra configuration. It lands under the ADR home at
+      <ADR_BASE>/diag/tnslsnr/<host>/<listener>/alert/log.xml (ADR_BASE
+      defaults to ORACLE_BASE, or ORACLE_HOME/log if ORACLE_BASE is unset),
+      with the text form under the sibling trace/ directory; ADRCI can also
+      read it. Setting DIAG_ADR_ENABLED_<listener_name>=off in listener.ora
+      reverts to non-ADR text-only logging governed by
+      LOG_DIRECTORY_<listener_name> and LOG_FILE_<listener_name>. Each
+      connection attempt is one <msg> element whose attributes carry the
+      record envelope (time, host_id, host_addr, pid, comp_id=tnslsnr) and
+      whose <txt> child holds the same asterisk-delimited "Timestamp * Connect
+      Data [* Protocol Info] * Event [* SID|Service] * Return Code" payload
+      the text listener.log records.
+    references:
+    - >-
+      https://docs.oracle.com/en/database/oracle/oracle-database/19/netrf/oracle-net-listener-parameters-in-listener-ora.html
+    - >-
+      https://docs.oracle.com/en/database/oracle/oracle-database/26/netag/understanding-automatic-diagnostic-repository.html
+    - >-
+      https://docs.oracle.com/database/121/SUTIL/GUID-E0FF3013-2EBF-4110-88BF-69E7DD2BBD7C.htm
+    - https://docs.nxlog.co/integrations/db/oracle-database.html
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Oracle listener pipeline (XML-envelope branch)
+      notes: >
+        The same hand-built two-stage TNS parser the text listener needs still
+        runs on the <txt> body - asterisk split, then a recursive walk of the
+        nested (key=(key=value)) groups inside CONNECT_DATA and ADDRESS -
+        because no Elastic integration or Cribl pack parses the listener in
+        either rendering (the Elastic Oracle integration's only log dataset is
+        database_audit). The XML form adds a preceding stage: extract the
+        <msg> element, read its envelope attributes, then hand the <txt>
+        content to the existing TNS walker. So this is the text pipeline's XML
+        branch, keyed on the <msg> boundary, not a second parser.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Split the <msg> records at the edge (a multiline rule on the
+          <msg>/</msg> boundary, then Extract XML), and take the authoritative
+          signals from the envelope rather than reconstructing them: pin
+          @timestamp from the msg time attribute, which is ISO 8601 with a
+          timezone offset and so removes the text feed's offset-less
+          DD-MON-YYYY host-timezone-attachment step and its non-English MON
+          locale hazard, and set observer.name, observer.ip and process.pid
+          from host_id, host_addr and pid - none of which the text
+          listener.log carries at all. Run the existing two-stage TNS parser
+          on the <txt> body, resolve the two host values exactly as on the
+          text feed (observed ADDRESS HOST becomes source.ip, the
+          client-asserted CID HOST stays a claim), and suppress or aggregate
+          the service_register / service_update / reload housekeeping msgs
+          that dominate the line count and carry no security value.
+        elastic: >
+          Own the same custom logs-oracle.listener ingest pipeline and data
+          stream as the text feed so the two renderings share a schema: the
+          XML form additionally populates observer.name, observer.ip and
+          process.pid, so add those to the index template. Resolve the
+          non-zero RETURN_CODE through a TNS error lookup into error.message
+          (12514 = listener does not currently know of service requested) and
+          derive event.outcome from it, set event.category to network plus
+          authentication consistently so failed connection attempts join
+          logon-failure alerting from the audit trail, map oracle.listener.sid
+          as keyword, and mark the client-asserted CID program/host/user
+          fields clearly in the field docs so analysts do not build
+          attribution rules on values the listener never verified.
+        relay: >
+          Full ECS-shaped NDJSON crosses (envelope mode B) - one connection
+          record per line, bounded and short once the housekeeping events are
+          suppressed. The XML wrapper is stripped low-side, so nothing
+          XML-shaped reaches the boundary; the content-filter friction is
+          unchanged from the text feed, namely that CID PROGRAM, CID HOST and
+          CID USER are supplied verbatim by the connecting client and are
+          attacker-controlled free text that must be length-capped and
+          charset-restricted low-side before a custom NDJSON filter has to
+          reason about them. Because the envelope now carries a proper record
+          time and pid, per-(dataset, hour) reconciliation on this
+          at-most-once, no-return-channel path is cleaner than on the text
+          feed; carry _raw across only until the hand-built TNS parser is
+          proven, since a mis-parsed connection record cannot be re-requested.
+      direct:
+        parse_location: low
+        cribl: >
+          High-side instances split the <msg> records at the edge (a multiline
+          rule on the <msg>/</msg> boundary, then Extract XML) and land direct
+          to Elastic (cribl -> elastic direct). Pin @timestamp from the msg
+          time attribute, which is ISO 8601 with a timezone offset and so
+          needs no host-timezone attachment or locale-dependent MON parse, set
+          observer.name, observer.ip and process.pid from host_id, host_addr
+          and pid, and run the two-stage TNS parser on the <txt> body -
+          resolving the observed ADDRESS HOST to source.ip while the
+          client-asserted CID HOST stays a claim - then suppress the
+          service_register / service_update / reload housekeeping msgs. The
+          decision that matters is text vs XML: prefer the XML log.xml where
+          it is already being produced (the default) because its <msg>
+          envelope removes the text feed's timezone-attachment guesswork and
+          adds the listener host and pid for free, and standardize the
+          pipeline on the <msg> boundary so a listener toggled between ADR and
+          non-ADR logging is handled without a downstream change.
+        elastic: >
+          Own the same custom logs-oracle.listener ingest pipeline and data
+          stream as the text feed so the two renderings share a schema: the
+          XML form additionally populates observer.name, observer.ip and
+          process.pid, so add those to the index template. Resolve the
+          non-zero RETURN_CODE through a TNS error lookup into error.message
+          (12514 = listener does not currently know of service requested) and
+          derive event.outcome from it, set event.category to network plus
+          authentication consistently so failed connection attempts join
+          logon-failure alerting from the audit trail, map oracle.listener.sid
+          as keyword, and mark the client-asserted CID program/host/user
+          fields clearly in the field docs so analysts do not build
+          attribution rules on values the listener never verified. Keep the
+          housekeeping suppression identical to the text branch, and tag the
+          input so XML-sourced records stay separable from text-sourced ones
+          if a host runs both during a migration.
+    fields:
+    - vendor: time
+      type: timestamp
+      description: msg-element timestamp of the log entry, ISO 8601 with a timezone offset
+      ecs: '@timestamp'
+      status: mapped
+      notes: >
+        the authoritative clock on this rendering - unlike the text log's
+        offset-less DD-MON-YYYY local time it carries the zone offset, so it
+        needs no host-timezone attachment and no locale-dependent MON parse
+    - vendor: host_id
+      type: string
+      description: hostname of the database server on which the listener is running
+      ecs: observer.name
+      status: mapped
+      notes: >
+        the listener is the observer of connection attempts; this is the
+        server that wrote the record, distinct from the client host in the
+        <txt> ADDRESS group, and the text listener.log carries no such field
+        at all
+    - vendor: host_addr
+      type: ip
+      description: network address of the database server on which the listener is running
+      ecs: observer.ip
+      status: mapped
+      notes: >-
+        listener-host IP, new to the XML envelope; do not confuse with the
+        observed client ADDRESS HOST in the payload, which is source.ip
+    - vendor: pid
+      type: integer
+      description: process id of the tnslsnr listener process that logged the entry
+      ecs: process.pid
+      status: mapped
+      notes: >-
+        identifies the listener process, not the client; absent from the text
+        listener.log
+    - vendor: comp_id
+      type: string
+      description: >-
+        ADR component id that produced the record, constant "tnslsnr" for the
+        listener log
+      ecs: null
+      status: unmapped
+      custom: oracle.listener.component
+      notes: >-
+        fixed value that distinguishes listener records from other ADR
+        components (rdbms, asm) when logs are pooled
+    - vendor: org_id
+      type: string
+      description: ADR organization id, constant "oracle"
+      ecs: null
+      status: unmapped
+      custom: oracle.listener.org_id
+      notes: >-
+        fixed provenance marker of no analytic value on its own; retained only
+        so the envelope inventory is complete
+    - vendor: type
+      type: enum
+      description: >-
+        ADR message class - NOTIFICATION, WARNING, ERROR, INCIDENT_ERROR,
+        TRACE or UNKNOWN
+      ecs: null
+      status: unmapped
+      custom: oracle.listener.message_type
+      notes: >
+        routine establish and housekeeping lines are NOTIFICATION; a
+        non-NOTIFICATION class is itself a triage signal, so keep it rather
+        than collapsing it into log.level
+    - vendor: level
+      type: integer
+      description: numeric ADR severity level of the entry (1 most severe)
+      ecs: log.level
+      status: partial
+      transform: >
+        numeric ADR level needs a lookup to the ECS log.level string
+        vocabulary; derive event.outcome from the payload RETURN_CODE, not
+        from this level
+    - vendor: txt
+      type: string
+      description: >-
+        msg body carrying the asterisk-delimited connect record, identical to
+        the text listener.log payload
+      ecs: null
+      status: partial
+      notes: >
+        parsed by the same two-stage TNS walker into the fields the listener
+        dataset documents (TIMESTAMP, CONNECT_DATA.*, ADDRESS.*, EVENT,
+        RETURN_CODE); it is the record content, while the <msg> attributes
+        above are the envelope, so it is not mapped as a single field but
+        split into those existing mappings

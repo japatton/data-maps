@@ -1,0 +1,1774 @@
+id: zos-racf
+name: IBM z/OS RACF security audit
+vendor: IBM
+versions: z/OS 2.4, 2.5, 3.1 (Security Server RACF)
+draft: true
+references:
+- >-
+  https://www.ibm.com/docs/SSLTBW_2.3.0/com.ibm.zos.v2r3.icha700/icha700_RACF_SMF_data_unload_utility__IRRADU00_.htm
+- https://publibfp.dhe.ibm.com/epubs/pdf/ich1a310.pdf
+- >-
+  https://www.ibm.com/docs/en/zos/3.1.0?topic=fust8d-format-header-portion-unloaded-smf-type-30-type-80
+- >-
+  https://www.ibm.com/docs/en/zos/3.1.0?topic=interfaces-format-unloaded-smf-type-81-data
+- https://www.ibm.com/docs/en/z-logdata-analytics/5.1.0?topic=insights-smf-80-data
+- https://www.redbooks.ibm.com/redpapers/pdfs/redp5465.pdf
+- https://public.dhe.ibm.com/s390/zos/racf/pdf/r03_utilities_for_auditors.pdf
+datasets:
+- id: racinit
+  name: RACINIT job initiation and logon (SMF 80 event 01)
+  description: >
+    RACF logon, batch job initiation and RACROUTE REQUEST=VERIFY events,
+    written as SMF type 80 event code 01 and delivered to the SIEM as IRRADU00
+    unload records with the JOBINIT event type and the INIT_ column-id prefix.
+    Fields below are the documented IRRADU00 unload column names, not raw SMF
+    binary offsets: the unload record is a fixed-position flat file whose
+    header (positions 1-280) is common to every event code and whose event
+    extension starts at position 282. The record carries no IP address for
+    classic 3270 sessions - the closest thing to a source is the port of entry
+    (INIT_UTK_SPOE) and its class (INIT_UTK_SPCLASS).
+  event_categories:
+  - authentication
+  route:
+    guarded:
+    - hop: other
+      name: z/OS SMF dump plus IRRADU00 unload (or IBM Common Data Provider Data Streamer)
+      notes: >
+        Transport reality, stated honestly: RACF itself only writes binary SMF
+        records. Something has to turn them into text before Cribl can see
+        them. In most shops that is a scheduled SMF dump feeding IRRADU00,
+        whose fixed-position flat file is then moved by batch SFTP - a
+        periodic file drop, not a stream, so end-to-end latency is the dump
+        interval (commonly 15 minutes to 24 hours). Sites running IBM Common
+        Data Provider for z Systems, zSecure Audit, or Vanguard instead get a
+        near-real-time push off the SMF in-memory resource or log stream.
+        Which of the two is in play must be confirmed per LPAR; it changes
+        alerting latency far more than it changes field names.
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Cribl receives either a Filesystem/S3 collector run over the IRRADU00
+        output or a CDP Data Streamer subscriber feed; that collector runs in
+        the mainframe enclave and pushes across the guard.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-zos_racf.racinit
+    direct:
+    - hop: other
+      name: z/OS SMF dump plus IRRADU00 unload (or IBM Common Data Provider Data Streamer)
+      notes: >
+        Transport reality, stated honestly: RACF itself only writes binary SMF
+        records. Something has to turn them into text before Cribl can see
+        them. In most shops that is a scheduled SMF dump feeding IRRADU00,
+        whose fixed-position flat file is then moved by batch SFTP - a
+        periodic file drop, not a stream, so end-to-end latency is the dump
+        interval (commonly 15 minutes to 24 hours). Sites running IBM Common
+        Data Provider for z Systems, zSecure Audit, or Vanguard instead get a
+        near-real-time push off the SMF in-memory resource or log stream.
+        Which of the two is in play must be confirmed per LPAR; it changes
+        alerting latency far more than it changes field names.
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Cribl receives either a Filesystem/S3 collector run over the IRRADU00
+        output or a CDP Data Streamer subscriber feed.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-zos_racf.racinit
+  formats:
+  - format: other
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom IRRADU00 fixed-position pipeline
+      notes: >
+        No Elastic integration and no Cribl pack exists for RACF or IRRADU00
+        output; the fixed-position column extraction is hand-built from the
+        IBM record layout tables. zSecure Audit and CDP can pre-shape the
+        records, but neither ships an Elastic-side parser.
+    fields:
+    - vendor: INIT_EVENT_TYPE
+      type: string
+      description: type of event described by the record, set to JOBINIT for RACINIT events
+      ecs: event.action
+      status: mapped
+      notes: >
+        the translated name of SMF type 80 event code 01; a numeric value here
+        means IRRADU00 could not translate the event code and only the header
+        portion was unloaded
+    - vendor: INIT_EVENT_QUAL
+      type: enum
+      description: >-
+        qualifier describing how the initiation ended (SUCCESSI, INVPSWD,
+        REVKUSER, PWDEXPR, PTKTREPL, ...)
+      ecs: event.reason
+      status: mapped
+      notes: >
+        34 documented qualifier values carrying the real authentication
+        failure reason; needs a lookup table to become readable, and is the
+        second input (with INIT_VIOLATION) to event.outcome
+    - vendor: INIT_VIOLATION
+      type: enum
+      description: whether this record represents a security violation (YES/NO)
+      ecs: event.outcome
+      status: mapped
+      transform: >
+        YES becomes failure and NO becomes success; the WARNING-class
+        qualifiers (WINSSECL, WSECLM, WNASECL) report NO here despite being
+        policy exceptions, so INIT_USER_WARNING must be checked before
+        treating the event as a clean success
+    - vendor: INIT_DATE_WRITTEN / INIT_TIME_WRITTEN
+      type: timestamp
+      description: >-
+        date (yyyy-mm-dd) and time (hh:mm:ss) the record was written to SMF,
+        in two separate fixed-position columns
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        the two columns must be concatenated into one value; they are local
+        LPAR time with no zone or sub-second precision, so the LPAR's UTC
+        offset has to be applied before indexing
+    - vendor: INIT_SYSTEM_SMFID
+      type: string
+      description: four-character SMF system identifier of the LPAR the record originated on
+      ecs: host.name
+      status: mapped
+      notes: >
+        the SMF ID is the only host identity in the record; on a sysplex it
+        identifies the LPAR, not the sysplex, so it must not be collapsed
+        across members
+    - vendor: INIT_EVT_USER_ID
+      type: string
+      description: RACF user ID associated with the event (up to 8 characters)
+      ecs: user.name
+      status: mapped
+    - vendor: INIT_EVT_GRP_ID
+      type: string
+      description: RACF group name the user was connected to for this event
+      ecs: user.group.name
+      status: mapped
+    - vendor: INIT_USER_NAME
+      type: string
+      description: 20-character programmer name associated with the RACF user ID
+      ecs: user.full_name
+      status: mapped
+    - vendor: INIT_APPL
+      type: string
+      description: >-
+        application name specified on the RACROUTE REQUEST=VERIFY (for example
+        a CICS region or TSO)
+      ecs: service.name
+      status: partial
+      notes: >
+        identifies the logical application the user authenticated to, but is
+        blank for many batch initiations and is a RACF APPL profile name
+        rather than a service name in the ECS sense
+    - vendor: INIT_UTK_SPOE
+      type: string
+      description: >-
+        port of entry from the UTOKEN - a terminal id, console name, JES input
+        node, or IP address depending on the POE class
+      ecs: source.address
+      status: partial
+      notes: >
+        the closest thing to a source identifier on the record; it is only an
+        IP address for TCP-attached sessions, so source.ip must be populated
+        conditionally on INIT_UTK_SPCLASS and left empty for TERMINAL, CONSOLE
+        and JESINPUT ports of entry
+    - vendor: INIT_UTK_SPCLASS
+      type: enum
+      description: class of the port of entry - TERMINAL, CONSOLE, JESINPUT or APPCPORT
+      ecs: null
+      status: unmapped
+      custom: racf.poe.class
+      notes: the discriminator that tells a parser how to interpret INIT_UTK_SPOE
+    - vendor: INIT_UTK_SUSER_ID
+      type: string
+      description: >-
+        user ID that submitted the work, when the initiation was submitted on
+        behalf of another user
+      ecs: source.user.name
+      status: mapped
+      notes: >
+        the submitting user ID; on surrogate and NJE submissions this is the
+        acting identity and differs from INIT_EVT_USER_ID
+    - vendor: INIT_UTK_SURROGAT
+      type: enum
+      description: whether the user is a surrogate user (YES/NO)
+      ecs: null
+      status: unmapped
+      custom: racf.token.surrogate
+      notes: flags surrogate submission, a standing mainframe privilege-abuse detection
+    - vendor: INIT_UTK_SESSTYPE
+      type: string
+      description: session type of the session being initiated
+      ecs: null
+      status: unmapped
+      custom: racf.session_type
+    - vendor: INIT_TERM
+      type: string
+      description: terminal associated with the event (up to 8 characters)
+      ecs: null
+      status: unmapped
+      custom: racf.terminal
+      notes: 3270 terminal id; not an ECS network address and not resolvable to one
+    - vendor: INIT_JOB_NAME
+      type: string
+      description: JES job name associated with the event
+      ecs: null
+      status: unmapped
+      custom: racf.job.name
+      notes: >
+        the unit-of-work name; it is neither a process name nor a host name in
+        ECS terms, but it is the primary pivot for mainframe triage
+    - vendor: INIT_UTK_SECL
+      type: string
+      description: SECLABEL of the user for this session
+      ecs: null
+      status: unmapped
+      custom: racf.seclabel.user
+      notes: mandatory-access-control label; no ECS equivalent exists
+    - vendor: INIT_LOGSTR
+      type: string
+      description: >-
+        LOGSTR= free-text data supplied by the caller of the RACROUTE macro
+        (up to 255 bytes)
+      ecs: message
+      status: partial
+      notes: >
+        unbounded caller-supplied text with no schema; useful context but the
+        main content-filter friction on the crossing, and it must be
+        length-capped and flagged rather than trusted
+    - vendor: >-
+        INIT_AUTH_NORMAL / INIT_AUTH_SPECIAL / INIT_AUTH_OPER /
+        INIT_AUTH_AUDIT / INIT_AUTH_TRUSTED / INIT_AUTH_BYPASS
+      type: enum
+      description: >-
+        family of YES/NO columns recording which authority let the request
+        through (normal checking, SPECIAL, OPERATIONS, AUDITOR, trusted,
+        *BYPASS*)
+      ecs: null
+      status: partial
+      custom: racf.auth_reason
+      notes: >
+        six separate fixed-position YES/NO columns that collapse naturally
+        into one keyword array; SPECIAL, OPERATIONS and *BYPASS* grants are
+        the privilege-escalation signal the CSOC wants and there is no ECS
+        field for "why was this allowed"
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Do the fixed-position column extraction on the low side, keyed off
+          the EVENT_TYPE value in positions 1-8, and emit one flat ECS-shaped
+          JSON object per unload record - a text grammar defined by byte
+          offsets is exactly what should not be shipped across a relay whose
+          content filter cannot count columns. Join INIT_DATE_WRITTEN and
+          INIT_TIME_WRITTEN into a single UTC @timestamp using the LPAR's
+          configured offset before anything else, derive event.outcome from
+          INIT_VIOLATION plus the INIT_EVENT_QUAL enum in the same place, and
+          cap INIT_LOGSTR (255 bytes of application free-text) with an
+          explicit truncation flag. Validate against a Cribl Schema Library
+          schema immediately before the forwarding destination with a
+          dead-letter route, and run the destination on Persistent Queue
+          backpressure.
+        elastic: >
+          Own a custom logs-zos_racf.racinit ingest pipeline that finishes
+          only what the low side cannot: resolve the INIT_EVENT_QUAL codes
+          into a readable failure reason (INVPSWD, REVKUSER, PWDEXPR,
+          PTKTREPL) via an enrich policy so the CSOC alerts on names rather
+          than eight-character mnemonics, and populate source.ip conditionally
+          from racf.poe.address only when racf.poe.class indicates a
+          TCP-attached port of entry, never blindly. Add explicitly typed
+          custom-namespace index-template mappings for racf.poe.class,
+          racf.session_type, racf.terminal, racf.job.name, racf.seclabel.user
+          and racf.auth_reason as keyword so SECLABEL and privilege-escalation
+          queries work without dynamic mapping.
+        relay: >
+          Full ECS-shaped NDJSON crosses (envelope mode B) - one JSON object
+          per unload record, UTF-8, LF-terminated, compression disabled,
+          nesting depth of two or less - because a byte-offset flat file is
+          unparseable to a generic content filter and because the source is
+          EBCDIC: transcode to UTF-8 low-side and normalize the trailing blank
+          padding IBM writes into every fixed-width column, or the filter sees
+          one 3,800-byte line of padding. The content-filter friction to
+          settle with the guard owner is INIT_LOGSTR, 255 bytes of
+          caller-supplied free text that may carry non-ASCII bytes; cap and
+          flag it low-side to a length the custom filter accepts. Nothing
+          CEF-shaped crosses - there is no CEF anywhere on this path. With no
+          return channel and a batch-dump upstream, reconcile low-side and
+          high-side counts per (dataset, SMF dump interval) rather than per
+          hour, and carry _raw for this dataset until the column offsets are
+          proven, since logon forensics is the highest-value RACF record.
+      direct:
+        parse_location: low
+        cribl: >
+          Do the fixed-position column extraction in the edge pipeline, keyed
+          off the EVENT_TYPE value in positions 1-8, and emit one flat
+          ECS-shaped JSON object per unload record so a text grammar defined
+          by byte offsets is resolved to named fields before anything
+          downstream consumes it. Join INIT_DATE_WRITTEN and INIT_TIME_WRITTEN
+          into a single UTC @timestamp using the LPAR's configured offset
+          before anything else, derive event.outcome from INIT_VIOLATION plus
+          the INIT_EVENT_QUAL enum in the same place, and cap INIT_LOGSTR (255
+          bytes of application free-text) with an explicit truncation flag.
+          Validate against a Cribl Schema Library schema immediately before
+          the forwarding destination with a dead-letter route, and run the
+          destination on Persistent Queue backpressure.
+        elastic: >
+          Own a custom logs-zos_racf.racinit ingest pipeline that finishes
+          only what the edge pipeline cannot: resolve the INIT_EVENT_QUAL
+          codes into a readable failure reason (INVPSWD, REVKUSER, PWDEXPR,
+          PTKTREPL) via an enrich policy so the CSOC alerts on names rather
+          than eight-character mnemonics, and populate source.ip conditionally
+          from racf.poe.address only when racf.poe.class indicates a
+          TCP-attached port of entry, never blindly. Add explicitly typed
+          custom-namespace index-template mappings for racf.poe.class,
+          racf.session_type, racf.terminal, racf.job.name, racf.seclabel.user
+          and racf.auth_reason as keyword so SECLABEL and privilege-escalation
+          queries work without dynamic mapping.
+  - format: syslog-leef
+    enable: >
+      Stand up an IBM Security zSecure Audit process on the LPAR to feed the
+      QRadar / JSA "IBM RACF" DSM instead of the IRRADU00 unload drop. In the
+      zSecure CARLa-driven components, configure the QRadar SIEM interface
+      (data-preparation setup) so it reads the SMF type 80 records - here the
+      RACINIT / JOBINIT logon and RACROUTE REQUEST=VERIFY events, SMF 80 event
+      code 01 - and renders each as a LEEF:1.0 event with named key=value
+      attributes, enriched from the system configuration and the RACF database
+      rather than the raw record alone. Deliver near real time by writing the
+      LEEF to the z/OS UNIX syslog daemon and forwarding it, or let QRadar
+      pull the generated LEEF log files on a schedule with the Log File
+      protocol (SFTP/FTP/SCP). The multi-factor-authentication SMF 80 fields
+      are part of the interface where MFA is in play. Note the documented
+      limitation that SMF type 80 events lacking a CLASS produce no LEEF
+      record - not a concern for logon events, but it means the LEEF feed is
+      not byte-for-byte equivalent to the SMF stream.
+    references:
+    - >-
+      https://www.juniper.net/documentation/us/en/software/jsa7.5.0/jsa-dsm/topics/concept/concept-jsa-configuring-dsm-ibm-racf.html
+    - https://www.ibm.com/docs/de/dsm?topic=racf
+    - https://www.ibm.com/support/pages/setting-data-preparation-qradar-siem
+    - >-
+      https://www.ibm.com/docs/en/SS2RWS_2.3.1/com.ibm.zsecure.doc_2.3.1/zsec_install.pdf
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom RACF logon LEEF pipeline
+      notes: >
+        No Elastic integration and no Cribl pack normalizes RACF in any
+        encoding, so LEEF is parsed by a custom pipeline keyed off the "LEEF:"
+        banner. LEEF is materially easier than the IRRADU00 feed in that it
+        carries named attributes and pre-joined date/time instead of
+        byte-offset columns, and zSecure has already transcoded EBCDIC and
+        resolved much of the enrichment from the RACF database; the per-event
+        RACINIT attribute names are set by the zSecure interface and are not
+        published, so the pipeline must be built against a captured sample
+        from the site's own zSecure QRadar process.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Terminate the LEEF stream on the edge worker group in the mainframe
+          enclave and split it on the LEEF "|"/tab delimiter into named
+          attributes, keyed on the banner so a site that runs both the
+          IRRADU00 feed and the zSecure LEEF feed during a migration lands
+          both in one normalized shape. Resolve the RACINIT outcome and the
+          failure qualifier (invalid password, revoked, expired, PassTicket
+          replay) into event.outcome and event.reason from the LEEF attributes
+          rather than trusting a single flag, apply the LPAR timezone to the
+          LEEF event time since it is naive local time, and populate source.ip
+          only when the port-of-entry attribute is a TCP-attached class - the
+          same conditional the IRRADU00 map applies to INIT_UTK_SPCLASS. Emit
+          one ECS-shaped JSON record per logon, validate with
+          C.Schema(...).validate before the destination behind a dead-letter
+          route, and run on Persistent Queue backpressure.
+        elastic: >
+          Land in the same custom logs-zos_racf.racinit ingest pipeline and
+          index template the IRRADU00 feed targets so the encoding a site
+          chooses does not fork the schema - LEEF-sourced and unload-sourced
+          logons must resolve to identical ECS fields. Finish only what the
+          edge cannot: enrich the SMFID in host.name with site/owner context,
+          hold the custom-namespace keys (racf.poe.class, racf.session_type,
+          racf.terminal, racf.job.name, racf.seclabel.user, racf.auth_reason)
+          as explicitly typed keyword, and keep the failure-reason lookup
+          published as a saved enrichment so a template flip does not silently
+          dynamic-map the LEEF attributes.
+        relay: >
+          Low-side instances cross the Everfox guard as full ECS-shaped NDJSON
+          (envelope mode B) - one logon per line, UTF-8, LF-terminated,
+          compression disabled, nesting depth <=2 - because no Elastic
+          integration exists to finish a thin envelope high-side, so LEEF is
+          resolved low-side and never itself reaches the boundary. The
+          content-filter friction is small next to the raw IRRADU00 line:
+          logon attributes are short and named, so the guard's custom filter
+          polices a bounded key set rather than a 3,800-byte fixed-position
+          record of blank padding. The residual friction is any caller
+          free-text the zSecure action carries through (the LOGSTR analogue);
+          cap and flag it low-side. Reconcile low- and high-side counts per
+          (dataset, hour) for the syslog transport, or per pull interval if
+          QRadar-style Log File retrieval is used, since the crossing is
+          at-most-once with no return channel.
+      direct:
+        parse_location: low
+        cribl: >
+          Terminate the LEEF stream on the edge worker group and split it on
+          the LEEF "|"/tab delimiter into named attributes, keyed on the
+          banner so a site that runs both the IRRADU00 feed and the zSecure
+          LEEF feed during a migration lands both in one normalized shape.
+          Resolve the RACINIT outcome and the failure qualifier (invalid
+          password, revoked, expired, PassTicket replay) into event.outcome
+          and event.reason from the LEEF attributes rather than trusting a
+          single flag, apply the LPAR timezone to the naive local event time,
+          populate source.ip only when the port-of-entry attribute is a
+          TCP-attached class, and emit one ECS-shaped JSON record per logon
+          validated with C.Schema(...).validate on Persistent Queue
+          backpressure. The operational choice that matters is transport: the
+          UNIX-syslog delivery is near real time while the Log File pull is a
+          scheduled batch retrieval, so pin logon - the highest-value RACF
+          record - to the syslog path where the site supports it, and
+          standardize the parser on the LEEF banner so a syslog and a
+          file-pulled sample land in the same pipeline.
+        elastic: >
+          Land in the same custom logs-zos_racf.racinit ingest pipeline and
+          index template the IRRADU00 feed targets so the encoding a site
+          chooses does not fork the schema - LEEF-sourced and unload-sourced
+          logons must resolve to identical ECS fields. Enrich the SMFID in
+          host.name with site/owner context, hold the custom-namespace keys
+          (racf.poe.class, racf.session_type, racf.terminal, racf.job.name,
+          racf.seclabel.user, racf.auth_reason) as explicitly typed keyword,
+          and keep the failure-reason lookup published as a saved enrichment
+          so a template flip does not silently dynamic-map the LEEF
+          attributes. Tag the input so LEEF-sourced records stay separable
+          from unload-sourced ones during a migration, and keep the
+          conditional source.ip logic identical across producers so dashboards
+          do not shift when a site moves from IRRADU00 text to a zSecure LEEF
+          push.
+    fields_omitted: >
+      The per-event attribute names in a RACINIT LEEF record are set by the
+      zSecure Audit QRadar interface's own field selection, which IBM does not
+      publish, so the attribute list exists only in a capture from the site's
+      zSecure process. The content is the SMF 80 event code 01 logon the
+      `other` entry inventories as INIT_ columns, re-rendered as named LEEF
+      attributes with the date/time pre-joined.
+    fields: []
+  - format: json
+    enable: >
+      Run IBM Z Common Data Provider (CDPz) on the LPAR and let its System
+      Data Engine gather SMF type 80 in near real time rather than waiting on
+      a scheduled SMF dump plus IRRADU00. Put SMF in log stream recording (or
+      expose the SMF in-memory resource) and grant the System Data Engine user
+      READ on the IFA.IFASMF.<resource> FACILITY profile, define a System Data
+      Engine started task, then in the CDPz Configuration Tool build a policy
+      that adds the SMF type 80 data stream (Add Data Stream in the Policy
+      Profile Edit window) and points it at a subscriber. The Data Streamer
+      emits the RACINIT events as JSON - concatenated JSON that a Logstash
+      subscriber splits, or JSON posted to the Splunk HTTP Event Collector
+      with a token - and it transcodes EBCDIC to the subscriber encoding
+      itself. The SDE deliberately collects only a subset of the RACF SMF 80
+      fields, so confirm the logon attributes the site needs are in the
+      selected data stream before cutting over.
+    references:
+    - https://www.ibm.com/docs/en/z-logdata-analytics/5.1.0?topic=insights-smf-80-data
+    - https://www.ibm.com/docs/en/zcdp/5.1.0?topic=engine-smf-data-stream-reference
+    - >-
+      https://higherlogicdownload.s3.amazonaws.com/IMWUC/UploadedImages/67355206-3a6a-46c5-817d-8fee55ef5e2d/handson_splunk_hec.pdf
+    - >-
+      https://www.ibm.com/docs/en/z-logdata-analytics/5.1.0?topic=dcfil-deploying-logstash-configuration-files-in-ingestion-kit-raw-data
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom CDPz SMF-80 JSON pipeline
+      notes: >
+        The Data Streamer output is already JSON with SDE-defined SMF-80 field
+        names, so the fixed-position column grammar the IRRADU00 feed needs is
+        not required - the pipeline extracts _raw as JSON and maps the SDE
+        field names to ECS. IBM ships Logstash ingestion-kit configs for CDPz,
+        but those target Logstash rather than our Cribl/Elastic path, so the
+        mapping is still hand-built; and because the SDE field names differ
+        from the IRRADU00 INIT_ columns, the ECS crosswalk must be authored
+        fresh against a captured CDPz sample. The SDE field inventory is
+        publicly documented but was not fetchable here, so the field table is
+        left empty.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Receive the CDPz JSON on the edge worker group with an HTTP/HEC or
+          TCP source and extract it as structured JSON rather than parsing
+          columns - the near-real-time in-memory feed removes the batch-dump
+          latency that hurts logon forensics most. Map the SDE SMF-80 fields
+          to the same ECS shape the IRRADU00 map produces: join the SDE
+          date/time to a UTC @timestamp with the LPAR offset, derive
+          event.outcome and event.reason from the SDE outcome/qualifier
+          fields, and populate source.ip only for TCP-attached ports of entry.
+          Because the SDE collects only a subset of SMF 80, assert the
+          required logon fields are present and dead-letter records that are
+          not. Schema-validate before the destination and use Persistent Queue
+          backpressure.
+        elastic: >
+          Target the same custom logs-zos_racf.racinit pipeline and template
+          as the LEEF and IRRADU00 producers so all three encodings converge
+          on one ECS schema. Finish enrichment high-side - resolve qualifier
+          codes to readable reasons, add site/owner context to host.name - and
+          keep the racf.* custom-namespace keys typed as keyword. Since the
+          SDE names differ from the IRRADU00 column ids, hold the CDPz-to-ECS
+          crosswalk as a documented, versioned mapping so an SDE template
+          change is caught rather than silently dynamic-mapped.
+        relay: >
+          Full ECS-shaped NDJSON crosses the guard (envelope mode B), one
+          logon per line, UTF-8, LF-terminated, compression disabled, nesting
+          depth <=2. CDPz has an advantage at the boundary: it has already
+          transcoded EBCDIC and emitted named JSON, so the low-side work is a
+          re-shape to ECS rather than a byte-offset parse, and the guard's
+          custom filter sees a small allow-listed key set. Resolve the JSON to
+          ECS low-side and let nothing raw-JSON cross - the SDE subset can
+          still carry caller free-text, so cap and flag it. Reconcile counts
+          per (dataset, hour) given the near-real-time stream and the
+          at-most-once crossing.
+      direct:
+        parse_location: low
+        cribl: >
+          Receive the CDPz JSON on the edge worker group with an HTTP/HEC or
+          TCP source and extract it as structured JSON rather than parsing
+          columns - the near-real-time in-memory feed removes the batch-dump
+          latency that hurts logon forensics most. Map the SDE SMF-80 fields
+          to the same ECS shape the IRRADU00 map produces: join the SDE
+          date/time to a UTC @timestamp with the LPAR offset, derive
+          event.outcome and event.reason from the SDE outcome/qualifier
+          fields, and populate source.ip only for TCP-attached ports of entry.
+          Because the SDE collects only a subset of SMF 80, assert the
+          required logon fields are present and dead-letter records that are
+          not, and schema-validate on Persistent Queue backpressure. The
+          decision here is producer latency and coverage: the CDPz in-memory
+          stream is the lowest-latency RACF option and the best fit for logon
+          alerting, but the SDE subset must be verified to carry every logon
+          field the CSOC needs, or the richer LEEF/IRRADU00 feed is
+          preferable.
+        elastic: >
+          Target the same custom logs-zos_racf.racinit pipeline and template
+          as the LEEF and IRRADU00 producers so all three encodings converge
+          on one ECS schema. Resolve qualifier codes to readable reasons, add
+          site/owner context to host.name, and keep the racf.*
+          custom-namespace keys typed as keyword. Since the SDE names differ
+          from the IRRADU00 column ids, hold the CDPz-to-ECS crosswalk as a
+          documented, versioned mapping so an SDE template change is caught
+          rather than silently dynamic-mapped, and keep the outcome derivation
+          identical to the other producers so moving a site onto the in-memory
+          stream changes latency, not field semantics.
+    fields_omitted: >
+      IBM publishes the System Data Engine key names for the SMF type 80 data
+      stream in the CDPz SMF data stream reference, but that reference could
+      not be retrieved for this entry, so the keys are not tabled here; the
+      SDE also collects only a subset of SMF 80, so confirm the selected data
+      stream carries the logon attributes before cutover. The logon content is
+      the SMF 80 event code 01 event the `other` entry inventories as INIT_
+      columns, under SDE names rather than IRRADU00 ones.
+    fields: []
+- id: resource-access
+  name: Resource access check (SMF 80 event 02)
+  description: >
+    RACROUTE REQUEST=AUTH resource authorization decisions - data set opens,
+    general resource class checks (FACILITY, OPERCMDS, SURROGAT, TSOAUTH) and
+    the violations they generate - written as SMF type 80 event code 02 and
+    unloaded by IRRADU00 with the ACCESS event type and the ACC_ column-id
+    prefix. This is the highest-volume RACF dataset by a wide margin and the
+    one where the SUCCESS-versus-violation split determines whether the feed
+    is affordable.
+  event_categories:
+  - file
+  route:
+    guarded:
+    - hop: other
+      name: z/OS SMF dump plus IRRADU00 unload (or IBM Common Data Provider Data Streamer)
+      notes: >
+        Same batch-or-stream question as the RACINIT dataset, but it bites
+        harder here: on a busy LPAR ACCESS records dominate SMF type 80
+        volume, so a 24-hour dump cycle turns the org's highest-volume
+        security feed into a once-a-day arrival.
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        This is the dataset where low-side volume shaping (dropping SUCCESS
+        reads on noisy classes) should be agreed before the crossing is sized.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-zos_racf.access
+    direct:
+    - hop: other
+      name: z/OS SMF dump plus IRRADU00 unload (or IBM Common Data Provider Data Streamer)
+      notes: >
+        Same batch-or-stream question as the RACINIT dataset, but it bites
+        harder here: on a busy LPAR ACCESS records dominate SMF type 80
+        volume, so a 24-hour dump cycle turns the org's highest-volume
+        security feed into a once-a-day arrival.
+    - hop: cribl
+      location: edge worker group
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-zos_racf.access
+  formats:
+  - format: other
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom IRRADU00 fixed-position pipeline
+      notes: >
+        Same hand-built fixed-position extraction as the RACINIT dataset, with
+        a longer extension (positions 282 through 1546) because the ACCESS
+        record carries both a UTOKEN and an RTOKEN block.
+    fields:
+    - vendor: ACC_EVENT_TYPE
+      type: string
+      description: >-
+        type of event described by the record, set to ACCESS for resource
+        authorization checks
+      ecs: event.action
+      status: mapped
+      notes: translated name of SMF type 80 event code 02
+    - vendor: ACC_EVENT_QUAL
+      type: enum
+      description: >-
+        qualifier describing the authorization decision (SUCCESS, INSAUTH,
+        PRFNFND, WARNING, FPROTALL, INSCATG, INSSECL, NOTCAT, ...)
+      ecs: event.reason
+      status: mapped
+      notes: >
+        14 documented values carrying why access was allowed or denied; needs
+        a lookup table, and distinguishing INSAUTH (a real violation) from
+        PRFNFND (no profile protects the resource) is the single most useful
+        triage split in the dataset
+    - vendor: ACC_VIOLATION
+      type: enum
+      description: whether this record represents a security violation (YES/NO)
+      ecs: event.outcome
+      status: mapped
+      transform: >
+        YES becomes failure and NO becomes success; WARNING-mode profiles
+        allow the access and report NO, so ACC_USER_WARNING must be consulted
+        before an event is treated as a clean success
+    - vendor: ACC_DATE_WRITTEN / ACC_TIME_WRITTEN
+      type: timestamp
+      description: >-
+        date (yyyy-mm-dd) and time (hh:mm:ss) the record was written to SMF,
+        in two separate fixed-position columns
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        concatenate the two columns and apply the LPAR's UTC offset; the value
+        is local time with second precision and no zone
+    - vendor: ACC_SYSTEM_SMFID
+      type: string
+      description: four-character SMF system identifier of the LPAR the record originated on
+      ecs: host.name
+      status: mapped
+    - vendor: ACC_EVT_USER_ID
+      type: string
+      description: RACF user ID that requested access to the resource
+      ecs: user.name
+      status: mapped
+    - vendor: ACC_EVT_GRP_ID
+      type: string
+      description: RACF group name in effect for the access request
+      ecs: user.group.name
+      status: mapped
+    - vendor: ACC_USER_NAME
+      type: string
+      description: 20-character user name taken from the ACEE
+      ecs: user.full_name
+      status: mapped
+    - vendor: ACC_RES_NAME
+      type: string
+      description: >-
+        name of the resource being accessed, or the old resource name (up to
+        255 characters)
+      ecs: file.path
+      status: partial
+      notes: >
+        only a data set path when ACC_CLASS is DATASET; for general resource
+        classes such as FACILITY, OPERCMDS or SURROGAT it is a profile-style
+        resource name and file.path is a misfit, so the copy must be
+        conditional on ACC_CLASS and racf.resource.name must always be
+        populated
+    - vendor: ACC_CLASS
+      type: string
+      description: >-
+        RACF class name of the resource (DATASET, FACILITY, OPERCMDS,
+        SURROGAT, TSOAUTH, ...)
+      ecs: null
+      status: unmapped
+      custom: racf.resource.class
+      notes: >
+        the discriminator for every other resource field on the record; ECS
+        has no field for the authorization namespace a decision was made in
+    - vendor: ACC_REQUEST
+      type: string
+      description: access authority requested by the caller (READ, UPDATE, CONTROL, ALTER, NONE)
+      ecs: null
+      status: unmapped
+      custom: racf.access.intent
+      notes: >
+        the intent side of the decision; ECS models file permissions but not a
+        requested-versus-granted authority pair, so this stays custom
+    - vendor: ACC_GRANT
+      type: string
+      description: access authority actually granted (READ, UPDATE, CONTROL, ALTER, NONE)
+      ecs: null
+      status: unmapped
+      custom: racf.access.allowed
+      notes: >
+        paired with racf.access.intent; requested UPDATE against granted READ
+        is a first-class detection and needs both fields indexed as keyword
+    - vendor: ACC_NAME
+      type: string
+      description: resource or profile name that covered the request (up to 246 characters)
+      ecs: null
+      status: unmapped
+      custom: racf.profile.name
+      notes: >
+        the profile that made the decision, distinct from ACC_RES_NAME which
+        is the resource actually touched; generic profiles make these differ
+        routinely
+    - vendor: ACC_TYPE
+      type: enum
+      description: >-
+        whether ACC_NAME holds a generic resource name (RESOURCE) or a generic
+        profile (PROFILE)
+      ecs: null
+      status: unmapped
+      custom: racf.resource.type
+    - vendor: ACC_OWN_ID
+      type: string
+      description: user ID or group that owns the profile protecting the resource
+      ecs: null
+      status: unmapped
+      custom: racf.profile.owner
+    - vendor: ACC_SECL
+      type: string
+      description: SECLABEL of the resource being accessed
+      ecs: null
+      status: unmapped
+      custom: racf.seclabel.resource
+      notes: >-
+        paired with the user SECLABEL for mandatory-access-control reporting;
+        no ECS equivalent
+    - vendor: ACC_UTK_SPOE
+      type: string
+      description: >-
+        port of entry from the UTOKEN - terminal id, console name, JES node,
+        or IP address depending on ACC_UTK_SPCLASS
+      ecs: source.address
+      status: partial
+      notes: >
+        same conditional-IP caveat as the RACINIT dataset; only TCP -attached
+        ports of entry yield anything that belongs in source.ip
+    - vendor: ACC_JOB_NAME
+      type: string
+      description: JES job name associated with the access request
+      ecs: null
+      status: unmapped
+      custom: racf.job.name
+    - vendor: ACC_LOGSTR
+      type: string
+      description: >-
+        LOGSTR= free-text data supplied by the caller of the RACROUTE macro
+        (up to 255 bytes)
+      ecs: message
+      status: partial
+      notes: >
+        caller-supplied context, frequently the only place a middleware
+        product records what it was really doing; unbounded, so it must be
+        capped and flagged before the crossing
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Extract the ACCESS extension low-side and shape the volume there:
+          keep every record where ACC_VIOLATION is YES or ACC_EVENT_QUAL is a
+          WARNING-class value, and apply an agreed suppression list to routine
+          SUCCESS reads on high-churn classes before the crossing is sized,
+          because this dataset alone can outweigh the rest of the mainframe
+          feed. Populate file.path from ACC_RES_NAME only when ACC_CLASS is
+          DATASET and always keep the unconditional copy in
+          racf.resource.name, cap ACC_LOGSTR, and drop the RTOKEN block
+          (ACC_RTK_*) entirely unless a documented server-to-client delegation
+          use case exists. Schema-validate before the forwarding destination
+          with a dead-letter route and Persistent Queue backpressure.
+        elastic: >
+          Own a custom logs-zos_racf.access ingest pipeline that resolves the
+          ACC_EVENT_QUAL enum (INSAUTH, PRFNFND, FPROTALL, INSSECL, NOTCAT)
+          into a readable denial reason through an enrich policy, and asserts
+          event.outcome came from the derived violation-plus-warning logic
+          rather than from ACC_VIOLATION alone. Add typed custom-namespace
+          index-template mappings for racf.access.intent, racf.access.allowed,
+          racf.resource.class, racf.resource.name, racf.resource.type,
+          racf.profile.owner and racf.seclabel.resource as keyword so
+          "requested UPDATE, granted READ" queries and SECLABEL reporting work
+          without dynamic mapping.
+        relay: >
+          Full ECS-shaped NDJSON crosses (envelope mode B) - one object per
+          ACCESS record, UTF-8 transcoded from EBCDIC low-side, LF-terminated,
+          compression disabled, nesting depth of two or less - so the guard's
+          custom filter sees a small allow-listed key set rather than a
+          1,546-byte fixed-position line that is mostly blank padding. The
+          friction to settle with the guard owner is ACC_RES_NAME and
+          ACC_NAME: 255- and 246-byte resource names that on a mainframe
+          routinely carry national-language and special characters, plus
+          ACC_LOGSTR free text; all three should be bounded and flagged
+          low-side. No CEF exists on this path. Because the crossing is
+          at-most-once and the upstream is a batch dump, reconcile counts per
+          (dataset, SMF dump interval), and make this the first dataset to
+          drop _raw once the column offsets are proven - it is the
+          highest-volume and lowest per-record forensic value of the four.
+      direct:
+        parse_location: low
+        cribl: >
+          Extract the ACCESS extension in the edge pipeline and shape the
+          volume there: keep every record where ACC_VIOLATION is YES or
+          ACC_EVENT_QUAL is a WARNING-class value, and apply an agreed
+          suppression list to routine SUCCESS reads on high-churn classes up
+          front, because this dataset alone can outweigh the rest of the
+          mainframe feed. Populate file.path from ACC_RES_NAME only when
+          ACC_CLASS is DATASET and always keep the unconditional copy in
+          racf.resource.name, cap ACC_LOGSTR, and drop the RTOKEN block
+          (ACC_RTK_*) entirely unless a documented server-to-client delegation
+          use case exists. Schema-validate before the forwarding destination
+          with a dead-letter route and Persistent Queue backpressure.
+        elastic: >
+          Own a custom logs-zos_racf.access ingest pipeline that resolves the
+          ACC_EVENT_QUAL enum (INSAUTH, PRFNFND, FPROTALL, INSSECL, NOTCAT)
+          into a readable denial reason through an enrich policy, and asserts
+          event.outcome came from the derived violation-plus-warning logic
+          rather than from ACC_VIOLATION alone. Add typed custom-namespace
+          index-template mappings for racf.access.intent, racf.access.allowed,
+          racf.resource.class, racf.resource.name, racf.resource.type,
+          racf.profile.owner and racf.seclabel.resource as keyword so
+          "requested UPDATE, granted READ" queries and SECLABEL reporting work
+          without dynamic mapping.
+  - format: syslog-leef
+    enable: >
+      Configure the zSecure Audit QRadar interface to render the RACROUTE
+      REQUEST=AUTH resource-access decisions - SMF type 80 event code 02, data
+      set opens and general-resource class checks (FACILITY, OPERCMDS,
+      SURROGAT, TSOAUTH) and their violations - as LEEF events with named
+      attributes, enriched from the RACF database, and deliver them near real
+      time over UNIX syslog or as scheduled LEEF log-file pulls. This is the
+      highest-volume RACF event class, so scope the zSecure selection tightly
+      and be aware of the documented limitation directly relevant here: SMF
+      type 80 records with a missing CLASS do not generate a LEEF record, so
+      the LEEF feed silently omits class-less access events the raw SMF stream
+      would carry - a coverage caveat to settle before it replaces the
+      IRRADU00 unload.
+    references:
+    - >-
+      https://www.juniper.net/documentation/us/en/software/jsa7.5.0/jsa-dsm/topics/concept/concept-jsa-configuring-dsm-ibm-racf.html
+    - https://www.ibm.com/docs/de/dsm?topic=racf
+    - https://www.ibm.com/support/pages/setting-data-preparation-qradar-siem
+    - >-
+      https://www.ibm.com/docs/en/SS2RWS_2.3.1/com.ibm.zsecure.doc_2.3.1/zsec_install.pdf
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom RACF resource-access LEEF pipeline
+      notes: >
+        Same custom LEEF pipeline approach as the logon feed - no vendor pack
+        parses RACF in any encoding. LEEF collapses the ACCESS extension into
+        a named attribute list, so the byte-offset extraction is avoided, but
+        the requested-versus-granted authority pair and the class/name split
+        that drive the useful detections still have to be reconstructed from
+        the LEEF attributes, whose names are set by the zSecure interface and
+        are not published; build against a captured sample.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Terminate the LEEF at the edge, split it to named attributes, and
+          shape the volume here because this dataset alone can outweigh the
+          rest of the mainframe feed: keep every record whose LEEF outcome is
+          a violation or warning, apply an agreed suppression list to routine
+          SUCCESS reads on high-churn classes, and split the resource identity
+          into class and name so file.path is populated only when the class is
+          DATASET while racf.resource.name is always kept. Derive
+          event.outcome from the LEEF outcome attribute plus the warning flag,
+          apply the LPAR timezone, and drop any RTOKEN/delegation attributes
+          unless a documented use case exists. Schema-validate before the
+          destination with a dead-letter route and Persistent Queue
+          backpressure.
+        elastic: >
+          Land in the same custom logs-zos_racf.access pipeline and template
+          as the IRRADU00 feed. Resolve the LEEF access qualifier into a
+          readable denial reason (insufficient authority vs no-profile vs
+          security-label failure) via an enrich policy, assert event.outcome
+          came from the violation-plus-warning logic rather than a lone flag,
+          and hold racf.access.intent, racf.access.allowed,
+          racf.resource.class, racf.resource.name, racf.resource.type,
+          racf.profile.owner and racf.seclabel.resource as typed keyword so
+          "requested UPDATE, granted READ" and SECLABEL queries work without
+          dynamic mapping.
+        relay: >
+          Full ECS-shaped NDJSON crosses (envelope mode B) - one access
+          decision per line, UTF-8, LF-terminated, compression disabled,
+          nesting depth <=2 - with LEEF resolved low-side so the guard's
+          custom filter sees a small key set rather than a 1,546-byte
+          fixed-position line of mostly blank padding. The friction to settle
+          with the guard owner is the resource and profile names: mainframe
+          resource names routinely carry national-language and special
+          characters and can run to 255 bytes, plus any caller free-text; all
+          should be bounded and flagged low-side. This is the highest-volume
+          feed, so shed SUCCESS-read volume before the crossing and reconcile
+          counts per (dataset, hour) since the crossing is at-most-once with
+          no return channel.
+      direct:
+        parse_location: low
+        cribl: >
+          Terminate the LEEF at the edge, split it to named attributes, and
+          shape the volume in the edge pipeline because this dataset alone can
+          outweigh the rest of the mainframe feed: keep every record whose
+          LEEF outcome is a violation or warning, apply an agreed suppression
+          list to routine SUCCESS reads on high-churn classes, and split the
+          resource identity into class and name so file.path is populated only
+          when the class is DATASET while racf.resource.name is always kept.
+          Derive event.outcome from the LEEF outcome attribute plus the
+          warning flag, apply the LPAR timezone, and drop any
+          RTOKEN/delegation attributes unless a documented use case exists.
+          Because this is the volume driver, the transport decision is real:
+          the near-real-time syslog path keeps violations timely, but a
+          scheduled LEEF file pull can batch the SUCCESS-read bulk off-peak;
+          whichever is chosen, apply the same suppression so the schema and
+          the volume story do not fork. Schema-validate before the destination
+          with a dead-letter route and Persistent Queue backpressure.
+        elastic: >
+          Land in the same custom logs-zos_racf.access pipeline and template
+          as the IRRADU00 feed. Resolve the LEEF access qualifier into a
+          readable denial reason (insufficient authority vs no-profile vs
+          security-label failure) via an enrich policy, assert event.outcome
+          came from the violation-plus-warning logic rather than a lone flag,
+          and hold racf.access.intent, racf.access.allowed,
+          racf.resource.class, racf.resource.name, racf.resource.type,
+          racf.profile.owner and racf.seclabel.resource as typed keyword so
+          "requested UPDATE, granted READ" and SECLABEL queries work without
+          dynamic mapping. Keep the class/name split, the
+          requested-versus-granted pair and the qualifier lookup identical
+          across producers so file-versus-general-resource categorization does
+          not drift when a site changes encoding.
+    fields_omitted: >
+      LEEF collapses the ACCESS extension into a named attribute list whose
+      names come from the zSecure interface's unpublished field selection, so
+      the class/name split and the requested-versus-granted authority pair can
+      only be inventoried from a site capture. The decisions are the SMF 80
+      event code 02 access checks the `other` entry inventories as ACC_
+      columns, less the class-less records the LEEF renderer does not emit.
+    fields: []
+  - format: json
+    enable: >
+      Add the SMF type 80 data stream to a CDPz System Data Engine policy so
+      the resource-access decisions stream as JSON off the SMF in-memory
+      resource / log stream instead of a batch IRRADU00 unload. The SDE task,
+      FACILITY-profile READ grant and Configuration Tool policy are set up as
+      for the logon stream; the Data Streamer emits concatenated JSON for a
+      Logstash subscriber or JSON to the Splunk HEC, EBCDIC already
+      transcoded. Because this is the highest-volume RACF class and the SDE
+      collects only a subset of SMF 80, confirm the subset carries the class,
+      requested-authority and granted-authority attributes the detections
+      need, and plan to shape the SUCCESS-read volume downstream - the SDE
+      does not itself do RACF-policy suppression.
+    references:
+    - https://www.ibm.com/docs/en/z-logdata-analytics/5.1.0?topic=insights-smf-80-data
+    - >-
+      https://www.ibm.com/docs/en/z-logdata-analytics/5.1.0?topic=s8d-smf-type-80-related-records-that-system-data-engine-creates
+    - https://www.ibm.com/docs/en/zcdp/5.1.0?topic=engine-smf-data-stream-reference
+    - >-
+      https://higherlogicdownload.s3.amazonaws.com/IMWUC/UploadedImages/67355206-3a6a-46c5-817d-8fee55ef5e2d/handson_splunk_hec.pdf
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom CDPz SMF-80 JSON pipeline
+      notes: >
+        Structured JSON from the Data Streamer, extracted as JSON rather than
+        column-parsed. The SDE may split SMF 80 into several related records
+        (the "SMF type 80-related records the System Data Engine creates"), so
+        the pipeline must recognize which SDE record carries the access
+        decision and merge the class/name and requested/granted fields; those
+        SDE field names differ from the ACC_ columns and are publicly
+        documented but were not fetchable here, so the table is left empty.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Receive the CDPz JSON at the edge and extract it structured. The
+          near-real-time in-memory feed is attractive for the highest-volume
+          class only if the volume is shaped low-side: the SDE has no notion
+          of RACF-policy suppression, so keep violations and warnings and
+          apply the agreed suppression list to routine SUCCESS reads here
+          before the crossing is sized. Map the SDE fields to ECS as the
+          IRRADU00 map does - conditional file.path on DATASET class, always
+          racf.resource.name, event.outcome from the SDE outcome plus warning
+          - and dead-letter records missing a field the SDE subset should have
+          carried. Schema-validate and run on Persistent Queue backpressure.
+        elastic: >
+          Target the shared logs-zos_racf.access pipeline and template so the
+          CDPz, LEEF and IRRADU00 encodings converge. Resolve the SDE
+          qualifier to a readable denial reason via an enrich policy, keep the
+          racf.* access and resource keys typed as keyword, and hold the
+          CDPz-to-ECS crosswalk as a versioned mapping since the SDE field
+          names are the odd vocabulary out among the three producers.
+        relay: >
+          Full ECS-shaped NDJSON crosses (envelope mode B), one access
+          decision per line, UTF-8, LF-terminated, compression disabled,
+          nesting depth <=2. CDPz's own EBCDIC transcode and named-JSON output
+          make the low-side step a re-shape rather than a byte-offset parse,
+          so the guard filter sees a bounded key set. The friction is
+          unchanged from the LEEF path - long, special-character resource and
+          profile names plus caller free-text, capped and flagged low-side -
+          and the SUCCESS-read volume must be shed before the crossing.
+          Reconcile counts per (dataset, hour) given the near-real-time stream
+          and the at-most-once crossing.
+      direct:
+        parse_location: low
+        cribl: >
+          Receive the CDPz JSON at the edge and extract it structured. The
+          near-real-time in-memory feed is attractive for the highest-volume
+          class only if the volume is shaped in the edge pipeline: the SDE has
+          no notion of RACF-policy suppression, so keep violations and
+          warnings and apply the agreed suppression list to routine SUCCESS
+          reads before forwarding. Map the SDE fields to ECS as the IRRADU00
+          map does - conditional file.path on DATASET class, always
+          racf.resource.name, event.outcome from the SDE outcome plus warning
+          - and dead-letter records missing a field the SDE subset should have
+          carried, then schema-validate on Persistent Queue backpressure. The
+          trade is latency and coverage against the SDE subset: the in-memory
+          stream is the lowest-latency option, but if the subset omits an
+          attribute a detection needs, the LEEF or IRRADU00 feed carries more.
+        elastic: >
+          Target the shared logs-zos_racf.access pipeline and template so the
+          CDPz, LEEF and IRRADU00 encodings converge. Resolve the SDE
+          qualifier to a readable denial reason via an enrich policy, keep the
+          racf.* access and resource keys typed as keyword, and hold the
+          CDPz-to-ECS crosswalk as a versioned mapping since the SDE field
+          names are the odd vocabulary out among the three producers. Keep the
+          class/name split, the requested-versus-granted pair and the
+          qualifier lookup identical to the other producers so categorization
+          is stable across encodings.
+    fields_omitted: >
+      The SDE key names for SMF type 80 are published in IBM's CDPz SMF data
+      stream reference but could not be retrieved for this entry, so they are
+      not tabled here; the SDE also splits SMF 80 into several related
+      records, so the pipeline must establish which record carries the access
+      decision and which of the class/name and requested/granted fields ride
+      on it. The decision content is what the `other` entry inventories as
+      ACC_ columns, emitted under SDE key names.
+    fields: []
+- id: racf-command
+  name: RACF command audit (SMF 80 events 08-24)
+  description: >
+    Audit records for RACF administrative commands - PERMIT (event code 19),
+    ADDSD (08), ALTDSD (11), ALTUSER (13), CONNECT (14), RDEFINE (21),
+    SETROPTS (24) and their siblings. Each command has its own IRRADU00
+    column-id prefix (PERM_, AD_, ALD_, ALU_, CON_, RDEF_, SETR_) over the
+    same 280-byte common header, so a parser keys off the EVENT_TYPE value in
+    positions 1-8 and then applies the matching extension layout. The operands
+    the administrator actually typed arrive as three 1,024-byte keyword blobs
+    (_SPECIFIED, _FAILED, _IGNORED) whose internal order and format IBM
+    explicitly excludes from the programming interface.
+  event_categories:
+  - iam
+  - configuration
+  route:
+    guarded:
+    - hop: other
+      name: z/OS SMF dump plus IRRADU00 unload (or IBM Common Data Provider Data Streamer)
+      notes: >
+        Same delivery mechanism as the other type 80 datasets. Command records
+        are low volume and high value, which makes them the worst fit for a
+        long batch dump cycle - a privileged ALTUSER should not reach the CSOC
+        a day late.
+    - hop: cribl
+      location: edge worker group, low-side enclave
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-zos_racf.command
+    direct:
+    - hop: other
+      name: z/OS SMF dump plus IRRADU00 unload (or IBM Common Data Provider Data Streamer)
+      notes: >
+        Same delivery mechanism as the other type 80 datasets. Command records
+        are low volume and high value, which makes them the worst fit for a
+        long batch dump cycle - a privileged ALTUSER should not reach the CSOC
+        a day late.
+    - hop: cribl
+      location: edge worker group
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-zos_racf.command
+  formats:
+  - format: other
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom IRRADU00 fixed-position pipeline
+      notes: >
+        Hand-built extraction with one branch per command extension layout; no
+        vendor pack tracks new event codes, so unrecognized EVENT_TYPE values
+        need an explicit fallback that keeps the common header.
+    fields:
+    - vendor: <col_id>_EVENT_TYPE
+      type: string
+      description: >-
+        name of the RACF command that was audited (PERMIT, ADDSD, ALTDSD,
+        ALTUSER, CONNECT, RDEFINE, SETROPTS, ...)
+      ecs: event.action
+      status: mapped
+      notes: >
+        IBM's own notation - <col_id> is replaced by the command's column
+        identifier - and the value in positions 1-8 is what tells a parser
+        which extension layout follows at position 282
+    - vendor: <col_id>_EVENT_QUAL
+      type: enum
+      description: >-
+        qualifier describing the command outcome (SUCCESS, INSAUTH, KEYWVIOL,
+        SECLSUCC, SECLFAIL)
+      ecs: event.reason
+      status: mapped
+      notes: >
+        KEYWVIOL means the command ran but specific keywords were rejected for
+        lack of authority - a partial success that neither success nor failure
+        alone describes
+    - vendor: <col_id>_VIOLATION
+      type: enum
+      description: whether this record represents a security violation (YES/NO)
+      ecs: event.outcome
+      status: mapped
+      transform: YES becomes failure and NO becomes success
+    - vendor: <col_id>_DATE_WRITTEN / <col_id>_TIME_WRITTEN
+      type: timestamp
+      description: >-
+        date (yyyy-mm-dd) and time (hh:mm:ss) the record was written to SMF,
+        in two separate fixed-position columns
+      ecs: '@timestamp'
+      status: partial
+      transform: 'concatenate the two columns and apply the LPAR''s UTC offset'
+    - vendor: <col_id>_SYSTEM_SMFID
+      type: string
+      description: four-character SMF system identifier of the LPAR the command ran on
+      ecs: host.name
+      status: mapped
+    - vendor: <col_id>_EVT_USER_ID
+      type: string
+      description: RACF user ID of the administrator who issued the command
+      ecs: user.name
+      status: mapped
+    - vendor: <col_id>_EVT_GRP_ID
+      type: string
+      description: RACF group name in effect when the command was issued
+      ecs: user.group.name
+      status: mapped
+    - vendor: PERM_USER_NAME / AD_USER_NAME / ALD_USER_NAME
+      type: string
+      description: 20-character user name of the command issuer
+      ecs: user.full_name
+      status: mapped
+    - vendor: PERM_RES_NAME
+      type: string
+      description: >-
+        name of the resource whose access list the PERMIT command changed (up
+        to 255 characters)
+      ecs: null
+      status: unmapped
+      custom: racf.resource.name
+      notes: >
+        the object of the permission change; for general resource classes this
+        is not a file path, so it stays custom rather than being forced into
+        file.path
+    - vendor: AD_DS_NAME / ALD_DS_NAME
+      type: string
+      description: 44-character data set name the ADDSD or ALTDSD command defined or altered
+      ecs: file.path
+      status: mapped
+      notes: >
+        genuinely a data set name on the data-set profile commands, so this is
+        the one command field that belongs in file.path without qualification
+    - vendor: PERM_CLASS / AD_CLASS
+      type: string
+      description: RACF class name the command operated in
+      ecs: null
+      status: unmapped
+      custom: racf.resource.class
+    - vendor: PERM_OWN_ID / AD_OWN_ID / ALD_OWN_ID
+      type: string
+      description: user ID or group that owns the profile the command targeted
+      ecs: null
+      status: unmapped
+      custom: racf.profile.owner
+    - vendor: PERM_SPECIFIED / AD_SPECIFIED / ALD_SPECIFIED
+      type: string
+      description: 1,024-byte blob of the keywords and operands specified on the command
+      ecs: null
+      status: partial
+      custom: racf.command.specified
+      notes: >
+        the only place the target of a PERMIT or CONNECT appears - ID() and
+        ACCESS() must be sub-parsed out of this blob to populate
+        user.target.name and the granted authority; IBM states the order and
+        format of these keyword fields are not part of the programming
+        interface, so the sub-parser must fail soft
+    - vendor: PERM_FAILED / AD_FAILED / ALD_FAILED
+      type: string
+      description: 1,024-byte blob of the keywords that failed on the command
+      ecs: null
+      status: unmapped
+      custom: racf.command.failed
+      notes: >
+        non-empty on KEYWVIOL events; this is what distinguishes a partially
+        rejected administrative change from a clean one
+    - vendor: PERM_IGNORED / ALD_IGNORED
+      type: string
+      description: 1,024-byte blob of the keywords that were ignored on the command
+      ecs: null
+      status: unmapped
+      custom: racf.command.ignored
+    - vendor: AD_SECL / ALD_OLD_SECL
+      type: string
+      description: >-
+        SECLABEL associated with the profile - the new label on ADDSD, the
+        label being removed on ALTDSD
+      ecs: null
+      status: unmapped
+      custom: racf.seclabel.profile
+    - vendor: AD_SECL_LINK / ALD_SECL_LINK
+      type: string
+      description: >-
+        16-character key linking the command to the data sets affected by the
+        SECLABEL change it caused
+      ecs: null
+      status: unmapped
+      custom: racf.seclabel.link
+      notes: >
+        the join key to the SMF type 83 (DSAF) records emitted for each
+        affected data set; without it a SECLABEL change and its blast radius
+        cannot be correlated
+    - vendor: <col_id>_TERM
+      type: string
+      description: terminal the command was issued from (up to 8 characters)
+      ecs: null
+      status: unmapped
+      custom: racf.terminal
+    - vendor: >-
+        <col_id>_LOG_ALWAYS / <col_id>_LOG_CMDVIOL / <col_id>_LOG_SPECIAL /
+        <col_id>_LOG_GLOBAL
+      type: enum
+      description: >-
+        family of YES/NO columns recording why the event was audited
+        (always-audited command, CMDVIOL, SPECIAL privilege, GLOBALAUDIT)
+      ecs: null
+      status: partial
+      custom: racf.log_reason
+      notes: >
+        separate fixed-position YES/NO columns that collapse into one keyword
+        array; they explain why RACF chose to log the event, which has no ECS
+        analogue but tells an auditor whether coverage is policy-driven or
+        incidental
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Branch low-side on the EVENT_TYPE column to pick the right extension
+          layout, and sub-parse the _SPECIFIED keyword blob there so
+          ID(userid) becomes user.target.name and ACCESS(level) becomes the
+          granted authority - a PERMIT with no parsed target is an
+          unactionable event, and this is the one place in the RACF feed where
+          an ECS-required field has to be manufactured rather than copied.
+          Emit an explicit unknown-command fallback that preserves the common
+          header instead of dropping the record, since IBM does not commit to
+          the keyword blob format and new event codes appear across releases.
+          Schema-validate before the forwarding destination, dead-letter the
+          failures, alert on the dead-letter rate itself, and use Persistent
+          Queue backpressure.
+        elastic: >
+          Own a custom logs-zos_racf.command ingest pipeline that resolves the
+          command event qualifiers (SUCCESS, INSAUTH, KEYWVIOL, SECLFAIL) into
+          readable outcomes and sets event.category consistently for
+          profile-creation versus permission-change commands, so a PERMIT and
+          an ADDSD do not land in the same undifferentiated bucket. Add typed
+          custom-namespace index-template mappings for racf.command.specified,
+          racf.command.failed and racf.command.ignored as text with a keyword
+          subfield, and racf.resource.class, racf.profile.owner,
+          racf.seclabel.profile and racf.seclabel.link as keyword - the
+          SECLABEL link key is what joins these command records to the SMF
+          type 83 data-set records they trigger.
+        relay: >
+          Full ECS-shaped NDJSON crosses (envelope mode B), UTF-8 transcoded
+          from EBCDIC and stripped of fixed-width blank padding low-side. The
+          content-filter friction here is the worst of any RACF dataset: three
+          1,024-byte keyword blobs per record carrying raw administrator
+          input, which is unbounded free text by construction. Parse them into
+          allow-listed keys low-side and forward the residual raw blob only
+          under an explicit length cap with a truncation flag, rather than
+          asking the guard's custom filter to reason about 3KB of command
+          syntax. No CEF exists on this path. This is the last dataset to drop
+          _raw - command records are the RACF equivalent of Windows Security
+          events for forensics - and count reconciliation should be per
+          (dataset, SMF dump interval) given the batch upstream.
+      direct:
+        parse_location: low
+        cribl: >
+          Branch in the edge pipeline on the EVENT_TYPE column to pick the
+          right extension layout, and sub-parse the _SPECIFIED keyword blob
+          there so ID(userid) becomes user.target.name and ACCESS(level)
+          becomes the granted authority - a PERMIT with no parsed target is an
+          unactionable event, and this is the one place in the RACF feed where
+          an ECS-required field has to be manufactured rather than copied.
+          Emit an explicit unknown-command fallback that preserves the common
+          header instead of dropping the record, since IBM does not commit to
+          the keyword blob format and new event codes appear across releases.
+          Schema-validate before the forwarding destination, dead-letter the
+          failures, alert on the dead-letter rate itself, and use Persistent
+          Queue backpressure.
+        elastic: >
+          Own a custom logs-zos_racf.command ingest pipeline that resolves the
+          command event qualifiers (SUCCESS, INSAUTH, KEYWVIOL, SECLFAIL) into
+          readable outcomes and sets event.category consistently for
+          profile-creation versus permission-change commands, so a PERMIT and
+          an ADDSD do not land in the same undifferentiated bucket. Add typed
+          custom-namespace index-template mappings for racf.command.specified,
+          racf.command.failed and racf.command.ignored as text with a keyword
+          subfield, and racf.resource.class, racf.profile.owner,
+          racf.seclabel.profile and racf.seclabel.link as keyword - the
+          SECLABEL link key is what joins these command records to the SMF
+          type 83 data-set records they trigger.
+  - format: syslog-leef
+    enable: >
+      Configure the zSecure Audit QRadar interface to render the RACF
+      administrative-command audit records - SMF type 80 event codes 08-24,
+      PERMIT, ADDSD, ALTDSD, ALTUSER, CONNECT, RDEFINE, SETROPTS and their
+      siblings - as LEEF events, enriched from the RACF database, and deliver
+      them near real time over UNIX syslog or as scheduled LEEF log-file
+      pulls. These records are low volume and high value, so the
+      near-real-time syslog transport is the strong recommendation: a
+      privileged ALTUSER or a rule-weakening PERMIT should not wait for a
+      scheduled pull. Confirm with a captured sample which command operands
+      the zSecure interface renders as LEEF attributes, since the operands an
+      administrator typed are the point of the record.
+    references:
+    - >-
+      https://www.juniper.net/documentation/us/en/software/jsa7.5.0/jsa-dsm/topics/concept/concept-jsa-configuring-dsm-ibm-racf.html
+    - https://www.ibm.com/docs/de/dsm?topic=racf
+    - https://www.ibm.com/support/pages/setting-data-preparation-qradar-siem
+    - >-
+      https://www.ibm.com/docs/en/SS2RWS_2.3.1/com.ibm.zsecure.doc_2.3.1/zsec_install.pdf
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom RACF command LEEF pipeline
+      notes: >
+        Custom LEEF pipeline as for the other type 80 datasets. The value of a
+        command record is the parsed target and authority - ID() becoming
+        user.target.name, ACCESS() becoming the granted level - and whether
+        those arrive as discrete LEEF attributes or embedded in a rendered
+        operand string depends on the zSecure interface's field selection,
+        which is not published; the sub-parser must fail soft against a
+        captured sample, and an unrecognized command must keep the common
+        header rather than drop.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Terminate the LEEF at the edge and branch on the command name
+          attribute to pick the right handling, sub-parsing the operand
+          attributes so a PERMIT resolves user.target.name and the granted
+          authority - a PERMIT with no parsed target is an unactionable event.
+          Preserve the audit-reason and any KEYWVIOL/failed-keyword detail as
+          explicit fields, mask new values for password and key operands
+          before they leave the enclave, apply the LPAR timezone, and emit an
+          explicit unknown-command fallback that keeps the common header.
+          Schema-validate before the destination, dead-letter the failures,
+          alert on the dead-letter rate itself, and use Persistent Queue
+          backpressure.
+        elastic: >
+          Land in the same custom logs-zos_racf.command pipeline and template
+          as the IRRADU00 feed. Resolve the command qualifiers (success,
+          insufficient authority, keyword violation, security-label
+          success/failure) into readable outcomes, set event.category
+          consistently for profile-creation versus permission-change commands
+          so a PERMIT and an ADDSD do not share one bucket, and hold
+          racf.command.specified/failed/ignored as text with a keyword
+          subfield and racf.resource.class, racf.profile.owner,
+          racf.seclabel.profile and racf.seclabel.link as keyword so the join
+          to the SMF type 83 data-set records survives.
+        relay: >
+          Full ECS-shaped NDJSON crosses (envelope mode B), one administrative
+          change per line, UTF-8, LF-terminated, compression disabled, nesting
+          depth <=2, with LEEF resolved low-side. The friction is the operand
+          content - raw administrator input, unbounded free text a field-aware
+          filter cannot allow-list - so parse it into allow-listed keys
+          low-side and forward any residual operand string only under an
+          explicit length cap with a truncation flag. This is the last dataset
+          to shed detail - command records are the RACF equivalent of Windows
+          Security events for forensics - and count reconciliation per
+          (dataset, hour) matters most here since a missing privilege grant is
+          the drop nobody notices.
+      direct:
+        parse_location: low
+        cribl: >
+          Terminate the LEEF at the edge and branch on the command name
+          attribute to pick the right handling, sub-parsing the operand
+          attributes so a PERMIT resolves user.target.name and the granted
+          authority - a PERMIT with no parsed target is an unactionable event.
+          Preserve the audit-reason and any KEYWVIOL/failed-keyword detail as
+          explicit fields, mask new values for password and key operands
+          before forwarding, apply the LPAR timezone, and emit an explicit
+          unknown-command fallback that keeps the common header. Because the
+          feed is low volume and high value, pin it to the near-real-time
+          syslog transport rather than a scheduled LEEF file pull wherever the
+          site supports it, so an administrative change is visible
+          immediately, and key the pipeline on the command-name attribute so a
+          syslog and a file-pulled sample resolve identically. Schema-validate
+          before the destination, dead-letter the failures, alert on the
+          dead-letter rate itself, and use Persistent Queue backpressure.
+        elastic: >
+          Land in the same custom logs-zos_racf.command pipeline and template
+          as the IRRADU00 feed. Resolve the command qualifiers (success,
+          insufficient authority, keyword violation, security-label
+          success/failure) into readable outcomes, set event.category
+          consistently for profile-creation versus permission-change commands
+          so a PERMIT and an ADDSD do not share one bucket, and hold
+          racf.command.specified/failed/ignored as text with a keyword
+          subfield and racf.resource.class, racf.profile.owner,
+          racf.seclabel.profile and racf.seclabel.link as keyword so the join
+          to the SMF type 83 data-set records survives. Keep the operand
+          sub-parse, the outcome derivation and the SECLABEL-link handling
+          identical across producers so a grant of SPECIAL or a SETROPTS
+          change alerts the same way regardless of encoding.
+    fields_omitted: >
+      Whether the operands that give a command record its value - ID() as the
+      target user, ACCESS() as the granted level - arrive as discrete LEEF
+      attributes or embedded in one rendered operand string is decided by the
+      zSecure interface's field selection, which IBM does not publish, so the
+      attribute shape is settled per site from a capture. The records are the
+      SMF 80 event codes 08-24 the `other` entry inventories.
+    fields: []
+  - format: json
+    enable: >
+      Add the SMF type 80 data stream to a CDPz System Data Engine policy so
+      the administrative-command records stream as JSON off the SMF in-memory
+      resource / log stream. Setup is the SDE task, FACILITY-profile READ
+      grant and Configuration Tool policy as for the other type 80 streams;
+      the Data Streamer emits concatenated JSON to Logstash or JSON to the
+      Splunk HEC, EBCDIC already transcoded. Because command records are the
+      point at which privilege is granted, confirm the SDE subset renders the
+      command operands - the target user id and the granted access level - and
+      not only the command name and outcome, since the SDE deliberately
+      collects a subset of SMF 80.
+    references:
+    - https://www.ibm.com/docs/en/z-logdata-analytics/5.1.0?topic=insights-smf-80-data
+    - https://www.ibm.com/docs/en/zcdp/5.1.0?topic=engine-smf-data-stream-reference
+    - >-
+      https://higherlogicdownload.s3.amazonaws.com/IMWUC/UploadedImages/67355206-3a6a-46c5-817d-8fee55ef5e2d/handson_splunk_hec.pdf
+    - >-
+      https://www.ibm.com/docs/en/z-logdata-analytics/5.1.0?topic=dcfil-deploying-logstash-configuration-files-in-ingestion-kit-raw-data
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom CDPz SMF-80 JSON pipeline
+      notes: >
+        Structured JSON extracted as JSON. The risk specific to commands is
+        operand fidelity: if the SDE subset does not carry the parsed operands
+        the way the SMF record does, the JSON feed loses the target/authority
+        detail that makes a command record actionable, so the pipeline must
+        assert those fields are present and treat their absence as a sourcing
+        gap. The SDE field names differ from the <col_id>_ columns and are
+        publicly documented but were not fetchable here, so the table is
+        empty.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Receive the CDPz JSON at the edge and extract it structured, keyed
+          on the command-name field. Resolve user.target.name and the granted
+          authority from the SDE operand fields - and if the subset does not
+          carry them, dead-letter and flag rather than emit a change with no
+          target. Preserve the outcome and any keyword-violation detail, mask
+          password/key operand values before they leave the enclave, apply the
+          LPAR timezone, and schema-validate before the destination on
+          Persistent Queue backpressure.
+        elastic: >
+          Target the shared logs-zos_racf.command pipeline and template so the
+          CDPz, LEEF and IRRADU00 encodings converge. Resolve the command
+          qualifiers to readable outcomes, set event.category consistently for
+          creation versus permission-change commands, keep the racf.command.*
+          and racf.seclabel.* keys typed, and hold the CDPz-to-ECS crosswalk
+          versioned since the SDE operand fields are the least standard part
+          of the record.
+        relay: >
+          Full ECS-shaped NDJSON crosses (envelope mode B), one change per
+          line, UTF-8, LF-terminated, compression disabled, nesting depth <=2.
+          CDPz's EBCDIC transcode and named JSON help, but the operand content
+          is the same free-text friction as the LEEF path - parse to
+          allow-listed keys low-side and cap any residual operand string with
+          a truncation flag. This is the last dataset to shed detail;
+          reconcile counts per (dataset, hour) given the at-most-once
+          crossing.
+      direct:
+        parse_location: low
+        cribl: >
+          Receive the CDPz JSON at the edge and extract it structured, keyed
+          on the command-name field. Resolve user.target.name and the granted
+          authority from the SDE operand fields - and if the subset does not
+          carry them, dead-letter and flag rather than emit a change with no
+          target. Preserve the outcome and any keyword-violation detail, mask
+          password/key operand values before forwarding, apply the LPAR
+          timezone, and schema-validate before the destination on Persistent
+          Queue backpressure. The in-memory stream gives the lowest latency
+          for these high-value records, which is exactly where latency
+          matters, provided the SDE subset carries the operands; if it does
+          not, prefer the LEEF or IRRADU00 feed. Key the pipeline on the
+          command-name field so all producers resolve identically.
+        elastic: >
+          Target the shared logs-zos_racf.command pipeline and template so the
+          CDPz, LEEF and IRRADU00 encodings converge. Resolve the command
+          qualifiers to readable outcomes, set event.category consistently for
+          creation versus permission-change commands, keep the racf.command.*
+          and racf.seclabel.* keys typed, and hold the CDPz-to-ECS crosswalk
+          versioned since the SDE operand fields are the least standard part
+          of the record. Keep the operand handling, the outcome derivation and
+          the SECLABEL-link handling identical to the other producers so a
+          privilege grant alerts the same way across encodings.
+    fields_omitted: >
+      IBM's CDPz SMF data stream reference names the SDE keys but could not be
+      retrieved for this entry, so no key list is given; because the SDE
+      collects only a subset of SMF type 80, whether the command operands -
+      target user id and granted access level - survive into the selected data
+      stream has to be confirmed against it. The records are the
+      administrative commands the `other` entry inventories.
+    fields: []
+- id: racf-init
+  name: RACF initialization (SMF type 81)
+  description: >
+    One record written at the completion of RACF initialization on each IPL,
+    unloaded by IRRADU00 with the RACFINIT event type and the RINI_ prefix. It
+    is a configuration snapshot rather than an event - which RACF database is
+    in use, which installation exits are active, and which SETROPTS options
+    and class-level auditing settings were in effect at IPL. Low volume and
+    high value for drift detection. The related type 81 class records (RINC_
+    prefix, one per active class) and the type 83 data-set-affected records
+    (DSAF_ prefix, emitted when a SECLABEL change ripples to data sets) ride
+    the same unload and are follow-on mapping work.
+  event_categories:
+  - configuration
+  route:
+    guarded:
+    - hop: other
+      name: z/OS SMF dump plus IRRADU00 unload (or IBM Common Data Provider Data Streamer)
+      notes: >
+        Same delivery as the type 80 datasets; type 81 appears only at IPL, so
+        a batch dump cycle is acceptable here in a way it is not for command
+        or logon records.
+    - hop: cribl
+      location: edge worker group, low-side enclave
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-zos_racf.init
+    direct:
+    - hop: other
+      name: z/OS SMF dump plus IRRADU00 unload (or IBM Common Data Provider Data Streamer)
+      notes: >
+        Same delivery as the type 80 datasets; type 81 appears only at IPL, so
+        a batch dump cycle is acceptable here in a way it is not for command
+        or logon records.
+    - hop: cribl
+      location: edge worker group
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-zos_racf.init
+  formats:
+  - format: other
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom IRRADU00 fixed-position pipeline
+      notes: >
+        A separate fixed-position layout from the type 80 records - the type
+        81 record has no event qualifier and no user identity, only a reserved
+        blank field at positions 10-17 kept for column alignment.
+    fields:
+    - vendor: RINI_EVENT_TYPE
+      type: string
+      description: type of the event, always set to RACFINIT
+      ecs: event.action
+      status: mapped
+      notes: >
+        the type 81 record has no event qualifier - positions 10-17 are a
+        reserved blank field kept only for column alignment with type 80
+        records - so there is nothing to map to event.reason
+    - vendor: RINI_DATE_WRITTEN / RINI_TIME_WRITTEN
+      type: timestamp
+      description: >-
+        date (yyyy-mm-dd) and time (hh:mm:ss) the record was written to SMF,
+        in two separate fixed-position columns
+      ecs: '@timestamp'
+      status: partial
+      transform: 'concatenate the two columns and apply the LPAR''s UTC offset'
+    - vendor: RINI_SYSTEM_SMFID
+      type: string
+      description: four-character SMF system identifier of the LPAR that initialized RACF
+      ecs: host.name
+      status: mapped
+    - vendor: RINI_DATASET_NAME
+      type: string
+      description: 44-character name of the RACF database data set in use for this IPL
+      ecs: file.path
+      status: mapped
+      notes: >-
+        identifies which RACF database an LPAR IPLed against; a swap is a
+        first-order security event
+    - vendor: RINI_DATASET_VOL
+      type: string
+      description: volume serial the RACF database data set resides on
+      ecs: null
+      status: unmapped
+      custom: racf.database.volume
+    - vendor: RINI_AUDIT_USER / RINI_AUDIT_GROUP / RINI_AUDIT_DATASET
+      type: enum
+      description: >-
+        YES/NO columns recording whether user, group and data set class
+        profile changes are being audited
+      ecs: null
+      status: unmapped
+      custom: racf.setropts.audit_classes
+      notes: >
+        the audit coverage in effect at IPL; collapsing the three columns into
+        one keyword array is what makes "auditing was silently turned off"
+        detectable
+    - vendor: RINI_ADSP
+      type: enum
+      description: whether automatic data set protection (ADSP) is active (YES/NO)
+      ecs: null
+      status: unmapped
+      custom: racf.setropts.adsp
+    - vendor: RINI_TAPEVOL
+      type: enum
+      description: whether tape volume protection is in effect (YES/NO)
+      ecs: null
+      status: unmapped
+      custom: racf.setropts.tapevol_protection
+    - vendor: RINI_DASD
+      type: enum
+      description: whether DASD volume protection is in effect (YES/NO)
+      ecs: null
+      status: unmapped
+      custom: racf.setropts.dasdvol_protection
+    - vendor: >-
+        RINI_RACINIT_PRE / RINI_RACINIT_POST / RINI_RACHECK_PRE /
+        RINI_RACHECK_POST / RINI_ENCRYPT_EXIT
+      type: enum
+      description: >-
+        YES/NO columns recording which RACF installation exits are active
+        (ICHRIX01/02, ICHRCX01/02, ICHDEX01)
+      ecs: null
+      status: unmapped
+      custom: racf.exits_active
+      notes: >
+        installation exits can override any RACF decision, so the set that is
+        loaded is a standing supply-chain question; ECS has no concept of a
+        security product's active hook points
+    - vendor: RINI_RACINIT_STATS
+      type: enum
+      description: whether RACINIT (logon) statistics are being recorded (YES/NO)
+      ecs: null
+      status: unmapped
+      custom: racf.setropts.racinit_stats
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Extract the type 81 layout low-side as its own branch keyed on the
+          RACFINIT event type, and synthesize the fields the record simply
+          does not have: event.outcome is always success because RACF only
+          writes this record on successful initialization, and there is no
+          user identity at all, so leave user.name empty rather than inventing
+          one. Collapse the several dozen YES/NO exit and SETROPTS columns
+          into bounded keyword arrays before the crossing so the record stays
+          a shallow, short-keyed JSON object instead of eighty booleans.
+        elastic: >
+          Own a custom logs-zos_racf.init ingest pipeline and treat this
+          dataset as configuration drift rather than alerting volume: index
+          the SETROPTS and exit-activation arrays as keyword, and build the
+          detection as a change-over-time comparison against the previous IPL
+          of the same host.name, since a single record carries no notion of
+          what changed. Add typed custom-namespace mappings for
+          racf.setropts.audit_classes, racf.setropts.adsp,
+          racf.setropts.tapevol_protection, racf.setropts.dasdvol_protection
+          and racf.database.volume, and document that the configuration
+          alerting profile's required user.name is genuinely absent here.
+        relay: >
+          Full ECS-shaped NDJSON crosses (envelope mode B), UTF-8 transcoded
+          low-side. This is the easiest RACF dataset for the guard's custom
+          filter - a handful of data set names and a bounded set of YES/NO
+          flags, no free text at all - provided the boolean columns are
+          collapsed into arrays low-side rather than crossing as eighty
+          separate keys. No CEF exists on this path. Volume is a few records
+          per LPAR per IPL, so count reconciliation is trivial and _raw can be
+          carried indefinitely at negligible cost.
+      direct:
+        parse_location: low
+        cribl: >
+          Extract the type 81 layout in the edge pipeline as its own branch
+          keyed on the RACFINIT event type, and synthesize the fields the
+          record simply does not have: event.outcome is always success because
+          RACF only writes this record on successful initialization, and there
+          is no user identity at all, so leave user.name empty rather than
+          inventing one. Collapse the several dozen YES/NO exit and SETROPTS
+          columns into bounded keyword arrays before forwarding so the record
+          stays a shallow, short-keyed JSON object instead of eighty booleans.
+        elastic: >
+          Own a custom logs-zos_racf.init ingest pipeline and treat this
+          dataset as configuration drift rather than alerting volume: index
+          the SETROPTS and exit-activation arrays as keyword, and build the
+          detection as a change-over-time comparison against the previous IPL
+          of the same host.name, since a single record carries no notion of
+          what changed. Add typed custom-namespace mappings for
+          racf.setropts.audit_classes, racf.setropts.adsp,
+          racf.setropts.tapevol_protection, racf.setropts.dasdvol_protection
+          and racf.database.volume, and document that the configuration
+          alerting profile's required user.name is genuinely absent here.

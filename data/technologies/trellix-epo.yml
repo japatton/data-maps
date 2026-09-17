@@ -1,0 +1,3310 @@
+id: trellix-epo
+name: Trellix ePO (HBSS/ESS)
+vendor: Trellix
+versions: McAfee ePO 5.9/5.10, Trellix ePO 5.10.x/5.11 (on-prem)
+draft: true
+references:
+- https://docs.nxlog.co/integrate/trellix-epo.html
+- >-
+  https://www.microfocus.com/documentation/arcsight/arcsight-smartconnectors/pdfdoc/mcafee-epo/mcafee-epo.pdf
+- https://www.elastic.co/docs/reference/integrations/trellix_epo_cloud
+- >-
+  https://helpcenter.threatq.com/Integration_Documentation/cdf/Trellix_ePO_Events_CDF.htm
+- >-
+  https://learn.microsoft.com/en-us/azure/sentinel/data-connectors/mcafee-epolicy-orchestrator-epo
+- >-
+  https://docs.cloud.google.com/chronicle/docs/ingestion/default-parsers/mcafee-dlp
+- https://kcm.trellix.com/corporate/index?page=content&id=KB91194
+- https://qmasters.co/mcafee-dlp-events-support/
+- >-
+  https://www.commoncriteriaportal.org/files/epfiles/383-4-477%20MFE%20DLP%2011-1%20ST%2010%20(190508).pdf
+datasets:
+- id: ens-threat
+  name: Endpoint Security threat event
+  description: >
+    Malware and threat detections raised by managed products (ENS Threat
+    Prevention, Adaptive Threat Protection, legacy VirusScan Enterprise) and
+    rolled up to the ePO server, then forwarded off-box by the registered
+    syslog server feature. This is the ESS/HBSS event stream a government SOC
+    actually watches.
+  event_categories:
+  - malware
+  - file
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        ePO's registered syslog server forwards threat events as CEF over
+        TLS/TCP (6514 by default) to a Cribl syslog source.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-trellix_epo.threat
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        ePO's registered syslog server forwards threat events as CEF over
+        TLS/TCP (6514 by default) to a Cribl syslog source.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-trellix_epo.threat
+  formats:
+  - format: syslog-cef
+    recommended: true
+    recommended_because: >-
+      the CEF syslog push is the feed the ArcSight connectors consume today,
+      so migration is a re-point rather than a new collector; it is parsed
+      low-side, so the guard crossing still carries NDJSON. The web-API poll
+      adds one field for an ePO API user and a polling schedule.
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Trellix ePO CEF pipeline
+      notes: >
+        No Cribl pack ships for ePO, and Elastic's trellix_epo_cloud
+        integration is an API collector for ePO SaaS only (it explicitly does
+        not support on-prem installations), so the CEF header plus the ePO
+        threat-event extension keys are extracted by a hand-built Cribl
+        pipeline. The legacy path was the ArcSight McAfee ePO DB
+        SmartConnector reading dbo.EPOEvents directly; the column names below
+        are the ones that connector exposed and the ones the syslog CEF
+        extension carries.
+    fields:
+    - vendor: DetectedUTC
+      type: timestamp
+      description: UTC time at which the managed product detected the threat on the endpoint
+      ecs: '@timestamp'
+      status: mapped
+      transform: >
+        emitted as epoch milliseconds by the ePO event API and as an ISO UTC
+        string in the CEF extension; normalize to @timestamp rather than using
+        the syslog receipt time, which can lag by an agent upload interval
+    - vendor: ReceivedUTC
+      type: timestamp
+      description: UTC time the ePO server received the event from the McAfee Agent
+      ecs: event.created
+      status: partial
+      notes: >
+        server-side receipt time, not ingest time; kept so the gap between
+        DetectedUTC and ReceivedUTC (agent-to-server upload lag, often tens of
+        minutes on ASCI-throttled endpoints) stays visible to analysts
+    - vendor: ThreatEventID
+      type: integer
+      description: >-
+        numeric ePO event id identifying the specific detection type (e.g.
+        1278 for an on-access file detection)
+      ecs: event.code
+      status: mapped
+      transform: >-
+        numeric id is stringified into event.code; the human-readable event
+        name lives in the ePO EPOEventFilterDesc table and needs a lookup to
+        become event.action-quality text
+    - vendor: ThreatName
+      type: string
+      description: >-
+        detection name assigned by the scanning engine (e.g. "EICAR test
+        file", "Trojan-FSGX!...")
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.threat.name
+      notes: >
+        the single most alert-relevant value in the record and it has no ECS
+        home - Elastic's own trellix_epo_cloud integration also leaves
+        threatname in the vendor namespace. Settled per the repository's
+        mapping convention: this is the engine's verdict about what it found,
+        not a rule that fired, so it stays in the vendor namespace and never
+        goes to rule.name. The hips-intrusion dataset in this same map is the
+        other half of that rule - SignatureName and SignatureID describe one
+        configured signature and do take rule.name / rule.id.
+    - vendor: ThreatType
+      type: string
+      description: >-
+        coarse classification of the detection (test, trojan, pup, exploit,
+        access protection, ...)
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.threat.type
+    - vendor: ThreatCategory
+      type: string
+      description: ePO threat taxonomy bucket, e.g. av.detect, access.protection, hip.sig, policy
+      ecs: null
+      status: partial
+      custom: trellix.epo.threat.category
+      notes: >
+        this is the field that actually discriminates AV detections from
+        Access Protection and Host IPS records inside one syslog stream; it
+        drives routing/event.category selection in the pipeline but cannot
+        itself be written to event.category, which is a closed ECS vocabulary
+    - vendor: ThreatSeverity
+      type: integer
+      description: ePO severity of the detection, 0-7
+      ecs: event.severity
+      status: partial
+      transform: >
+        the ePO scale is inverted relative to intuition (0-2 = critical/ high,
+        3-4 = medium, 5-7 = informational); a lookup must invert and rescale
+        it before threshold-based alerting is safe
+    - vendor: ThreatActionTaken
+      type: string
+      description: >-
+        response the product took on the threat, emitted as a localization key
+        such as IDS_ALERT_ACT_TAK_DEL or IDS_ALERT_ACT_TAK_CLE
+      ecs: event.action
+      status: partial
+      transform: >
+        values are IDS_ALERT_ACT_TAK_* resource keys, not English; a lookup
+        table (deleted, cleaned, denied access, continued, quarantined, none)
+        is required before event.action is readable or groupable
+    - vendor: ThreatHandled
+      type: boolean
+      description: whether the managed product successfully remediated the threat
+      ecs: event.outcome
+      status: mapped
+      transform: >
+        boolean true/false is translated to success/failure; this is the only
+        clean outcome signal in the record - ThreatActionTaken alone does not
+        say whether the action succeeded
+    - vendor: AnalyzerName
+      type: string
+      description: >-
+        name of the managed product that made the detection (Trellix Endpoint
+        Security, VirusScan Enterprise, ...)
+      ecs: observer.product
+      status: mapped
+    - vendor: AnalyzerDetectionMethod
+      type: string
+      description: >-
+        how the threat was found (On-Access Scan, On-Demand Scan, Real
+        Protect, Exploit Prevention, ...)
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.analyzer.detection_method
+      notes: >-
+        scan engine / detection technique; drives triage priority but has no
+        ECS equivalent
+    - vendor: AnalyzerDATVersion
+      type: string
+      description: signature (DAT) content version loaded on the endpoint at detection time
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.analyzer.dat_version
+      notes: >-
+        also the practical way to spot endpoints running stale content, an ESS
+        compliance question in its own right
+    - vendor: SourceIPV4
+      type: ip
+      description: IPv4 address the threat originated from
+      ecs: source.ip
+      status: partial
+      transform: >
+        the ePO database stores this as a signed 32-bit integer offset by
+        2^31; the syslog/CEF path emits a dotted quad. Pipelines fed from the
+        legacy ArcSight DB connector still need the integer-to-IP conversion,
+        the syslog path does not
+    - vendor: SourceProcessName
+      type: string
+      description: >-
+        full path of the process that triggered the detection, e.g.
+        C:\Windows\explorer.exe
+      ecs: process.executable
+      status: mapped
+    - vendor: SourceUserName
+      type: string
+      description: account the source process was running as
+      ecs: source.user.name
+      status: mapped
+    - vendor: TargetHostName
+      type: string
+      description: hostname of the endpoint the threat was found on
+      ecs: host.name
+      status: mapped
+    - vendor: TargetIPV4
+      type: ip
+      description: IPv4 address of the affected endpoint
+      ecs: host.ip
+      status: partial
+      notes: >
+        CEF carries this in the destination (dst) slot, but for endpoint
+        detections the target IS the managed host, so it is mapped to host.ip
+        rather than destination.ip; ArcSight-era content that keyed on
+        destinationAddress needs reverting when it is ported
+    - vendor: TargetUserName
+      type: string
+      description: account associated with the affected file or process, e.g. WINDOWS-NEW\Admin
+      ecs: user.name
+      status: partial
+      transform: >-
+        arrives as DOMAIN\user and must be split into user.domain plus
+        user.name; unqualified local accounts appear without a domain
+    - vendor: TargetFileName
+      type: string
+      description: full path of the file the detection fired on
+      ecs: file.path
+      status: mapped
+    - vendor: TargetHash
+      type: string
+      description: MD5 hash of the detected file
+      ecs: file.hash.md5
+      status: mapped
+      notes: >
+        ePO threat events carry MD5 only. The malware alerting profile
+        requires file.hash.sha256, so this dataset cannot satisfy it without a
+        downstream hash-enrichment lookup
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Own the whole parse here: CEF header plus the ePO threat extension
+          keys, branching on ThreatCategory so av.detect records leave on this
+          route and hip.sig records leave on the HIPS one, and emit full
+          ECS-shaped JSON — no integration exists for on-prem ePO, so there is
+          nothing downstream to hand a raw payload to. Do the normalizations
+          low-side where the reference data is closest: invert and rescale the
+          0-7 ePO severity, resolve IDS_ALERT_ACT_TAK_* into readable
+          event.action text through a lookup, translate ThreatHandled into
+          event.outcome, split DOMAIN\user into user.domain plus user.name,
+          and key @timestamp off DetectedUTC rather than syslog receipt time
+          so agent upload lag does not silently backdate detections. Carry a
+          ThreatEventID→event-name lookup exported from EPOEventFilterDesc
+          alongside the pipeline, then Schema-Library validate
+          (C.Schema(...).validate) with a dead-letter route immediately before
+          the destination and Persistent Queue backpressure rather than Block;
+          keep _raw, since malware detections are the forensic class and this
+          hand-built parser is unproven.
+        elastic: >
+          The trellix_epo_cloud integration is an ePO SaaS API collector and
+          does not apply, so stand up a custom ingest pipeline and index
+          template for logs-trellix_epo.threat that accepts the pre-shaped
+          documents instead of re-parsing them, with custom-namespace keyword
+          mappings for trellix.epo.threat.name, .type, .category and
+          trellix.epo.analyzer.detection_method and .dat_version. Keep
+          ThreatName in the vendor namespace per the repository's mapping
+          convention — it is the engine's verdict, not a rule that fired, so
+          CSOC content keys on trellix.epo.threat.name and not rule.name — and
+          assert in the template that ThreatCategory never reaches the closed
+          event.category vocabulary. Record the profile gap explicitly: this
+          feed carries MD5 only, so either add a hash-enrichment lookup that
+          resolves file.hash.sha256 or accept that the malware alerting
+          profile is unsatisfiable from this dataset alone, and validate that
+          TargetIPV4 lands in host.ip so ported ArcSight content keyed on
+          destinationAddress is caught.
+        relay: >
+          The appliance keeps emitting CEF over syslog and that does not
+          change, but the conversion happens on the low-side worker, so full
+          ECS-shaped JSON crosses the guard and no CEF reaches the boundary or
+          Elastic. The content-inspection friction here is operator- and
+          attacker-influenced free text — ThreatName strings, long Windows
+          file paths with unicode and backslash escaping, and DOMAIN\user
+          values — so normalize to UTF-8, strip control characters and enforce
+          declared length caps before the guard destination, and hold the
+          document to two levels of nesting with short ASCII allowlisted keys
+          so a custom NDJSON filter can stay simple. Treat the crossing as
+          at-most-once with no return channel: Persistent Queue on the guard
+          destination and per (dataset, hour) low-side/high-side count
+          reconciliation are the only drop detectors.
+      direct:
+        parse_location: low
+        cribl: >
+          Own the whole parse here: CEF header plus the ePO threat extension
+          keys, branching on ThreatCategory so av.detect records leave on this
+          route and hip.sig records leave on the HIPS one, and emit full
+          ECS-shaped JSON — no integration exists for on-prem ePO, so there is
+          nothing downstream to hand a raw payload to. Do the normalizations
+          at parse time where the reference data is closest: invert and
+          rescale the 0-7 ePO severity, resolve IDS_ALERT_ACT_TAK_* into
+          readable event.action text through a lookup, translate ThreatHandled
+          into event.outcome, split DOMAIN\user into user.domain plus
+          user.name, and key @timestamp off DetectedUTC rather than syslog
+          receipt time so agent upload lag does not silently backdate
+          detections. Carry a ThreatEventID→event-name lookup exported from
+          EPOEventFilterDesc alongside the pipeline, then Schema-Library
+          validate (C.Schema(...).validate) with a dead-letter route
+          immediately before the destination and Persistent Queue backpressure
+          rather than Block; keep _raw, since malware detections are the
+          forensic class and this hand-built parser is unproven.
+        elastic: >
+          The trellix_epo_cloud integration is an ePO SaaS API collector and
+          does not apply, so stand up a custom ingest pipeline and index
+          template for logs-trellix_epo.threat that accepts the pre-shaped
+          documents instead of re-parsing them, with custom-namespace keyword
+          mappings for trellix.epo.threat.name, .type, .category and
+          trellix.epo.analyzer.detection_method and .dat_version. Keep
+          ThreatName in the vendor namespace per the repository's mapping
+          convention — it is the engine's verdict, not a rule that fired, so
+          CSOC content keys on trellix.epo.threat.name and not rule.name — and
+          assert in the template that ThreatCategory never reaches the closed
+          event.category vocabulary. Record the profile gap explicitly: this
+          feed carries MD5 only, so either add a hash-enrichment lookup that
+          resolves file.hash.sha256 or accept that the malware alerting
+          profile is unsatisfiable from this dataset alone, and validate that
+          TargetIPV4 lands in host.ip so ported ArcSight content keyed on
+          destinationAddress is caught.
+  - format: jdbc-sql
+    enable: >
+      No console toggle is involved: the dbo.EPOEvents view exists as soon as
+      ePO is installed and holds every managed-product event the agents roll
+      up, joined at query time to the product-specific extension tables
+      (EPExtendedEvent / the threat-event extension the ENS and VirusScan
+      modules write). Create a read-only SQL Server login and grant it SELECT
+      on dbo.EPOEvents (and the extension views) in the ePO_<servername>
+      database, then point a JDBC/ODBC collector at the ePO SQL Server. Filter
+      on ThreatCategory / ThreatType server-side so the AV-detect rows leave
+      on this route and HIPS rows leave on the intrusion one, and page on the
+      monotonically increasing AutoID high-water mark so each row is read
+      exactly once. This is the ePO 'epo'/'endpointsecurity' device-type path
+      the ArcSight McAfee ePO DB SmartConnector implemented.
+    references:
+    - >-
+      https://www.microfocus.com/documentation/arcsight/arcsight-smartconnectors/pdfdoc/mcafee-epo/mcafee-epo.pdf
+    - https://docs.nxlog.co/integrate/trellix-epo.html
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: Cribl Database Collector against dbo.EPOEvents plus a normalization pipeline
+      notes: >
+        No Cribl pack or Elastic integration covers on-prem ePO, so a
+        scheduled Database Collector reads the view and a hand-built pipeline
+        normalizes the columns. The DB view carries two conversions the CEF
+        path does not: the IPv4 columns (ThreatSourceIPv4, IPv4) are stored as
+        signed 32-bit integers offset by 2^31 and must be turned back into
+        dotted quads, and the timestamps are DB-native datetimes rather than
+        the ISO strings the syslog extension emits. Because the column set is
+        a superset of what the CEF stream forwards, this path recovers
+        detection detail (attack-vector type, per-action status, file
+        access/modify times, source and target hashes) the registered syslog
+        feed drops.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Run the Database Collector low-side next to the ePO SQL Server,
+          keyed on the AutoID high-water mark, and own the whole normalize
+          here because there is nothing downstream to hand a raw row to. Do
+          the DB-specific fixes first: convert the signed-integer IPv4 columns
+          to dotted quads, invert and rescale the 0-7 ThreatSeverity (0-2
+          critical/high, 3-4 medium, 5-7 informational) before any threshold
+          alerting, resolve ThreatAction and the First/Second ActionStatus
+          codes into readable event.action text through a lookup, split the
+          DOMAIN\\user UserName values into user.domain plus user.name, and
+          key @timestamp off GeneratedTime rather than collector poll time so
+          agent upload lag does not backdate detections. Carry the
+          ThreatEventID->event-name lookup exported from EPOEventFilterDesc
+          alongside the pipeline, Schema-Library validate with a dead-letter
+          route before the destination, and use Persistent Queue backpressure
+          rather than Block. Keep _raw while this hand-built parser is
+          unproven - malware detections are the forensic class.
+        elastic: >
+          Stand up a custom ingest pipeline and index template for
+          logs-trellix_epo.threat that accepts the pre-shaped documents
+          instead of re-parsing them, with custom-namespace keyword mappings
+          for trellix.epo.threat.name, .type, .category, .family and
+          trellix.epo.analyzer.detection_method and .dat_version. Keep
+          ThreatName in the vendor namespace per the repository's mapping
+          convention - it is the engine's verdict, not a rule that fired, so
+          CSOC content keys on trellix.epo.threat.name and not rule.name - and
+          assert in the template that ThreatCategory never reaches the closed
+          event.category vocabulary. This DB path carries only TargetHash
+          (MD5), so either add a hash-enrichment lookup that resolves
+          file.hash.sha256 or accept that the malware alerting profile is
+          unsatisfiable from this dataset alone, and validate that the target
+          IPv4 lands in host.ip so ported ArcSight content keyed on
+          destinationAddress is caught.
+        relay: >
+          The collector and its AutoID high-water mark must live low-side - a
+          database connection cannot cross a one-way guard - so the crossing
+          carries emitted NDJSON, never a SQL session and never CEF. The
+          content-inspection friction is operator- and attacker-influenced
+          free text: ThreatName strings, long Windows file paths with unicode
+          and backslash escaping, Description text and DOMAIN\\user values.
+          Normalize to UTF-8, strip control characters and enforce declared
+          length caps before the guard destination, and hold the document to
+          two levels of nesting with short ASCII allowlisted keys so a custom
+          NDJSON filter stays simple. Treat the crossing as at-most-once with
+          no return channel: Persistent Queue on the guard destination and per
+          (dataset, hour) low-side/high-side row-count reconciliation are the
+          only drop detectors, and the high side can never tell the collector
+          to re-read an AutoID window.
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side ePO whose SQL Server is reachable without the guard,
+          the Database Collector and the same normalizations apply without the
+          length-capping and dead-letter discipline the crossing forces. The
+          decision that matters here is deduplication against any CEF syslog
+          feed collected from the same ePO: key on ThreatEventID with
+          GeneratedTime and the target host so a detection seen on both the DB
+          read and the registered-syslog stream is recognized as one event
+          rather than double-counted, and retain the richer DB-only columns
+          (attack-vector type, action statuses, file times) for hunting since
+          there is no boundary to strip them for.
+        elastic: >
+          Stand up a custom ingest pipeline and index template for
+          logs-trellix_epo.threat that accepts the pre-shaped documents, with
+          custom-namespace keyword mappings for trellix.epo.threat.name,
+          .type, .category, .family and trellix.epo.analyzer.detection_method
+          and .dat_version, keeping ThreatName on trellix.epo.threat.name per
+          the repository's mapping convention so CSOC content keys on the
+          vendor namespace rather than rule.name. With no boundary, keep the
+          source and target hashes and the full timestamp set the DB view
+          carries and treat this feed as the authoritative detail source where
+          the syslog CEF stream is the low-latency alerting feed - reconcile
+          observer.product from DetectingProductName/AnalyzerName so both
+          feeds line up for the same endpoint estate.
+    fields:
+    - vendor: GeneratedTime
+      type: timestamp
+      description: DB-native time the managed product generated the detection on the endpoint
+      ecs: '@timestamp'
+      status: mapped
+      transform: >
+        the DB equivalent of the CEF DetectedUTC; key @timestamp off it rather
+        than collector poll time, which lags by an agent upload interval
+    - vendor: ReceivedTime
+      type: timestamp
+      description: time the ePO server received the event from the McAfee Agent
+      ecs: event.created
+      status: partial
+      notes: >-
+        server-side receipt time, not ingest time; kept so the agent-to-server
+        upload gap stays visible
+    - vendor: ThreatEventID
+      type: integer
+      description: numeric ePO event id identifying the specific detection type
+      ecs: event.code
+      status: mapped
+      transform: >-
+        stringified into event.code; the human-readable name lives in
+        EPOEventFilterDesc and needs a lookup to become event.action-quality
+        text
+    - vendor: Name
+      type: string
+      description: >-
+        resolved event name for the detection (the EPOEventFilterDesc label
+        for the ThreatEventID)
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.threat.event_name
+      notes: >-
+        the readable event name the DB view joins in; distinct from the
+        free-text Description in message
+    - vendor: ThreatName
+      type: string
+      description: detection name assigned by the scanning engine (e.g. "EICAR test file")
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.threat.name
+      notes: >
+        the single most alert-relevant value in the record and it has no ECS
+        home. Settled per the repository's mapping convention: a detection
+        verdict stays in the vendor namespace, and rule.* is reserved for a
+        configured rule - on this technology that is the hips-intrusion
+        signature, not an AV detection name.
+    - vendor: FamilyName
+      type: string
+      description: malware family the detection was classified under
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.threat.family
+      notes: a grouping key the registered-syslog CEF stream does not forward
+    - vendor: ThreatType
+      type: string
+      description: >-
+        coarse classification of the detection (test, trojan, pup, exploit,
+        access protection, ...)
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.threat.type
+    - vendor: ThreatCategory
+      type: string
+      description: ePO threat taxonomy bucket, e.g. av.detect, access.protection, hip.sig, policy
+      ecs: null
+      status: partial
+      custom: trellix.epo.threat.category
+      notes: >
+        the field that discriminates AV detections from Access Protection and
+        Host IPS rows inside the one view; it drives route and event.category
+        selection but cannot itself be written to event.category, a closed ECS
+        vocabulary
+    - vendor: ThreatSeverity
+      type: integer
+      description: ePO severity of the detection, 0-7
+      ecs: event.severity
+      status: partial
+      transform: >
+        the ePO scale is inverted relative to intuition (0-2 critical/ high,
+        3-4 medium, 5-7 informational); a lookup must invert and rescale it
+        before threshold-based alerting is safe
+    - vendor: ThreatAction
+      type: string
+      description: response the product took on the threat
+      ecs: event.action
+      status: partial
+      transform: >-
+        emitted as a numeric/enum action code in the view rather than English;
+        a lookup is required before event.action is readable or groupable
+    - vendor: FirstActionStatus
+      type: integer
+      description: status of the first remediation action the product attempted
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.threat.first_action_status
+      notes: >-
+        pairs with SecondActionStatus to say whether the attempted action
+        succeeded; the DB view keeps both, the CEF stream collapses them
+    - vendor: SecondActionStatus
+      type: integer
+      description: status of the second remediation action the product attempted
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.threat.second_action_status
+    - vendor: AttackVectorType
+      type: integer
+      description: >-
+        numeric code for the vector by which the threat arrived (file, web,
+        email, network, ...)
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.threat.attack_vector_type
+      notes: >-
+        DB-only enrichment absent from the syslog CEF extension; drives triage
+        but has no ECS equivalent
+    - vendor: AnalyzerDetectionMethod
+      type: string
+      description: >-
+        how the threat was found (On-Access Scan, On-Demand Scan, Real
+        Protect, Exploit Prevention, ...)
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.analyzer.detection_method
+    - vendor: DATVersion
+      type: string
+      description: signature (DAT) content version loaded on the endpoint at detection time
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.analyzer.dat_version
+      notes: >-
+        also the practical way to spot endpoints running stale content, an ESS
+        compliance question in its own right
+    - vendor: DetectingProductID
+      type: string
+      description: internal id of the managed product that made the detection
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.analyzer.product_id
+    - vendor: AgentGUID
+      type: string
+      description: GUID of the McAfee Agent that reported the event
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.agent_guid
+      notes: the stable per-endpoint agent identity; the join key back to the System Tree
+    - vendor: DetectingProductHostName
+      type: string
+      description: hostname of the endpoint running the detecting product
+      ecs: observer.hostname
+      status: mapped
+    - vendor: DetectingProductVersion
+      type: string
+      description: version of the managed product that made the detection
+      ecs: observer.version
+      status: mapped
+    - vendor: DetectingProductMAC
+      type: string
+      description: MAC address of the endpoint running the detecting product
+      ecs: observer.mac
+      status: mapped
+    - vendor: Description
+      type: string
+      description: free-text summary the product wrote for the detection
+      ecs: message
+      status: mapped
+    - vendor: TargetHash
+      type: string
+      description: MD5 hash of the detected file
+      ecs: file.hash.md5
+      status: mapped
+      notes: >-
+        ePO threat events carry MD5 only; the malware alerting profile
+        requires file.hash.sha256, so this dataset cannot satisfy it without a
+        downstream hash-enrichment lookup
+    - vendor: SourceHash
+      type: string
+      description: hash of the source process/file that triggered the detection
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.source.hash
+      notes: >-
+        algorithm not declared in the column, so it cannot go into a typed
+        file.hash.* field without probing the digest length
+    - vendor: TargetFileSize
+      type: long
+      description: size in bytes of the file the detection fired on
+      ecs: file.size
+      status: mapped
+    - vendor: FilePath
+      type: string
+      description: full path of the file the detection fired on
+      ecs: file.path
+      status: mapped
+    - vendor: TargetAccessTime
+      type: timestamp
+      description: time the target file was last accessed
+      ecs: file.accessed
+      status: mapped
+    - vendor: TargetModifyTime
+      type: timestamp
+      description: time the target file was last modified
+      ecs: file.mtime
+      status: mapped
+    - vendor: ThreatSourceURL
+      type: string
+      description: URL the threat originated from, on web-borne detections
+      ecs: url.full
+      status: partial
+      notes: populated only for web/download vectors; empty on file-system detections
+    - vendor: ThreatSourceIPv4
+      type: ip
+      description: IPv4 address the threat originated from
+      ecs: source.ip
+      status: partial
+      transform: >-
+        stored in the DB as a signed 32-bit integer offset by 2^31; convert to
+        a dotted quad before writing source.ip
+    - vendor: ThreatSourceHostName
+      type: string
+      description: hostname the threat originated from
+      ecs: source.domain
+      status: partial
+      notes: commonly empty for local file-system detections
+    - vendor: ThreatSourceMAC
+      type: string
+      description: MAC address of the source of the threat
+      ecs: source.mac
+      status: mapped
+    - vendor: SourcePort
+      type: port
+      description: source port on network-borne detections
+      ecs: source.port
+      status: mapped
+    - vendor: ThreatSourceProcessName
+      type: string
+      description: full path of the process that triggered the detection
+      ecs: process.executable
+      status: mapped
+    - vendor: ThreatSourceUserName
+      type: string
+      description: account the source process was running as
+      ecs: source.user.name
+      status: mapped
+    - vendor: IPv4
+      type: ip
+      description: IPv4 address of the affected endpoint (the detection target)
+      ecs: host.ip
+      status: partial
+      transform: >
+        stored as a signed 32-bit integer offset by 2^31; convert to a dotted
+        quad. For endpoint detections the target IS the managed host, so it
+        maps to host.ip not destination.ip - ArcSight-era content keyed on
+        destinationAddress needs reverting when ported
+    - vendor: HostName
+      type: string
+      description: hostname of the affected endpoint
+      ecs: host.name
+      status: mapped
+    - vendor: MAC
+      type: string
+      description: MAC address of the affected endpoint
+      ecs: host.mac
+      status: mapped
+    - vendor: UserName
+      type: string
+      description: account associated with the affected file or process
+      ecs: user.name
+      status: partial
+      transform: >-
+        arrives as DOMAIN\\user and must be split into user.domain plus
+        user.name; unqualified local accounts appear without a domain
+    - vendor: NetworkProtocol
+      type: string
+      description: transport protocol on network-borne detections
+      ecs: network.transport
+      status: partial
+      transform: emitted upper-case; lower-case it before writing network.transport
+  - format: api-pull
+    enable: >
+      The ePO Web API exposes the same events over an authenticated HTTPS
+      remote command instead of a direct database connection. POST or GET the
+      core.executeQuery command against the ePO console port, e.g.
+      https://<epo-server>:8443/remote/core.executeQuery, with an ePO user
+      that holds query permission (HTTP Basic auth over TLS), passing
+      target=EPOEvents, a select clause enumerating the EPOEvents columns
+      (select=(select EPOEvents.AutoID EPOEvents.DetectedUTC
+      EPOEvents.ThreatName EPOEvents.ThreatCategory EPOEvents.ThreatSeverity
+      EPOEvents.ThreatActionTaken ...)), a where clause bounding the window
+      (where=(where (newerThan EPOEvents.DetectedUTC 3600000))) and
+      &:output=json to get a JSON result set (xml, terse and verbose are the
+      other output modes). Page on AutoID or DetectedUTC to avoid re-reading
+      rows. This needs no SQL login or direct DB network path - only the ePO
+      console's HTTPS port - which is why it is the transport of choice when
+      the collector cannot reach SQL Server directly.
+    references:
+    - >-
+      https://communitym.trellix.com/t5/ePolicy-Orchestrator-ePO/ePO-API-Scripting-Guide/td-p/424176
+    - >-
+      https://community.mcafee.com/t5/ePolicy-Orchestrator-ePO/ePolicy-Orchestrator-web-API-JSON/m-p/693323
+    - https://kcm.trellix.com/corporate/index?page=content&id=KB81322
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        Cribl REST Collector against core.executeQuery plus the shared
+        EPOEvents normalization pipeline
+      notes: >
+        A REST Collector polls core.executeQuery and a pipeline unwraps the
+        JSON result array into one NDJSON row per record. The returned
+        properties are the EPOEvents query-table columns
+        (EPOEvents.ThreatName, EPOEvents.ThreatCategory, ...), the same
+        vocabulary the direct dbo.EPOEvents read exposes, so once unwrapped
+        the rows feed the identical normalization branch as the jdbc-sql path
+        - the same severity inversion, DOMAIN\\user split and event-name
+        lookup apply. The trade against the direct DB read is throughput and
+        query cost: the API is a point-in-time query bounded by the ePO
+        server's own load, so it suits gap-fill and lower-volume estates
+        rather than a firehose. The one shape difference is that the Web API
+        returns the IPv4 columns already rendered as dotted quads, so the
+        signed-integer conversion the DB view needs does not apply here.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Run the REST Collector low-side against the ePO console's HTTPS
+          port, checkpoint on the maximum DetectedUTC (or AutoID) seen, and
+          unwrap the JSON results array into one NDJSON line per row with a
+          fixed EPOEvents _dataId so the high side selects the threat branch.
+          Push the window and column projection into the select/where clause
+          because the API bills the ePO server's CPU, unlike the DB read where
+          filtering is a SQL predicate. From there apply the same
+          normalizations as the direct-read path - severity inversion, action
+          lookup, DOMAIN\\user split, @timestamp off DetectedUTC - then
+          Schema-Library validate with a dead-letter route and run the Elastic
+          and guard destinations on Persistent Queue backpressure.
+        elastic: >
+          Feed the same custom logs-trellix_epo.threat pipeline and template
+          the jdbc-sql path uses; the documents are identical once the
+          collector has unwrapped the result set, so the ThreatName mapping
+          decision, the closed-vocabulary event.category assertion and the
+          MD5-only hash-profile gap all apply unchanged. Record which
+          collection transport produced a given document in the pipeline so an
+          operator can tell the API-pull feed from a DB-read or CEF feed when
+          reconciling counts.
+        relay: >
+          NDJSON crosses, never a database session or an HTTPS query -
+          core.executeQuery is polled low-side and only the emitted documents
+          reach the guard. The content-filter friction is the same free text
+          as the DB path (ThreatName, long file paths, DOMAIN\\user,
+          Description), so cap and UTF-8-normalize those low-side and keep the
+          document shallow with short ASCII allowlisted keys. Treat the
+          crossing as at-most-once; because the poller keeps its DetectedUTC
+          high-water mark low-side, per (dataset, hour) count reconciliation
+          is the only drop detector and the high side can never ask for a
+          window to be re-queried.
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side ePO reachable without the guard, the REST Collector
+          and unwrap are identical without the capping and dead-letter
+          discipline. The governing decision is query scheduling against the
+          ePO server's load: stagger and scope the queries so a backfill does
+          not starve the console, and dedupe against any CEF or DB-read feed
+          from the same ePO by keying on ThreatEventID with DetectedUTC and
+          the target host.
+        elastic: >
+          Feed the same custom logs-trellix_epo.threat pipeline and template
+          the jdbc-sql path uses; the documents are identical once the
+          collector has unwrapped the result set, so the ThreatName mapping
+          decision, the closed-vocabulary event.category assertion and the
+          MD5-only hash-profile gap all apply. With no boundary, widen the
+          select clause to carry the DB-only detail columns (attack-vector
+          type, action statuses, file times) for hunting, and treat this
+          transport as the credential-light alternative to a direct SQL login
+          where security policy forbids opening a database path to the
+          collector.
+    fields:
+    - vendor: EPOEvents.AutoID
+      type: long
+      description: >-
+        monotonically increasing unique id of the event row, used as the query
+        high-water mark
+      ecs: event.id
+      status: mapped
+    - vendor: EPOEvents.DetectedUTC
+      type: timestamp
+      description: UTC time the managed product detected the threat on the endpoint
+      ecs: '@timestamp'
+      status: mapped
+      transform: >-
+        returned as an ISO UTC string by the JSON output; key @timestamp off
+        it rather than poll time
+    - vendor: EPOEvents.ReceivedUTC
+      type: timestamp
+      description: UTC time the ePO server received the event from the agent
+      ecs: event.created
+      status: partial
+      notes: server receipt time, kept so agent-to-server upload lag stays visible
+    - vendor: EPOEvents.ThreatEventID
+      type: integer
+      description: numeric ePO event id identifying the detection type
+      ecs: event.code
+      status: mapped
+    - vendor: EPOEvents.ThreatName
+      type: string
+      description: detection name assigned by the scanning engine
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.threat.name
+      notes: >
+        same no-ECS-home detection verdict as on the other transports; settled
+        to the vendor namespace per the repository's mapping convention, never
+        rule.name
+    - vendor: EPOEvents.ThreatType
+      type: string
+      description: coarse classification of the detection
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.threat.type
+    - vendor: EPOEvents.ThreatCategory
+      type: string
+      description: >-
+        ePO threat taxonomy bucket that discriminates AV, access-protection
+        and HIPS rows
+      ecs: null
+      status: partial
+      custom: trellix.epo.threat.category
+      notes: >-
+        drives route/event.category selection but cannot be written to the
+        closed event.category vocabulary
+    - vendor: EPOEvents.ThreatSeverity
+      type: integer
+      description: ePO severity of the detection, 0-7
+      ecs: event.severity
+      status: partial
+      transform: inverted 0-7 scale; a lookup must invert and rescale before threshold alerting
+    - vendor: EPOEvents.ThreatActionTaken
+      type: string
+      description: >-
+        response the product took, emitted as a localization key such as
+        IDS_ALERT_ACT_TAK_DEL
+      ecs: event.action
+      status: partial
+      transform: >-
+        IDS_ALERT_ACT_TAK_* resource keys, not English; a lookup table is
+        required before event.action is readable
+    - vendor: EPOEvents.ThreatHandled
+      type: boolean
+      description: whether the managed product successfully remediated the threat
+      ecs: event.outcome
+      status: mapped
+      transform: boolean true/false translated to success/failure
+    - vendor: EPOEvents.AnalyzerName
+      type: string
+      description: name of the managed product that made the detection
+      ecs: observer.product
+      status: mapped
+    - vendor: EPOEvents.AnalyzerDetectionMethod
+      type: string
+      description: how the threat was found (On-Access Scan, Real Protect, Exploit Prevention, ...)
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.analyzer.detection_method
+    - vendor: EPOEvents.AnalyzerDATVersion
+      type: string
+      description: signature (DAT) content version loaded at detection time
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.analyzer.dat_version
+    - vendor: EPOEvents.SourceIPV4
+      type: ip
+      description: IPv4 address the threat originated from
+      ecs: source.ip
+      status: partial
+      notes: >-
+        the JSON output renders this as a dotted quad, so the signed-integer
+        conversion the direct DB read needs does not apply here
+    - vendor: EPOEvents.SourceProcessName
+      type: string
+      description: full path of the process that triggered the detection
+      ecs: process.executable
+      status: mapped
+    - vendor: EPOEvents.SourceUserName
+      type: string
+      description: account the source process was running as
+      ecs: source.user.name
+      status: mapped
+    - vendor: EPOEvents.TargetHostName
+      type: string
+      description: hostname of the endpoint the threat was found on
+      ecs: host.name
+      status: mapped
+    - vendor: EPOEvents.TargetIPV4
+      type: ip
+      description: IPv4 address of the affected endpoint
+      ecs: host.ip
+      status: partial
+      notes: the target is the managed host, so it maps to host.ip not destination.ip
+    - vendor: EPOEvents.TargetUserName
+      type: string
+      description: account associated with the affected file or process
+      ecs: user.name
+      status: partial
+      transform: arrives as DOMAIN\\user and must be split into user.domain plus user.name
+    - vendor: EPOEvents.TargetFileName
+      type: string
+      description: full path of the file the detection fired on
+      ecs: file.path
+      status: mapped
+    - vendor: EPOEvents.TargetHash
+      type: string
+      description: MD5 hash of the detected file
+      ecs: file.hash.md5
+      status: mapped
+      notes: >-
+        MD5 only, as on the other transports; the malware alerting profile
+        needs a downstream sha256 enrichment
+- id: hips-intrusion
+  name: Host IPS intrusion event
+  description: >
+    Host Intrusion Prevention signature and firewall events (HIPS 8.0 and the
+    ENS Firewall/Exploit Prevention successors) rolled up to ePO -
+    buffer-overflow, illegal API use, service/registry protection, and
+    blocked-connection records.
+  event_categories:
+  - network
+  - process
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same registered-syslog CEF stream as the threat dataset, split out in
+        the pipeline on ThreatCategory.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-trellix_epo.hips
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Same registered-syslog CEF stream as the threat dataset, split out in
+        the pipeline on ThreatCategory.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-trellix_epo.hips
+  formats:
+  - format: syslog-cef
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Trellix ePO CEF pipeline
+      notes: >-
+        HIPS records reuse the threat-event envelope and add
+        signature/connection extension keys, so they are branched off the same
+        pipeline rather than given a separate source
+    fields:
+    - vendor: SignatureID
+      type: integer
+      description: numeric id of the Host IPS signature that fired
+      ecs: rule.id
+      status: mapped
+    - vendor: SignatureName
+      type: string
+      description: human-readable name of the Host IPS signature
+      ecs: rule.name
+      status: mapped
+    - vendor: SigRuleClass
+      type: string
+      description: >-
+        signature rule class (Buffer Overflow, Files, Registry, Services,
+        HTTP, Program, ...)
+      ecs: rule.category
+      status: mapped
+    - vendor: ThreatEventID
+      type: integer
+      description: numeric ePO event id for the intrusion record
+      ecs: event.code
+      status: mapped
+    - vendor: EventPolicyType
+      type: integer
+      description: >-
+        numeric code for which HIPS policy family raised the event (IPS,
+        firewall, application blocking)
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.hips.policy_type
+    - vendor: ThreatSeverity
+      type: integer
+      description: severity of the intrusion event, 0-7
+      ecs: event.severity
+      status: partial
+      transform: >-
+        same inverted 0-7 ePO scale as the threat dataset; needs the same
+        lookup before threshold alerting
+    - vendor: ThreatAction
+      type: enum
+      description: what HIPS did with the matching activity (Blocked, Permitted, Block)
+      ecs: event.action
+      status: mapped
+      transform: >
+        the vendor value is copied to event.action verbatim and also drives
+        event.outcome - Blocked/Block become success (the control worked),
+        Permitted becomes success with a log-only reaction; there is no
+        separate outcome column
+    - vendor: Direction
+      type: enum
+      description: direction of the connection or activity relative to the protected host
+      ecs: network.direction
+      status: partial
+      transform: >-
+        vendor inbound/outbound values must be normalized to ECS's
+        ingress/egress vocabulary
+    - vendor: LocalIPAddress
+      type: ip
+      description: address of the protected endpoint on the intercepted connection
+      ecs: host.ip
+      status: mapped
+    - vendor: LocalPort
+      type: port
+      description: port on the protected endpoint side of the intercepted connection
+      ecs: source.port
+      status: partial
+      notes: >
+        the ArcSight-era mapping treated the local endpoint as the source
+        regardless of Direction; for inbound intrusions this is really the
+        destination port, so Direction has to be consulted before the
+        source/destination pair is trustworthy for network alerting
+    - vendor: RemotePort
+      type: port
+      description: port on the peer side of the intercepted connection
+      ecs: destination.port
+      status: partial
+      notes: same Direction-dependent inversion as LocalPort
+    - vendor: NetworkProtocol
+      type: string
+      description: transport protocol of the intercepted connection (TCP, UDP, ICMP)
+      ecs: network.transport
+      status: partial
+      transform: >-
+        emitted upper-case and occasionally as a numeric IANA value;
+        lower-case it and resolve numerics before writing network.transport
+    - vendor: ThreatSourceIPv4
+      type: ip
+      description: IPv4 address of the remote peer that triggered the signature
+      ecs: source.ip
+      status: mapped
+    - vendor: ThreatSourceHostName
+      type: string
+      description: hostname of the remote peer that triggered the signature
+      ecs: source.domain
+      status: partial
+      notes: >-
+        only resolved when HIPS has a name for the peer; commonly empty on raw
+        network signatures
+    - vendor: ProcessName
+      type: string
+      description: full path of the local process whose activity matched the signature
+      ecs: process.executable
+      status: mapped
+    - vendor: AppHash
+      type: string
+      description: hash of the application binary HIPS blocked or observed
+      ecs: null
+      status: partial
+      custom: trellix.epo.hips.app_hash
+      notes: >-
+        the algorithm is not declared in the record (MD5 on HIPS 8.0,
+        SHA-1/SHA-256 on newer ENS builds), so it cannot be written into a
+        typed file.hash.* field without probing the digest length
+    - vendor: AppSigner
+      type: string
+      description: code-signing subject of the application involved in the event
+      ecs: process.code_signature.subject_name
+      status: mapped
+    - vendor: EventUserName
+      type: string
+      description: account under which the intercepted activity occurred
+      ecs: user.name
+      status: mapped
+    - vendor: DetectingProductName
+      type: string
+      description: name of the reporting HIPS/ENS product
+      ecs: observer.product
+      status: mapped
+    - vendor: DetectingProductHostName
+      type: string
+      description: hostname of the endpoint running the detecting product
+      ecs: observer.hostname
+      status: mapped
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Reuse the threat CEF header parser but give the intrusion branch its
+          own extension stage for the signature and connection keys, and emit
+          full ECS-shaped JSON with the same inverted 0-7 severity lookup
+          applied. The network normalizations belong here, not downstream:
+          consult Direction before assigning the source/destination pair, so
+          an inbound intrusion puts LocalPort in destination.port instead of
+          inheriting the ArcSight-era assumption that the protected host is
+          always the source, map inbound/outbound to the ECS ingress/egress
+          vocabulary, lower-case NetworkProtocol and resolve numeric IANA
+          values, and derive event.outcome from ThreatAction while retaining
+          the raw verb (Blocked/Block is the control working, Permitted is
+          log-only). Probe the AppHash digest length to decide whether it can
+          be typed, Schema-Library validate with a dead-letter route before
+          the destination, use Persistent Queue rather than Block, and keep
+          _raw — IDS-class records are forensically valuable.
+        elastic: >
+          No integration covers on-prem ePO, so logs-trellix_epo.hips needs
+          its own custom ingest pipeline and index template that accepts
+          pre-shaped documents, with custom-namespace keyword mappings for
+          trellix.epo.hips.policy_type and trellix.epo.hips.app_hash. Assert
+          at the template level that network.direction only ever holds
+          ingress/egress and that the source/destination port pair arrives
+          already Direction-corrected, since silently accepting the legacy
+          orientation is what will make ported ArcSight network content match
+          backwards. Leave AppHash in the vendor namespace unless the low-side
+          digest-length probe is in place — writing an undeclared algorithm
+          into a typed file.hash.* field is worse than not mapping it — and
+          confirm rule.name/rule.category carry the signature name and rule
+          class before detection rules key on them.
+        relay: >
+          Same crossing shape as the threat dataset — CEF is parsed low-side
+          and only full ECS JSON reaches the guard — and because both streams
+          arrive on one syslog source they must be split before the guard
+          destination so each dataset can be counted and reconciled on its
+          own. Signature names, full process paths and code-signing subject
+          strings are the unbounded free-text fields a content filter will
+          reject or truncate, so cap them and keep the document shallow with
+          short ASCII allowlisted keys. Persistent Queue backpressure and per
+          (dataset, hour) count reconciliation stand in for the
+          acknowledgements the one-way path cannot provide.
+      direct:
+        parse_location: low
+        cribl: >
+          Reuse the threat CEF header parser but give the intrusion branch its
+          own extension stage for the signature and connection keys, and emit
+          full ECS-shaped JSON with the same inverted 0-7 severity lookup
+          applied. The network normalizations belong here, not downstream:
+          consult Direction before assigning the source/destination pair, so
+          an inbound intrusion puts LocalPort in destination.port instead of
+          inheriting the ArcSight-era assumption that the protected host is
+          always the source, map inbound/outbound to the ECS ingress/egress
+          vocabulary, lower-case NetworkProtocol and resolve numeric IANA
+          values, and derive event.outcome from ThreatAction while retaining
+          the raw verb (Blocked/Block is the control working, Permitted is
+          log-only). Probe the AppHash digest length to decide whether it can
+          be typed, Schema-Library validate with a dead-letter route before
+          the destination, use Persistent Queue rather than Block, and keep
+          _raw — IDS-class records are forensically valuable.
+        elastic: >
+          No integration covers on-prem ePO, so logs-trellix_epo.hips needs
+          its own custom ingest pipeline and index template that accepts
+          pre-shaped documents, with custom-namespace keyword mappings for
+          trellix.epo.hips.policy_type and trellix.epo.hips.app_hash. Assert
+          at the template level that network.direction only ever holds
+          ingress/egress and that the source/destination port pair arrives
+          already Direction-corrected, since silently accepting the legacy
+          orientation is what will make ported ArcSight network content match
+          backwards. Leave AppHash in the vendor namespace unless the
+          parse-time digest-length probe is in place — writing an undeclared
+          algorithm into a typed file.hash.* field is worse than not mapping
+          it — and confirm rule.name/rule.category carry the signature name
+          and rule class before detection rules key on them.
+  - format: jdbc-sql
+    enable: >
+      Read dbo.EPOEvents joined to the Host IPS extension view from the ePO
+      SQL Server with a read-only SQL login, exactly as for the threat feed,
+      and select the intrusion rows by ThreatCategory (hip.sig and the
+      firewall/application-blocking categories). There is no separate console
+      step - the HIPS module writes into the same event view - so the same
+      Database Collector and AutoID high-water mark serve both datasets;
+      branch on ThreatCategory in the collector query so intrusion records
+      leave on this route.
+    references:
+    - >-
+      https://www.microfocus.com/documentation/arcsight/arcsight-smartconnectors/pdfdoc/mcafee-epo/mcafee-epo.pdf
+    - https://docs.nxlog.co/integrate/trellix-epo.html
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        Cribl Database Collector against dbo.EPOEvents (HIPS extension) plus
+        the shared normalization pipeline
+      notes: >
+        HIPS rows reuse the threat-event envelope and add signature and
+        connection columns, so they branch off the same collector and pipeline
+        rather than getting a separate source. The same DB-native conversions
+        apply - signed-integer IPv4 columns to dotted quads, inverted 0-7
+        severity - plus the network-orientation work the CEF path also needs:
+        Direction must be consulted before the source/destination port pair is
+        trustworthy, and NetworkProtocol must be lower-cased and numeric IANA
+        values resolved.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Reuse the threat collector's header handling but give the intrusion
+          branch its own stage for the signature and connection columns, and
+          emit full ECS-shaped JSON with the same inverted 0-7 severity
+          lookup. Do the network normalizations here, not downstream: consult
+          Direction before assigning the source/destination pair so an inbound
+          intrusion puts LocalPort in destination.port instead of inheriting
+          the ArcSight-era assumption that the protected host is always the
+          source, map inbound/outbound to the ECS ingress/egress vocabulary,
+          lower-case NetworkProtocol and resolve numeric IANA values, and
+          derive event.outcome from ThreatAction while keeping the raw verb
+          (Blocked/Block is the control working, Permitted is log-only). Probe
+          the AppHash digest length to decide whether it can be typed,
+          Schema-Library validate with a dead-letter route, use Persistent
+          Queue rather than Block, and keep _raw - IDS-class records are
+          forensically valuable.
+        elastic: >
+          Stand up a custom ingest pipeline and index template for
+          logs-trellix_epo.hips that accepts the pre-shaped documents, with
+          custom-namespace keyword mappings for trellix.epo.hips.policy_type
+          and trellix.epo.hips.app_hash. Assert at the template level that
+          network.direction only ever holds ingress/egress and that the
+          source/destination port pair arrives already Direction-corrected,
+          since silently accepting the legacy orientation is what makes ported
+          ArcSight network content match backwards. Leave AppHash in the
+          vendor namespace unless the low-side digest-length probe is in
+          place, and confirm rule.name/rule.category carry the signature name
+          and rule class before detection rules key on them.
+        relay: >
+          Same crossing shape as the threat DB read - the rows are parsed and
+          normalized low-side and only full ECS JSON reaches the guard - and
+          because both datasets come off the one collector they must be split
+          before the guard destination so each can be counted and reconciled
+          on its own. Signature names, full process paths and code-signing
+          subject strings are the unbounded free-text fields a content filter
+          will reject or truncate, so cap them and keep the document shallow
+          with short ASCII allowlisted keys. Persistent Queue backpressure and
+          per (dataset, hour) row-count reconciliation stand in for the
+          acknowledgements the one-way path cannot provide.
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side ePO whose SQL Server is reachable without the guard,
+          the collector and normalizations are identical without the capping
+          and dead-letter discipline. Dedupe against any CEF syslog feed from
+          the same ePO by keying on SignatureID with GeneratedTime and the
+          protected host, and retain the DB-only columns (ApiName,
+          DetailedEventInfo, EventPolicyType detail) for hunting since there
+          is no boundary to strip them.
+        elastic: >
+          Stand up a custom ingest pipeline and index template for
+          logs-trellix_epo.hips that accepts the pre-shaped documents, with
+          custom-namespace keyword mappings for trellix.epo.hips.policy_type
+          and trellix.epo.hips.app_hash, and assert at the template level that
+          network.direction only ever holds ingress/egress with the
+          source/destination port pair already Direction-corrected. With no
+          boundary, keep the connection and application-identity detail the DB
+          view carries and treat this feed as the detail source complementing
+          the low-latency CEF alerting stream, reconciling observer.product
+          from DetectingProductName so both line up per endpoint.
+    fields:
+    - vendor: SignatureID
+      type: integer
+      description: numeric id of the Host IPS signature that fired
+      ecs: rule.id
+      status: mapped
+    - vendor: SignatureName
+      type: string
+      description: human-readable name of the Host IPS signature
+      ecs: rule.name
+      status: mapped
+    - vendor: Signature
+      type: integer
+      description: signature number carried alongside the signature id on the intrusion row
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.hips.signature_number
+      notes: the DB view keeps this as a separate numeric column from SignatureID
+    - vendor: SigRuleClass
+      type: string
+      description: >-
+        signature rule class (Buffer Overflow, Files, Registry, Services,
+        HTTP, Program, ...)
+      ecs: rule.category
+      status: mapped
+    - vendor: ThreatEventID
+      type: integer
+      description: numeric ePO event id for the intrusion record
+      ecs: event.code
+      status: mapped
+    - vendor: EventPolicyType
+      type: integer
+      description: >-
+        numeric code for which HIPS policy family raised the event (IPS,
+        firewall, application blocking)
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.hips.policy_type
+    - vendor: ThreatSeverity
+      type: integer
+      description: severity of the intrusion event, 0-7
+      ecs: event.severity
+      status: partial
+      transform: >-
+        same inverted 0-7 ePO scale as the threat dataset; needs the same
+        lookup before threshold alerting
+    - vendor: ThreatAction
+      type: enum
+      description: what HIPS did with the matching activity (Blocked, Permitted, Block)
+      ecs: event.action
+      status: mapped
+      transform: >
+        copied to event.action verbatim and also drives event.outcome -
+        Blocked/Block become success (the control worked), Permitted becomes
+        success with a log-only reaction; there is no separate outcome column
+    - vendor: Direction
+      type: enum
+      description: direction of the connection or activity relative to the protected host
+      ecs: network.direction
+      status: partial
+      transform: >-
+        vendor inbound/outbound values must be normalized to ECS's
+        ingress/egress vocabulary
+    - vendor: LocalIPAddress
+      type: ip
+      description: address of the protected endpoint on the intercepted connection
+      ecs: host.ip
+      status: partial
+      transform: >-
+        stored as a signed 32-bit integer offset by 2^31 in the DB; convert to
+        a dotted quad before writing host.ip
+    - vendor: LocalPort
+      type: port
+      description: port on the protected endpoint side of the intercepted connection
+      ecs: source.port
+      status: partial
+      notes: >
+        the ArcSight-era mapping treated the local endpoint as the source
+        regardless of Direction; for inbound intrusions this is really the
+        destination port, so Direction has to be consulted before the
+        source/destination pair is trustworthy
+    - vendor: RemotePort
+      type: port
+      description: port on the peer side of the intercepted connection
+      ecs: destination.port
+      status: partial
+      notes: same Direction-dependent inversion as LocalPort
+    - vendor: NetworkProtocol
+      type: string
+      description: transport protocol of the intercepted connection (TCP, UDP, ICMP)
+      ecs: network.transport
+      status: partial
+      transform: >-
+        emitted upper-case and occasionally as a numeric IANA value;
+        lower-case it and resolve numerics before writing network.transport
+    - vendor: ThreatSourceIPv4
+      type: ip
+      description: IPv4 address of the remote peer that triggered the signature
+      ecs: source.ip
+      status: partial
+      transform: >-
+        stored as a signed 32-bit integer offset by 2^31; convert to a dotted
+        quad before writing source.ip
+    - vendor: ThreatSourceHostName
+      type: string
+      description: hostname of the remote peer that triggered the signature
+      ecs: source.domain
+      status: partial
+      notes: >-
+        only resolved when HIPS has a name for the peer; commonly empty on raw
+        network signatures
+    - vendor: ThreatSourceProcessName
+      type: string
+      description: full path of the local process whose activity matched the signature
+      ecs: process.executable
+      status: mapped
+    - vendor: AppHash
+      type: string
+      description: hash of the application binary HIPS blocked or observed
+      ecs: null
+      status: partial
+      custom: trellix.epo.hips.app_hash
+      notes: >-
+        the algorithm is not declared in the row (MD5 on HIPS 8.0,
+        SHA-1/SHA-256 on newer ENS builds), so it cannot be written into a
+        typed file.hash.* field without probing the digest length
+    - vendor: AppSigner
+      type: string
+      description: code-signing subject of the application involved in the event
+      ecs: process.code_signature.subject_name
+      status: mapped
+    - vendor: AppDesc
+      type: string
+      description: descriptive name of the application involved in the event
+      ecs: file.name
+      status: partial
+      notes: >-
+        a display name for the binary, not a filesystem name; kept as
+        file.name for grouping but distinct from the full path in
+        process.executable
+    - vendor: ApiName
+      type: string
+      description: name of the intercepted API call on illegal-API-use signatures
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.hips.api_name
+      notes: >-
+        DB-only column the CEF stream drops; identifies the specific blocked
+        API on behavioral signatures
+    - vendor: DetailedEventInfo
+      type: string
+      description: expanded per-signature detail for the intrusion record
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.hips.detailed_event_info
+      notes: >-
+        free-text signature-specific detail; a content-filter risk on the
+        guarded path, cap it low-side
+    - vendor: EventUserName
+      type: string
+      description: account under which the intercepted activity occurred
+      ecs: user.name
+      status: mapped
+    - vendor: DetectingProductName
+      type: string
+      description: name of the reporting HIPS/ENS product
+      ecs: observer.product
+      status: mapped
+    - vendor: DetectingProductHostName
+      type: string
+      description: hostname of the endpoint running the detecting product
+      ecs: observer.hostname
+      status: mapped
+    - vendor: DetectingProductVersion
+      type: string
+      description: version of the reporting HIPS/ENS product
+      ecs: observer.version
+      status: mapped
+- id: device-control
+  name: Device Control removable-media event
+  description: >
+    Removable-media and peripheral decisions raised by the Device Control half
+    of the DLP Endpoint agent - plug-and-play device rules that stop a device
+    loading, removable-storage device rules that force a volume read only or
+    block it outright, and removable-storage file-access rules that block a
+    read or a write to a mounted volume. The agent reports each decision to
+    ePO twice over, and the two reports are not equivalent. A coarse row lands
+    in the ePO threat-event table, where the registered syslog server can
+    forward it as CEF alongside the ENS detections; the full incident lands in
+    the DLP incident tables, and only that row carries the device identity -
+    USB vendor and product id, USB serial, volume serial and label, device
+    class GUID, device instance path, compatible id and bus type. The device
+    identity is the reason this feed exists: a USB-exfiltration investigation
+    is built on a serial and an instance path, not on the fact that something
+    was blocked, so the syslog stream alone does not carry the dataset's value
+    and the database read below is the recommended path. Categorized file
+    rather than configuration: these records are mount, read and write
+    decisions against media, while the policy edits that create the device
+    rules are ePO console activity and belong to epo-audit. Plug-and-play
+    blocks that never touch a file ride the same record because they carry the
+    same device columns; those rows have no file.path and alerting content
+    must tolerate that.
+  event_categories:
+  - file
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Two collections off the same ePO. An Automatic Response on the DLP
+        event group drives the registered syslog server, which forwards the
+        threat-event view of each decision as CEF over TLS/TCP (6514 by
+        default) to a Cribl syslog source; a Cribl Database Collector reads
+        dbo.DLP_EventView on the ePO SQL Server for the incident view that
+        carries the device identity. On the guarded path both run low side.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-trellix_epo.device_control
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Two collections off the same ePO. An Automatic Response on the DLP
+        event group drives the registered syslog server, which forwards the
+        threat-event view of each decision as CEF over TLS/TCP (6514 by
+        default) to a Cribl syslog source; a Cribl Database Collector reads
+        dbo.DLP_EventView on the ePO SQL Server for the incident view that
+        carries the device identity.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-trellix_epo.device_control
+  formats:
+  - format: syslog-cef
+    enable: >
+      Two settings, both on the ePO console. Register the syslog receiver at
+      Menu -> Configuration -> Registered Servers -> New Server, server type
+      Syslog, and choose Common Event Format (CEF) as the event format; ePO
+      syslog forwarding is TCP only and requires TLS, so a plain UDP 514
+      receiver will never see traffic. Then create the forwarding rule at Menu
+      -> Automation -> Automatic Responses -> New Response with event group
+      DLP Events and event type DLP Incident Events, and bind it to the
+      registered syslog server. This reuses the same registered-server
+      plumbing as the ens-threat feed, so a site already forwarding ENS
+      detections adds Device Control by adding a response rule, not a
+      collector.
+    references:
+    - >-
+      https://docs.cloud.google.com/chronicle/docs/ingestion/default-parsers/mcafee-dlp
+    - https://kcm.trellix.com/corporate/index?page=content&id=KB91194
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Trellix ePO CEF pipeline, device-control branch
+      notes: >
+        No Cribl pack ships for ePO and Elastic's trellix_epo_cloud
+        integration is an API collector for ePO SaaS only, so this branches
+        off the same hand-built CEF pipeline the threat and HIPS datasets use,
+        split on ThreatEventID and ThreatCategory. The important limitation is
+        in the payload, not the parser: what an Automatic Response hands the
+        registered syslog server is the ePO threat-event property set, the
+        same envelope ENS detections arrive in, so the extension carries a
+        detection-shaped view of the decision and none of the removable-media
+        columns. The USB serial, volume serial, device class GUID and device
+        instance path are incident-table columns and are absent here. Treat
+        this format as the low-latency notification that a device rule fired
+        and the jdbc-sql entry as the record that can be investigated.
+    fields:
+    - vendor: DetectedUTC
+      type: timestamp
+      description: UTC time the agent enforced the device rule on the endpoint
+      ecs: '@timestamp'
+      status: mapped
+      transform: >
+        key @timestamp off this rather than syslog receipt time; a laptop that
+        was offline when the device was plugged in uploads the decision on its
+        next agent-server interval, which can be tens of minutes later
+    - vendor: ReceivedUTC
+      type: timestamp
+      description: UTC time the ePO server received the event from the McAfee Agent
+      ecs: event.created
+      status: partial
+      notes: >-
+        server-side receipt time, not ingest time; kept so the agent-to-server
+        upload gap stays visible
+    - vendor: ThreatEventID
+      type: integer
+      description: numeric ePO event id identifying which Device Control rule class fired
+      ecs: event.code
+      status: mapped
+      transform: >-
+        stringified into event.code; the readable label lives in the ePO
+        EPOEventFilterDesc table and needs the same lookup the threat dataset
+        carries
+    - vendor: ThreatCategory
+      type: string
+      description: ePO threat taxonomy bucket the DLP product writes its rows under
+      ecs: null
+      status: partial
+      custom: trellix.epo.device_control.category
+      notes: >
+        this is what separates DLP rows from av.detect and hip.sig rows inside
+        the one syslog stream, so it drives the routing decision in the
+        pipeline; it cannot itself be written to event.category, which is a
+        closed ECS vocabulary
+    - vendor: ThreatName
+      type: string
+      description: >-
+        label the DLP product puts on the violation, typically naming the rule
+        that fired
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.device_control.threat_name
+      notes: >
+        not rule.name. The repository's rule doctrine wants a name and an id
+        that describe the same configured object, and the CEF envelope carries
+        no companion rule id - this is a display label reusing the threat-name
+        slot of a detection-shaped record. The incident row read by the
+        jdbc-sql entry does carry the rule name proper, and that one goes to
+        rule.name.
+    - vendor: ThreatType
+      type: string
+      description: coarse classification of the DLP violation
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.device_control.threat_type
+    - vendor: ThreatSeverity
+      type: integer
+      description: ePO severity of the event, 0-7
+      ecs: event.severity
+      status: partial
+      transform: >
+        the ePO scale is inverted relative to intuition (0-2 = critical/high,
+        3-4 = medium, 5-7 = informational) and runs the opposite direction to
+        the 0-4 ladder the DLP incident tables use, so the two collection
+        paths cannot share one severity lookup
+    - vendor: ThreatActionTaken
+      type: string
+      description: reaction the agent applied, emitted as an IDS_ALERT_ACT_TAK_* localization key
+      ecs: event.action
+      status: partial
+      transform: >
+        resource keys, not English; the same lookup the threat dataset needs
+        applies, and for Device Control the values that matter are the blocked
+        and read-only reactions rather than the clean/delete verbs
+    - vendor: ThreatHandled
+      type: boolean
+      description: whether the agent successfully applied the reaction
+      ecs: event.outcome
+      status: mapped
+      transform: >-
+        boolean true/false translated to success/failure; ThreatActionTaken
+        alone does not say whether the block held
+    - vendor: AnalyzerName
+      type: string
+      description: name of the managed product that raised the event
+      ecs: observer.product
+      status: mapped
+      notes: >-
+        Device Control ships inside the DLP Endpoint agent, so this reads as
+        the DLP product even on a Device Control-only licence
+    - vendor: TargetHostName
+      type: string
+      description: hostname of the endpoint the device was attached to
+      ecs: host.name
+      status: mapped
+    - vendor: TargetIPV4
+      type: ip
+      description: IPv4 address of the endpoint
+      ecs: host.ip
+      status: partial
+      notes: >
+        CEF carries this in the destination slot, but for an endpoint control
+        decision the target IS the managed host, so it goes to host.ip and not
+        destination.ip; ArcSight content keyed on destinationAddress needs
+        reverting when it is ported
+    - vendor: TargetUserName
+      type: string
+      description: account the device rule was evaluated against
+      ecs: user.name
+      status: partial
+      transform: >-
+        arrives as DOMAIN\user and must be split into user.domain plus
+        user.name; unqualified local accounts appear without a domain
+    - vendor: SourceUserName
+      type: string
+      description: account the process attempting the access was running as
+      ecs: source.user.name
+      status: mapped
+    - vendor: SourceProcessName
+      type: string
+      description: full path of the process that attempted the access
+      ecs: process.executable
+      status: mapped
+      notes: >-
+        a full path here, unlike the incident table's ApplicationFileName,
+        which is a bare file name and maps to process.name
+    - vendor: TargetFileName
+      type: string
+      description: path of the file the access was attempted on
+      ecs: file.path
+      status: mapped
+      notes: >-
+        empty for plug-and-play and device-load blocks, which are decisions
+        about a device rather than a file
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Own the whole parse here: CEF header plus the ePO threat extension,
+          branching on ThreatCategory and ThreatEventID so device-control rows
+          leave on this route while av.detect and hip.sig rows leave on
+          theirs, and emit full ECS-shaped JSON - no integration exists for
+          on-prem ePO, so there is nothing downstream to hand a raw payload
+          to. Apply the same normalizations the threat branch does, because
+          the envelope is the same one: invert and rescale the 0-7 severity,
+          resolve IDS_ALERT_ACT_TAK_* through a lookup, translate
+          ThreatHandled into event.outcome, split DOMAIN\user, and key
+          @timestamp off DetectedUTC. Two things are specific to this branch.
+          Tag every document with the collection transport, because the
+          jdbc-sql feed carries the same decisions with far more detail and an
+          operator must be able to tell them apart. And do not let an empty
+          TargetFileName look like a parse failure: plug-and-play blocks
+          legitimately carry no file, so route them past the Schema-Library
+          validate step rather than into the dead-letter queue. Persistent
+          Queue backpressure rather than Block, and keep _raw.
+        elastic: >
+          Stand up a custom ingest pipeline and index template for
+          logs-trellix_epo.device_control that accepts the pre-shaped
+          documents instead of re-parsing them, with custom-namespace keyword
+          mappings for trellix.epo.device_control.category, .threat_name and
+          .threat_type. The template must document what this format cannot
+          answer, because the gap is the whole point of the dataset: no
+          volume.* field is populated on this path, so any hunt keyed on a USB
+          serial or a device instance path returns nothing from
+          syslog-collected documents even though the same decision is present
+          in the index from the database feed. Assert that ThreatCategory
+          never reaches the closed event.category vocabulary, and treat
+          documents from this transport as notifications that a device rule
+          fired rather than as the investigable record.
+        relay: >
+          CEF is converted on the low-side worker, so full ECS-shaped JSON
+          crosses the guard and no CEF reaches the boundary or Elastic. The
+          content-inspection friction is the usual Windows free text - long
+          file paths with unicode and backslash escaping, DOMAIN\user values,
+          and violation labels an operator wrote - so normalize to UTF-8,
+          strip control characters and enforce declared length caps before the
+          guard destination, and hold the document to two levels of nesting
+          with short ASCII allowlisted keys so a custom NDJSON filter stays
+          simple. Split this stream from the threat and HIPS streams before
+          the guard destination, since all three arrive on one syslog source
+          and each has to be counted on its own. Treat the crossing as
+          at-most-once with no return channel: Persistent Queue on the guard
+          destination and per (dataset, hour) count reconciliation are the
+          only drop detectors.
+      direct:
+        parse_location: low
+        cribl: >
+          Own the whole parse here: CEF header plus the ePO threat extension,
+          branching on ThreatCategory and ThreatEventID so device-control rows
+          leave on this route while av.detect and hip.sig rows leave on
+          theirs, and emit full ECS-shaped JSON. Apply the same normalizations
+          the threat branch does - severity inversion, IDS_ALERT_ACT_TAK_*
+          lookup, ThreatHandled to event.outcome, DOMAIN\user split,
+          @timestamp off DetectedUTC. Without a boundary the governing
+          decision is deduplication against the database feed from the same
+          ePO: key on ThreatEventID with DetectedUTC and the endpoint hostname
+          so one blocked write is recognized as one event seen twice rather
+          than two events, and let the database document win on conflict since
+          it carries the device columns. Route plug-and-play blocks with no
+          TargetFileName past schema validation rather than into the
+          dead-letter queue.
+        elastic: >
+          Stand up a custom ingest pipeline and index template for
+          logs-trellix_epo.device_control that accepts the pre-shaped
+          documents, with custom-namespace keyword mappings for
+          trellix.epo.device_control.category, .threat_name and .threat_type.
+          Record in the template that no volume.* field is populated from this
+          transport, so a serial-keyed hunt cannot be answered by
+          syslog-collected documents; with both feeds landing in one data
+          stream that difference is invisible unless the collection transport
+          is written into every document. Keep the violation label on
+          trellix.epo.device_control.threat_name rather than rule.name, so
+          CSOC content that does key on rule.name only ever matches the
+          database feed's real rule names.
+  - format: jdbc-sql
+    enable: >
+      No console toggle. The DLP incident tables exist as soon as the DLP
+      Endpoint extension is installed, and dbo.DLP_EventView is the view that
+      exposes host DLP incidents, including the removable-storage incident
+      types that carry the device identity. Create a read-only SQL Server
+      login and grant it SELECT on dbo.DLP_EventView and the evidence tables
+      it joins to (DLP_EventInfo, DLP_EvidenceTypeAndValue, keyed on
+      EventRowID) in the ePO_<servername> database, then point a JDBC/ODBC
+      collector at the ePO SQL Server. Filter on IncidentType server-side so
+      only the removable-storage types leave on this route and the rest leave
+      on the dlp-endpoint one, and page on the monotonically increasing
+      EventRowID high-water mark so each row is read exactly once. This is the
+      'dlpincident' device-type path the ArcSight McAfee ePO DB SmartConnector
+      implemented.
+    references:
+    - >-
+      https://www.microfocus.com/documentation/arcsight/arcsight-smartconnectors/pdfdoc/mcafee-epo/mcafee-epo.pdf
+    - https://qmasters.co/mcafee-dlp-events-support/
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        Cribl Database Collector against dbo.DLP_EventView plus a
+        device-control normalization pipeline
+      notes: >
+        No Cribl pack or Elastic integration covers on-prem DLP Endpoint, so a
+        scheduled Database Collector reads the view and a hand-built pipeline
+        normalizes the columns. This path is the reason the dataset is worth
+        onboarding: the removable-storage incident types carry DeviceName,
+        DeviceDescription, USBVendorId, USBProductId, USBSerialNumber,
+        VolumeSerialNumber, VolumeLabel, DeviceClassGUID, DeviceInstanceID,
+        DeviceCompatibleID, BusType, DeviceFileSystemType and the plug/unplug
+        times, none of which the registered syslog forward emits. The severity
+        ladder here is the DLP one (0=Info, 1=Warning, 2=Minor, 3=Major,
+        4=Critical) and runs the opposite direction to the 0-7 ePO threat
+        scale, so the two feeds need separate lookups even though they
+        describe the same decisions.
+    fields:
+    - vendor: ViolationUTCTime
+      type: timestamp
+      description: UTC time the device rule was violated on the endpoint
+      ecs: '@timestamp'
+      status: mapped
+      transform: >-
+        key @timestamp off this rather than collector poll time, which lags by
+        an agent upload interval plus the polling schedule
+    - vendor: ViolationLocalTime
+      type: timestamp
+      description: 'same violation time expressed in the endpoint''s local timezone'
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.device_control.violation_local_time
+      notes: >
+        kept because the endpoint's local time is what a user-facing interview
+        is conducted in, but never used as @timestamp - the column carries no
+        offset, so on a roaming estate it cannot be resolved to an instant
+    - vendor: InsertionTime
+      type: timestamp
+      description: time the ePO event parser inserted the incident row
+      ecs: event.created
+      status: partial
+      notes: >-
+        server-side insertion, not ingest; the gap to ViolationUTCTime is the
+        agent-to-server upload lag and is worth keeping visible
+    - vendor: IncidentId
+      type: integer
+      description: unique identifier of the incident in the DLP Incident Manager
+      ecs: event.id
+      status: mapped
+      notes: >-
+        the join key back to the Incident Manager console, so an analyst can
+        pivot from an Elastic document to the incident and its evidence
+    - vendor: IncidentType
+      type: integer
+      description: >-
+        numeric incident type; 10000 and 40102 are the removable-storage
+        protection types this dataset selects on
+      ecs: event.code
+      status: mapped
+      transform: >-
+        stringified into event.code; the same column is the server-side filter
+        that separates this dataset from dlp-endpoint
+    - vendor: Severity
+      type: integer
+      description: DLP incident severity, 0=Info 1=Warning 2=Minor 3=Major 4=Critical
+      ecs: event.severity
+      status: partial
+      transform: >
+        rescale before any threshold alerting, and do not reuse the threat
+        feed's lookup: this ladder ascends with seriousness while the ePO 0-7
+        threat scale descends, so sharing a lookup silently inverts every
+        Device Control alert
+    - vendor: ActualAction
+      type: integer
+      description: reaction the agent actually applied, 0=No action 1=Block
+      ecs: event.action
+      status: partial
+      transform: >-
+        numeric enum, not English; a lookup is required before event.action is
+        readable, and the no-action value is the monitor-only case that must
+        not be alerted on as a block
+    - vendor: RulesToDisplay
+      type: string
+      description: name of the device or removable-storage rule that fired
+      ecs: rule.name
+      status: mapped
+      notes: >
+        this one does go to rule.name: it names a configured device rule an
+        administrator wrote, which is exactly what rule.* is for, and it is
+        the same object the DLP policy holds. rule.id stays empty rather than
+        being filled from IncidentType or PolicyRevision - neither identifies
+        the rule - so CSOC content must key on rule.name alone here.
+    - vendor: PolicyRevision
+      type: string
+      description: revision of the DLP policy the rule was published in
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.device_control.policy_revision
+      notes: >-
+        not rule.version: it versions the containing policy, not the rule, so
+        writing it to rule.version would make two rules from one policy look
+        like one rule at one version
+    - vendor: Name
+      type: string
+      description: hostname of the endpoint the device was attached to
+      ecs: host.name
+      status: mapped
+    - vendor: IP
+      type: ip
+      description: IPv4 address of the endpoint at violation time
+      ecs: host.ip
+      status: partial
+      notes: >-
+        the ArcSight connector put this in the source address; for an endpoint
+        control decision the endpoint is the host, so it goes to host.ip
+    - vendor: FQDN
+      type: string
+      description: fully qualified domain name of the endpoint
+      ecs: host.hostname
+      status: partial
+      notes: >-
+        ECS has no host.fqdn, and host.name already carries the short name the
+        console shows; the FQDN is kept on host.hostname so a
+        System-Tree-renamed endpoint can still be resolved
+    - vendor: Username_NTLM
+      type: string
+      description: account logged on to the endpoint when the rule fired
+      ecs: user.name
+      status: partial
+      transform: arrives as DOMAIN\user and must be split into user.domain plus user.name
+    - vendor: SID
+      type: string
+      description: Windows security identifier of that account
+      ecs: user.id
+      status: mapped
+      notes: >-
+        the stable identifier when the account is later renamed, which is
+        exactly the case an exfiltration investigation runs into
+    - vendor: ApplicationFileName
+      type: string
+      description: file name of the process that attempted the access
+      ecs: process.name
+      status: mapped
+      notes: >-
+        a bare file name in this view, not a path, so it maps to process.name
+        and leaves process.executable empty; the CEF path carries the full
+        path instead
+    - vendor: FilePath
+      type: string
+      description: full path of the file the access was attempted on
+      ecs: file.path
+      status: mapped
+    - vendor: FileName
+      type: string
+      description: file name without the directory
+      ecs: file.name
+      status: mapped
+    - vendor: FileSize
+      type: integer
+      description: size in bytes of the file involved
+      ecs: file.size
+      status: mapped
+      notes: >-
+        the volume the copy actually moved, and the field a bulk-exfiltration
+        threshold is built on
+    - vendor: FileType
+      type: string
+      description: 'DLP''s own classification of the file''s type'
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.device_control.file_type
+      notes: >-
+        a product taxonomy label rather than a media type, so it does not go
+        to file.mime_type; derive file.extension from FileName instead
+    - vendor: FailureReason
+      type: string
+      description: why the agent could not apply the intended reaction
+      ecs: event.reason
+      status: mapped
+      notes: >-
+        populated only when the reaction failed, which is the case a SOC most
+        wants alerted - a device rule that did not hold
+    - vendor: EvidenceCount
+      type: integer
+      description: number of evidence items the agent attached to the incident
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.device_control.evidence_count
+      notes: >
+        a pointer, never the evidence. The evidence copy itself is written to
+        the ePO evidence share and stays there; nothing but this count and the
+        IncidentId crosses the guard, so an analyst pivots back to the
+        Incident Manager to open it.
+    - vendor: DeviceName
+      type: string
+      description: device name of the removable volume as Windows enumerated it
+      ecs: volume.device_name
+      status: mapped
+    - vendor: DeviceDescription
+      type: string
+      description: friendly description of the device
+      ecs: volume.product_name
+      status: partial
+      notes: >-
+        ECS wants a product name and the column is a Windows friendly
+        description, which is usually but not always the product string
+    - vendor: USBVendorId
+      type: string
+      description: USB vendor id from the device descriptor
+      ecs: volume.vendor_id
+      status: mapped
+    - vendor: USBProductId
+      type: string
+      description: USB product id from the device descriptor
+      ecs: volume.product_id
+      status: mapped
+    - vendor: USBSerialNumber
+      type: string
+      description: serial number the USB device reports in its descriptor
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.device_control.media_serial
+      notes: >
+        the single most investigation-relevant value in the record. Its
+        natural ECS target, device.serial_number, is beta in 9.4.0 and this
+        repository does not map to beta fields, so it stays in the vendor
+        namespace; adopt when GA. Note that it is not volume.serial_number -
+        that is the file-system serial, which reformatting changes and which a
+        determined user can set, while this one comes off the hardware
+        descriptor.
+    - vendor: VolumeSerialNumber
+      type: string
+      description: file-system serial number of the mounted volume
+      ecs: volume.serial_number
+      status: mapped
+      notes: >-
+        changes on reformat, so it identifies a volume rather than a device;
+        correlate on USBSerialNumber when tracking the physical stick
+    - vendor: VolumeLabel
+      type: string
+      description: user-visible label of the mounted volume
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.device_control.volume_label
+      notes: >-
+        not volume.mount_name, which ECS defines as the mount point rather
+        than the label; the drive letter is not in this view at all
+    - vendor: DeviceClassGUID
+      type: string
+      description: Windows setup class GUID of the device
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.device_control.device_class_guid
+      notes: >-
+        the class the device presented as, which is how a phone or a camera
+        mounting as mass storage is told apart from a plain USB stick
+    - vendor: DeviceInstanceID
+      type: string
+      description: Windows device instance path for the specific device
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.device_control.device_instance_id
+      notes: >
+        deliberately not device.id. The ECS device fieldset describes the
+        endpoint reporting the event, and writing a peripheral's identity
+        there would make the host and the thing plugged into it
+        indistinguishable. volume.* is the only ECS fieldset that speaks about
+        removable media, and it has no instance-path member, so this stays
+        custom.
+    - vendor: DeviceCompatibleID
+      type: string
+      description: Windows compatible id the device advertised
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.device_control.device_compatible_id
+    - vendor: BusType
+      type: string
+      description: bus the device attached over, e.g. USB, Bluetooth, FireWire
+      ecs: volume.bus_type
+      status: mapped
+    - vendor: DeviceFileSystemType
+      type: string
+      description: file system on the mounted volume
+      ecs: volume.file_system_type
+      status: mapped
+    - vendor: FileSystemAccess
+      type: integer
+      description: access mode the volume was mounted with
+      ecs: volume.writable
+      status: partial
+      transform: >-
+        a numeric code that must be resolved to a boolean; this is how a
+        read-only reaction is told apart from an outright block, so it is
+        worth the lookup
+    - vendor: PluginLocalTime
+      type: timestamp
+      description: endpoint-local time the device was plugged in
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.device_control.plugged_in_time
+      notes: >-
+        not event.start: it times the device session, not this event, and one
+        plug-in produces many incidents
+    - vendor: UnpluggedLocalTime
+      type: timestamp
+      description: endpoint-local time the device was removed
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.device_control.unplugged_time
+      notes: >-
+        empty while the device is still attached; with PluginLocalTime it
+        brackets the exposure window an investigation reports
+    - vendor: DlpAgentVersion
+      type: string
+      description: version of the DLP Endpoint agent that raised the incident
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.device_control.agent_version
+      notes: >-
+        the practical way to spot endpoints running an agent too old to
+        enforce the current device rules, an ESS compliance question of its
+        own
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Run the Database Collector low-side next to the ePO SQL Server,
+          keyed on the EventRowID high-water mark, filtering IncidentType to
+          the removable-storage types server-side, and own the whole normalize
+          here because there is nothing downstream to hand a raw row to. The
+          device columns are the payload, so treat them as first-class:
+          populate volume.device_name, .vendor_id, .product_id,
+          .serial_number, .bus_type, .file_system_type and .writable, and
+          carry USBSerialNumber, DeviceInstanceID, DeviceClassGUID and
+          DeviceCompatibleID in the trellix.epo.device_control namespace
+          rather than dropping them for being unmappable. Do the DLP-specific
+          fixes next: rescale the 0-4 severity with its own lookup and never
+          the threat feed's inverted 0-7 one, resolve ActualAction, split
+          DOMAIN\user, and key @timestamp off ViolationUTCTime rather than
+          poll time. Normalize the serials to a single case and strip
+          whitespace at parse time - correlation across weeks of records fails
+          silently otherwise. Schema-Library validate with a dead-letter route
+          before the destination, Persistent Queue rather than Block, and keep
+          _raw.
+        elastic: >
+          Stand up a custom ingest pipeline and index template for
+          logs-trellix_epo.device_control that accepts the pre-shaped
+          documents instead of re-parsing them, mapping the volume.* fields as
+          keywords and adding custom-namespace keyword mappings for
+          trellix.epo.device_control.media_serial, .device_instance_id,
+          .device_class_guid, .device_compatible_id, .volume_label,
+          .policy_revision, .file_type, .evidence_count and the plug/unplug
+          times. media_serial is the field CSOC hunting content will key on,
+          so give it a keyword mapping and a documented normalization now:
+          when device.serial_number leaves beta the reindex is a rename, but
+          only if the values were normalized on the way in. Keep rule.name for
+          the device rule and leave rule.id unpopulated rather than filling it
+          from IncidentType. Record explicitly that the evidence file is not
+          in Elastic - EvidenceCount and IncidentId are the pointer back to
+          the Incident Manager, and no analyst workflow should assume the copy
+          crossed.
+        relay: >
+          The collector and its EventRowID high-water mark must live low-side
+          - a database session cannot cross a one-way guard - so the crossing
+          carries emitted NDJSON only, and the evidence copy on the ePO
+          evidence share never crosses at all. The content-inspection friction
+          here is unusually sharp: USB serials, device instance paths and
+          compatible ids are attacker-influenced strings that a device
+          presents about itself, so they must be treated as hostile input,
+          held to a declared character class and length cap, and normalized to
+          UTF-8 with control characters stripped before the guard destination.
+          Do the capping deliberately rather than by truncation policy - a
+          silently truncated serial correlates to the wrong device, which is
+          worse than a dropped field. Keep the document to two levels of
+          nesting with short ASCII allowlisted keys so a custom NDJSON filter
+          stays simple. Treat the crossing as at-most-once: Persistent Queue
+          on the guard destination and per (dataset, hour) row-count
+          reconciliation are the only drop detectors, and the high side can
+          never ask for an EventRowID window to be re-read.
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side ePO whose SQL Server is reachable without the guard,
+          the Database Collector and the same normalizations apply without the
+          length-capping and dead-letter discipline the crossing forces. The
+          decision that matters here is deduplication against the CEF feed
+          collected from the same ePO: key on IncidentId where the syslog row
+          carries it and otherwise on the endpoint hostname with
+          ViolationUTCTime and ThreatEventID, and let this document win,
+          because the syslog row is a strict subset of it. Keep the serial
+          normalization anyway - it is a correlation requirement, not a
+          boundary one - and retain the plug/unplug times and the full device
+          column set for hunting, since there is no boundary to strip them
+          for.
+        elastic: >
+          Stand up a custom ingest pipeline and index template for
+          logs-trellix_epo.device_control that accepts the pre-shaped
+          documents, mapping the volume.* fields as keywords and adding
+          custom-namespace keyword mappings for
+          trellix.epo.device_control.media_serial, .device_instance_id,
+          .device_class_guid, .device_compatible_id, .volume_label and the
+          plug/unplug times. With no boundary this feed is the authoritative
+          record and the CEF stream is only the low-latency notification, so
+          write the collection transport into every document and build hunting
+          content against the database documents alone. Keep rule.name for the
+          device rule with rule.id unpopulated, and treat media_serial as the
+          join key across datasets - it is what ties a Device Control block to
+          a DLP Endpoint incident raised on the same stick.
+- id: dlp-endpoint
+  name: DLP Endpoint incident
+  description: >
+    Data-loss incidents raised by the DLP Endpoint agent when a protection
+    rule matches classified content - a classification hit on a file being
+    copied, mailed, printed, posted to the web, written to a network share,
+    put on the clipboard, captured off the screen or pushed to a cloud service
+    - together with the reaction the agent applied (monitor, block, encrypt,
+    quarantine, request user justification) and whether it held. These records
+    do not arrive in the ePO threat-event table with the ENS detections and
+    cannot be recovered from it: an incident lives in the DLP incident tables
+    behind the DLP Incident Manager with its own schema, its own 0-4 severity
+    ladder and its own identifier, which is exactly why it is a dataset of its
+    own rather than a branch of ens-threat. Where a rule is configured to
+    collect evidence, the agent writes a copy of the offending data to the ePO
+    evidence share and links it to the incident; the evidence itself never
+    leaves that share and never crosses the guard - only the incident id and
+    the evidence count travel, and an analyst pivots back to the Incident
+    Manager console to open the copy. Categorized file and process: the record
+    is anchored on the file and the classification that matched it, and it
+    names the application that attempted the transfer with a pid, which is
+    what makes an incident actionable rather than merely reportable. It is
+    honestly only a partial fit for the process profile - the incident carries
+    no command line - and the email, web-post, printing and network channels
+    are represented in the inventory but are not what the alerting profile is
+    anchored on.
+  event_categories:
+  - file
+  - process
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        DLP incidents are not carried by the registered syslog server's
+        default threat feed, so the primary collection is a Cribl Database
+        Collector reading the DLP incident tables on the ePO SQL Server; on
+        the guarded path the poller runs on the low side. An Automatic
+        Response on the DLP event group can additionally push a
+        threat-event-shaped CEF copy to a Cribl syslog source for latency.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-trellix_epo.dlp_endpoint
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        DLP incidents are not carried by the registered syslog server's
+        default threat feed, so the primary collection is a Cribl Database
+        Collector reading the DLP incident tables on the ePO SQL Server. An
+        Automatic Response on the DLP event group can additionally push a
+        threat-event-shaped CEF copy to a Cribl syslog source for latency.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-trellix_epo.dlp_endpoint
+  formats:
+  - format: jdbc-sql
+    enable: >
+      No console toggle. The DLP incident tables exist as soon as the DLP
+      Endpoint extension is installed, and dbo.DLP_EventView is the view that
+      exposes host DLP incidents; DLP_EventInfo holds the per-incident detail
+      and DLP_EvidenceTypeAndValue the evidence rows, joined on EventRowID.
+      Create a read-only SQL Server login and grant it SELECT on those in the
+      ePO_<servername> database, then point a JDBC/ODBC collector at the ePO
+      SQL Server and page on the monotonically increasing EventRowID
+      high-water mark so each incident is read exactly once. Exclude the
+      removable-storage incident types server-side, since those leave on the
+      device-control route. Do not grant the login access to the evidence
+      share: the pointer is collected, the evidence is not. This is the
+      'dlpincident' device-type path the ArcSight McAfee ePO DB SmartConnector
+      implemented.
+    references:
+    - >-
+      https://www.microfocus.com/documentation/arcsight/arcsight-smartconnectors/pdfdoc/mcafee-epo/mcafee-epo.pdf
+    - https://qmasters.co/mcafee-dlp-events-support/
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        Cribl Database Collector against dbo.DLP_EventView plus a DLP incident
+        normalization pipeline
+      notes: >
+        No Cribl pack or Elastic integration covers on-prem DLP Endpoint, so a
+        scheduled Database Collector reads the view and a hand-built pipeline
+        normalizes the columns. The incident schema is wide because it is a
+        union: a base record (incident id and type, violation times, severity,
+        rule, reaction, failure reason, evidence count, endpoint, user,
+        application) plus a channel-specific tail that differs per incident
+        type - destination path for network-share incidents, destination URL
+        for web posts, sender/recipients/subject for email, printer name for
+        printing, address and port pair for network protection, cloud service
+        for cloud. A record therefore has many null columns by design, and the
+        pipeline must not treat that as a parse failure. The severity ladder
+        here is DLP's own (0=Info, 1=Warning, 2=Minor, 3=Major, 4=Critical)
+        and runs the opposite direction to the ePO 0-7 threat scale.
+    fields:
+    - vendor: ViolationUTCTime
+      type: timestamp
+      description: UTC time the protection rule was violated on the endpoint
+      ecs: '@timestamp'
+      status: mapped
+      transform: >-
+        key @timestamp off this rather than collector poll time, which lags by
+        an agent upload interval plus the polling schedule
+    - vendor: InsertionTime
+      type: timestamp
+      description: time the ePO event parser inserted the incident row
+      ecs: event.created
+      status: partial
+      notes: >-
+        server-side insertion, not ingest; the gap to ViolationUTCTime is the
+        agent-to-server upload lag
+    - vendor: IncidentId
+      type: integer
+      description: unique identifier of the incident in the DLP Incident Manager
+      ecs: event.id
+      status: mapped
+      notes: >
+        the pivot key. It is what an analyst types into the Incident Manager
+        to reach the evidence copy that did not cross the boundary, so it is
+        load-bearing rather than decorative and must survive every pipeline
+        stage intact.
+    - vendor: IncidentType
+      type: integer
+      description: >-
+        numeric incident type naming the channel, e.g. 40200 email, 40301
+        printing, 40500 web post, 40400 network, 40700 cloud
+      ecs: event.code
+      status: mapped
+      transform: >-
+        stringified into event.code; it also selects which channel-specific
+        columns are populated, so the pipeline branches on it before
+        attempting the tail
+    - vendor: Severity
+      type: integer
+      description: DLP incident severity, 0=Info 1=Warning 2=Minor 3=Major 4=Critical
+      ecs: event.severity
+      status: partial
+      transform: >
+        rescale before any threshold alerting and keep it separate from the
+        threat feed's lookup: this ladder ascends with seriousness while the
+        ePO 0-7 threat scale descends, so one shared lookup inverts every DLP
+        alert silently
+    - vendor: ActualAction
+      type: integer
+      description: reaction the agent actually applied, 0=No action 1=Block
+      ecs: event.action
+      status: partial
+      transform: >
+        a numeric enum needing a lookup. The no-action value is the
+        monitor-only case that a great many DLP rules run in, so alerting that
+        does not distinguish it will report a blocked exfiltration where the
+        data actually left
+    - vendor: ActualActionOther
+      type: string
+      description: >-
+        secondary reaction detail where the rule applied more than a block,
+        e.g. encrypt or quarantine
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.dlp_endpoint.action_other
+      notes: >-
+        event.action already carries the primary verb and ECS has no second
+        action slot; the ArcSight connector parked this in an unrelated hash
+        field, which is worth not repeating
+    - vendor: RulesToDisplay
+      type: string
+      description: name of the protection rule that matched
+      ecs: rule.name
+      status: mapped
+      notes: >
+        this does go to rule.name: it names a configured protection rule an
+        administrator wrote, which is what rule.* is for. rule.id stays empty
+        rather than being filled from IncidentType or PolicyRevision - neither
+        identifies the rule - so CSOC content keys on rule.name alone.
+        Multiple rules can match one transfer and the column then carries a
+        list, which the pipeline must split rather than index as one string.
+    - vendor: PolicyRevision
+      type: string
+      description: revision of the DLP policy the rule was published in
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.dlp_endpoint.policy_revision
+      notes: >-
+        not rule.version: it versions the containing policy, not the rule, and
+        is most useful for answering whether an endpoint was enforcing the
+        policy the SOC thinks it was
+    - vendor: EvidenceCount
+      type: integer
+      description: number of evidence items the agent attached to the incident
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.dlp_endpoint.evidence_count
+      notes: >
+        a pointer, never the evidence. The copy of the offending data is
+        written to the ePO evidence share and stays there; a non-zero count
+        tells an analyst a copy exists and IncidentId tells them where to ask
+        for it. Nothing about the evidence content crosses the guard.
+    - vendor: TotalContentSize
+      type: integer
+      description: total size in bytes of the content the rule inspected
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.dlp_endpoint.content_size
+      notes: >-
+        not file.size, which is the size of the file named by FileName; on a
+        multi-attachment mail or a multi-file copy the two differ, and the
+        bulk-transfer threshold belongs on this one
+    - vendor: FailureReason
+      type: string
+      description: why the agent could not apply the intended reaction
+      ecs: event.reason
+      status: mapped
+      notes: >-
+        populated only when the reaction failed, which is the case a SOC most
+        wants alerted - a block that did not hold means the data left
+    - vendor: ItemType
+      type: string
+      description: kind of item the incident was raised on
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.dlp_endpoint.item_type
+    - vendor: Name
+      type: string
+      description: hostname of the endpoint the incident was raised on
+      ecs: host.name
+      status: mapped
+    - vendor: IP
+      type: ip
+      description: IPv4 address of the endpoint at violation time
+      ecs: host.ip
+      status: partial
+      notes: >-
+        the ArcSight connector put this in the source address; for an endpoint
+        incident the endpoint is the host, so it goes to host.ip
+    - vendor: FQDN
+      type: string
+      description: fully qualified domain name of the endpoint
+      ecs: host.hostname
+      status: partial
+      notes: >-
+        ECS has no host.fqdn and host.name already carries the short name the
+        console shows, so the FQDN is kept on host.hostname
+    - vendor: Username_NTLM
+      type: string
+      description: account logged on to the endpoint when the rule matched
+      ecs: user.name
+      status: partial
+      transform: arrives as DOMAIN\user and must be split into user.domain plus user.name
+    - vendor: SID
+      type: string
+      description: Windows security identifier of that account
+      ecs: user.id
+      status: mapped
+      notes: >-
+        the stable identifier when an account is later renamed, which is the
+        case a long-running insider investigation runs into
+    - vendor: UserGroups
+      type: string
+      description: directory groups the account belonged to at violation time
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.dlp_endpoint.user_groups
+      notes: >
+        deliberately not user.roles, which ECS defines as roles rather than
+        directory group membership, and not user.group.name, which is a single
+        primary group. This is a snapshot list and its value is that it is a
+        snapshot: it says what the account could reach at the moment of the
+        violation, not what it can reach today.
+    - vendor: ApplicationFileName
+      type: string
+      description: file name of the application that attempted the transfer
+      ecs: process.name
+      status: mapped
+      notes: >-
+        a bare file name in this view, not a path, so it maps to process.name
+        and leaves process.executable empty
+    - vendor: ProcessId
+      type: integer
+      description: pid of that application on the endpoint
+      ecs: process.pid
+      status: mapped
+      notes: >-
+        documented for the application file-access incident type; it makes the
+        incident joinable to endpoint process telemetry from the same host and
+        window, which is the only way to recover the command line this feed
+        does not carry
+    - vendor: FilePath
+      type: string
+      description: full path of the file the rule matched on
+      ecs: file.path
+      status: mapped
+    - vendor: FileName
+      type: string
+      description: file name without the directory
+      ecs: file.name
+      status: mapped
+    - vendor: FileSize
+      type: integer
+      description: size in bytes of that file
+      ecs: file.size
+      status: mapped
+    - vendor: FileType
+      type: string
+      description: 'DLP''s own classification of the file''s type'
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.dlp_endpoint.file_type
+      notes: >-
+        a product taxonomy label rather than a media type, so it does not go
+        to file.mime_type; derive file.extension from FileName instead
+    - vendor: SHA1
+      type: string
+      description: SHA-1 hash of the file the incident was raised on
+      ecs: file.hash.sha1
+      status: mapped
+      notes: >
+        documented from ePO 5.10 onward; earlier incident schemas carry no
+        hash at all. SHA-1 is the only digest here, so this dataset cannot
+        satisfy a sha256-keyed profile and correlation with the ens-threat
+        feed, which carries MD5 only, needs a hash-enrichment lookup on both
+        sides to meet in the middle.
+    - vendor: DestinationPath
+      type: string
+      description: target path for a network-share protection incident
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.dlp_endpoint.destination_path
+      notes: >-
+        a UNC destination rather than a local file, so it is not a second
+        file.path; keeping it separate is what lets a share-exfiltration hunt
+        distinguish source from target
+    - vendor: DestinationURL
+      type: string
+      description: target URL for a web-post protection incident
+      ecs: url.original
+      status: mapped
+    - vendor: Sender
+      type: string
+      description: sender address on an email protection incident
+      ecs: email.from.address
+      status: mapped
+    - vendor: Recipients
+      type: string
+      description: To recipients on an email protection incident
+      ecs: email.to.address
+      status: partial
+      transform: >-
+        a delimited list that must be split into the ECS array; RecipientsCc
+        and RecipientsBcc are separate columns and belong on email.cc.address
+        and email.bcc.address rather than being concatenated in as the
+        ArcSight connector did
+    - vendor: Subject
+      type: string
+      description: subject line on an email protection incident
+      ecs: email.subject
+      status: mapped
+      notes: >-
+        free text a user wrote, so it is one of the fields the guard's content
+        filter is most likely to object to
+    - vendor: PrinterName
+      type: string
+      description: printer targeted by a printing protection incident
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.dlp_endpoint.printer_name
+      notes: >-
+        ECS has no printer fieldset and the value is neither a host nor a
+        service in any reliable sense - it is a Windows print-queue name - so
+        it stays custom rather than being forced into host.name
+    - vendor: DestIP
+      type: ip
+      description: destination address on a network protection incident
+      ecs: destination.ip
+      status: mapped
+    - vendor: DestPort
+      type: integer
+      description: destination port on a network protection incident
+      ecs: destination.port
+      status: mapped
+    - vendor: SourcePort
+      type: integer
+      description: source port on a network protection incident
+      ecs: source.port
+      status: mapped
+    - vendor: NetworkProtocol
+      type: string
+      description: transport protocol on a network protection incident
+      ecs: network.transport
+      status: partial
+      transform: >-
+        lower-case it and resolve numeric IANA values before writing, the same
+        normalization the hips-intrusion dataset applies
+    - vendor: ConnectionDirection
+      type: integer
+      description: direction of the connection, 0=Inbound 1=Outbound
+      ecs: network.direction
+      status: partial
+      transform: >-
+        map to the ECS ingress/egress vocabulary, and consult it before
+        assigning the source/destination pair rather than assuming the
+        endpoint is always the source
+    - vendor: CloudService
+      type: string
+      description: cloud service targeted by a cloud protection incident
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.dlp_endpoint.cloud_service
+      notes: >-
+        a product-side label for the service, not a hostname or an ECS
+        service.name in the observability sense, so it stays custom
+    - vendor: VisibleApplications
+      type: string
+      description: applications on screen when a screen-capture protection incident fired
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.dlp_endpoint.visible_applications
+    - vendor: DlpAgentVersion
+      type: string
+      description: version of the DLP Endpoint agent that raised the incident
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.dlp_endpoint.agent_version
+      notes: >-
+        the practical way to spot endpoints running an agent too old to
+        enforce the current policy
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Run the Database Collector low-side next to the ePO SQL Server,
+          keyed on the EventRowID high-water mark, excluding the
+          removable-storage incident types that leave on the device-control
+          route, and own the whole normalize here because there is nothing
+          downstream to hand a raw row to. Branch on IncidentType before
+          touching the channel tail, so a printing incident is not run through
+          the email stage and a wholly null tail is recognized as normal
+          rather than dead-lettered. Do the DLP-specific fixes: rescale the
+          0-4 severity with its own lookup and never the threat feed's
+          inverted 0-7 one, resolve ActualAction and keep the monitor-only
+          value distinguishable from a block, split the RulesToDisplay list
+          and the Recipients list into arrays, split DOMAIN\user, and key
+          @timestamp off ViolationUTCTime. Two things must be done here and
+          nowhere else. Redaction is pinned low-side: subjects, URLs, file
+          paths and recipient addresses are the content the incident is about,
+          so whatever the data owner will not let cross has to be dropped or
+          hashed before the guard destination, not filtered in Elastic. And
+          the evidence copy stays put - carry EvidenceCount and IncidentId and
+          never let a pipeline stage read from the evidence share.
+          Schema-Library validate with a dead-letter route, Persistent Queue
+          rather than Block, keep _raw.
+        elastic: >
+          Stand up a custom ingest pipeline and index template for
+          logs-trellix_epo.dlp_endpoint that accepts the pre-shaped documents
+          instead of re-parsing them, with custom-namespace keyword mappings
+          for trellix.epo.dlp_endpoint.policy_revision, .action_other,
+          .evidence_count, .content_size, .item_type, .user_groups,
+          .file_type, .destination_path, .printer_name, .cloud_service,
+          .visible_applications and .agent_version. Keep rule.name for the
+          protection rule and leave rule.id unpopulated rather than filling it
+          from IncidentType. Assert that email.to.address, email.cc.address
+          and email.bcc.address arrive as arrays and that network.direction
+          only ever holds ingress/egress. Document the two profile gaps
+          plainly instead of letting them be discovered during an incident:
+          there is no process.command_line in this feed at all, so
+          process-profile content must join to endpoint telemetry on host and
+          pid, and the only digest is SHA-1, so nothing here answers a
+          sha256-keyed hunt. Say in the template that the evidence file is not
+          in Elastic and that IncidentId is the pointer back to the Incident
+          Manager.
+        relay: >
+          The collector and its EventRowID high-water mark must live low-side
+          - a database session cannot cross a one-way guard - so the crossing
+          carries emitted NDJSON only, and the evidence copy on the ePO
+          evidence share never crosses at all; that is a property of the
+          design, not an operational choice, and it is the single most
+          important thing to tell the guard owner. This is the highest-
+          friction feed in the technology, because the fields that make an
+          incident useful are the fields a content filter exists to stop: mail
+          subjects, recipient addresses, destination URLs, UNC paths and long
+          Windows file paths, all of them user-authored free text. Normalize
+          to UTF-8, strip control characters, enforce declared length caps and
+          apply the agreed redaction before the guard destination, and hold
+          the document to two levels of nesting with short ASCII allowlisted
+          keys so a custom NDJSON filter stays simple. Expect the per-feed
+          policy negotiation to be about content rather than shape here, and
+          budget for it. Treat the crossing as at-most-once: Persistent Queue
+          on the guard destination and per (dataset, hour) row-count
+          reconciliation are the only drop detectors, and the high side can
+          never ask for an EventRowID window to be re-read.
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side ePO whose SQL Server is reachable without the guard,
+          the Database Collector and the same normalizations apply without the
+          redaction and length-capping the crossing forces - which is the
+          substantive difference for this dataset, since the content is the
+          point of it. Still branch on IncidentType before the channel tail
+          and still split the rule and recipient lists. The governing decision
+          here is deduplication against any CEF copy pushed from the same ePO
+          by an Automatic Response: key on IncidentId where it is present and
+          otherwise on the endpoint hostname with ViolationUTCTime, and let
+          this document win, because the syslog copy is a strict subset of it.
+          Retain the full channel tail for hunting, since there is no boundary
+          to strip it for.
+        elastic: >
+          Stand up a custom ingest pipeline and index template for
+          logs-trellix_epo.dlp_endpoint that accepts the pre-shaped documents,
+          with the same custom-namespace keyword mappings and the same
+          rule.name-without-rule.id decision. With no boundary this feed is
+          the authoritative record and any CEF copy is only a latency
+          shortcut, so write the collection transport into every document and
+          build content against the database documents. The two profile gaps
+          are unchanged by the absence of a guard and still belong in the
+          template: no process.command_line anywhere in the feed, and SHA-1 as
+          the only digest. Note also that the evidence copy is still not in
+          Elastic even here - it is on the ePO evidence share by design, not
+          because the guard stopped it.
+  - format: syslog-cef
+    enable: >
+      Register the syslog receiver at Menu -> Configuration -> Registered
+      Servers -> New Server, server type Syslog, event format Common Event
+      Format (CEF); ePO syslog forwarding is TCP only and requires TLS. Then
+      create a rule at Menu -> Automation -> Automatic Responses -> New
+      Response with event group DLP Events and event type DLP Incident Events,
+      bound to that registered server. This is a latency shortcut, not a
+      substitute for the database read: what the response hands the syslog
+      server is the ePO threat-event property set, so the incident id, the
+      rule name, the DLP severity ladder, the evidence count and every
+      channel-specific column are absent from it.
+    references:
+    - >-
+      https://docs.cloud.google.com/chronicle/docs/ingestion/default-parsers/mcafee-dlp
+    - https://kcm.trellix.com/corporate/index?page=content&id=KB91194
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Trellix ePO CEF pipeline, DLP branch
+      notes: >
+        Branches off the same hand-built CEF pipeline the threat and HIPS
+        datasets use, split on ThreatCategory and ThreatEventID. The inventory
+        below is the ePO threat-event envelope, not the DLP incident schema,
+        and that is the whole reason this entry is not the recommended one: an
+        Automatic Response renders a DLP incident through ePO's own event
+        properties before the registered syslog server sees it, so what
+        arrives is a detection-shaped summary. Use it to alert in seconds and
+        use the jdbc-sql entry to investigate; the two describe the same
+        incidents and must be deduplicated.
+    fields:
+    - vendor: DetectedUTC
+      type: timestamp
+      description: UTC time the protection rule was violated on the endpoint
+      ecs: '@timestamp'
+      status: mapped
+      transform: >-
+        key @timestamp off this rather than syslog receipt time, which lags by
+        an agent upload interval
+    - vendor: ReceivedUTC
+      type: timestamp
+      description: UTC time the ePO server received the event from the McAfee Agent
+      ecs: event.created
+      status: partial
+      notes: >-
+        server-side receipt time, not ingest time; kept so the agent-to-server
+        upload gap stays visible
+    - vendor: ThreatEventID
+      type: integer
+      description: numeric ePO event id identifying the DLP event class
+      ecs: event.code
+      status: mapped
+      notes: >-
+        not the DLP IncidentType, and the two numbering schemes do not line
+        up; content written against one will not match the other
+    - vendor: ThreatCategory
+      type: string
+      description: ePO threat taxonomy bucket the DLP product writes its rows under
+      ecs: null
+      status: partial
+      custom: trellix.epo.dlp_endpoint.category
+      notes: >-
+        drives the routing decision that separates DLP rows from av.detect and
+        hip.sig rows in the shared syslog stream; it cannot be written to
+        event.category, a closed ECS vocabulary
+    - vendor: ThreatName
+      type: string
+      description: label the DLP product puts on the violation
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.dlp_endpoint.threat_name
+      notes: >
+        not rule.name. The repository's rule doctrine wants a name and an id
+        describing one configured object; this is a display label in a
+        detection-shaped record with no companion rule id. The incident row
+        read by the jdbc-sql entry carries the protection rule name proper,
+        and that one does go to rule.name - so rule.name-keyed content matches
+        the database feed and never this one.
+    - vendor: ThreatSeverity
+      type: integer
+      description: ePO severity of the event, 0-7
+      ecs: event.severity
+      status: partial
+      transform: >-
+        the ePO scale is inverted (0-2 critical/high, 3-4 medium, 5-7
+        informational) and is not the DLP 0-4 ladder the incident tables use;
+        the two feeds need separate lookups
+    - vendor: ThreatActionTaken
+      type: string
+      description: reaction applied, emitted as an IDS_ALERT_ACT_TAK_* localization key
+      ecs: event.action
+      status: partial
+      transform: >-
+        resource keys, not English; a lookup is required, and it will not
+        distinguish the DLP reactions (encrypt, quarantine, request
+        justification) as finely as ActualAction plus ActualActionOther do
+    - vendor: ThreatHandled
+      type: boolean
+      description: whether the agent successfully applied the reaction
+      ecs: event.outcome
+      status: mapped
+      transform: >-
+        boolean true/false translated to success/failure; the only clean
+        outcome signal on this path
+    - vendor: AnalyzerName
+      type: string
+      description: name of the managed product that raised the event
+      ecs: observer.product
+      status: mapped
+    - vendor: TargetHostName
+      type: string
+      description: hostname of the endpoint the incident was raised on
+      ecs: host.name
+      status: mapped
+    - vendor: TargetIPV4
+      type: ip
+      description: IPv4 address of the endpoint
+      ecs: host.ip
+      status: partial
+      notes: >-
+        CEF carries this in the destination slot, but for an endpoint incident
+        the target IS the managed host, so it goes to host.ip and not
+        destination.ip
+    - vendor: TargetUserName
+      type: string
+      description: account associated with the affected file
+      ecs: user.name
+      status: partial
+      transform: arrives as DOMAIN\user and must be split into user.domain plus user.name
+    - vendor: SourceUserName
+      type: string
+      description: account the transferring process was running as
+      ecs: source.user.name
+      status: mapped
+    - vendor: SourceProcessName
+      type: string
+      description: full path of the application that attempted the transfer
+      ecs: process.executable
+      status: mapped
+      notes: >-
+        a full path here, unlike the incident table's ApplicationFileName,
+        which is a bare file name and maps to process.name; a pipeline merging
+        the two feeds must populate both or joins will miss
+    - vendor: TargetFileName
+      type: string
+      description: path of the file the rule matched on
+      ecs: file.path
+      status: mapped
+    - vendor: SourceURL
+      type: string
+      description: URL involved in a web-channel violation
+      ecs: url.original
+      status: partial
+      notes: >-
+        the envelope's single URL slot, so it carries the destination of a web
+        post rather than a referring source despite the column name
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Own the whole parse here: CEF header plus the ePO threat extension,
+          branching on ThreatCategory and ThreatEventID so DLP rows leave on
+          this route, and emit full ECS-shaped JSON. Apply the shared
+          normalizations - inverted 0-7 severity, IDS_ALERT_ACT_TAK_* lookup,
+          ThreatHandled to event.outcome, DOMAIN\user split, @timestamp off
+          DetectedUTC. The branch-specific work is honesty about what this
+          document is: tag the collection transport, do not populate
+          rule.name, and leave the DLP incident fields absent rather than
+          synthesizing them from the threat envelope, because a half-filled
+          incident is worse than an obviously partial notification. The same
+          redaction the database path needs applies to whatever free text does
+          arrive here, and it is pinned low-side. Schema-Library validate with
+          a dead-letter route, Persistent Queue rather than Block, keep _raw.
+        elastic: >
+          Feed the same custom logs-trellix_epo.dlp_endpoint pipeline and
+          template the jdbc-sql path uses, with custom-namespace keyword
+          mappings for trellix.epo.dlp_endpoint.category and .threat_name. The
+          template must make the two transports distinguishable, because they
+          land in one data stream and describe the same incidents at very
+          different fidelity: without a collection-transport field, a
+          dashboard counting incidents double-counts and a hunt keyed on
+          rule.name silently drops every syslog-collected document. Treat
+          documents from this transport as notifications and hold
+          investigative content to the database feed.
+        relay: >
+          CEF is converted on the low-side worker, so full ECS-shaped JSON
+          crosses the guard and no CEF reaches the boundary or Elastic. This
+          stream shares one syslog source with the threat, HIPS and
+          device-control feeds, so split it before the guard destination or
+          none of the four can be counted or reconciled on its own. The
+          content-inspection friction is the same user-authored free text the
+          database path carries, in smaller quantity: file paths, URLs and
+          DOMAIN\user values, so normalize to UTF-8, strip control characters,
+          apply the agreed redaction and enforce declared length caps before
+          the guard destination, and keep the document shallow with short
+          ASCII allowlisted keys. Persistent Queue on the guard destination
+          and per (dataset, hour) count reconciliation are the only drop
+          detectors on a path with no return channel.
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side ePO reachable without the guard, the same CEF parse
+          and normalizations apply without the redaction and capping
+          discipline. The governing decision is deduplication against the
+          database feed from the same ePO: key on the endpoint hostname with
+          DetectedUTC and ThreatEventID, and let the database document win on
+          conflict, because it is a strict superset. Where the database
+          collector is running there is little reason to keep this feed at all
+          beyond the latency it buys, so make that a conscious choice rather
+          than an accident of both being switched on.
+        elastic: >
+          Feed the same custom logs-trellix_epo.dlp_endpoint pipeline and
+          template the jdbc-sql path uses, with custom-namespace keyword
+          mappings for trellix.epo.dlp_endpoint.category and .threat_name, and
+          the collection-transport field written into every document so the
+          two fidelities stay distinguishable in one data stream. Keep
+          rule.name unpopulated on this path so rule-keyed content matches
+          only the records that genuinely carry a protection rule name.
+  - format: api-pull
+    enable: >
+      DLP 11.10 and later publish REST API calls against the on-prem DLP
+      extension for retrieving incident ids and incident details, and a
+      separate call for retrieving and decrypting referenced evidence. An
+      HTTPS collector holding an ePO account with DLP Incident Manager
+      permission can therefore poll incidents without a SQL login or a direct
+      database network path, which is the deciding factor where the ePO SQL
+      Server is not reachable from the collector. The evidence-retrieval call
+      exists but must not be enabled on a guarded feed: it would pull the
+      evidence copy off the share and into the pipeline, which is exactly what
+      the design keeps from happening.
+    references:
+    - >-
+      https://docs.trellix.com/bundle/data-loss-prevention-11.10.x-product-guide/page/UUID-47966329-122f-386a-329b-5264f33df5a0.html
+    - >-
+      https://docs.trellix.com/bundle/data-loss-prevention-11.11.x-product-guide/page/UUID-fbf85735-9c01-7a2a-e634-9aeaadd1a194.html
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: Cribl REST Collector against the DLP incident REST API
+      notes: >
+        A two-call collection: fetch the incident ids for a bounded window,
+        then fetch the details for each id and unwrap the response into one
+        NDJSON row per incident. Once unwrapped the rows are expected to carry
+        the same incident vocabulary the database view exposes, so they should
+        feed the identical normalization branch - the same severity ladder,
+        the same ActualAction lookup, the same DOMAIN\user split. The trade
+        against the direct read is throughput and cost: two calls per incident
+        against the ePO console's own CPU suits a lower-volume estate or a
+        gap-fill, not a firehose.
+    fields_omitted: >-
+      The response property names are published only inside the Trellix
+      documentation portal, which serves its pages from a client-side
+      application this repository's research could not read, so the inventory
+      would have to be guessed from the database column names. It is not
+      guessed here. Onboard against the jdbc-sql inventory and replace this
+      note with a real inventory captured from a live API response.
+    fields: []
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Run the REST Collector low-side against the ePO console's HTTPS
+          port, checkpoint on the highest incident id or violation time seen,
+          and unwrap the details response into one NDJSON line per incident
+          with a fixed dataset id so the high side selects the DLP branch.
+          Push the window into the id-listing call rather than filtering after
+          the fact, because the API bills the ePO server's CPU and the detail
+          call is per incident. Do not enable the evidence-retrieval call: the
+          evidence copy stays on the ePO evidence share, and a collector that
+          pulls it turns a pointer into a payload at the one boundary where
+          that must not happen. Otherwise apply the same normalizations as the
+          database path, Schema-Library validate with a dead-letter route, and
+          run the destinations on Persistent Queue backpressure.
+        elastic: >
+          Feed the same custom logs-trellix_epo.dlp_endpoint pipeline and
+          template the jdbc-sql path uses once the collector has unwrapped the
+          responses, and write the collection transport into every document so
+          an operator reconciling counts can tell an API-pulled incident from
+          a database-read or CEF one. Until a live response has been captured
+          and the property names confirmed, treat the mapping as provisional
+          and keep the pipeline's unknown-field handling permissive rather
+          than dropping properties it does not recognize.
+        relay: >
+          NDJSON crosses, never an HTTPS session and never a database
+          connection - the API is polled low-side and only emitted documents
+          reach the guard. The evidence copy does not cross, and on this
+          format that is an active decision rather than a limitation, because
+          the API is capable of fetching it. The content-filter friction is
+          the same user-authored free text as the database path - subjects,
+          URLs, UNC and Windows paths, DOMAIN\user - so cap, redact and
+          UTF-8-normalize low-side and keep the document shallow with short
+          ASCII allowlisted keys. Treat the crossing as at-most-once: the
+          poller keeps its high-water mark low-side, so per (dataset, hour)
+          count reconciliation is the only drop detector and the high side can
+          never ask for a window to be re-queried.
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side ePO reachable without the guard, the REST Collector
+          and unwrap are identical without the redaction and capping
+          discipline. The governing decision is query scheduling against the
+          ePO console's load: the detail call is per incident, so a backfill
+          across a busy day can starve the console - stagger and scope the
+          windows, and prefer the database read outright wherever a SQL login
+          is obtainable. Dedupe against any database or CEF feed from the same
+          ePO by keying on the incident id.
+        elastic: >
+          Feed the same custom logs-trellix_epo.dlp_endpoint pipeline and
+          template the jdbc-sql path uses, with the collection transport
+          written into every document. Keep the mapping provisional until a
+          live response has confirmed the property names, and prefer the
+          database feed as the authoritative record wherever both are running.
+- id: epo-audit
+  name: ePO server audit log
+  description: >
+    Administrative activity on the ePO console itself - console logons, policy
+    and task edits, System Tree changes, and repository/agent deployment
+    commands - recorded in the OrionAuditLog table.
+  event_categories:
+  - configuration
+  - authentication
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        The registered syslog server feature forwards threat events only, so
+        audit records are collected instead by a Cribl Database Collector
+        querying the ePO SQL Server (dbo.OrionAuditLog); on the guarded path
+        the poller runs on the low side.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-trellix_epo.audit
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        The registered syslog server feature forwards threat events only, so
+        audit records are collected instead by a Cribl Database Collector
+        querying the ePO SQL Server (dbo.OrionAuditLog).
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-trellix_epo.audit
+  formats:
+  - format: api-pull
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: Cribl Database Collector against dbo.OrionAuditLog
+      notes: >-
+        replaces the ArcSight McAfee ePO DB SmartConnector's orionaudit device
+        type; scheduled collection keyed on AutoID to avoid re-reading rows
+    fields:
+    - vendor: AutoID
+      type: long
+      description: monotonically increasing unique id of the audit record
+      ecs: event.id
+      status: mapped
+      notes: 'also the collector''s high-water mark for incremental pulls'
+    - vendor: StartTime
+      type: timestamp
+      description: time the administrative action began
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: EndTime
+      type: timestamp
+      description: time the administrative action completed
+      ecs: event.end
+      status: mapped
+    - vendor: UserName
+      type: string
+      description: ePO console account that performed the action
+      ecs: user.name
+      status: mapped
+    - vendor: UserID
+      type: integer
+      description: internal ePO user id of the acting account
+      ecs: user.id
+      status: mapped
+    - vendor: CmdName
+      type: string
+      description: name of the ePO command invoked, e.g. Policy Assignment, Logon, Repository Pull
+      ecs: event.action
+      status: mapped
+    - vendor: Message
+      type: string
+      description: summary text describing the audited action
+      ecs: message
+      status: mapped
+    - vendor: DetailMessage
+      type: string
+      description: expanded detail for the audited action, including failure reasons
+      ecs: event.reason
+      status: mapped
+    - vendor: Success
+      type: boolean
+      description: whether the administrative action succeeded
+      ecs: event.outcome
+      status: mapped
+      transform: >-
+        the column is emitted variously as 1/0, "Success", or "Failed"
+        depending on ePO version; normalize all three shapes to
+        success/failure
+    - vendor: Priority
+      type: integer
+      description: audit priority, 1-8, where 1 is most significant
+      ecs: event.severity
+      status: partial
+      transform: >-
+        inverted 1-8 scale like the threat severities; needs a lookup rather
+        than a direct copy
+    - vendor: RemoteAddress
+      type: ip
+      description: address of the client the administrator connected from
+      ecs: source.ip
+      status: partial
+      notes: >
+        the ArcSight DB connector put this in destinationAddress, which is
+        backwards for an admin-session view; mapping it to source.ip here
+        means ported ArcSight content keyed on the destination address has to
+        be reverted
+    - vendor: LocalAddress
+      type: ip
+      description: address of the ePO server interface that served the console session
+      ecs: destination.ip
+      status: mapped
+    - vendor: AdditionalDetailsURI
+      type: string
+      description: console URI pointing at the full detail record for the audited action
+      ecs: event.url
+      status: mapped
+    - vendor: TenantId
+      type: integer
+      description: tenant identifier in multi-tenant ePO deployments
+      ecs: null
+      status: unmapped
+      custom: trellix.epo.tenant_id
+      notes: >-
+        constant in single-tenant government deployments; retained because it
+        is the join key when several ePO instances are merged
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Run the Database Collector against dbo.OrionAuditLog on the low side
+          next to the ePO SQL Server, keyed on the AutoID high-water mark, and
+          emit full ECS-shaped JSON — the rows arrive already structured, so
+          the work is normalization rather than parsing. Do three fixes here:
+          collapse the three shapes Success is emitted in (1/0, "Success",
+          "Failed") into a single event.outcome, invert the 1-8 Priority scale
+          through a lookup instead of copying it into event.severity, and
+          bound or mask DetailMessage, which carries failure reasons and
+          policy payloads that can include credentials. Validate against a
+          Schema Library schema with a dead-letter route before the
+          destination and use Persistent Queue backpressure; _raw adds little
+          here beyond a duplicate of the already-structured row, so drop it
+          once the collector's column mapping is proven.
+        elastic: >
+          Build a custom ingest pipeline and index template for
+          logs-trellix_epo.audit — the trellix_epo_cloud integration does not
+          cover on-prem — with a keyword mapping for trellix.epo.tenant_id,
+          which is the join key when several ePO instances are merged even
+          though it is constant in single-tenant deployments. Assert the admin
+          session orientation the map chose: RemoteAddress in source.ip and
+          LocalAddress in destination.ip, the reverse of the ArcSight DB
+          connector, so ported content keyed on destinationAddress is caught
+          rather than quietly matching the wrong host. Keep @timestamp on
+          StartTime with EndTime in event.end so action duration stays
+          derivable, and note in the template that event.url points at a
+          low-side ePO console URI that a high-side analyst cannot follow.
+        relay: >
+          This is the dataset that cannot cross as-is: a scheduled SQL poller
+          is a poor fit for a one-way relay, so the collector and its AutoID
+          high-water mark must live low-side, with the crossing carrying
+          emitted NDJSON rather than any database connection. Prefer the
+          Filesystem → Automated Secure Transfer drop-box → Filesystem
+          collector variant for this feed, since a batch-shaped source is the
+          one with a real replay story under an at-most-once crossing, and
+          remember the high side can never tell the poller to re-read a
+          window. DetailMessage is the content-filter risk — unbounded free
+          text, sometimes kilobyte policy detail — so cap it low-side and
+          reconcile row counts per (dataset, hour) to detect silent drops.
+      direct:
+        parse_location: low
+        cribl: >
+          Run the Database Collector against dbo.OrionAuditLog next to the ePO
+          SQL Server, keyed on the AutoID high-water mark, and emit full
+          ECS-shaped JSON — the rows arrive already structured, so the work is
+          normalization rather than parsing. Do three fixes here: collapse the
+          three shapes Success is emitted in (1/0, "Success", "Failed") into a
+          single event.outcome, invert the 1-8 Priority scale through a lookup
+          instead of copying it into event.severity, and bound or mask
+          DetailMessage, which carries failure reasons and policy payloads
+          that can include credentials. Validate against a Schema Library
+          schema with a dead-letter route before the destination and use
+          Persistent Queue backpressure; _raw adds little here beyond a
+          duplicate of the already-structured row, so drop it once the
+          collector's column mapping is proven.
+        elastic: >
+          Build a custom ingest pipeline and index template for
+          logs-trellix_epo.audit — the trellix_epo_cloud integration does not
+          cover on-prem — with a keyword mapping for trellix.epo.tenant_id,
+          which is the join key when several ePO instances are merged even
+          though it is constant in single-tenant deployments. Assert the admin
+          session orientation the map chose: RemoteAddress in source.ip and
+          LocalAddress in destination.ip, the reverse of the ArcSight DB
+          connector, so ported content keyed on destinationAddress is caught
+          rather than quietly matching the wrong host. Keep @timestamp on
+          StartTime with EndTime in event.end so action duration stays
+          derivable, and note in the template that event.url points at the ePO
+          console detail record for the audited action.

@@ -1,0 +1,1491 @@
+id: building-automation
+name: Building Automation (Tridium Niagara/Metasys)
+vendor: Multiple
+versions: Niagara 4.10-4.15 (syslog export requires 4.13+); Metasys 12.x-14.x
+draft: true
+references:
+- >-
+  https://downloads.onesight.solutions/Tridium/Niagara%204%20Documents/niagara_histories_guide_8-7-2025.pdf
+- >-
+  https://www.tridium.com/content/dam/tridium/en/documents/document-lists/niagara/tri-Niagara4-Hardening-Guide-en-2025.pdf
+- >-
+  https://downloads.onesight.solutions/Tridium/Niagara%204%20Documents/docPlatform.pdf
+- >-
+  https://downloads.onesight.solutions/Tridium/Niagara%204%20Documents/docStationSecurity.pdf
+- https://github.com/thomasjupe/NiagaraN4BQLQueries/blob/main/N4BQLAuditLogQueries
+- https://jci-metasys.github.io/api-landing/api/v4
+- >-
+  https://docs.johnsoncontrols.com/bas/r/Metasys/en-US/Metasys-System-Configuration-Guide/10.1/Metasys-system/Metasys-System-Capabilities/Audit-Trails-Transaction-Data-Management
+datasets:
+- id: operator-audit
+  name: Niagara station audit and security-audit records
+  description: >
+    Tridium Niagara AuditHistoryService records - one per user-initiated
+    change to any component in the station - plus the separate security
+    history the AuditHistoryService writes for authentication events (log-in,
+    log-out) and for changes to properties carrying the "security" facet.
+    Niagara 4.9 split security history out of the standard audit history so
+    frequent connection events cannot flood the audit trail; 4.13 added
+    SyslogPlatformService, whose Station Audit Enabled and Security Audit
+    Enabled settings are what get these records off the JACE/Supervisor and
+    onto a collector at all. This is the IT/OT convergence signal on this
+    technology: a domain account appearing on a JACE, an off-hours config
+    change, or a burst of failed station log-ins is the first observable of a
+    compromised BAS. Placeholder note: the bas.* custom namespace root is
+    provisional pending the org's OT namespace decision.
+  event_categories:
+  - authentication
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge Cribl worker group, OT/building enclave
+      notes: >
+        Receives BSD-format (RFC 3164) syslog from SyslogPlatformService over
+        UDP/TCP/TLS, default port 1514, default facility local0. BAS
+        controllers sit on a separate building network, so the receiver is
+        per-site and the mix differs between sites.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-bas.niagara_audit
+    direct:
+    - hop: cribl
+      location: edge Cribl worker group, OT/building enclave
+      notes: >
+        Receives BSD-format (RFC 3164) syslog from SyslogPlatformService over
+        UDP/TCP/TLS, default port 1514, default facility local0. BAS
+        controllers sit on a separate building network, so the receiver is
+        per-site and the mix differs between sites.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-bas.niagara_audit
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Niagara audit pipeline
+      notes: >
+        No Elastic integration and no Cribl pack exists for the Niagara
+        Framework. The syslog MSG body is a Niagara-rendered audit record, not
+        a documented CSV/CEF/kv grammar, so the extraction is a hand-built
+        regex/kv pipeline keyed on the documented audit record columns
+        (Timestamp, Operation, Target, Slot Name, Old Value, Value, User Name)
+        and must be re-tested on every Niagara point release.
+    fields:
+    - vendor: Timestamp
+      type: timestamp
+      description: when the audited event occurred, as recorded in the audit history record
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        Niagara renders station-local time with a time zone; the BSD (RFC
+        3164) syslog header carries no year, so the record-body timestamp must
+        be preferred over the header and the year reconciled at ingest
+    - vendor: Operation
+      type: enum
+      description: >-
+        type of audited event - the service audits Property changed, Property
+        added, Property removed, Property renamed, Property reordered and
+        Action invoked
+      ecs: event.action
+      status: mapped
+      transform: >
+        copied verbatim to event.action; the security history adds
+        authentication operations (log-in, log-out) that the standard audit
+        history never carries, and the same vocabulary also drives the derived
+        event.outcome
+    - vendor: User Name
+      type: string
+      description: station user account that made the change or authenticated
+      ecs: user.name
+      status: mapped
+    - vendor: Target
+      type: string
+      description: ORD of the modified component (e.g. station:|slot:/Drivers/BacnetNetwork/AHU_1)
+      ecs: null
+      status: unmapped
+      custom: bas.niagara.audit.target
+      notes: >
+        Niagara ORD identifying the component acted upon; no ECS field models
+        a station-relative object path. Deliberately not file.path - an ORD is
+        a framework object reference, not a filesystem path.
+    - vendor: Slot Name
+      type: string
+      description: name of the component slot (property or action) that was modified or invoked
+      ecs: null
+      status: unmapped
+      custom: bas.niagara.audit.slot_name
+      notes: >
+        the Niagara Histories Guide Last Record table mis-describes this
+        column as "Identifies the host IP address"; every observed record and
+        every published BQL audit query treats slotName as the changed slot,
+        so parse it as the slot name and take the client address from the
+        authentication message text instead
+    - vendor: Old Value
+      type: string
+      description: property value before the change
+      ecs: null
+      status: unmapped
+      custom: bas.niagara.audit.old_value
+      notes: >-
+        unbounded free text; can carry a whole serialized sub-component on a
+        container property change
+    - vendor: Value
+      type: string
+      description: property value after the change
+      ecs: null
+      status: unmapped
+      custom: bas.niagara.audit.new_value
+      notes: >-
+        same unbounded free text as Old Value; the pair is the actual change
+        evidence a CSOC alerts on
+    - vendor: history name
+      type: string
+      description: >-
+        name of the history the record was written to - AuditHistory for
+        ordinary configuration changes, SecurityHistory for authentication and
+        security-facet property changes
+      ecs: null
+      status: unmapped
+      custom: bas.niagara.audit.history_name
+      notes: >
+        security-related property changes are written to BOTH histories while
+        authentication events go only to the security history, so this field
+        is required to de-duplicate and to isolate the security-relevant
+        subset
+    - vendor: auth scheme
+      description: >-
+        authentication scheme used for the station log-in (Fox, Web/HTTPS, PKI
+        client certificate, SAML SSO, LDAP/Kerberos)
+      ecs: null
+      status: unmapped
+      custom: bas.niagara.auth.scheme
+      notes: >
+        not a documented audit column - it is embedded in the security audit
+        message text and must be extracted; it is the field that distinguishes
+        a local station account from a domain-federated one, which is the
+        IT/OT convergence signal
+    - vendor: client address
+      type: ip
+      description: address of the client the station log-in originated from
+      ecs: source.ip
+      status: partial
+      notes: >
+        not a documented audit column; carried inside the security audit
+        message text and must be regex-extracted. Without it the
+        authentication alerting profile has no source, so this extraction is
+        load-bearing rather than cosmetic.
+    - vendor: login result
+      description: whether the station log-in or configuration action succeeded
+      ecs: event.outcome
+      status: partial
+      notes: >
+        Niagara publishes no outcome column on either history; success and
+        failure must be derived from the Operation value and the log-in result
+        wording in the message text, which is the single largest gap for the
+        authentication profile on this technology
+    - vendor: MSG
+      type: string
+      description: >-
+        full Niagara-rendered audit or security-audit message body carried in
+        the BSD syslog payload
+      ecs: message
+      status: mapped
+    - vendor: HOSTNAME
+      type: string
+      description: >-
+        BSD syslog header hostname of the JACE or Supervisor host that emitted
+        the record
+      ecs: host.name
+      status: mapped
+    - vendor: station name
+      type: string
+      description: >-
+        name of the Niagara station (the running application) that generated
+        the audit record
+      ecs: observer.name
+      status: partial
+      notes: >
+        one host can run one station but a Supervisor aggregates histories
+        from many controller stations, so station name and HOSTNAME are not
+        interchangeable; observer.name holds the station that recorded the
+        event, host.name the box it ran on
+    - vendor: TAG
+      type: string
+      description: BSD syslog TAG identifying the emitting Niagara process
+      ecs: log.syslog.appname
+      status: mapped
+    - vendor: Facility
+      type: enum
+      description: syslog facility configured on SyslogPlatformService, defaults to local0
+      ecs: log.syslog.facility.name
+      status: mapped
+      notes: >-
+        operator-selectable, so the facility value cannot be used as a
+        reliable source discriminator across sites
+    - vendor: Log Level Filter
+      type: enum
+      description: >-
+        minimum Niagara log level forwarded to the syslog server - Off,
+        Severe, Warning, Info, Config, Fine, Finer, Finest, All (default Info)
+      ecs: log.level
+      status: partial
+      notes: >
+        Niagara's level vocabulary is java.util.logging-style, not syslog
+        severities; it needs a lookup to ECS numeric event.severity and a
+        second mapping to log.syslog.severity.name if syslog-native severity
+        queries are wanted
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Parse the Niagara-rendered MSG body into full ECS-shaped JSON on the
+          edge worker group and do the three normalizations the map flags
+          before anything leaves the building enclave: derive event.outcome
+          from the operation vocabulary plus the log-in/log-out result text
+          (there is no outcome column), split the ORD in Target into a
+          station-relative component path so alerting is not matching on raw
+          ord: prefixes, and tag each record with the originating history name
+          so security-audit records stay separable from ordinary configuration
+          churn. Extract the client address out of the authentication message
+          text into source.ip here rather than downstream, mask
+          credential-bearing Old Value/Value pairs on security-facet
+          properties (cipher suite, key store, password-policy slots), and
+          gate the destination with C.Schema(...).validate plus a dead-letter
+          route, since a hand-built parser with no vendor pack will silently
+          mis-shape records after a Niagara point release.
+        elastic: >
+          Own a custom logs-bas.niagara_audit ingest pipeline - there is no
+          integration to inherit from - and give it the two lookups the low
+          side should not carry: the Niagara log-level enum
+          (Severe/Warning/Info/Config/Fine/Finer/Finest) to numeric
+          event.severity, and a station-to-site/owner enrich policy so a JACE
+          hostname resolves to a building. Add explicit custom-namespace
+          index-template mappings for bas.niagara.audit.target, .slot_name,
+          .history_name and .auth_scheme as keyword and .old_value/.new_value
+          as keyword with ignore_above, so arbitrary property values cannot
+          blow up the mapping under dynamic mapping, and assert event.outcome
+          is populated for every authentication record before the CSOC builds
+          failed-log-in thresholds on it.
+        relay: >
+          Low-side instances cross the guard: full ECS-shaped NDJSON crosses
+          (envelope mode B) - UTF-8, LF-terminated, compression disabled,
+          nesting depth two - because the guard's content filter needs
+          field-aware records to make any decision about property values, and
+          a thin envelope over a free-form Niagara audit line gives it nothing
+          to inspect. The friction to settle with the guard owner is Old
+          Value/Value: unbounded free text that can carry entire serialized
+          component configurations, arbitrary unicode from operator-entered
+          point names, and kilobyte-scale values, so cap and flag both
+          low-side to a length the custom NDJSON filter accepts. The vendor
+          feed is raw BSD syslog rather than CEF, so nothing CEF-shaped
+          reaches the boundary; treat the crossing as at-most-once with no
+          return channel and reconcile low-side and high-side counts per
+          (dataset, hour). Carry _raw across until the hand-built parser is
+          proven - this is a low-volume, high-forensic-value dataset and
+          should be the last place _raw is dropped on this technology.
+      direct:
+        parse_location: low
+        cribl: >
+          Parse the Niagara-rendered MSG body into full ECS-shaped JSON on the
+          edge worker group and do the three normalizations the map flags
+          before anything leaves the building enclave: derive event.outcome
+          from the operation vocabulary plus the log-in/log-out result text
+          (there is no outcome column), split the ORD in Target into a
+          station-relative component path so alerting is not matching on raw
+          ord: prefixes, and tag each record with the originating history name
+          so security-audit records stay separable from ordinary configuration
+          churn. Extract the client address out of the authentication message
+          text into source.ip here rather than downstream, mask
+          credential-bearing Old Value/Value pairs on security-facet
+          properties (cipher suite, key store, password-policy slots), and
+          gate the destination with C.Schema(...).validate plus a dead-letter
+          route, since a hand-built parser with no vendor pack will silently
+          mis-shape records after a Niagara point release.
+        elastic: >
+          Own a custom logs-bas.niagara_audit ingest pipeline - there is no
+          integration to inherit from - and give it the two lookups the edge
+          tier should not carry: the Niagara log-level enum
+          (Severe/Warning/Info/Config/Fine/Finer/Finest) to numeric
+          event.severity, and a station-to-site/owner enrich policy so a JACE
+          hostname resolves to a building. Add explicit custom-namespace
+          index-template mappings for bas.niagara.audit.target, .slot_name,
+          .history_name and .auth_scheme as keyword and .old_value/.new_value
+          as keyword with ignore_above, so arbitrary property values cannot
+          blow up the mapping under dynamic mapping, and assert event.outcome
+          is populated for every authentication record before the CSOC builds
+          failed-log-in thresholds on it.
+  - format: api-pull
+    enable: >
+      On the JACE/Supervisor station install the oBIX driver (obixDriver ->
+      ObixNetwork) and enable the oBIX servlet so the station's histories are
+      reachable at the station oBIX lobby (typically /obix over the
+      WebService, HTTPS with client authentication); the AuditHistory and,
+      from Niagara 4.9 on, the separate SecurityHistory appear as History
+      objects whose records expose the audit columns. A collector reads them
+      with the oBIX History query operation (preset ranges such as last24Hours
+      or an explicit start/end HistoryFilter) and checkpoints on the record
+      timestamp, or, where oBIX is not licensed, the same columns are
+      retrievable with a scheduled BQL query against
+      history:/<station>/AuditHistory (for example "select timestamp,
+      operation, target, slotName, value, userName from audit:AuditRecord").
+      Collection needs a dedicated station user with read rights on the two
+      histories - creating that account is itself an audited configuration
+      change that shows up in this feed. The pull runs against the station
+      directly, so per-site reachability into the building enclave is
+      required.
+    references:
+    - https://docs.oasis-open.org/obix/obix/v1.1/cs01/obix-v1.1-cs01.html
+    - http://docs.oasis-open.org/obix/obix/v1.1/cs01/schemas/stdlib.obix
+    - https://onesight.solutions/howto-enable-obix-in-tridium-niagara-4/
+    - https://github.com/thomasjupe/NiagaraN4BQLQueries/blob/main/N4BQLAuditLogQueries
+    - >-
+      https://downloads.onesight.solutions/Tridium/Niagara%204%20Documents/niagara_histories_guide_8-7-2025.pdf
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Niagara oBIX/BQL audit collector pipeline
+      notes: >
+        No Elastic integration and no Cribl pack exists for the Niagara
+        Framework. A Cribl REST Collector (or Elastic Agent httpjson input on
+        the direct side) drives the oBIX History query and receives XML oBIX
+        obj documents, or NDJSON rows from a BQL response; the pipeline's work
+        is XML-to-JSON, ECS renaming and paging/checkpoint hygiene rather than
+        the line grammar the syslog form needs. The audit columns arrive
+        discretely, but auth scheme and client address are still embedded in
+        the SecurityHistory record value text and need the same extraction
+        there as in the syslog form, and neither history carries an outcome
+        column, so event.outcome is still derived from operation plus the
+        log-in result wording.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Run the collector on the building-enclave worker group against each
+          station and shape full ECS JSON before the guard. Query the two
+          histories on separate schedules and tag each record with the
+          originating history ord so SecurityHistory authentication records
+          stay separable from AuditHistory configuration churn, exactly as the
+          syslog form is tagged. Checkpoint on the record timestamp with a
+          small overlap window and de-duplicate on (timestamp, operation,
+          target, userName), because an oBIX history re-query with overlap
+          re-delivers boundary records; a downstream at-most-once crossing
+          plus a duplicate is worse than a gap. Split the ORD in target into a
+          station-relative component path, mask credential-bearing value text
+          on security-facet slots, and gate the guard destination with
+          C.Schema(...).validate and a dead-letter route.
+        elastic: >
+          Own the same custom logs-bas.niagara_audit ingest pipeline the
+          technology already needs - there is no integration to inherit - and
+          carry the two lookups the low side should not: the Niagara log-level
+          enum to numeric event.severity and a station-to-site enrich policy.
+          Map bas.niagara.audit.target, .slot_name, .history_name and
+          .new_value as keyword with ignore_above so an arbitrary property
+          value cannot blow up the mapping, and assert event.outcome is
+          populated on every SecurityHistory-sourced record before
+          failed-log-in thresholds are built.
+        relay: >
+          The collector must sit low-side: the guard is one-way with no return
+          channel, so the oBIX/BQL request cannot originate on the high side.
+          Cross full ECS-shaped NDJSON (envelope mode B) so the content filter
+          can inspect operation, target and the masked value fields rather
+          than an opaque line. The content-filter friction is the value
+          column: unbounded free text that can carry an entire serialized
+          sub-component and operator-entered unicode point names, so
+          length-cap and flag it low-side to what the custom NDJSON filter
+          accepts. Treat the crossing as at-most-once with no acknowledgement
+          and reconcile low-side vs high-side counts per (dataset, hour)
+          against the collector's own paging totals; this is the last place
+          _raw should be dropped on this technology.
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side station with no guard, point the same collector
+          straight at the core worker group, or let an Elastic Agent httpjson
+          input drive the oBIX query. The one decision that matters is not
+          double-counting against any co-running SyslogPlatformService feed
+          for the same station during cutover - pick one authoritative audit
+          transport per station and key de-duplication on (timestamp,
+          operation, target, userName) if both run briefly in parallel.
+        elastic: >
+          Own the custom logs-bas.niagara_audit ingest pipeline and map
+          bas.niagara.audit.target, .slot_name, .history_name and .new_value
+          as keyword with ignore_above so an arbitrary property value cannot
+          blow up the mapping. With no boundary, retain the full value text
+          for change forensics rather than capping it, and keep the record
+          timestamp authoritative for @timestamp since the oBIX abstime
+          carries a full ISO-8601 instant with time zone.
+    fields:
+    - vendor: timestamp
+      type: timestamp
+      description: >-
+        oBIX/BQL record timestamp of the audited event, an ISO-8601 abstime
+        carrying date and time zone.
+      ecs: '@timestamp'
+      status: mapped
+      notes: >
+        the oBIX History abstime is a full instant with time zone, so the
+        year/zone reconciliation the BSD syslog header forces is not needed on
+        this transport; prefer it as @timestamp
+    - vendor: operation
+      type: enum
+      description: >-
+        type of audited event (Property
+        changed/added/removed/renamed/reordered, Action invoked; the security
+        history adds log-in and log-out).
+      ecs: event.action
+      status: mapped
+      transform: >
+        copied to event.action; the same vocabulary drives the derived
+        event.outcome, since neither history carries an outcome column
+    - vendor: userName
+      type: string
+      description: station user account that made the change or authenticated.
+      ecs: user.name
+      status: mapped
+    - vendor: target
+      type: string
+      description: >-
+        ORD of the modified component returned by the query (e.g.
+        station:|slot:/Drivers/BacnetNetwork/AHU_1).
+      ecs: null
+      status: unmapped
+      custom: bas.niagara.audit.target
+      notes: >
+        Niagara ORD identifying the component acted upon; no ECS field models
+        a station-relative object path, and it is deliberately not file.path -
+        an ORD is a framework object reference
+    - vendor: slotName
+      type: string
+      description: >-
+        name of the component slot (property or action) that was modified or
+        invoked, returned as a discrete BQL/oBIX column.
+      ecs: null
+      status: unmapped
+      custom: bas.niagara.audit.slot_name
+      notes: >
+        every published BQL audit query treats slotName as the changed slot;
+        take the client address from the SecurityHistory record value text
+        instead, not from this column
+    - vendor: value
+      type: string
+      description: property value after the change, as returned in the audit record.
+      ecs: null
+      status: unmapped
+      custom: bas.niagara.audit.new_value
+      notes: >
+        unbounded free text; on a container-property change it can carry a
+        whole serialized sub-component, so it is the main content-filter
+        exposure on the pull transport
+    - vendor: history ord
+      type: string
+      description: >-
+        ord of the history the record was queried from - AuditHistory for
+        configuration changes, SecurityHistory for authentication and
+        security-facet property changes.
+      ecs: null
+      status: unmapped
+      custom: bas.niagara.audit.history_name
+      notes: >
+        on this transport the two histories are queried as separate ords,
+        which is what keeps the security-relevant subset separable; carry the
+        source ord as the tag rather than re-deriving it
+    - vendor: auth scheme
+      description: >-
+        authentication scheme used for the station log-in (Fox, Web/HTTPS, PKI
+        client certificate, SAML SSO, LDAP/Kerberos), embedded in the
+        SecurityHistory record value text.
+      ecs: null
+      status: unmapped
+      custom: bas.niagara.auth.scheme
+      notes: >
+        not a discrete oBIX/BQL column - it is inside the security record
+        value text and must be extracted; it is the field that distinguishes a
+        local station account from a domain-federated one, the IT/OT
+        convergence signal
+    - vendor: client address
+      type: ip
+      description: >-
+        address of the client the station log-in originated from, carried
+        inside the SecurityHistory record value text.
+      ecs: source.ip
+      status: partial
+      notes: >
+        not a discrete column on this transport either; regex-extract it from
+        the security record value, without it the authentication alerting
+        profile has no source
+    - vendor: login result
+      description: whether the station log-in or configuration action succeeded.
+      ecs: event.outcome
+      status: partial
+      notes: >
+        neither AuditHistory nor SecurityHistory publishes an outcome column,
+        so success/failure is derived from operation and the log-in result
+        wording in the record value - the single largest gap for the
+        authentication profile
+- id: alarm-events
+  name: Niagara alarm records
+  description: >
+    Alarm records routed off the station by the AlarmService, covering
+    HVAC/process alarms and the security-relevant subset a SOC actually cares
+    about: controller and fieldbus device-offline (a JACE losing a
+    BACnet/Modbus device), station down, and the SyslogPlatformService's own
+    connection-failure and message-queue-full alarms - the last two being the
+    only signal that the log feed itself has stopped. Field names below are
+    the alarm record properties addressable from BQL against the alarm
+    database.
+  event_categories:
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge Cribl worker group, OT/building enclave
+      notes: >
+        Alarms reach the collector either through the same
+        SyslogPlatformService station-log stream or through an AlarmService
+        console/relay recipient, and follow the same routing as the audit
+        dataset for a given station.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-bas.niagara_alarm
+    direct:
+    - hop: cribl
+      location: edge Cribl worker group, OT/building enclave
+      notes: >
+        Alarms reach the collector either through the same
+        SyslogPlatformService station-log stream or through an AlarmService
+        console/relay recipient, and follow the same routing as the audit
+        dataset for a given station.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-bas.niagara_alarm
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Niagara alarm pipeline
+      notes: >
+        No Elastic integration or Cribl pack exists. The alarm record is
+        rendered into the syslog payload rather than emitted as a structured
+        document, so the pipeline extracts the alarm record properties (uuid,
+        source, alarmClass, priority, sourceState, ackState,
+        alarmData.msgText) by pattern. Where a station can be reached
+        directly, a BQL/oBIX collector against the alarm database is the
+        lower-risk alternative and yields the same property names.
+    fields:
+    - vendor: timestamp
+      type: timestamp
+      description: time the alarm record was generated
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: uuid
+      type: string
+      description: 'unique identifier shared by every record in one alarm''s lifecycle'
+      ecs: event.id
+      status: mapped
+      notes: >-
+        the offnormal, acknowledge and return-to-normal records all carry the
+        same uuid; it is the only correlation key across them
+    - vendor: source
+      type: string
+      description: ORD of the point or device that raised the alarm
+      ecs: null
+      status: unmapped
+      custom: bas.niagara.alarm.source_ord
+      notes: station-relative object reference, same ORD form as the audit record Target
+    - vendor: alarmData.sourceName
+      type: string
+      description: display name of the alarm source point or device
+      ecs: null
+      status: unmapped
+      custom: bas.niagara.alarm.source_name
+      notes: >
+        human-readable point/device name; deliberately not host.name or
+        observer.name - the source is usually a fieldbus point behind the
+        station, not a host
+    - vendor: alarmClass
+      type: string
+      description: >-
+        alarm class the record was routed through (DefaultAlarmClass, and
+        site-defined classes such as Critical, Maintenance, Security)
+      ecs: null
+      status: unmapped
+      custom: bas.niagara.alarm.class
+      notes: >
+        a routing/notification grouping, not a detection rule - kept custom
+        rather than mapped to rule.name, which would imply a signature the
+        framework does not have
+    - vendor: priority
+      type: integer
+      description: alarm priority, 1-255
+      ecs: event.severity
+      status: partial
+      transform: >
+        the Niagara scale is INVERTED relative to ECS: 1 is the most urgent
+        and 255 the least, while ECS event.severity increases with severity,
+        so a lookup/inversion is required before any alerting threshold is
+        built on it
+    - vendor: sourceState
+      type: enum
+      description: state of the alarm source - normal, offnormal, fault, alert
+      ecs: null
+      status: unmapped
+      custom: bas.niagara.alarm.source_state
+      notes: >-
+        fault is the state that carries device-offline and communication-loss
+        alarms, which is the security-relevant subset
+    - vendor: ackState
+      type: enum
+      description: acknowledgement state - unacked, acked, unackedAlert, ackedAlert
+      ecs: null
+      status: unmapped
+      custom: bas.niagara.alarm.ack_state
+    - vendor: ackRequired
+      type: boolean
+      description: whether the alarm class requires operator acknowledgement
+      ecs: null
+      status: unmapped
+      custom: bas.niagara.alarm.ack_required
+    - vendor: alarmTransition
+      type: enum
+      description: >-
+        lifecycle transition the record represents (to offnormal, to normal,
+        to fault, acknowledged)
+      ecs: event.action
+      status: partial
+      notes: >
+        drives event.action, but the vendor vocabulary is a state transition
+        rather than an action taken by an actor; the acknowledge transition is
+        the only one with a human subject
+    - vendor: normalTime
+      type: timestamp
+      description: time the alarm source returned to normal
+      ecs: event.end
+      status: partial
+      notes: >-
+        only populated once the return-to-normal record arrives; null on the
+        originating offnormal record
+    - vendor: ackTime
+      type: timestamp
+      description: time an operator acknowledged the alarm
+      ecs: null
+      status: unmapped
+      custom: bas.niagara.alarm.ack_time
+    - vendor: user
+      type: string
+      description: station user who acknowledged the alarm
+      ecs: user.name
+      status: partial
+      notes: >
+        this is the acknowledging operator, not an actor who caused the alarm;
+        populated only on acknowledge records, so user.name is null on the
+        alarm records that matter most for detection
+    - vendor: alarmData.msgText
+      type: string
+      description: operator-facing alarm message text
+      ecs: message
+      status: mapped
+      notes: >-
+        site-authored free text with no documented length bound; the main
+        content-filter exposure on this dataset
+    - vendor: HOSTNAME
+      type: string
+      description: BSD syslog header hostname of the JACE or Supervisor host that routed the alarm
+      ecs: host.name
+      status: mapped
+    - vendor: station name
+      type: string
+      description: Niagara station that routed the alarm record
+      ecs: observer.name
+      status: partial
+      notes: >-
+        a Supervisor relays alarms raised on subordinate controller stations,
+        so this is the relaying station and not always where the alarm
+        originated
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Extract the alarm record properties low-side into ECS JSON and fix
+          the severity inversion at the edge: Niagara alarm priority is a
+          1-255 scale where LOWER is more urgent, the opposite of ECS numeric
+          event.severity, so invert it through an explicit lookup rather than
+          copying the number. Collapse the alarm lifecycle low-side too -
+          offnormal, return-to-normal and acknowledge arrive as separate
+          records sharing a uuid, so set event.action from the transition and
+          carry the uuid untouched as the correlation key instead of leaving
+          three unrelated-looking events for the CSOC to join. Add a low-side
+          alerting hook on the SyslogPlatformService connection and queue-full
+          alarms, since those are the only in-band evidence that this feed has
+          stopped, and run Persistent Queue backpressure on the destination.
+        elastic: >
+          Own a custom logs-bas.niagara_alarm ingest pipeline that derives
+          event.outcome, which the vendor record simply does not carry - alarm
+          records have a source state and an ack state but no success/failure
+          notion - so set it explicitly (or leave it unset with a documented
+          reason) rather than letting the configuration alerting profile
+          silently fail its required-field check. Map
+          bas.niagara.alarm.source_ord, .source_name, .class, .source_state
+          and .ack_state as keyword and .ack_required as boolean in the
+          custom-namespace index template, and add an enrich policy that
+          resolves alarmClass to a criticality tier so device-offline alarms
+          on security-relevant controllers can be separated from routine HVAC
+          noise.
+        relay: >
+          Low-side instances cross the guard: full ECS-shaped NDJSON crosses
+          (envelope mode B) so the guard can make decisions on the alarm class
+          and source rather than on an opaque line, with the same outer
+          envelope keys as the audit dataset. Content-filter friction here is
+          alarmData.msgText: operator-authored free text with site-specific
+          unicode and no documented length bound, plus deep alarmData
+          sub-property nesting that must be flattened to depth two low-side
+          with short ASCII keys before the custom NDJSON filter sees it. The
+          crossing is at-most-once with no acknowledgement, and because the
+          lifecycle records share a uuid, a dropped return-to-normal leaves a
+          permanently open alarm on the high side - reconcile per (dataset,
+          hour) and drop _raw on this route before dropping it on the audit
+          dataset.
+      direct:
+        parse_location: low
+        cribl: >
+          Extract the alarm record properties into ECS JSON at the edge and
+          fix the severity inversion there: Niagara alarm priority is a 1-255
+          scale where LOWER is more urgent, the opposite of ECS numeric
+          event.severity, so invert it through an explicit lookup rather than
+          copying the number. Collapse the alarm lifecycle at the edge too -
+          offnormal, return-to-normal and acknowledge arrive as separate
+          records sharing a uuid, so set event.action from the transition and
+          carry the uuid untouched as the correlation key instead of leaving
+          three unrelated-looking events for the CSOC to join. Add an edge
+          alerting hook on the SyslogPlatformService connection and queue-full
+          alarms, since those are the only in-band evidence that this feed has
+          stopped, and run Persistent Queue backpressure on the destination.
+        elastic: >
+          Own a custom logs-bas.niagara_alarm ingest pipeline that derives
+          event.outcome, which the vendor record simply does not carry - alarm
+          records have a source state and an ack state but no success/failure
+          notion - so set it explicitly (or leave it unset with a documented
+          reason) rather than letting the configuration alerting profile
+          silently fail its required-field check. Map
+          bas.niagara.alarm.source_ord, .source_name, .class, .source_state
+          and .ack_state as keyword and .ack_required as boolean in the
+          custom-namespace index template, and add an enrich policy that
+          resolves alarmClass to a criticality tier so device-offline alarms
+          on security-relevant controllers can be separated from routine HVAC
+          noise.
+  - format: api-pull
+    enable: >
+      With the oBIX driver installed and the oBIX servlet enabled on the
+      station, the AlarmService is reachable through the oBIX Alarming feed: a
+      collector creates an oBIX watch, adds the alarm feed as a watch input
+      and polls it for new alarm records, each record exposing the standard
+      Alarming contract children (source, timestamp, plus normalTimestamp for
+      stateful alarms and ackTimestamp/ackUser once acknowledged). Where a
+      longer look-back or the full Niagara-specific record is wanted, run a
+      scheduled BQL query against the alarm database ord (alarm:/<station>/...
+      ) which additionally returns the Niagara record properties (uuid,
+      alarmClass, priority, sourceState, ackState, alarmData.msgText). Both
+      paths need a station user with read rights on the AlarmService and run
+      against the station directly, so per-site reachability into the building
+      enclave is required.
+    references:
+    - https://docs.oasis-open.org/obix/obix/v1.1/cs01/obix-v1.1-cs01.html
+    - http://docs.oasis-open.org/obix/obix/v1.1/cs01/schemas/stdlib.obix
+    - https://onesight.solutions/howto-enable-obix-in-tridium-niagara-4/
+    - >-
+      https://www.tridium.com/us/en/services-support/events/2025/06/2025-06-12-niagara-data-service-alarms
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Niagara oBIX alarm collector pipeline
+      notes: >
+        No Elastic integration or Cribl pack exists. A Cribl REST Collector
+        (or Elastic Agent httpjson input on the direct side) drives the oBIX
+        watch/feed poll or the BQL query and receives oBIX obj XML; the
+        pipeline flattens the alarm obj, resolves the source ref to an ORD,
+        and does ECS renaming rather than text parsing. The oBIX Alarming
+        contract guarantees only source and timestamp plus the ack/normal/
+        value children below, so the BQL path is the one to use when the
+        Niagara alarmClass/priority/sourceState grouping is needed for triage.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Poll the oBIX alarm feed (or BQL alarm database) on the
+          building-enclave worker group and shape full ECS JSON before the
+          guard. Resolve the source ref to a station-relative ORD low-side
+          and, where the BQL path is used, invert Niagara alarm priority
+          through an explicit lookup - the 1-255 scale is inverted relative to
+          ECS numeric event.severity, 1 being most urgent. Collapse the alarm
+          lifecycle low-side: offnormal, normalTimestamp and acknowledge
+          arrive for one alarm, so set event.action from the transition and
+          carry the alarm's uuid (BQL path) or the source+timestamp pair (oBIX
+          path) untouched as the correlation key. Keep the low-side alerting
+          hook on the SyslogPlatformService connection/queue-full alarms if
+          that stream also runs, since those remain the only in-band evidence
+          the feed has stopped.
+        elastic: >
+          Own the custom logs-bas.niagara_alarm ingest pipeline that derives
+          event.outcome - the alarm record carries no success/failure notion -
+          and map bas.niagara.alarm.source_ord, .source_name, .class,
+          .source_state, .ack_state as keyword and .ack_required as boolean in
+          the custom-namespace index template, with an enrich policy that
+          resolves alarmClass to a criticality tier so device-offline alarms
+          on security-relevant controllers separate from routine HVAC noise.
+        relay: >
+          The collector must sit low-side: the guard has no return channel, so
+          the oBIX watch poll or BQL query cannot originate high-side. Cross
+          full ECS-shaped NDJSON (envelope mode B) so the content filter can
+          decide on alarm class and source rather than an opaque line, with
+          the same outer envelope keys as the audit dataset. The friction is
+          alarmValue and alarmData.msgText: operator-authored free text with
+          site-specific unicode and no documented length bound, plus nested
+          alarm obj structure that must be flattened to depth two low-side.
+          The crossing is at-most-once; because lifecycle records share a
+          correlation key, a dropped return-to-normal leaves a permanently
+          open alarm on the high side, so reconcile per (dataset, hour).
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side station with no guard, point the same collector
+          directly at the core worker group or let an Elastic Agent httpjson
+          input drive the poll. Pick one authoritative alarm transport per
+          station so the oBIX/BQL pull is not double-counted against any
+          co-running SyslogPlatformService alarm stream during cutover, keying
+          de-duplication on the alarm uuid (BQL) or source+timestamp (oBIX).
+        elastic: >
+          Own the custom logs-bas.niagara_alarm ingest pipeline that derives
+          event.outcome and map bas.niagara.alarm.source_ord, .source_name,
+          .class, .source_state and .ack_state as keyword and .ack_required as
+          boolean in the custom-namespace index template. With no boundary
+          retain the full alarmData.msgText and alarmValue for triage rather
+          than capping them, and keep normalTimestamp mapped to event.end so
+          open-vs-closed alarm dashboards work without a downstream join.
+    fields:
+    - vendor: source
+      type: string
+      description: >-
+        oBIX ref to the point or device that raised the alarm; resolves to a
+        station-relative ORD.
+      ecs: null
+      status: unmapped
+      custom: bas.niagara.alarm.source_ord
+      notes: >
+        same ORD form as the audit record target; resolve the ref low-side
+        rather than shipping the raw oBIX href
+    - vendor: timestamp
+      type: timestamp
+      description: oBIX Alarming-contract abstime the alarm record was generated.
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: normalTimestamp
+      type: timestamp
+      description: oBIX StatefulAlarm abstime recording when the alarm source returned to normal.
+      ecs: event.end
+      status: partial
+      notes: >
+        null on the originating offnormal record and populated only once the
+        return-to-normal transition arrives, so event.end is absent on the
+        alarm records that matter most for detection
+    - vendor: ackTimestamp
+      type: timestamp
+      description: oBIX AckAlarm abstime an operator acknowledged the alarm.
+      ecs: null
+      status: unmapped
+      custom: bas.niagara.alarm.ack_time
+    - vendor: ackUser
+      type: string
+      description: oBIX AckAlarm string naming the station user who acknowledged the alarm.
+      ecs: user.name
+      status: partial
+      notes: >
+        the acknowledging operator, not an actor who caused the alarm, and
+        null until the acknowledge record arrives - so user.name is empty on
+        the originating alarm
+    - vendor: alarmValue
+      type: string
+      description: >-
+        oBIX PointAlarm object carrying the point value that was in effect
+        when the alarm was raised.
+      ecs: null
+      status: unmapped
+      custom: bas.niagara.alarm.alarm_value
+      notes: >
+        free-form obj whose type varies per point; flatten to a scalar and
+        bound its length low-side before it reaches the guard filter
+    - vendor: uuid
+      type: string
+      description: >-
+        unique identifier shared by every record in one alarm's lifecycle,
+        returned on the BQL alarm-database path.
+      ecs: event.id
+      status: mapped
+      notes: >
+        offnormal, acknowledge and return-to-normal records share it; it is
+        the only cross-record correlation key and is present on the BQL path,
+        not on the minimal oBIX Alarming contract
+    - vendor: alarmClass
+      type: string
+      description: >-
+        alarm class the record routed through (DefaultAlarmClass and
+        site-defined classes such as Critical, Maintenance, Security),
+        returned on the BQL path.
+      ecs: null
+      status: unmapped
+      custom: bas.niagara.alarm.class
+      notes: >-
+        a routing/notification grouping, not a detection rule; kept custom
+        rather than mapped to rule.name
+    - vendor: priority
+      type: integer
+      description: Niagara alarm priority 1-255, returned on the BQL path.
+      ecs: event.severity
+      status: partial
+      transform: >
+        the Niagara scale is inverted relative to ECS - 1 is most urgent, 255
+        least - so a lookup/inversion is required before any alerting
+        threshold is built on it
+    - vendor: sourceState
+      type: enum
+      description: >-
+        state of the alarm source (normal, offnormal, fault, alert), returned
+        on the BQL path.
+      ecs: null
+      status: unmapped
+      custom: bas.niagara.alarm.source_state
+      notes: >-
+        fault carries device-offline and communication-loss alarms, the
+        security-relevant subset
+    - vendor: ackState
+      type: enum
+      description: >-
+        acknowledgement state (unacked, acked, unackedAlert, ackedAlert),
+        returned on the BQL path.
+      ecs: null
+      status: unmapped
+      custom: bas.niagara.alarm.ack_state
+    - vendor: alarmData.msgText
+      type: string
+      description: operator-facing alarm message text, returned on the BQL path.
+      ecs: message
+      status: mapped
+      notes: >-
+        site-authored free text with no documented length bound; the main
+        content-filter exposure on this dataset
+- id: metasys-audit
+  name: Metasys audit trail
+  description: >
+    Johnson Controls Metasys audit messages - the Audit Trail records
+    significant events generated by user action or system activity, including
+    Site Management Portal log-ins, commands issued to points, device restarts
+    and security changes. Records are held in a local repository on the
+    detecting server or engine and forwarded to the ADS/ADX Audit Repository,
+    from which the Metasys REST API v4 audits resource exposes them with the
+    field names below. Included as the second class exemplar: Metasys is
+    architecturally different from Niagara (server-side repository plus REST
+    API rather than station-side syslog), so the two datasets need different
+    collection designs even though they answer the same detection questions.
+  event_categories:
+  - authentication
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge Cribl worker group, OT/building enclave
+      notes: >
+        Cribl REST Collector against the Metasys REST API v4 audits endpoint
+        on the ADS/ADX, paged and checkpointed on creationTime. The pull
+        collector must sit on the BAS side of the guard, since the guard is
+        one-way with no return channel and cannot carry the API request.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-bas.metasys_audit
+    direct:
+    - hop: cribl
+      location: edge Cribl worker group, OT/building enclave
+      notes: >
+        Cribl REST Collector against the Metasys REST API v4 audits endpoint
+        on the ADS/ADX, paged and checkpointed on creationTime.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-bas.metasys_audit
+  formats:
+  - format: api-pull
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Metasys REST collector pipeline
+      notes: >
+        No Elastic integration or Cribl pack exists for Metasys. The API
+        returns JSON already, so the pipeline's work is enum de-prefixing,
+        preData/postData flattening and ECS renaming rather than text parsing.
+        Collection requires a Metasys service account with audit-read rights -
+        itself a change the CSOC should expect to see in this very dataset.
+    fields:
+    - vendor: id
+      type: string
+      description: UUID uniquely identifying the audit record
+      ecs: event.id
+      status: mapped
+    - vendor: creationTime
+      type: timestamp
+      description: ISO-8601 time the audit record was generated
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: user
+      type: string
+      description: username that initiated the audited action
+      ecs: user.name
+      status: mapped
+      notes: >
+        per the SMP Audit Viewer documentation this column records both
+        authorized users who logged in and unauthorized users who only tried,
+        so it is populated on failed log-ins too
+    - vendor: actionType
+      type: enum
+      description: >-
+        user or system action performed (write, command, log-in, log-out,
+        device restart, security change, ...)
+      ecs: event.action
+      status: partial
+      transform: >
+        the API returns a fully qualified enum-set string such as
+        auditActionTypeEnumSet.writeAuditActionType; strip the enum-set prefix
+        and the trailing AuditActionType suffix before writing event.action,
+        or every alert rule ends up matching on vendor serialization details
+    - vendor: classLevel
+      type: enum
+      description: >-
+        class or family the audit belongs to (e.g.
+        auditClassesEnumSet.userActionAuditClass)
+      ecs: null
+      status: unmapped
+      custom: bas.metasys.audit.class_level
+      notes: >
+        the discriminator that separates user-action audits from system and
+        error classes; needed to decide which records are authentication
+        events, since actionType alone is not sufficient
+    - vendor: originApplication
+      type: enum
+      description: Metasys application that generated the audit message
+      ecs: event.provider
+      status: partial
+      transform: >
+        another enum-set-prefixed string needing de-prefixing; event.provider
+        is the closest ECS home for "which component of the product emitted
+        this", but the value is an application identifier rather than a log
+        provider name
+    - vendor: itemReference
+      type: string
+      description: >-
+        reference to the item the audit activity concerns, in
+        {siteHostname}:{deviceHostname}/{object} form
+      ecs: null
+      status: unmapped
+      custom: bas.metasys.audit.item_reference
+      notes: >-
+        composite reference; the deviceHostname segment is what identifies the
+        engine or server involved
+    - vendor: deviceHostname
+      type: string
+      description: >-
+        hostname of the Metasys engine or server the audited item belongs to,
+        taken from the itemReference
+      ecs: host.name
+      status: partial
+      notes: >
+        not a standalone API field - it is the second segment of itemReference
+        and must be split out, but without it neither the authentication nor
+        the configuration alerting profile has a host
+    - vendor: preData
+      type: string
+      description: >-
+        state before the action, returned as an object wrapping the item value
+        and a schema descriptor
+      ecs: null
+      status: unmapped
+      custom: bas.metasys.audit.pre_data
+      notes: >
+        self-describing nested structure whose type varies per audited object;
+        flatten to a scalar string before indexing or dynamic mapping will fan
+        out one field per audited datatype
+    - vendor: postData
+      type: string
+      description: state after the action, same object-plus-schema structure as preData
+      ecs: null
+      status: unmapped
+      custom: bas.metasys.audit.post_data
+      notes: >
+        on log-in audits this carries the IP address of the client computer
+        used to reach the Metasys system rather than a property value, so a
+        classLevel-conditional rule must promote it to source.ip instead of
+        leaving the authentication profile without a source address
+    - vendor: errorString
+      type: string
+      description: error message when the audited action failed, null otherwise
+      ecs: error.message
+      status: mapped
+    - vendor: status
+      type: string
+      description: status of the audited operation, frequently null
+      ecs: event.outcome
+      status: partial
+      transform: >
+        not a clean success/failure enum - outcome must be derived from status
+        together with errorString (a null errorString being the real success
+        signal) before event.outcome is trustworthy
+    - vendor: description
+      type: string
+      description: human-readable description of the audited event
+      ecs: message
+      status: mapped
+    - vendor: signature
+      type: string
+      description: >-
+        electronic signature captured with the action in Metasys for Validated
+        Environments deployments, null elsewhere
+      ecs: null
+      status: unmapped
+      custom: bas.metasys.audit.signature
+      notes: >
+        MVE 21 CFR Part 11 compliance evidence rather than detection content;
+        retain for audit completeness but keep out of the default field set
+    - vendor: parameters
+      type: string
+      description: additional parameters supplied with the audited action, returned as an array
+      ecs: null
+      status: unmapped
+      custom: bas.metasys.audit.parameters
+      notes: >-
+        variable-length array; join to a bounded string low-side rather than
+        indexing as an open array
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Do the enum de-prefixing at the collector: actionType and classLevel
+          arrive as fully qualified enum-set strings
+          (auditActionTypeEnumSet.writeAuditActionType,
+          auditClassesEnumSet.userActionAuditClass) that must be stripped to a
+          bare verb before event.action is usable for alerting, and
+          originApplication needs the same treatment. Flatten the
+          self-describing preData/postData objects - each wraps an item plus a
+          schema descriptor - into scalar before/after values at depth two,
+          and add the conditional the Metasys documentation makes necessary:
+          on log-in audits the client machine's IP address arrives in the post
+          value rather than in any address field, so promote it to source.ip
+          only for authentication classLevels. Checkpoint the collector on
+          creationTime with overlap, since an at-most-once downstream crossing
+          plus a gap in the pull window loses records with no way to notice.
+        elastic: >
+          Own a custom logs-bas.metasys_audit ingest pipeline that derives
+          event.outcome from errorString and status together rather than from
+          either alone - a null errorString is the actual success signal and
+          status is frequently empty - and that sets user.name and
+          related.user consistently so failed-log-in thresholds work across
+          both BAS exemplars. Map bas.metasys.audit.item_reference,
+          .class_level, .pre_data, .post_data and .signature as keyword with
+          ignore_above in the custom-namespace index template, and keep the
+          MVE electronic signature and annotation fields indexed but excluded
+          from the default field set, since they are compliance evidence
+          rather than detection content.
+        relay: >
+          Low-side instances cross the guard: full ECS-shaped NDJSON crosses
+          (envelope mode B), sharing the outer envelope keys used by the two
+          Niagara datasets so the guard sees one schema for the whole
+          technology. The collector itself must stay low-side: the guard has
+          no return channel, so an API pull cannot be run from the high side.
+          Content filter friction is preData/postData - self-describing nested
+          objects of arbitrary type carrying operator-entered values - so
+          flatten them to scalars, bound their length and allowlist their keys
+          low-side rather than asking a custom NDJSON filter to walk an
+          open-ended structure. Nothing CEF-shaped is involved; the crossing
+          is at-most-once, so reconcile counts per (dataset, hour) against the
+          collector's own paging totals.
+      direct:
+        parse_location: low
+        cribl: >
+          Do the enum de-prefixing at the collector: actionType and classLevel
+          arrive as fully qualified enum-set strings
+          (auditActionTypeEnumSet.writeAuditActionType,
+          auditClassesEnumSet.userActionAuditClass) that must be stripped to a
+          bare verb before event.action is usable for alerting, and
+          originApplication needs the same treatment. Flatten the
+          self-describing preData/postData objects - each wraps an item plus a
+          schema descriptor - into scalar before/after values at depth two,
+          and add the conditional the Metasys documentation makes necessary:
+          on log-in audits the client machine's IP address arrives in the post
+          value rather than in any address field, so promote it to source.ip
+          only for authentication classLevels. Checkpoint the collector on
+          creationTime with overlap, since a gap in the pull window loses
+          records with no way to notice.
+        elastic: >
+          Own a custom logs-bas.metasys_audit ingest pipeline that derives
+          event.outcome from errorString and status together rather than from
+          either alone - a null errorString is the actual success signal and
+          status is frequently empty - and that sets user.name and
+          related.user consistently so failed-log-in thresholds work across
+          both BAS exemplars. Map bas.metasys.audit.item_reference,
+          .class_level, .pre_data, .post_data and .signature as keyword with
+          ignore_above in the custom-namespace index template, and keep the
+          MVE electronic signature and annotation fields indexed but excluded
+          from the default field set, since they are compliance evidence
+          rather than detection content.
+  - format: syslog-csv
+    enable: >
+      Add a Syslog DDA (Destination Delivery Agent) to the Site object in the
+      Site Management Portal on the ADS/ADX/OAS or engine and configure up to
+      three Syslog server destinations (IP/host, UDP port 514), then route the
+      audit and/or event Reporting Actions to the Syslog DDA so the local
+      Audit Repository entries are forwarded as they are written. Each Metasys
+      audit entry is delivered as one BSD syslog frame; the MSG field carries
+      the Audit Viewer columns in fixed order separated by the vertical bar,
+      with any empty column rendered as a single dash, and all audit entries
+      are stamped Facility 13 / Severity 6. This is a push transport, so
+      unlike the REST pull it needs no return path into the Metasys system and
+      can be received by a low-side collector and forwarded one-way; scope a
+      service account only if the Reporting Action configuration itself is
+      access-controlled, since adding the DDA is an audited change that
+      appears in this very feed.
+    references:
+    - >-
+      https://docs.johnsoncontrols.com/bas/api/khub/documents/ncacQKktTM2MIKOPkoGzqw/content
+    - >-
+      https://www.johnsoncontrols.com/-/media/project/jci-global/johnson-controls/us-region/united-states-johnson-controls/cyber-solutions/documents/metasys-release-14-hardening-guide-rev-a-final.pdf
+    - >-
+      https://docs.johnsoncontrols.com/bas/r/Metasys/en-US/Metasys-Site-Management-Portal-Help/14.0/View-Menu/Launching-the-Audit-Viewer/Audit-Trail/Audit-Trail-Concepts/Audit-Trail-Overview
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Metasys Syslog DDA audit pipeline
+      notes: >
+        No Elastic integration or Cribl pack exists for Metasys. The MSG body
+        is a positional pipe-delimited record (When | Item | Class Level |
+        Origin Application | User | Action Type | Description | Previous Value
+        | Post Value | Status) with '-' for empty columns, so the pipeline
+        splits on the bar, restores nulls from '-', and ECS-renames by
+        position - a fixed grammar rather than the enum de-prefixing the REST
+        form needs. The trailing Status column is frequently empty (Metasys
+        renders a blank as '-'), so event.outcome should be cross-checked
+        against the Action Type and Description wording rather than trusted on
+        Status alone, and, since this transport carries no record UUID,
+        de-duplication has to key on (When, Item, User, Action Type) rather
+        than an id.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Terminate the Syslog DDA on a building-enclave Syslog source and
+          split the positional record low-side, restoring '-' columns to null
+          before anything is shaped. Promote the client machine's IP address
+          out of the Post Value column into source.ip only for
+          authentication-class audits, exactly as the REST postData rule does,
+          since Metasys carries the log-in origin address there rather than in
+          a dedicated field. Prefer the body When over the RFC 3164 header
+          time (the BSD header carries no year) and reconcile the year at
+          ingest. Split the deviceHostname segment out of the Item reference
+          so the record has a host, mask credential-bearing Post Value text on
+          security-class audits, and gate the guard destination with
+          C.Schema(...).validate plus a dead-letter route.
+        elastic: >
+          Own the same custom logs-bas.metasys_audit ingest pipeline the
+          technology already needs and set event.outcome from the trailing
+          Status column, cross-checked against the Action Type and Description
+          wording since Status is frequently empty (Metasys renders a blank as
+          '-') and cannot be trusted alone. Map
+          bas.metasys.audit.item_reference, .class_level, .pre_data and
+          .post_data as keyword with ignore_above in the custom-namespace
+          index template and keep user.name / related.user set consistently so
+          failed-log-in thresholds work across both BAS exemplars; the
+          electronic-signature and parameters columns the REST form exposes
+          are not present on this transport, so no MVE field handling is
+          needed here.
+        relay: >
+          This is a push feed, so the collector need not sit low-side for the
+          transport's sake - but the guard is still one-way and at-most-once,
+          so shape full ECS-shaped NDJSON (envelope mode B) low-side and share
+          the outer envelope keys used by the two Niagara datasets so the
+          guard sees one schema for the whole technology. The content-filter
+          friction is Previous Value / Post Value: unbounded operator-entered
+          free text (and the log-in IP on auth audits) that must be
+          length-capped, sanitized and, for Post Value, promoted to source.ip
+          low-side before the custom NDJSON filter sees it. Because there is
+          no record id on this transport, reconcile counts per (dataset, hour)
+          on (When, Item, User) tuples rather than an id.
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side Metasys with no guard, terminate the Syslog DDA
+          directly on the core worker group's Syslog source. The decision that
+          matters is not double-counting against any co-running REST audits
+          collector for the same server - pick one authoritative audit
+          transport per ADS/ADX, keying de-duplication on (When, Item, User,
+          Action Type) if both run briefly in parallel during cutover.
+        elastic: >
+          Own the custom logs-bas.metasys_audit ingest pipeline and map
+          bas.metasys.audit.item_reference, .class_level, .pre_data and
+          .post_data as keyword with ignore_above in the custom-namespace
+          index template. With no boundary retain the full Previous/Post Value
+          text for change forensics rather than capping it, and treat
+          whichever transport the site standardizes on as authoritative so the
+          audit count is not inflated by running the DDA and the REST pull
+          together.
+    fields:
+    - vendor: When
+      type: timestamp
+      description: time the audit entry was recorded, as shown in the Audit Viewer When column.
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        prefer this body value over the BSD (RFC 3164) syslog header, which
+        carries no year, and reconcile the year at ingest
+    - vendor: Item
+      type: string
+      description: >-
+        reference to the item the audit activity concerns, in
+        {siteHostname}:{deviceHostname}/{object} form.
+      ecs: null
+      status: unmapped
+      custom: bas.metasys.audit.item_reference
+      notes: >
+        composite reference; the deviceHostname segment must be split out to
+        host.name, without it neither alerting profile has a host
+    - vendor: Class Level
+      type: enum
+      description: class or family the audit belongs to (user action, system, error, ...).
+      ecs: null
+      status: unmapped
+      custom: bas.metasys.audit.class_level
+      notes: >
+        the discriminator that separates user-action audits from system and
+        error classes, needed to decide which records are authentication
+        events since Action Type alone is not sufficient
+    - vendor: Origin Application
+      type: enum
+      description: Metasys application that generated the audit message.
+      ecs: event.provider
+      status: partial
+      notes: >
+        closest ECS home for which component emitted the record, but the value
+        is an application identifier rather than a log provider name
+    - vendor: User
+      type: string
+      description: >-
+        username that initiated the audited action; records both users who
+        logged in and users who only tried.
+      ecs: user.name
+      status: mapped
+      notes: populated on failed log-ins too, per the Audit Viewer documentation
+    - vendor: Action Type
+      type: enum
+      description: >-
+        user or system action performed (write, command, log-in, log-out,
+        device restart, security change, ...), rendered as the friendly Audit
+        Viewer label.
+      ecs: event.action
+      status: mapped
+      notes: >
+        on this transport it is the display label, so it does not carry the
+        auditActionTypeEnumSet prefix the REST form returns and needs no
+        de-prefixing
+    - vendor: Description
+      type: string
+      description: human-readable description of the audited event.
+      ecs: message
+      status: mapped
+    - vendor: Previous Value
+      type: string
+      description: state before the action, as rendered in the audit entry.
+      ecs: null
+      status: unmapped
+      custom: bas.metasys.audit.pre_data
+      notes: >
+        free text of arbitrary length and type; length-cap and sanitize
+        low-side before the boundary
+    - vendor: Post Value
+      type: string
+      description: >-
+        state after the action; on log-in audits this carries the IP address
+        of the client computer used to reach the Metasys system rather than a
+        property value.
+      ecs: null
+      status: unmapped
+      custom: bas.metasys.audit.post_data
+      notes: >
+        a Class-Level-conditional rule must promote this to source.ip on
+        authentication audits instead of leaving the profile without a source
+        address
+    - vendor: Status
+      type: string
+      description: >-
+        status of the audited operation, the trailing Audit Viewer column,
+        frequently empty.
+      ecs: event.outcome
+      status: partial
+      transform: >
+        rendered as '-' when blank, which is the common case, so derive
+        event.outcome from Status cross-checked against Action Type and the
+        Description wording rather than trusting the Status column alone
+    - vendor: PRI Facility
+      type: enum
+      description: >-
+        syslog facility of the audit frame, fixed at 13 (log audit) for all
+        Metasys audit entries.
+      ecs: log.syslog.facility.name
+      status: mapped
+      notes: >-
+        fixed by the DDA, so unlike an operator-selectable facility it is a
+        reliable audit-stream discriminator
+    - vendor: PRI Severity
+      type: enum
+      description: >-
+        syslog severity of the audit frame, fixed at 6 (Informational) for
+        Metasys audit entries.
+      ecs: log.syslog.severity.name
+      status: mapped
+    - vendor: Header hostname
+      type: string
+      description: >-
+        BSD syslog header hostname of the ADS/ADX/OAS server whose Syslog DDA
+        emitted the frame.
+      ecs: host.name
+      status: partial
+      notes: >
+        this is the server running the DDA, not the engine the audited item
+        belongs to; the engine is identified by the deviceHostname segment of
+        Item, so the two are not interchangeable

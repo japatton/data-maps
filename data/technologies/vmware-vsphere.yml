@@ -1,0 +1,1176 @@
+id: vmware-vsphere
+name: VMware vCenter/ESXi
+vendor: Broadcom
+versions: vSphere 7.0 U3, vSphere 8.0
+draft: true
+references:
+- >-
+  https://techdocs.broadcom.com/us/en/vmware-cis/vsphere/vsphere/8-0/esx-installation-and-setup/installing-and-setting-up-esxi-install/setting-up-esxi-install/configuring-system-logging-install/protocols-formats-and-framing-of-esxi-syslog-messages-install.html
+- >-
+  https://knowledge.broadcom.com/external/article/306962/location-and-contents-of-esxi-log-files.html
+- >-
+  https://knowledge.broadcom.com/external/article/421596/esxi-log-file-formats-introduced-from-vs.html
+- >-
+  https://techdocs.broadcom.com/us/en/vmware-cis/vsphere/vsphere/7-0/vsphere-monitoring-and-performance/monitoring-events-and-alarms/remote-streaming-of-events/configure-streaming-of-events-to-a-remote-server.html
+- >-
+  https://techdocs.broadcom.com/us/en/vmware-cis/vsphere/vsphere/8-0/vsphere-security/understanding-vsphere-hardening-and-compliance/audit-logging/single-sign-on-audit-events.html
+- https://www.elastic.co/docs/reference/integrations/vsphere
+- https://github.com/lamw/vcenter-authn-authz-log-examples
+- https://docs.cribl.io/stream/usecase-syslog/
+datasets:
+- id: esxi-syslog
+  name: ESXi host syslog
+  description: >
+    The consolidated vmsyslogd stream from each ESXi host - hostd (host
+    management, VM and host tasks/events, SDK session logins), vpxa (vCenter
+    agent), vmkernel (device, storage and network events), vobd (VMkernel
+    Observation events, including the vob.user.* SSH-session and
+    account-lockout observations), shell (ESXi Shell enable/disable and every
+    command entered) and auth (shell/SSH authentication). ESXi forwards the
+    whole stream to the configured remote syslog targets; forwarding an
+    individual log file is not supported, so the SOC gets one mixed-grammar
+    feed and must discriminate on the syslog ident.
+  event_categories:
+  - authentication
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Receives the ESXi syslog stream over TCP/TLS (Syslog.global.logHost
+        with an ssl:// or tcp:// target) in the low-side management enclave
+        and crosses the Everfox HSG. That crossing shape - and this dataset's
+        parse location - is the relay question below.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-vsphere.log
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Receives the ESXi syslog stream over TCP/TLS (Syslog.global.logHost
+        with an ssl:// or tcp:// target) and forwards straight to the
+        Elastic-side core worker group - high-side instances take no guard
+        hop.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-vsphere.log
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: elastic-integration
+      artifact: Elastic VMware vSphere integration (vsphere.log data stream)
+      notes: >
+        The integration's log data stream is real but thin: its ingest
+        pipeline groks the syslog header (priority, RFC 3339 timestamp, host,
+        process.name, process.pid) and lifts only log.level, log.logger,
+        event.id and a coarse event.action out of the body, then exports just
+        three package fields (vsphere.log.datacenter, vsphere.log.file.path,
+        vsphere.log.api.invocations). Everything security-relevant in the
+        hostd/vobd/auth message bodies still needs a logs-vsphere.log@custom
+        pipeline. Note the integration's UDP syslog input default (port 9525)
+        does not match the TCP/TLS transport this route uses.
+    fields:
+    - vendor: PRI
+      type: integer
+      description: syslog priority value encoding facility and severity
+      ecs: log.syslog.priority
+      status: mapped
+    - vendor: TIMESTAMP
+      type: timestamp
+      description: RFC 3339 message timestamp emitted by vmsyslogd, UTC with sub-second precision
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: HOSTNAME
+      type: string
+      description: hostname of the ESXi host that generated the message
+      ecs: host.name
+      status: mapped
+    - vendor: APP-NAME
+      type: string
+      description: >-
+        syslog ident naming the ESXi component that logged the line (hostd,
+        vpxa, vmkernel, vobd, shell, sshd, sysboot)
+      ecs: process.name
+      status: mapped
+      notes: >
+        the ident is the only reliable discriminator for which ESXi log file a
+        line came from, because ESXi forwards one merged stream and per-file
+        forwarding is unsupported; branch every downstream extraction on it
+    - vendor: PROCID
+      type: integer
+      description: >-
+        process id of the emitting daemon, rendered in brackets after the
+        program name from ESXi 8.0
+      ecs: process.pid
+      status: mapped
+    - vendor: severity
+      type: enum
+      description: >-
+        per-message severity token (7.x spells it error/warning/info/verbose;
+        8.0 emits the abbreviated Em/Al/Cr/Er/Wa/No/In/Db form with a numeric
+        code, e.g. "Er(163)")
+      ecs: log.level
+      status: partial
+      transform: >
+        normalize the 8.0 two-letter abbreviation and its parenthesised
+        combined severity/facility code down to the 7.x word before setting
+        log.level, and derive the numeric ECS event.severity from the same
+        token; the raw form differs between 7.x and 8.0 hosts in the same
+        cluster during an upgrade
+    - vendor: sub
+      type: string
+      description: >-
+        subsystem key in the Originator@6876 structured-data element naming
+        the emitting hostd/vpxa subsystem (e.g. Vimsvc.ha-eventmgr, vpxLro)
+      ecs: log.logger
+      status: mapped
+      notes: >-
+        the subsystem that raised the line; Vimsvc.ha-eventmgr carries the
+        host-local session and event records the SOC cares about
+    - vendor: opID
+      type: string
+      description: >-
+        operation id in the Originator@6876 structured-data element,
+        correlating every line belonging to one management operation
+      ecs: null
+      status: unmapped
+      custom: vmware.vsphere.esxi.op_id
+      notes: >
+        host-local operation correlation id (e.g. esxcli-76-ecbf); it is not a
+        trace/transaction id in the ECS sense and has no ECS home, so it is
+        kept custom for stitching multi-line operations
+    - vendor: user
+      type: string
+      description: >-
+        user key in the Originator@6876 structured-data element, present on
+        the hostd lines that run under an authenticated session
+      ecs: user.name
+      status: partial
+      notes: >-
+        only some hostd/vpxa messages carry the structured-data user key; when
+        absent the acting user has to come out of the message body instead
+    - vendor: Event <key>
+      type: long
+      description: >
+        host-local monotonically increasing event number that prefixes hostd
+        event records, rendered as "Event 975279 : " ahead of the event text
+      ecs: event.sequence
+      status: partial
+      transform: >
+        strip the literal Event prefix and the trailing separator and store
+        the integer; the counter is per-host and resets on hostd restart, so
+        it orders events within a host but is not globally unique
+    - vendor: vob.<id>
+      type: string
+      description: >-
+        bracketed VMkernel Observation identifier on vobd lines
+        (vob.user.ssh.session.opened, vob.user.ssh.session.closed,
+        vob.user.ssh.session.failed, vob.user.account.locked,
+        esx.problem.vmsyslogd.remote.failure, ...)
+      ecs: event.code
+      status: mapped
+      notes: >
+        the stable machine-readable event identifier on this feed - the
+        vob.user.* subset is the security-relevant one (SSH session
+        open/close/fail, local account lockout) and is what alerting should
+        key on rather than the free-text description
+    - vendor: User <user>@<addr> logged in as <client>
+      type: string
+      description: >-
+        hostd Vimsvc.ha-eventmgr session-login record naming the account, the
+        client address and the client/SDK string
+      ecs: user.name
+      status: partial
+      transform: >
+        split into user.name (the account, e.g. root or dcui), source.ip (the
+        client address, frequently 127.0.0.1 for vpxa, DCUI and local pyvmomi
+        sessions) and user_agent.original (the client string, e.g.
+        "VMware-client/8.0.3" or "pyvmomi"); loopback sources are the normal
+        vCenter-agent case and must not be alerted on as interactive logins
+    - vendor: Cannot login <user>@<addr>
+      type: string
+      description: hostd record for a rejected host session, naming the account and client address
+      ecs: event.outcome
+      status: partial
+      transform: >-
+        presence of this message form sets event.outcome to failure; the
+        account and client address still have to be split out into user.name
+        and source.ip
+    - vendor: Accepted|Failed <method> for <user> from <ip> port <port>
+      type: string
+      description: >-
+        auth/sshd authentication record for ESXi Shell and SSH access, naming
+        method (password, publickey), account, client address and port
+      ecs: event.outcome
+      status: partial
+      transform: >
+        Accepted maps to success and Failed / "Invalid user" to failure, with
+        user.name, source.ip and source.port extracted from the same line;
+        keep the method (password vs publickey) so key-based access to the
+        hypervisor is separable
+    - vendor: shell command text
+      type: string
+      description: >-
+        every command entered in the ESXi Shell, logged verbatim to the shell
+        stream along with shell enable/disable events
+      ecs: process.command_line
+      status: partial
+      notes: >
+        direct hypervisor shell activity, the highest-value ESXi telemetry for
+        intrusion detection; free text with no length bound, and it can carry
+        credentials typed on a command line, so it needs masking before it
+        leaves the enclave
+    - vendor: MSG
+      type: string
+      description: free-text message body following the structured data
+      ecs: message
+      status: mapped
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Keep the core worker group close to pass-through and spend the
+          low-side budget on volume rather than grammar: ESXi is
+          overwhelmingly debug/informational chatter, so drop the
+          debug-severity events (the documented 80-90% of an ESXi syslog feed)
+          and the vpxa VpxLRO BEGIN/END lro- pairs before the Elastic
+          destination, using the syslog ident and severity token that are
+          already in the header. Add the host-to-cluster and host-to-owner
+          enrichment here where the inventory lookup lives, normalize the ESXi
+          7.x versus 8.0 severity spellings (error versus Er(163)) into one
+          token so the high-side pipeline needs a single branch, and run the
+          destination on Persistent Queue backpressure.
+        elastic: >
+          The stock vSphere integration only parses the syslog envelope, so
+          own a logs-vsphere.log@custom pipeline that does the security
+          extraction: branch on process.name and grok the hostd
+          Vimsvc.ha-eventmgr session lines into user.name, source.ip and
+          user_agent.original, the "Cannot login" line into a failure
+          event.outcome, the sshd/auth Accepted/Failed/Invalid-user lines into
+          user.name, source.ip and source.port, and promote the bracketed
+          vob.* identifier to event.code so account lockouts and SSH session
+          opens are alertable. Add custom-namespace keyword mappings for the
+          opID and Originator structured-data values and for the shell command
+          text, and convert the 7.x/8.0 severity token into both log.level and
+          the numeric ECS event.severity rather than leaving it as free text.
+        relay: >
+          Low-side instances cross the guard, which makes this route hybrid
+          rather than low: ship the thin envelope (_dataId, @timestamp, host,
+          _raw) so the guard sees one JSON schema instead of the six distinct
+          message grammars this single feed carries. The content-filter
+          friction is the unbounded free-text body - vmkernel and hostd lines
+          run to the RFC 5424 2048-byte ceiling and vmsyslogd appends
+          msgModified/originalLen parameters when it truncates, so cap and
+          flag _raw low-side and strip control and non-UTF-8 bytes before the
+          crossing. Nothing CEF-shaped is involved; the crossing would be
+          at-most-once, so reconcile counts per (dataset, hour) and drop _raw
+          here first if the byte budget is tight, since this is the
+          highest-volume of the three datasets.
+      direct:
+        parse_location: high
+        cribl: >
+          Spend the pipeline budget on volume rather than grammar: ESXi is
+          overwhelmingly debug/informational chatter, so drop the
+          debug-severity events (the documented 80-90% of an ESXi syslog feed)
+          and the vpxa VpxLRO BEGIN/END lro- pairs before the Elastic
+          destination, using the syslog ident and severity token that are
+          already in the header. Add the host-to-cluster and host-to-owner
+          enrichment here where the inventory lookup lives, normalize the ESXi
+          7.x versus 8.0 severity spellings (error versus Er(163)) into one
+          token so the pipeline needs a single branch, and run the destination
+          on Persistent Queue backpressure.
+        elastic: >
+          The stock vSphere integration only parses the syslog envelope, so
+          own a logs-vsphere.log@custom pipeline that does the security
+          extraction: branch on process.name and grok the hostd
+          Vimsvc.ha-eventmgr session lines into user.name, source.ip and
+          user_agent.original, the "Cannot login" line into a failure
+          event.outcome, the sshd/auth Accepted/Failed/Invalid-user lines into
+          user.name, source.ip and source.port, and promote the bracketed
+          vob.* identifier to event.code so account lockouts and SSH session
+          opens are alertable. Add custom-namespace keyword mappings for the
+          opID and Originator structured-data values and for the shell command
+          text, and convert the 7.x/8.0 severity token into both log.level and
+          the numeric ECS event.severity rather than leaving it as free text.
+- id: vcenter-events
+  name: vCenter Server event stream
+  description: >
+    vCenter Server events (the vim.event.* objects behind the Events tab)
+    streamed to the remote syslog target by vpxd when
+    vpxd.event.syslog.enabled is set. One line per event, rendered as an
+    "Event" keyword followed by the Event data object's properties in
+    brackets: key, chain sequence, createdTime, eventTypeId, severity,
+    userName, the affected inventory object and the fullFormattedMessage. This
+    carries the inventory-change and administrative record a SOC needs -
+    VmCreatedEvent, VmRemovedEvent, VmPoweredOnEvent, UserLoginSessionEvent,
+    PermissionAddedEvent/PermissionUpdatedEvent and the task events - and only
+    newly generated events are streamed after the setting is enabled.
+  event_categories:
+  - configuration
+  - authentication
+  - iam
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Receives the vpxd event stream from the vCenter Server Appliance's
+        configured syslog forwarder, on the same listener as the ESXi feed and
+        discriminated by the vpxd ident. The positional bracket grammar is the
+        reason the crossing shape matters on this dataset.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-vsphere.log
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Receives the vpxd event stream from the vCenter Server Appliance's
+        configured syslog forwarder, on the same listener as the ESXi feed and
+        discriminated by the vpxd ident; high-side instances forward straight
+        to Elastic with no guard hop.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-vsphere.log
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom vCenter event pipeline
+      notes: >
+        The Elastic vSphere integration ingests these lines through the same
+        syslog input but its pipeline stops at the header - it does not
+        understand the bracketed Event grammar, so eventTypeId, severity,
+        userName, the object name and the formatted message all stay buried in
+        message. A hand-built positional parser is needed either low-side in
+        Cribl or as a logs-vsphere.log@custom pipeline; the bracket count
+        varies with which inventory arguments the event carries, so it must be
+        tolerant rather than strictly positional.
+    fields:
+    - vendor: key
+      type: long
+      description: vCenter-assigned event identifier, unique within the vCenter Server instance
+      ecs: event.id
+      status: mapped
+      notes: >-
+        rendered as the first bracket after the Event keyword; stable enough
+        to deduplicate replayed events on the high side
+    - vendor: chainId
+      type: long
+      description: >-
+        identifier shared by every event produced by the same originating task
+        or operation
+      ecs: null
+      status: unmapped
+      custom: vmware.vsphere.vcenter.chain_id
+      notes: >
+        correlates a task's begin/progress/complete events into one chain;
+        equal to key for standalone events. Not event.sequence (that models
+        ordering, not grouping) and not a trace id, so it stays custom
+    - vendor: createdTime
+      type: timestamp
+      description: >-
+        UTC time the event was created inside vCenter, distinct from the
+        syslog header time the line was emitted
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: eventTypeId
+      type: string
+      description: >-
+        fully qualified event class, e.g. vim.event.VmCreatedEvent,
+        vim.event.UserLoginSessionEvent, vim.event.PermissionAddedEvent,
+        esx.audit.ssh.enabled
+      ecs: event.code
+      status: mapped
+      notes: >
+        the machine-readable event identity and the correct alerting key. A
+        parallel mapping to a normalized event.action verb is worth
+        maintaining as a lookup, but the class string itself belongs in
+        event.code
+    - vendor: severity
+      type: enum
+      description: event severity, one of error, warning, info or user
+      ecs: log.level
+      status: partial
+      transform: >
+        copy the vendor word to log.level and derive numeric ECS
+        event.severity through a lookup; note "user" is not a severity level
+        at all but a marker for user-initiated events, so it must not be
+        folded into the numeric scale - carry it as a separate flag
+    - vendor: userName
+      type: string
+      description: >-
+        SSO principal that triggered the event, rendered as DOMAIN\user (e.g.
+        VSPHERE.LOCAL\Administrator) or empty for system-generated events
+      ecs: user.name
+      status: partial
+      transform: >-
+        split the DOMAIN\user form into user.name and user.domain;
+        system-generated events leave this empty and must not be attributed to
+        a user
+    - vendor: fullFormattedMessage
+      type: string
+      description: human-readable rendering of the event with its arguments substituted in
+      ecs: message
+      status: mapped
+    - vendor: host.name
+      type: string
+      description: 'name of the ESXi host the event concerns, from the event''s HostEventArgument'
+      ecs: host.name
+      status: mapped
+      notes: >-
+        the host the event is ABOUT; the vCenter appliance that emitted the
+        line is the observer and is carried separately
+    - vendor: vm.name
+      type: string
+      description: 'name of the virtual machine the event concerns, from the event''s VmEventArgument'
+      ecs: null
+      status: unmapped
+      custom: vmware.vsphere.vcenter.vm.name
+      notes: >
+        the VM acted upon - the single most useful pivot on this dataset
+        (VmCreatedEvent, VmRemovedEvent, VmReconfiguredEvent). No ECS field
+        models a hypervisor guest by name; host.target.* is for a host being
+        administered over a management protocol, not an inventory object, so
+        this stays custom
+    - vendor: datacenter.name
+      type: string
+      description: name of the datacenter containing the object the event concerns
+      ecs: null
+      status: unmapped
+      custom: vmware.vsphere.vcenter.datacenter
+      notes: >-
+        the Elastic vSphere integration already ships a vsphere.log.datacenter
+        keyword; keep both spellings aligned or pick one at the index template
+    - vendor: computeResource.name
+      type: string
+      description: name of the cluster or compute resource containing the object the event concerns
+      ecs: null
+      status: unmapped
+      custom: vmware.vsphere.vcenter.compute_resource
+    - vendor: ipAddress
+      type: ip
+      description: >-
+        client address on session events (UserLoginSessionEvent,
+        UserLogoutSessionEvent, BadUsernameSessionEvent)
+      ecs: source.ip
+      status: mapped
+    - vendor: userAgent
+      type: string
+      description: >-
+        client string on session events, identifying the vSphere Client,
+        PowerCLI, pyvmomi or SDK client that authenticated
+      ecs: user_agent.original
+      status: mapped
+      notes: >-
+        the practical way to separate interactive administrator logins from
+        automation and API clients on this feed
+    - vendor: principal
+      type: string
+      description: >-
+        user or group a permission was granted to or removed from on
+        PermissionAddedEvent / PermissionUpdatedEvent / PermissionRemovedEvent
+      ecs: user.target.name
+      status: mapped
+      notes: >-
+        the account being acted upon, distinct from userName which is the
+        administrator making the change
+    - vendor: role
+      type: string
+      description: name of the vCenter role granted in a permission event
+      ecs: user.target.roles
+      status: mapped
+    - vendor: group
+      type: boolean
+      description: whether the permission principal is a group rather than a user
+      ecs: null
+      status: unmapped
+      custom: vmware.vsphere.vcenter.permission.is_group
+      notes: >
+        without this flag a group grant is indistinguishable from a user grant
+        on user.target.name, which materially changes the blast radius of a
+        privilege-escalation alert
+    - vendor: HOSTNAME
+      type: string
+      description: syslog header hostname, the vCenter Server Appliance that streamed the event
+      ecs: observer.name
+      status: mapped
+      notes: >-
+        the emitting vCenter, deliberately kept off host.name so the ESXi host
+        argument can own it
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Own the bracket grammar in the low-side pipeline rather than in a
+          Kibana grok: match on the "Event" keyword after the vpxd ident,
+          parse tolerantly (the inventory-object brackets are present only for
+          events that carry those arguments) and emit ECS JSON with
+          eventTypeId in event.code and the formatted message in message.
+          Split the DOMAIN\user userName form into user.name and user.domain
+          low-side so the two spellings of the same SSO principal do not
+          fragment dashboards, and translate the error/warning/info/user
+          severity vocabulary through a lookup into numeric event.severity.
+          Enrich with the datacenter-to-enclave lookup here and keep _raw on
+          this route - it is low-volume and each record is individually
+          significant.
+        elastic: >
+          Land the pre-shaped documents in logs-vsphere.log and keep high-side
+          work to normalization the low side cannot do: derive event.outcome
+          from the eventTypeId family (the *FailedEvent and
+          NoAccessUserEvent/BadUsernameSessionEvent forms are failures, the
+          plain lifecycle events are successes) and maintain the
+          eventTypeId-to-event.action mapping table as an enrich policy so new
+          vim.event classes after a vCenter upgrade fail visibly instead of
+          silently dropping to unknown. Add custom-namespace keyword mappings
+          for the chain id, the VM/datacenter/inventory object names and the
+          permission principal-is-group flag, and align the datacenter field
+          with the integration's existing vsphere.log.datacenter so the two
+          spellings do not diverge.
+        relay: >
+          Full ECS-shaped NDJSON crosses on the low-side instances (envelope
+          mode B): the bracket grammar is exactly what should not reach a
+          content filter, because a free-text fullFormattedMessage inside an
+          ambiguously-delimited positional record makes field-aware inspection
+          impossible. Cap the formatted message and the inventory object names
+          low-side, hold the JSON to two levels of nesting with short ASCII
+          keys, and expect VM and datacenter names to carry operator-supplied
+          unicode that needs normalizing before the crossing. Nothing CEF is
+          involved; treat the crossing as at-most-once and reconcile per
+          (dataset, hour) - this feed is low-volume enough that a missing hour
+          is obvious.
+      direct:
+        parse_location: low
+        cribl: >
+          Own the bracket grammar in the pipeline rather than in a Kibana
+          grok: match on the "Event" keyword after the vpxd ident, parse
+          tolerantly (the inventory-object brackets are present only for
+          events that carry those arguments) and emit ECS JSON with
+          eventTypeId in event.code and the formatted message in message.
+          Split the DOMAIN\user userName form into user.name and user.domain
+          so the two spellings of the same SSO principal do not fragment
+          dashboards, and translate the error/warning/info/user severity
+          vocabulary through a lookup into numeric event.severity. Enrich with
+          the datacenter-to-enclave lookup here and keep _raw on this route -
+          it is low-volume and each record is individually significant.
+        elastic: >
+          Land the pre-shaped documents in logs-vsphere.log and keep the
+          Elastic pipeline to the normalization the upstream shaping cannot
+          do: derive event.outcome from the eventTypeId family (the
+          *FailedEvent and NoAccessUserEvent/BadUsernameSessionEvent forms are
+          failures, the plain lifecycle events are successes) and maintain the
+          eventTypeId-to-event.action mapping table as an enrich policy so new
+          vim.event classes after a vCenter upgrade fail visibly instead of
+          silently dropping to unknown. Add custom-namespace keyword mappings
+          for the chain id, the VM/datacenter/inventory object names and the
+          permission principal-is-group flag, and align the datacenter field
+          with the integration's existing vsphere.log.datacenter so the two
+          spellings do not diverge.
+  - format: api-pull
+    enable: >
+      No vpxd setting is required - the event history is always available on
+      vCenter through the Web Services SDK. A collector authenticates to the
+      vSphere Web Services endpoint (https://<vcsa-fqdn>/sdk, the same SOAP
+      API PowerCLI and govmomi use) with a read-only Service Account and calls
+      EventManager. Two access patterns exist: QueryEvents(filter) with an
+      EventFilterSpec for a bounded historical pull (by time window, by
+      entity, by userName, by eventTypeId or by category), or
+      CreateCollectorForEvents(filter) to obtain an EventHistoryCollector and
+      page forward with ReadNextEvents while tracking latestPage as a cursor -
+      both are pull/poll models, there is no server push. In practice this is
+      driven by a small govmomi or PowerCLI (Get-VIEvent) agent, or by the
+      VMware Event Broker Appliance which re-emits the same objects as
+      CloudEvents; task events arrive in the same stream since TaskEvent is a
+      subclass of Event. Note the EventHistoryCollector is session-scoped
+      (maxCollector per session) and its cursor does not persist across a
+      reconnect, so the collector must checkpoint the last key it read itself.
+    references:
+    - >-
+      https://developer.broadcom.com/xapis/vsphere-web-services-api/latest/vim.event.EventManager.html
+    - >-
+      https://techdocs.broadcom.com/us/en/vmware-cis/vsphere/vsphere-sdks-tools/8-0/web-services-sdk-programming-guide/events-and-alarms/understanding-events/managing-events-with-eventmanager.html
+    - >-
+      https://techdocs.broadcom.com/us/en/vmware-cis/vsphere/vsphere-sdks-tools/8-0/web-services-sdk-programming-guide/events-and-alarms/understanding-events/event-data-objects.html
+    - https://developer.vmware.com/docs/4206/vim.event.Event.html
+    - >-
+      https://vdc-download.vmware.com/vmwb-repository/dcr-public/65815ae0-8525-4524-b7f9-18467d0831ff/8a063568-1464-4b8b-8f40-9231bac8a6d9/doc/vim.event.EventEx.html
+    - https://williamlam.com/2019/12/listing-all-events-for-vcenter-server.html
+    - >-
+      https://williamlam.com/2021/11/monitoring-vsphere-account-password-permission-changes.html
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        custom vCenter EventManager collector (govmomi / PowerCLI Get-VIEvent
+        / VMware Event Broker) into a Cribl HTTP source + shaping pipeline
+      notes: >
+        No stock Elastic integration ingests the vCenter event log over the
+        API - the Elastic vSphere integration's API side is the performance
+        (metrics) endpoint, and its log data stream reads syslog only. So the
+        alternate is a purpose-built SOAP/govmomi collector that emits one
+        NDJSON document per Event to a Cribl HTTP Source; because the API
+        already delivers typed objects, the Cribl pipeline is mostly renames
+        and MoRef-name lifts rather than a positional grok. The eventTypeId /
+        object-class-to-event.action mapping and the roleId-to-role-name
+        lookup are the substantive work, and the collector must dedup against
+        the vpxd syslog feed if both are collected (same key values).
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Run the EventManager collector inside the low-side enclave next to
+          its vCenter and shape the typed objects in the low-side pipeline:
+          lift each EventArgument's name (host.host/vm/datacenter/
+          computeResource/ds/net/dvs) into its target field, split the
+          DOMAIN\user userName into user.name and user.domain, resolve the
+          permission-event roleId to a role name low-side where the vCenter
+          lookup is reachable, and set event.code from the object's dynamic
+          type (or EventEx.eventTypeId). Checkpoint the last event key to a
+          KV/lookup so a collector restart resumes instead of replaying, and
+          cap fullFormattedMessage and any EventEx string arguments before the
+          destination. Emit flat ECS JSON so the high side and the guard both
+          see one schema.
+        elastic: >
+          Keep high-side work to the normalization the low side cannot do:
+          maintain the eventTypeId/object-class to event.action mapping and
+          the *FailedEvent / NoAccessUserEvent / BadUsernameSessionEvent to
+          event.outcome=failure derivation as enrich policies so a new
+          vim.event class after a vCenter upgrade surfaces as unmapped rather
+          than silently unknown, and align vsphere.log.datacenter with the
+          custom datacenter key so the API and syslog spellings do not diverge
+          in one index. Assert event.code is populated on every record, since
+          an unrecognised EventEx type otherwise lands with an empty action.
+        relay: >
+          Only the resulting NDJSON crosses the Everfox HSG - the SOAP
+          request/response poll is entirely low-side, which is what makes an
+          api-pull feed guard-compatible at all (a one-way guard cannot carry
+          the bidirectional SOAP session, so nothing about the pull itself
+          traverses the boundary). Send flat, two-level, short-ASCII-key JSON
+          with a capped fullFormattedMessage and capped EventEx arguments,
+          normalize operator-supplied unicode in VM/datacenter/object names
+          before the crossing, and treat the crossing as at-most-once:
+          reconcile per (dataset, hour) on the monotonic event key, which the
+          API exposes as a first-class field. Nothing CEF is involved. Pick
+          either this api-pull feed or the vpxd syslog feed as the
+          authoritative one across the guard so the same event key is not
+          relayed twice.
+      direct:
+        parse_location: low
+        cribl: >
+          High-side vCenter instances run the collector and shaping in the
+          core worker group with no cap/normalize budget pressure: lift the
+          EventArgument names, split userName, resolve roleId to role name,
+          and set event.code from the object type or EventEx.eventTypeId. Keep
+          _raw - this feed is low-volume and each record is individually
+          significant - and checkpoint the last key for restart-safe resume.
+        elastic: >
+          Land the pre-shaped documents in logs-vsphere.log and own the enrich
+          policies that normalize them (eventTypeId to event.action,
+          failure-class to event.outcome) plus keyword mappings for the custom
+          chain id, vm/datacenter/compute-resource names and the permission
+          is_group flag. Because the API delivers typed severity on EventEx
+          directly, prefer it over a description lookup where present and fall
+          back to the EventManager.description eventInfo severity for base
+          typed events.
+    fields:
+    - vendor: key
+      type: long
+      description: >-
+        vCenter-assigned event identifier, unique within the vCenter Server
+        instance and monotonically increasing
+      ecs: event.id
+      status: mapped
+      notes: >-
+        a first-class typed property on the API object (not a leading
+        positional bracket as on the syslog feed); stable dedup and
+        reconciliation key across the guard
+    - vendor: chainId
+      type: long
+      description: >-
+        identifier shared by every event produced by the same originating task
+        or operation; equals key for standalone events
+      ecs: null
+      status: unmapped
+      custom: vmware.vsphere.vcenter.chain_id
+      notes: >-
+        correlates a task's begin/progress/complete events into one chain. Not
+        event.sequence (that models ordering, not grouping) and not a trace
+        id, so it stays custom
+    - vendor: createdTime
+      type: timestamp
+      description: >-
+        UTC time the event was created inside vCenter, delivered as an
+        xsd:dateTime rather than the syslog header emit time
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: object type / eventTypeId
+      type: string
+      description: >-
+        the event class identity - the Event object's dynamic type (e.g.
+        vim.event.VmCreatedEvent, UserLoginSessionEvent, PermissionAddedEvent)
+        for typed events, or the EventEx.eventTypeId string (e.g.
+        esx.audit.ssh.enabled, com.vmware.*) for extended events
+      ecs: event.code
+      status: mapped
+      notes: >
+        the machine-readable event identity and the correct alerting key. On
+        the API the identity is the object class itself, so a collector must
+        read the SOAP xsi:type (or EventEx.eventTypeId) rather than a string
+        field the way the syslog feed's eventTypeId token is read; a parallel
+        event.action verb is worth maintaining as a lookup, but the class
+        belongs in event.code
+    - vendor: severity
+      type: enum
+      description: >-
+        event severity - error, warning, info or user - carried directly on
+        EventEx as its severity property, and available for typed events from
+        EventManager.description.eventInfo
+      ecs: log.level
+      status: partial
+      transform: >
+        copy the vendor word to log.level and derive numeric ECS
+        event.severity through a lookup; EventEx records expose severity on
+        the object, but base typed events do not carry it inline and require
+        the description eventInfo lookup, so the collector must supply both
+        paths. "user" is a user-initiated marker, not a level, and must not be
+        folded into the numeric scale
+    - vendor: userName
+      type: string
+      description: >-
+        SSO principal that triggered the event, as DOMAIN\user (e.g.
+        VSPHERE.LOCAL\Administrator) or empty for system-generated events
+      ecs: user.name
+      status: partial
+      transform: >-
+        split the DOMAIN\user form into user.name and user.domain;
+        system-generated events leave this empty and must not be attributed to
+        a user
+    - vendor: fullFormattedMessage
+      type: string
+      description: human-readable rendering of the event with its arguments substituted in
+      ecs: message
+      status: mapped
+    - vendor: host.name
+      type: string
+      description: >-
+        name of the ESXi host the event concerns, carried in the typed
+        HostEventArgument (a name plus a HostSystem MoRef)
+      ecs: host.name
+      status: mapped
+      notes: >-
+        the host the event is ABOUT; the vCenter that answered the API call is
+        the observer and is carried separately. The API delivers this as a
+        nested typed object rather than a positional bracket, so the name lift
+        is unambiguous
+    - vendor: vm.name
+      type: string
+      description: >-
+        name of the virtual machine the event concerns, from the typed
+        VmEventArgument (name plus a VirtualMachine MoRef)
+      ecs: null
+      status: unmapped
+      custom: vmware.vsphere.vcenter.vm.name
+      notes: >
+        the VM acted upon and the single most useful pivot on this dataset
+        (VmCreatedEvent, VmRemovedEvent, VmReconfiguredEvent). No ECS field
+        models a hypervisor guest by name, so this stays custom; the API
+        additionally carries the VirtualMachine MoRef, giving a stable join
+        key the syslog feed does not
+    - vendor: datacenter.name
+      type: string
+      description: >-
+        name of the datacenter containing the object the event concerns, from
+        the typed DatacenterEventArgument
+      ecs: null
+      status: unmapped
+      custom: vmware.vsphere.vcenter.datacenter
+      notes: >-
+        the Elastic vSphere integration already ships a vsphere.log.datacenter
+        keyword; keep both spellings aligned or pick one at the index template
+    - vendor: computeResource.name
+      type: string
+      description: >-
+        name of the cluster or compute resource containing the object the
+        event concerns, from the typed ComputeResourceEventArgument
+      ecs: null
+      status: unmapped
+      custom: vmware.vsphere.vcenter.compute_resource
+    - vendor: ds.name
+      type: string
+      description: >-
+        name of the datastore the event concerns, from the typed
+        DatastoreEventArgument (name plus a Datastore MoRef)
+      ecs: null
+      status: unmapped
+      custom: vmware.vsphere.vcenter.datastore
+      notes: >-
+        present on datastore-scoped events (DatastoreFileEvent and the
+        datastore lifecycle events); the syslog rendering folds it into the
+        free-text message
+    - vendor: net.name
+      type: string
+      description: name of the network the event concerns, from the typed NetworkEventArgument
+      ecs: null
+      status: unmapped
+      custom: vmware.vsphere.vcenter.network
+    - vendor: dvs.name
+      type: string
+      description: >-
+        name of the distributed virtual switch the event concerns, from the
+        typed DvsEventArgument
+      ecs: null
+      status: unmapped
+      custom: vmware.vsphere.vcenter.dvs
+    - vendor: changeTag
+      type: string
+      description: >-
+        client-supplied change identifier tagging the API operation that
+        produced the event, when the caller set one
+      ecs: null
+      status: unmapped
+      custom: vmware.vsphere.vcenter.change_tag
+      notes: >-
+        an API-only correlation handle (the syslog feed carries no
+        equivalent); lets automation stitch the events it caused back to its
+        own change ticket
+    - vendor: ipAddress
+      type: ip
+      description: >-
+        client address on session events (UserLoginSessionEvent,
+        UserLogoutSessionEvent, BadUsernameSessionEvent), delivered as a
+        first-class SessionEvent property
+      ecs: source.ip
+      status: mapped
+    - vendor: userAgent
+      type: string
+      description: >-
+        client string on session events, identifying the vSphere Client,
+        PowerCLI, pyvmomi or SDK client that authenticated
+      ecs: user_agent.original
+      status: mapped
+      notes: >-
+        the practical way to separate interactive administrator logins from
+        automation and API clients on this feed
+    - vendor: sessionId
+      type: string
+      description: >-
+        the vCenter session identifier on session events, exposed as its own
+        SessionEvent property on the API
+      ecs: null
+      status: unmapped
+      custom: vmware.vsphere.vcenter.session_id
+      notes: >-
+        lets a login be correlated to the subsequent operations run under the
+        same session - a structured field the positional syslog grammar does
+        not surface
+    - vendor: principal
+      type: string
+      description: >-
+        user or group a permission was granted to or removed from on
+        PermissionAddedEvent / PermissionUpdatedEvent / PermissionRemovedEvent
+      ecs: user.target.name
+      status: mapped
+      notes: >-
+        the account being acted upon, distinct from userName which is the
+        administrator making the change
+    - vendor: group
+      type: boolean
+      description: >-
+        whether the permission principal is a group rather than a user,
+        carried as a typed boolean on the permission events
+      ecs: null
+      status: unmapped
+      custom: vmware.vsphere.vcenter.permission.is_group
+      notes: >-
+        without this flag a group grant is indistinguishable from a user grant
+        on user.target.name, which materially changes the blast radius of a
+        privilege-escalation alert
+    - vendor: role
+      type: string
+      description: >-
+        the vCenter role granted in a permission event; the API carries both a
+        numeric roleId and the role name
+      ecs: user.target.roles
+      status: partial
+      transform: >
+        take the role name for user.target.roles; the API additionally exposes
+        the numeric roleId (which the syslog feed does not), so keep it for a
+        stable join to the role definition since role names can be edited.
+        Resolve roleId to name against the AuthorizationManager low-side where
+        that lookup is reachable
+    - vendor: arguments
+      type: nested
+      description: >-
+        EventEx key/value argument array (vmodl.KeyAnyValue), the typed
+        substitution values the fullFormattedMessage is rendered from; today
+        string and moid types only
+      ecs: null
+      status: unmapped
+      custom: vmware.vsphere.vcenter.event_args
+      notes: >
+        on extended events these carry the individual field values as
+        structured key/value pairs, whereas the syslog feed only ships the
+        pre-rendered fullFormattedMessage - so the API exposes as data what
+        the syslog stream leaves as free text. Flatten to short keys and cap
+        before the crossing
+    - vendor: objectName
+      type: string
+      description: >-
+        name of the managed object an EventEx concerns, alongside objectType
+        (e.g. Datastore, HostSystem) and objectId (the MoRef value)
+      ecs: null
+      status: unmapped
+      custom: vmware.vsphere.vcenter.object.name
+      notes: >-
+        the target of an extended event when it is not one of the typed
+        EventArgument slots; objectType and objectId give the type and MoRef
+        for a stable join
+- id: vcenter-sso-audit
+  name: vCenter SSO audit events
+  description: >
+    vSphere Single Sign-On audit events, written by the SSO/STS service to
+    /var/log/audit/sso-events/audit_events.log as one JSON object per line and
+    included automatically in the appliance's syslog forwarding. Introduced in
+    6.7 U2 and present in 7.x and 8.0, these cover login and logout attempts
+    (com.vmware.sso.LoginSuccess, LoginFailure, Logout), privilege and role
+    changes, local account changes, identity-source changes and
+    security-policy changes - the authoritative authentication record for
+    vCenter, at a level of detail the vpxd event stream does not reproduce.
+  event_categories:
+  - authentication
+  - iam
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Arrives as a JSON payload inside the appliance's syslog forwarding
+        rather than as a separate feed, so it lands on the same listener as
+        the vpxd event stream and is separated by the JSON body.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-vsphere.log
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Arrives as a JSON payload inside the appliance's syslog forwarding
+        rather than as a separate feed, so it lands on the same listener as
+        the vpxd event stream and is separated by the JSON body; high-side
+        instances forward straight to Elastic with no guard hop.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-vsphere.log
+  formats:
+  - format: json
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom SSO audit pipeline
+      notes: >
+        No Elastic integration parses these records - the vSphere
+        integration's pipeline treats the JSON body as an opaque message
+        string. The payload is already well-formed JSON with a small stable
+        key set, so a low-side JSON parse plus field renames is nearly all the
+        parsing needed; the work is in the vendor's non-ISO timestamp format
+        and in the outcome and account details that only exist inside the
+        free-text description.
+    fields:
+    - vendor: user
+      type: string
+      description: >-
+        SSO principal that performed the action, as user@domain (e.g.
+        administrator@vsphere.local) or DOMAIN\user
+      ecs: user.name
+      status: partial
+      transform: >-
+        split on @ (or on the backslash for the DOMAIN\user spelling) into
+        user.name and user.domain; the same principal appears in both
+        spellings and in mixed case across event types, so case-fold before
+        correlating
+    - vendor: client
+      type: ip
+      description: address of the client used to connect to vCenter Server, when available
+      ecs: source.ip
+      status: partial
+      notes: >
+        documented as available "if available" and emitted as an empty string
+        for actions taken locally or by the appliance itself; normalize the
+        empty string to null rather than indexing it, or the ip mapping
+        rejects the document
+    - vendor: timestamp
+      type: timestamp
+      description: time the audit event occurred, formatted "MM/DD/YYYY HH:MM:SS UTC"
+      ecs: '@timestamp'
+      status: partial
+      transform: >-
+        not ISO 8601 - parse the US-order date with the literal UTC suffix and
+        re-emit as ISO 8601; second-granularity only, so high-rate logon
+        bursts do not order reliably on this field alone
+    - vendor: type
+      type: string
+      description: >-
+        audit event class, e.g. com.vmware.sso.LoginSuccess,
+        com.vmware.sso.LoginFailure, com.vmware.sso.PrincipalManagement,
+        com.vmware.sso.RoleManagement, com.vmware.sso.PasswordPolicy,
+        com.vmware.sso.LockoutPolicy, com.vmware.sso.CertificateManager
+      ecs: event.code
+      status: mapped
+      notes: >-
+        the only reliable discriminator on this dataset - outcome, category
+        and action all have to be derived from it
+    - vendor: eventSeverity
+      type: enum
+      description: vendor severity label on the audit record (INFO, WARNING, ERROR)
+      ecs: log.level
+      status: partial
+      notes: >
+        observed as INFO even on com.vmware.sso.LoginFailure records, so it
+        must not drive event.outcome or alert thresholds; derive severity from
+        the type instead and keep this field only for fidelity
+    - vendor: description
+      type: string
+      description: >-
+        free-text account of what happened, e.g. "User
+        administrator@vsphere.local@192.168.30.182 failed to log in with
+        response code 401" or the full details of a local user creation
+      ecs: message
+      status: mapped
+      notes: >
+        unbounded free text and the only place several details exist - created
+        account names and attributes, identity-source parameters, policy
+        values - which makes it both the highest-value and the least
+        structured field on the dataset
+    - vendor: response code <n> (in description)
+      type: integer
+      description: >-
+        HTTP response code the STS returned for the authentication attempt,
+        embedded in the description text (200 on success, 401 on failure)
+      ecs: http.response.status_code
+      status: partial
+      transform: >-
+        extract from the description free text; it is not a separate JSON key,
+        and it is only present on the login event types
+    - vendor: derived outcome
+      type: enum
+      description: success or failure of the audited action, not emitted as its own key
+      ecs: event.outcome
+      status: partial
+      transform: >
+        derive from the type suffix (LoginSuccess to success, LoginFailure to
+        failure) corroborated by the response code in the description;
+        administrative types such as PrincipalManagement and PasswordPolicy
+        record only successful changes and should be left unknown rather than
+        assumed successful
+    - vendor: created principal (in description)
+      type: string
+      description: >-
+        account being created, modified or deleted on
+        com.vmware.sso.PrincipalManagement records, named inside the
+        description text
+      ecs: user.target.name
+      status: partial
+      transform: >
+        extract the quoted account name from the description; there is no
+        structured key for the target principal, so local-account creation on
+        the SSO domain - a documented persistence technique against vSphere -
+        is only detectable by parsing free text
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Strip the syslog header, parse the JSON body low-side and fix the
+          two things that make these records hard to use: reformat the
+          "MM/DD/YYYY HH:MM:SS UTC" timestamp into ISO 8601 before anything
+          downstream tries to sort on it, and derive event.outcome from the
+          type suffix (LoginSuccess / LoginFailure) rather than trusting
+          eventSeverity, which is INFO even for failed logins. Split the
+          user@domain principal into user.name and user.domain, leave the
+          client field null rather than empty-string when the action was
+          local, and validate against a Schema Library schema with a
+          dead-letter route before the destination since the key set is small
+          and stable enough for strict validation to be safe.
+        elastic: >
+          Own a logs-vsphere.log@custom branch for these records and keep the
+          high side to enrichment: an enrich policy over the com.vmware.sso.*
+          type values that yields event.action and event.category so a new SSO
+          event class shows up as unmapped instead of silently unclassified,
+          and index-template keyword mappings for the sso type and the
+          extracted response code. Assert that event.outcome is populated on
+          every LoginSuccess/LoginFailure record, because eventSeverity being
+          constant INFO means a missing outcome silently hides failed-logon
+          alerting rather than raising an error.
+        relay: >
+          These records are already NDJSON-shaped, so they are the cheapest of
+          the three datasets to send across the guard: emit the parsed object
+          as one flat JSON line per event, UTF-8, LF-terminated, compression
+          disabled, and the custom content filter can allow-list the small
+          fixed key set outright. The one unbounded field is description,
+          which embeds account names, identity-source configuration and policy
+          text as free text - cap it and normalize unicode low-side. Nothing
+          CEF is involved; the crossing is at-most-once, so reconcile per
+          (dataset, hour), and keep _raw here because these are low-volume,
+          forensically load-bearing authentication records.
+      direct:
+        parse_location: low
+        cribl: >
+          Strip the syslog header, parse the JSON body and fix the two things
+          that make these records hard to use: reformat the "MM/DD/YYYY
+          HH:MM:SS UTC" timestamp into ISO 8601 before anything downstream
+          tries to sort on it, and derive event.outcome from the type suffix
+          (LoginSuccess / LoginFailure) rather than trusting eventSeverity,
+          which is INFO even for failed logins. Split the user@domain
+          principal into user.name and user.domain, leave the client field
+          null rather than empty-string when the action was local, and
+          validate against a Schema Library schema with a dead-letter route
+          before the destination since the key set is small and stable enough
+          for strict validation to be safe.
+        elastic: >
+          Own a logs-vsphere.log@custom branch for these records and keep the
+          high side to enrichment: an enrich policy over the com.vmware.sso.*
+          type values that yields event.action and event.category so a new SSO
+          event class shows up as unmapped instead of silently unclassified,
+          and index-template keyword mappings for the sso type and the
+          extracted response code. Assert that event.outcome is populated on
+          every LoginSuccess/LoginFailure record, because eventSeverity being
+          constant INFO means a missing outcome silently hides failed-logon
+          alerting rather than raising an error.

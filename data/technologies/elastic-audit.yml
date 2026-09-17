@@ -1,0 +1,887 @@
+id: elastic-audit
+name: Elastic Stack Audit
+vendor: Elastic
+versions: Elasticsearch 8.x / 9.x, Kibana 8.x / 9.x
+draft: true
+references:
+- >-
+  https://www.elastic.co/guide/en/elasticsearch/reference/current/audit-event-types.html
+- >-
+  https://www.elastic.co/guide/en/elasticsearch/reference/current/enable-audit-logging.html
+- https://www.elastic.co/guide/en/kibana/current/xpack-security-audit-logging.html
+- https://www.elastic.co/docs/reference/integrations/elasticsearch
+- >-
+  https://github.com/elastic/integrations/tree/main/packages/elasticsearch/data_stream/audit
+- >-
+  https://github.com/elastic/integrations/tree/main/packages/kibana/data_stream/audit
+datasets:
+- id: es-security-audit
+  name: Elasticsearch security audit log
+  description: >
+    The SIEM observing itself. Elasticsearch's security audit trail
+    (<cluster>_audit.json on each node, one JSON object per line) records
+    every authentication attempt, authorization decision, IP-filter verdict,
+    and security configuration change on the cluster that holds the org's
+    logs. This is the dataset that answers who read, exported, or deleted an
+    index, who was granted a role, and who touched the audit indices
+    themselves - so its own integrity and retention matter more than its
+    volume. Audit logging is off by default and must be enabled with
+    xpack.security.audit.enabled on every node.
+  event_categories:
+  - authentication
+  - iam
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Elastic Agent (Elasticsearch integration, audit data stream) tails the
+        per-node audit JSON file and ships to the local worker group.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-elasticsearch.audit
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Elastic Agent (Elasticsearch integration, audit data stream) tails the
+        per-node audit JSON file and ships to the local worker group.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-elasticsearch.audit
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: Elasticsearch integration, audit data stream
+      notes: >
+        The events are already ECS-ish on the wire - the integration's
+        pipeline-json is mostly dot-expansion and renaming rather than grammar
+        parsing. The real work is version alignment (the raw event.type key
+        collides with the ECS event.type vocabulary) and the gaps the stock
+        pipeline leaves or introduces.
+    fields:
+    - vendor: event.type
+      type: enum
+      description: >-
+        processing layer that produced the event - rest, transport, ip_filter,
+        or security_config_change
+      ecs: null
+      status: partial
+      custom: elasticsearch.audit.layer
+      notes: >
+        the raw JSON key is literally event.type but its vocabulary
+        (rest/transport/ip_filter/security_config_change) is not the ECS
+        event.type vocabulary, so it is renamed to a custom layer field; this
+        is the field that should be driving event.category and event.type
+        instead of the pipeline's hardcoded database/access
+    - vendor: event.action
+      type: enum
+      description: >-
+        the specific audited action - authentication_success,
+        authentication_failed, realm_authentication_failed,
+        anonymous_access_denied, access_granted, access_denied,
+        run_as_granted, run_as_denied, connection_granted, connection_denied,
+        tampered_request, put_role, delete_user, create_apikey, ...
+      ecs: event.action
+      status: mapped
+      transform: >
+        copied verbatim to event.action and is also the only source of
+        event.outcome - there is no outcome attribute in the audit event.
+        Suffix _success/_granted maps to success and _failed/_denied to
+        failure; the security_config_change actions (put_*, delete_*,
+        change_*, create_*, invalidate_*) carry no success/failure semantics
+        at all and must resolve to unknown rather than being swept into
+        failure the way the stock pipeline does.
+    - vendor: user.name
+      type: string
+      description: >-
+        effective username the request ran as; under run-as this is the
+        impersonated identity, and under API-key auth it is the key owner
+      ecs: user.name
+      status: mapped
+    - vendor: user.roles
+      type: string
+      description: array of role names held by the effective user; empty for service accounts
+      ecs: user.roles
+      status: mapped
+    - vendor: user.realm
+      type: string
+      description: >-
+        name of the authentication realm the effective user came from (native,
+        file, ldap1, saml1, _es_api_key, ...)
+      ecs: null
+      status: unmapped
+      custom: elasticsearch.audit.user.realm
+      notes: >
+        ECS user.domain was considered and rejected - it models a directory
+        the user belongs to, whereas a realm is the cluster's own
+        authentication provider instance and two realms can front the same
+        directory; kept custom, matching the Elastic integration
+    - vendor: user.run_as.name
+      type: string
+      description: username being impersonated on a run_as_granted / run_as_denied event
+      ecs: user.effective.name
+      status: mapped
+      notes: >
+        ECS impersonation semantics line up here - the run-as target is the
+        identity whose privileges are exercised. Note the vendor uses a
+        different shape on the downstream access_* events, where user.name
+        holds the impersonated identity and user.run_by.name the
+        authenticating principal; both shapes must be normalized onto
+        user.name / user.effective.name consistently.
+    - vendor: authentication.type
+      type: enum
+      description: how the request authenticated - REALM, API_KEY, TOKEN, ANONYMOUS, or INTERNAL
+      ecs: null
+      status: unmapped
+      custom: elasticsearch.audit.authentication.type
+      notes: >
+        no ECS field models authentication method; this is the cheapest filter
+        for separating human sessions from service/API-key traffic on a
+        self-audit dashboard
+    - vendor: apikey.id
+      type: string
+      description: identifier of the API key used, present when authentication.type is API_KEY
+      ecs: null
+      status: unmapped
+      custom: elasticsearch.audit.apikey.id
+      notes: >
+        ECS 9.4 has no API-key identity field, so key-scoped access to the log
+        indices cannot be expressed in a standard namespace; also note the
+        stock pipeline does not dot-expand this key, so it arrives as a
+        literal dotted field name unless the index template declares it
+    - vendor: origin.address
+      type: string
+      description: >-
+        source address of the request as host:port, e.g. "10.4.2.11:53412" or
+        "[::1]:51324"
+      ecs: source.ip
+      status: partial
+      transform: >
+        grok-split on the trailing colon into source.ip and source.port, with
+        the verbatim value retained in source.address; the bracketed IPv6 form
+        needs its own pattern. The value is frequently the cluster's own bound
+        address or a peer node's address for internal transport actions, so it
+        is not a user-attribution field on its own - see x_forwarded_for.
+    - vendor: origin.type
+      type: enum
+      description: where the request entered from - rest, transport, or local_node
+      ecs: null
+      status: unmapped
+      custom: elasticsearch.audit.origin.type
+      notes: >
+        local_node marks cluster-internal activity and is the primary lever
+        for suppressing the access_granted volume floor without losing
+        operator activity
+    - vendor: x_forwarded_for
+      type: string
+      description: verbatim value of the X-Forwarded-For HTTP request header on rest-layer events
+      ecs: network.forwarded_ip
+      status: partial
+      transform: >
+        comma-separated proxy chain as a raw string; split and parse to an ip
+        array before use. This is the real client attribution on this dataset
+        - Kibana proxies user requests to Elasticsearch, so origin.address
+        holds Kibana's address while the analyst's address only appears here.
+    - vendor: request.id
+      type: string
+      description: >-
+        synthetic identifier correlating the rest and transport events
+        generated by one incoming request
+      ecs: http.request.id
+      status: partial
+      notes: >
+        the integration copies it to http.request.id, but it is not an HTTP
+        request id - it also spans the transport-layer events a single REST
+        call fans out to, which is exactly the property that makes "one search
+        touched these fourteen indices" reconstructable
+    - vendor: request.name
+      type: string
+      description: >-
+        name of the transport request handler class, e.g. DeleteIndexRequest,
+        SearchRequest, PutRoleRequest
+      ecs: null
+      status: unmapped
+      custom: elasticsearch.audit.request.name
+      notes: readable proxy for what the request actually did; no ECS equivalent
+    - vendor: action
+      type: string
+      description: >-
+        transport action name executed, e.g. indices:admin/delete,
+        cluster:admin/xpack/security/role/put
+      ecs: null
+      status: unmapped
+      custom: elasticsearch.audit.action
+      notes: >
+        deliberately not mapped to event.action, which already holds the audit
+        verdict (access_granted / access_denied); pairing the two under one
+        field would destroy the granted/denied signal
+    - vendor: indices
+      type: string
+      description: array of index names the request resolved to
+      ecs: null
+      status: unmapped
+      custom: elasticsearch.audit.indices
+      notes: >
+        the highest-value field on the dataset and it has no ECS home - it is
+        what turns access_granted into "who read logs-panw.traffic" or "who
+        deleted the audit index"; keyword-mapped array, and any detection for
+        privileged access to the audit trail keys on it
+    - vendor: url.path
+      type: string
+      description: >-
+        URL-encoded path portion of a rest-layer request, e.g.
+        /logs-panw.traffic/_search
+      ecs: url.path
+      status: mapped
+      notes: >
+        the pipeline also concatenates path and the url.query attribute into
+        url.original; url.query carries the query string (including GET-style
+        search bodies) and should be kept queryable alongside it
+    - vendor: request.body
+      type: string
+      description: >-
+        full body of the rest request, only emitted when
+        xpack.security.audit.logfile.events.emit_request_body is enabled
+      ecs: http.request.body.content
+      status: partial
+      notes: >
+        off by default; when enabled it is the only way to see what a search
+        actually asked for, but it is kilobyte-scale free text that can
+        contain credential material from security APIs - mask before indexing
+        and never enable it without a retention decision
+    - vendor: trace.id
+      type: string
+      description: identifier taken from the traceparent HTTP header
+      ecs: trace.id
+      status: mapped
+      notes: >
+        the join key between this dataset and the Kibana audit log - the same
+        trace.id appears on both sides of a user action performed in the UI.
+        Some 7.x/8.x builds render the key as trace_id; confirm against the
+        deployed version.
+    - vendor: node.name
+      type: string
+      description: >-
+        name of the Elasticsearch node that recorded the event, as configured
+        in elasticsearch.yml
+      ecs: host.name
+      status: mapped
+    - vendor: put.user.name
+      type: string
+      description: >-
+        username inside the put object of a put_user security_config_change
+        event (the account being created or overwritten)
+      ecs: user.target.name
+      status: partial
+      notes: >
+        the stock ingest pipeline renames this into user.name, where the
+        acting principal's own user.name immediately overwrites it, and then
+        removes the entire put object - so the created/modified account and
+        the role definition it carried are both lost. It belongs in
+        user.target.name, and the sibling put.role.* body needs capturing
+        before the removal (see the cribl recommendation) or no
+        privilege-escalation detection on this cluster is possible.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Keep the core worker group a pass-through - the source is already
+          NDJSON - but do two things before the Elastic destination that
+          cannot be recovered downstream: promote the security_config_change
+          body (put.role.name, put.role.cluster/indices privileges,
+          put.role_mapping.name, put.user.name) into stable top-level keys,
+          because the stock ingest pipeline removes the whole put object, and
+          carry _raw for this route permanently - this is the cluster's
+          tamper-evidence trail, not ordinary log volume. Control volume by
+          filtering the access_granted floor (internal _xpack/_system
+          principals and indices:monitor/* and indices:data/read/search
+          transport actions from the local node) with an explicit carve-out
+          that never drops the security_config_change layer,
+          connection_denied, run_as_*, or any event whose indices array
+          touches the audit or security indices. Run the Elastic destination
+          on Persistent Queue backpressure and alert on queue depth: a cluster
+          outage must not silently discard the record of that outage.
+        elastic: >
+          Use the Elasticsearch integration's audit data stream and own a
+          logs-elasticsearch.audit@custom pipeline for four defects this map
+          records. First, the stock outcome logic is a two-branch painless
+          script whose second branch overwrites the first, so every
+          security_config_change action (put_role, delete_user, create_apikey)
+          lands as event.outcome failure - rederive outcome from the action
+          suffix (_success/_granted to success, _failed/_denied to failure,
+          config-change actions to unknown). Second, event.category is
+          hardcoded to database and event.type to access for every record;
+          drive them off the layer field so authentication, iam, and
+          configuration events are separable. Third, put the modified account
+          in user.target.name rather than letting put.user.name overwrite the
+          acting principal's user.name, or admin-activity dashboards will
+          credit the change to its victim. Fourth, prefer x_forwarded_for over
+          source.ip for attribution, since Kibana proxies user requests and
+          origin.address is usually Kibana's own address. Add explicitly typed
+          custom-namespace mappings for elasticsearch.audit.indices, .action,
+          .request.name, .layer, .origin.type, .user.realm,
+          .authentication.type and .apikey.id as keyword, and give this data
+          stream its own ILM policy with longer retention and a write-
+          restricted role than ordinary log data streams.
+        relay: >
+          The low-side Elasticsearch instance's audit crosses the guard. The
+          feed is already NDJSON, so no CEF conversion is needed - constrain
+          it instead: the request.body attribute (only present when
+          emit_request_body is enabled) carries the full query DSL at kilobyte
+          scale with arbitrary unicode terms, and the indices array is
+          unbounded in length, so cap both and hold the record to two levels
+          of nesting with short ASCII keys before a guard destination.
+          Validate with C.Schema(...).validate plus a dead-letter route, run
+          the guard destination on Persistent Queue backpressure, and
+          reconcile low-side and high-side counts per (dataset, hour) - a
+          silently dropped audit record is the one loss this technology exists
+          to prevent.
+      direct:
+        parse_location: high
+        cribl: >
+          Keep the core worker group a pass-through - the source is already
+          NDJSON, and there is no low-side crossing to shape for here - but do
+          two things before the Elastic destination that cannot be recovered
+          downstream: promote the security_config_change body (put.role.name,
+          put.role.cluster/indices privileges, put.role_mapping.name,
+          put.user.name) into stable top-level keys, because the stock ingest
+          pipeline removes the whole put object, and carry _raw for this route
+          permanently - this is the cluster's tamper-evidence trail, not
+          ordinary log volume. Control volume by filtering the access_granted
+          floor (internal _xpack/_system principals and indices:monitor/* and
+          indices:data/read/search transport actions from the local node) with
+          an explicit carve-out that never drops the security_config_change
+          layer, connection_denied, run_as_*, or any event whose indices array
+          touches the audit or security indices. Run the Elastic destination
+          on Persistent Queue backpressure and alert on queue depth: a cluster
+          outage must not silently discard the record of that outage.
+        elastic: >
+          Use the Elasticsearch integration's audit data stream and own a
+          logs-elasticsearch.audit@custom pipeline for four defects this map
+          records. First, the stock outcome logic is a two-branch painless
+          script whose second branch overwrites the first, so every
+          security_config_change action (put_role, delete_user, create_apikey)
+          lands as event.outcome failure - rederive outcome from the action
+          suffix (_success/_granted to success, _failed/_denied to failure,
+          config-change actions to unknown). Second, event.category is
+          hardcoded to database and event.type to access for every record;
+          drive them off the layer field so authentication, iam, and
+          configuration events are separable. Third, put the modified account
+          in user.target.name rather than letting put.user.name overwrite the
+          acting principal's user.name, or admin-activity dashboards will
+          credit the change to its victim. Fourth, prefer x_forwarded_for over
+          source.ip for attribution, since Kibana proxies user requests and
+          origin.address is usually Kibana's own address. Add explicitly typed
+          custom-namespace mappings for elasticsearch.audit.indices, .action,
+          .request.name, .layer, .origin.type, .user.realm,
+          .authentication.type and .apikey.id as keyword, and give this data
+          stream its own ILM policy with longer retention and a write-
+          restricted role than ordinary log data streams.
+- id: kibana-audit
+  name: Kibana audit log
+  description: >
+    Kibana's own audit trail (a dedicated JSON file appender configured in
+    kibana.yml, one ECS-shaped object per line) covering analyst logins and
+    logouts, saved-object reads and writes, space membership, and every
+    detection-rule, connector, and case mutation. This is where the Elastic
+    Security app's own administrative activity is recorded - disabling a
+    detection rule or exporting a dashboard full of query results shows up
+    here and nowhere else. Audit logging is off by default
+    (xpack.security.audit.enabled).
+  event_categories:
+  - authentication
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Elastic Agent (Kibana integration, audit data stream) tails the audit
+        file appender on each Kibana node.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-kibana.audit
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Elastic Agent (Kibana integration, audit data stream) tails the audit
+        file appender on each Kibana node.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-kibana.audit
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: Kibana integration, audit data stream
+      notes: >
+        Kibana emits native ECS, so the integration's pipeline-json is a bare
+        JSON merge into the document root with dot-expansion - it renames
+        nothing. Everything the map flags below is therefore a gap that
+        survives ingest untouched.
+    fields:
+    - vendor: event.action
+      type: string
+      description: >-
+        the specific operation audited - user_login, user_logout,
+        session_cleanup, http_request,
+        saved_object_create/update/delete/get/find, space_create,
+        connector_create, rule_update, rule_disable, case_create, ...
+      ecs: event.action
+      status: mapped
+    - vendor: event.category
+      type: enum
+      description: high-level category Kibana assigns - database, web, or authentication
+      ecs: event.category
+      status: mapped
+      notes: >
+        all three values are already valid ECS event.category members, so this
+        passes through cleanly - the opposite of the Elasticsearch audit
+        dataset, where the same-named key needs renaming
+    - vendor: event.type
+      type: enum
+      description: subcategory Kibana assigns - creation, access, change, or deletion
+      ecs: event.type
+      status: mapped
+      notes: all four values are valid ECS event.type members and pass through unchanged
+    - vendor: event.outcome
+      type: enum
+      description: result of the operation - success, failure, or unknown
+      ecs: event.outcome
+      status: partial
+      notes: >
+        the vocabulary matches ECS but the semantics do not match operator
+        intuition - an authorized create/update/delete is logged as unknown
+        because Kibana records the intent before the write is confirmed, and
+        only an unauthorized attempt is failure. Alerting that treats unknown
+        as a problem will fire on every normal write.
+    - vendor: message
+      type: string
+      description: human-readable rendering of the audited event
+      ecs: message
+      status: mapped
+    - vendor: user.name
+      type: string
+      description: login name of the user who performed the action
+      ecs: user.name
+      status: mapped
+    - vendor: user.id
+      type: string
+      description: identifier of the user that is stable across sessions
+      ecs: user.id
+      status: mapped
+    - vendor: user.roles
+      type: string
+      description: 'array of the user''s Kibana/Elasticsearch role names at the time of the event'
+      ecs: user.roles
+      status: mapped
+    - vendor: client.ip
+      type: ip
+      description: IP address of the client that initiated the request
+      ecs: client.ip
+      status: partial
+      notes: >
+        passes through as client.ip and nothing populates source.ip; the CSOC
+        authentication profile requires source.ip, so this needs an explicit
+        copy on the Elastic side. Behind a reverse proxy the real client is in
+        the x-forwarded-for request header instead.
+    - vendor: http.request.method
+      type: string
+      description: HTTP method of the request that produced the event (get, post, put, delete)
+      ecs: http.request.method
+      status: mapped
+    - vendor: url.path
+      type: string
+      description: path of the Kibana request, e.g. /api/detection_engine/rules
+      ecs: url.path
+      status: mapped
+    - vendor: trace.id
+      type: string
+      description: identifier correlating a single transaction across Kibana and Elasticsearch
+      ecs: trace.id
+      status: mapped
+      notes: >
+        the join key to the Elasticsearch audit dataset - it is what turns "an
+        analyst opened a dashboard" into "and these indices were read as a
+        result"
+    - vendor: kibana.space_id
+      type: string
+      description: id of the Kibana space the event occurred in, e.g. default
+      ecs: null
+      status: unmapped
+      custom: kibana.space_id
+      notes: >
+        Kibana's own tenancy boundary; no ECS equivalent, and the namespace is
+        already the vendor's so it needs no renaming - only an explicit
+        keyword mapping
+    - vendor: kibana.session_id
+      type: string
+      description: id of the user session, unique per login attempt
+      ecs: null
+      status: unmapped
+      custom: kibana.session_id
+      notes: >
+        ECS 9.4 has no application session identifier (the session_leader
+        family models process sessions, not user sessions), so this stays
+        custom; it is the field that stitches a login to everything that
+        followed it
+    - vendor: kibana.saved_object.type
+      type: string
+      description: >-
+        type of the saved object touched - dashboard, index-pattern, rule,
+        action, case, ...
+      ecs: null
+      status: unmapped
+      custom: kibana.saved_object.type
+      notes: >-
+        with event.action, this is what separates a dashboard edit from a
+        detection-rule edit
+    - vendor: kibana.saved_object.id
+      type: string
+      description: identifier of the specific saved object touched
+      ecs: null
+      status: unmapped
+      custom: kibana.saved_object.id
+    - vendor: kibana.authentication_provider
+      type: string
+      description: >-
+        name of the configured authentication provider that handled the login,
+        e.g. my-saml-provider
+      ecs: null
+      status: unmapped
+      custom: kibana.authentication_provider
+    - vendor: kibana.authentication_realm
+      type: string
+      description: name of the Elasticsearch realm that fulfilled the login, e.g. native
+      ecs: null
+      status: unmapped
+      custom: kibana.authentication_realm
+      notes: >
+        same reasoning as the Elasticsearch dataset's user.realm - ECS
+        user.domain models a directory, not the stack's own realm
+        configuration, so it is kept custom
+    - vendor: error.message
+      type: string
+      description: description of the error when an operation failed
+      ecs: error.message
+      status: mapped
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Pass through on the core worker group; the only collection decision
+          that matters is pointing the Elastic Agent at the dedicated audit
+          file appender rather than at Kibana's general server log, because
+          the two are interleaved on stdout and a stdout-based collection
+          loses the audit/non-audit distinction. Suppress volume with an
+          allow-list, not field trimming: the http_request action fires on
+          essentially every UI interaction and dominates the feed, so keep
+          user_login, user_logout, session_cleanup, every saved_object_*
+          action on security-relevant types (rule, connector, case, space,
+          dashboard), and all space_* and rule_* mutations, and drop the rest.
+          Keep _raw for the retained set and run the Elastic destination on
+          Persistent Queue backpressure.
+        elastic: >
+          Use the Kibana integration's audit data stream and add a
+          logs-kibana.audit@custom pipeline for three things the stock
+          pass-through leaves undone. Copy client.ip into source.ip - the CSOC
+          authentication profile keys on source.ip and Kibana only ever writes
+          client.ip, so login alerting silently loses its source pivot; parse
+          the x-forwarded-for request header the same way for proxied
+          deployments. Assert a host identity: the Kibana audit record carries
+          no host or node field of its own, so host.name and service.node.name
+          must be set from agent metadata or the log file path, or both the
+          authentication and configuration profiles lose their host pivot.
+          Handle the outcome vocabulary deliberately rather than treating it
+          as binary - Kibana logs an authorized-but-not-yet-completed write as
+          unknown, so unknown is the normal state for create/update/delete and
+          must not be alerted on as failure, while failure genuinely means
+          unauthorized. Map kibana.space_id, kibana.session_id,
+          kibana.saved_object.type, kibana.saved_object.id,
+          kibana.authentication_provider and kibana.authentication_realm as
+          keyword in the index template, and build the cross-tier pivot on
+          trace.id against logs-elasticsearch.audit.
+        relay: >
+          The low-side Kibana instance's audit crosses the guard. The feed is
+          already NDJSON so no CEF conversion is involved, and the record is
+          shallow enough to cross as-is - the content-filter friction is the
+          free-text fields a user controls: kibana.saved_object.name and the
+          rendered message string carry analyst-authored dashboard, rule, and
+          case titles with arbitrary unicode, and error.message can carry a
+          stack trace. Cap those lengths and strip control characters
+          low-side, gate the guard destination with C.Schema(...).validate and
+          a dead-letter route on Persistent Queue backpressure, and reconcile
+          counts per (dataset, hour) since the crossing is at-most-once with
+          no acknowledgement.
+      direct:
+        parse_location: high
+        cribl: >
+          Pass through on the core worker group; the only collection decision
+          that matters is pointing the Elastic Agent at the dedicated audit
+          file appender rather than at Kibana's general server log, because
+          the two are interleaved on stdout and a stdout-based collection
+          loses the audit/non-audit distinction. Suppress volume with an
+          allow-list, not field trimming: the http_request action fires on
+          essentially every UI interaction and dominates the feed, so keep
+          user_login, user_logout, session_cleanup, every saved_object_*
+          action on security-relevant types (rule, connector, case, space,
+          dashboard), and all space_* and rule_* mutations, and drop the rest.
+          Keep _raw for the retained set and run the Elastic destination on
+          Persistent Queue backpressure.
+        elastic: >
+          Use the Kibana integration's audit data stream and add a
+          logs-kibana.audit@custom pipeline for three things the stock
+          pass-through leaves undone. Copy client.ip into source.ip - the CSOC
+          authentication profile keys on source.ip and Kibana only ever writes
+          client.ip, so login alerting silently loses its source pivot; parse
+          the x-forwarded-for request header the same way for proxied
+          deployments. Assert a host identity: the Kibana audit record carries
+          no host or node field of its own, so host.name and service.node.name
+          must be set from agent metadata or the log file path, or both the
+          authentication and configuration profiles lose their host pivot.
+          Handle the outcome vocabulary deliberately rather than treating it
+          as binary - Kibana logs an authorized-but-not-yet-completed write as
+          unknown, so unknown is the normal state for create/update/delete and
+          must not be alerted on as failure, while failure genuinely means
+          unauthorized. Map kibana.space_id, kibana.session_id,
+          kibana.saved_object.type, kibana.saved_object.id,
+          kibana.authentication_provider and kibana.authentication_realm as
+          keyword in the index template, and build the cross-tier pivot on
+          trace.id against logs-elasticsearch.audit.
+  - format: syslog-raw
+    enable: >
+      Kibana's audit trail is written by the appender named in
+      xpack.security.audit.appender, and that appender carries a layout whose
+      type is either json (the ECS-compliant format) or pattern (a
+      human-readable text line). Setting
+      xpack.security.audit.appender.layout.type: pattern in kibana.yml
+      switches the same audit events from one NDJSON object per line to a
+      bracketed text line rendered from a conversion-token string - the audit
+      appender's default pattern is [%date][%level][%logger]%meta %message,
+      where %date is the event timestamp, %level the log level, %logger the
+      audit logger context, %message the human-readable rendering, and %meta
+      the audit event's structured metadata serialized as an inline JSON
+      object. The appender type itself stays console/file/rolling-file (the
+      audit appender does not accept the otel or any network appender, so this
+      is still a local file/stdout sink, not a syslog or HTTP transport); only
+      the on-disk line shape changes. A full pattern appender therefore looks
+      like xpack.security.audit.appender: {type: rolling-file, fileName:
+      ./logs/audit.log, policy: {...}, strategy: {...}, layout: {type:
+      pattern, pattern: "[%date][%level][%logger]%meta %message"}}. This is a
+      strictly worse shape for an audit feed and is not recommended over the
+      json layout; it is documented here because a Kibana node inherited with
+      a pattern-configured audit appender emits a line the stock Kibana
+      integration cannot parse as JSON.
+    references:
+    - >-
+      https://www.elastic.co/docs/reference/kibana/configuration-reference/security-settings
+    - >-
+      https://www.elastic.co/docs/reference/kibana/configuration-reference/logging-settings
+    - >-
+      https://www.elastic.co/docs/deploy-manage/security/logging-configuration/configuring-audit-logs
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        Cribl pipeline: grok the [%date][%level][%logger] prefix, JSON-parse
+        the %meta object, reconstitute the ECS document, then feed
+        logs-kibana.audit
+      notes: >
+        The Kibana integration's audit data stream is a bare JSON merge and
+        assumes every line is a complete NDJSON object, so a pattern-layout
+        line breaks it outright - the leading [%date][%level][%logger] bracket
+        run is not JSON and the parse fails before the payload is reached. The
+        recovery is mechanical rather than a new grammar: grok the three
+        bracketed prefix tokens, extract the %meta segment (which is itself a
+        JSON object carrying the entire audit field set - event.action,
+        event.outcome, event.category, event.type, user.name, user.roles,
+        client.ip, http.request.method, url.path, trace.id, kibana.space_id,
+        kibana.session_id, kibana.saved_object.type/id,
+        kibana.authentication_provider/realm, error.message and the rest),
+        JSON-parse it back into the document root, and drop the redundant
+        prefix. The prefix adds nothing the payload lacks: %level and %logger
+        are already inside %meta as log.level and log.logger, and %message
+        duplicates the message field. Once reconstituted the record is
+        byte-for-byte the json-layout document, so every gap and mapping the
+        json format documents (client.ip needing a source.ip copy, the unknown
+        outcome semantics, the missing host identity, the keyword mappings for
+        the kibana.* namespace) applies unchanged downstream. The only net
+        effect of the pattern layout is the extra fragile grok step and the
+        loss of NDJSON's line-level robustness: an unescaped bracket or
+        newline inside %message can corrupt the prefix grok in a way the
+        pure-JSON feed never suffers.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          The correct low-side action is to eliminate the format, not to carry
+          it: flip the low-side Kibana's audit appender back to layout.type:
+          json so the feed rejoins the ordinary NDJSON path, because a
+          bracketed text line is the wrong thing to hand a content-filtering
+          guard that wants shallow, well-formed NDJSON. If the appender cannot
+          be changed in time, reconstitute early - grok the
+          [%date][%level][%logger] prefix and JSON-parse %meta on the edge
+          worker group so a clean NDJSON object, not a text line, is what
+          approaches the crossing, and fail the record to a dead-letter route
+          rather than forwarding a line whose prefix grok did not match, since
+          a half-parsed audit line is worse than a flagged gap. The free-text
+          exposure is identical to the json format because %meta carries the
+          same keys: cap and strip control characters from the reconstructed
+          kibana.saved_object.name, the message rendering, and any
+          error.stack_trace inside %meta before the guard, and keep the same
+          allow-list (user_login, user_logout, session_cleanup, the
+          security-relevant saved_object_* actions, and all space_* and rule_*
+          mutations) rather than trimming fields. Run the guard destination on
+          Persistent Queue backpressure.
+        elastic: >
+          Nothing new lands in Elastic once the line is reconstituted - the
+          target is still the Kibana integration's audit data stream and the
+          same logs-kibana.audit@custom pipeline the json format needs,
+          because after JSON-parsing %meta the document is identical. Do not
+          build a parallel parser or a second data stream for the pattern
+          variant; converge it onto the json path at collection so there is
+          one set of mappings, one ILM policy, and one set of detections.
+          Carry forward every json-format fix on that custom pipeline: copy
+          client.ip into source.ip, assert host.name and service.node.name
+          from agent metadata or the file path, treat the unknown outcome as
+          the normal state for authorized writes, and map kibana.space_id,
+          kibana.session_id, kibana.saved_object.type, kibana.saved_object.id,
+          kibana.authentication_provider and kibana.authentication_realm as
+          keyword. The one pattern-specific guard rail is a parse-failure
+          monitor: alert when the prefix grok or the %meta JSON parse fails,
+          because on this format a parse failure silently drops an audit
+          record.
+        relay: >
+          The relay goal is that nothing pattern-shaped ever reaches the guard
+          - the crossing should see the same NDJSON the json format produces,
+          so reconstitute before the boundary and let the record ride the
+          standard route. The content-filter friction is then exactly the json
+          format's friction: the user-controlled free-text keys inside %meta
+          (kibana.saved_object.name, the message string, and any error stack
+          trace) carry arbitrary unicode and must be length-capped and
+          control-stripped, and the record is otherwise shallow enough to
+          cross as-is. Gate the guard destination with C.Schema(...).validate
+          against the reconstituted NDJSON shape plus a dead-letter route, run
+          it on Persistent Queue backpressure, and reconcile counts per
+          (dataset, hour) - the crossing is at-most-once, and the pattern
+          layout's fragile prefix grok makes a silent drop marginally more
+          likely, so the reconciliation matters more here, not less.
+      direct:
+        parse_location: high
+        cribl: >
+          For the high-side Kibana there is no guard to shape for, so the only
+          decision is where to reconstitute. Prefer fixing the source - set
+          layout.type: json on the high-side Kibana audit appender and the
+          problem disappears - but if a pattern-configured node must be
+          ingested as-is, do the grok-prefix-plus-%meta-JSON-parse on the core
+          worker group and pass the reconstituted NDJSON straight to the
+          Elastic destination, exactly as the json format is passed through.
+          Keep the reconstitution logic byte-identical across both enclaves so
+          their audit documents stay mergeable, and point the Elastic Agent at
+          the dedicated audit file appender rather than at Kibana's general
+          server log, since pattern lines and ordinary server-log pattern
+          lines interleave on stdout and are far harder to separate than two
+          JSON streams would be.
+        elastic: >
+          Land the reconstituted document in the same Kibana audit data stream
+          and the same logs-kibana.audit@custom pipeline as every other Kibana
+          audit record; the pattern layout must not fork the mapping story.
+          Run the identical fixes the json format calls for - the source.ip
+          copy from client.ip, the asserted host.name/service.node.name, the
+          deliberate unknown-outcome handling, the keyword mappings across the
+          kibana.* namespace, and the trace.id cross-tier pivot against
+          logs-elasticsearch.audit - and add a parse-failure alert so a
+          prefix-grok miss on this format is visible rather than a silent hole
+          in the audit trail.
+    fields:
+    - vendor: '%date'
+      type: timestamp
+      description: event timestamp rendered into the bracketed line prefix by the pattern layout
+      ecs: '@timestamp'
+      status: mapped
+      notes: >
+        the first bracket token of the default audit pattern
+        [%date][%level][%logger]%meta %message; grok it off the prefix and use
+        it as the document timestamp, the same instant the json layout carries
+        as @timestamp
+    - vendor: '%level'
+      type: string
+      description: log level of the audit record as rendered in the line prefix, e.g. INFO
+      ecs: log.level
+      status: mapped
+      notes: >
+        redundant with the log.level key already present inside the %meta JSON
+        blob; keep one copy on ingest rather than emitting both from the
+        prefix and the payload
+    - vendor: '%logger'
+      type: string
+      description: audit logger context name in the line prefix, e.g. plugins.security.audit.ecs
+      ecs: log.logger
+      status: mapped
+      notes: >
+        identifies the emitting logger; like %level it also appears inside
+        %meta as log.logger, so it is a duplicate rather than new information,
+        useful only to confirm the line came from the audit logger and not
+        another Kibana logger sharing the appender
+    - vendor: '%meta'
+      type: string
+      description: >-
+        the audit event's structured metadata serialized as an inline JSON
+        object, carrying the full audit field set (event.action,
+        event.outcome, user.name, client.ip, trace.id, kibana.space_id,
+        kibana.saved_object.type/id, kibana.authentication_provider/realm,
+        error.message and the rest)
+      ecs: null
+      status: partial
+      transform: >
+        this is the real payload of the pattern line and it is not a scalar
+        field - it is a JSON object embedded mid-line. Extract the segment
+        between the %logger bracket and the trailing %message, JSON-parse it,
+        and merge it into the document root; the result is the identical ECS
+        structure the json layout emits, so every field the json format
+        documents is recovered here and is not re-inventoried on this entry.
+        Its free-text members (kibana.saved_object.name, the message
+        rendering, error stack traces) carry the same capping and
+        control-strip obligations as the json format before any guard crossing
+    - vendor: '%message'
+      type: string
+      description: >-
+        human-readable rendering of the audited event, the trailing token of
+        the pattern line
+      ecs: message
+      status: mapped
+      notes: >
+        duplicates the message field that also appears inside %meta; on a
+        pattern line it is the terminal token and can itself contain brackets
+        or unicode, which is the token most likely to corrupt a naive prefix
+        grok if the pattern is parsed left-to-right without anchoring on the
+        %meta JSON boundary

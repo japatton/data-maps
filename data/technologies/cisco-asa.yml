@@ -1,0 +1,1744 @@
+id: cisco-asa
+name: Cisco ASA
+vendor: Cisco
+versions: ASA 9.12, ASA 9.16, ASA 9.20
+draft: true
+references:
+- https://www.cisco.com/c/en/us/td/docs/security/asa/syslog/asa-syslog.html
+- >-
+  https://www.cisco.com/c/en/us/td/docs/security/asa/syslog/asa-syslog/syslog-messages-302003-to-342008.html
+- >-
+  https://www.cisco.com/c/en/us/support/docs/security/adaptive-security-appliance-asa-software/116149-qanda-ASA-00.html
+- https://www.elastic.co/docs/reference/integrations/cisco_asa
+- >-
+  https://github.com/elastic/integrations/blob/main/packages/cisco_asa/data_stream/log/elasticsearch/ingest_pipeline/default.yml
+- >-
+  https://github.com/elastic/integrations/blob/main/packages/cisco_asa/data_stream/log/fields/fields.yml
+datasets:
+- id: connection-events
+  name: Connection build/teardown events
+  description: >
+    Flow lifecycle records for every session the appliance permits:
+    %ASA-6-302013/302015 "Built" on flow creation and %ASA-6-302014/302016
+    "Teardown" on flow expiration (plus the ICMP variants 302020/302021).
+    These are the highest-volume ASA messages by an order of magnitude and are
+    the closest ASA analogue to a traffic/session log — but unlike a CSV
+    firewall log they are free-text sentences whose token order changes with
+    the message ID, so every field below is positional within one specific
+    message template.
+  event_categories:
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Receives RFC 3164 syslog over UDP/514 (or TCP/1470) from the ASA
+        "logging host" configuration. The free-text tail of each message (the
+        unparsed remainder, identity-firewall user strings) is what a
+        content-inspection allow-list constrains on the low-side path. All
+        four datasets in this file share one syslog listener and therefore one
+        route.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cisco_asa.log
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Receives RFC 3164 syslog over UDP/514 (or TCP/1470) from the ASA
+        "logging host" configuration. All four datasets in this file share one
+        syslog listener and therefore one route.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cisco_asa.log
+  formats:
+  - format: syslog-raw
+    recommended: true
+    recommended_because: >-
+      all four ASA datasets share one syslog listener and the cisco_asa
+      integration, and the Built/Teardown messages keep ACL names, interface
+      names and teardown reasons; NetFlow Secure Event Logging is the volume-
+      reduction alternative and would be a separate flow dataset, not a
+      replacement for these records.
+    parsing:
+      mechanism: elastic-integration
+      artifact: Cisco ASA integration (cisco_asa), data stream logs-cisco_asa.log
+      notes: >
+        The Elastic cisco_asa integration ships one ingest pipeline that
+        branches on the parsed message ID and applies a per-ID grok/dissect
+        pattern; ALL four datasets in this file land in the single
+        logs-cisco_asa.log data stream, so dataset separation here is logical
+        (an event.code filter), not a routing split. Message IDs with no
+        branch in the pipeline keep only the syslog header fields and
+        event.original. Cribl-side volume reduction (dropping 302013/ 302014
+        for known-good internal flows) is the usual pre-Elastic step and
+        should be a Cribl pipeline in front of this integration.
+    fields:
+    - vendor: message_id
+      type: string
+      description: Six-digit ASA syslog message number identifying the message template
+      ecs: event.code
+      status: mapped
+      transform: >
+        the numeric ID in the %ASA-<level>-<message_id> header (302013/302015
+        = built, 302014/302016 = teardown). It is the primary key for all
+        downstream parsing AND the source of event.action (flow-creation /
+        flow-expiration), event.type and event.outcome via a static lookup
+        table — ASA emits no separate action or outcome token in these
+        messages.
+    - vendor: level
+      type: integer
+      description: Syslog severity digit carried in the message header
+      ecs: log.syslog.severity.code
+      status: partial
+      notes: >
+        the severity digit in the %ASA-<level>- header (0=emergency ..
+        7=debugging). The Elastic pipeline also copies it verbatim into
+        event.severity, which inverts ECS's "higher is worse" convention; plan
+        a lookup rather than trusting event.severity for thresholds.
+    - vendor: '{inbound | outbound}'
+      type: enum
+      description: Whether the original control connection was initiated from outside or inside
+      ecs: network.direction
+      status: partial
+      notes: >
+        only present on 302013/302015. When the value is "outbound" the ASA
+        prints the two sockets in reverse order, so the parser must swap the
+        source and destination halves; the teardown messages (302014/302016)
+        carry no direction token at all and inherit nothing, leaving
+        network.direction null on roughly half the dataset.
+    - vendor: connection_id
+      type: string
+      description: Unique identifier the appliance assigns to the flow
+      ecs: null
+      status: unmapped
+      custom: cisco.asa.connection_id
+      notes: >
+        appliance-local flow identifier; the only join key between a Built
+        record and its matching Teardown, and therefore the field an analyst
+        needs to reconstruct byte counts for a session. No ECS equivalent.
+    - vendor: real-address (source)
+      type: ip
+      description: Pre-NAT address of the connection initiator
+      ecs: source.ip
+      status: mapped
+    - vendor: real-port (source)
+      type: port
+      description: Pre-NAT port of the connection initiator
+      ecs: source.port
+      status: mapped
+    - vendor: mapped-address (source)
+      type: ip
+      description: Post-NAT translated address of the initiator
+      ecs: source.nat.ip
+      status: mapped
+      notes: >-
+        on 302013/302015 only; when no NAT applies the ASA repeats the real
+        address here rather than omitting it
+    - vendor: mapped-port (source)
+      type: port
+      description: Post-NAT translated port of the initiator
+      ecs: source.nat.port
+      status: mapped
+    - vendor: real-address (destination)
+      type: ip
+      description: Pre-NAT address of the connection responder
+      ecs: destination.ip
+      status: mapped
+    - vendor: real-port (destination)
+      type: port
+      description: Pre-NAT port of the connection responder
+      ecs: destination.port
+      status: mapped
+    - vendor: mapped-address (destination)
+      type: ip
+      description: Post-NAT translated address of the responder
+      ecs: destination.nat.ip
+      status: mapped
+    - vendor: mapped-port (destination)
+      type: port
+      description: Post-NAT translated port of the responder
+      ecs: destination.nat.port
+      status: mapped
+    - vendor: protocol
+      type: enum
+      description: Transport protocol carrying the flow
+      ecs: network.transport
+      status: mapped
+      transform: printed uppercase (TCP/UDP/ICMP); lowercase it for ECS
+    - vendor: interface_name (source side)
+      type: string
+      description: nameif label of the interface the flow entered on
+      ecs: observer.ingress.interface.name
+      status: partial
+      notes: >
+        the nameif label ("inside", "outside", "dmz") preceding the source
+        socket. The stock integration parks it at cisco.asa.source_interface
+        and never populates observer.ingress.interface.name — a rename is
+        required if the CSOC wants to pivot on interface in ECS terms.
+    - vendor: interface_name (destination side)
+      type: string
+      description: nameif label of the interface the flow exited on
+      ecs: observer.egress.interface.name
+      status: partial
+      notes: >-
+        same gap as the source-side interface; stock lands at
+        cisco.asa.destination_interface
+    - vendor: idfw_user
+      type: string
+      description: Identity Firewall user associated with the socket
+      ecs: source.user.name
+      status: partial
+      notes: >
+        identity-firewall / cut-through-proxy user in parentheses after a
+        socket. Populated only when Identity Firewall or AAA cut-through is
+        configured; the same parenthesised slot may instead hold a numeric
+        security group tag (e.g. "16:Engineering"), so a parser must
+        disambiguate user from SGT before writing source.user.name.
+    - vendor: bytes
+      type: bytes
+      description: Total bytes transferred over the connection before teardown
+      ecs: network.bytes
+      status: partial
+      notes: >
+        teardown messages only, and it is a single connection total — the ASA
+        does not split sent vs received, so source.bytes and destination.bytes
+        stay empty for this dataset.
+    - vendor: duration
+      type: string
+      description: Wall-clock lifetime of the flow formatted as hh mm ss
+      ecs: event.duration
+      status: partial
+      transform: >
+        printed as hh:mm:ss (teardown only); must be parsed to nanoseconds for
+        event.duration, and event.start can then be back-derived from
+        @timestamp minus duration.
+    - vendor: reason
+      type: enum
+      description: Documented reason the appliance tore the flow down
+      ecs: event.reason
+      status: mapped
+      notes: >-
+        teardown reason string (TCP FINs, TCP Reset-O, SYN Timeout, Flow
+        closed by inspection, Free the flow, ...)
+    - vendor: hostname
+      type: string
+      description: Appliance name carried in the syslog header
+      ecs: observer.hostname
+      status: partial
+      notes: >
+        the syslog header hostname, which is only present if "logging
+        device-id hostname" is configured; without it the appliance cannot be
+        identified from the message body at all and observer.name must come
+        from the Cribl source/input metadata.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Put a volume-reduction pipeline in front of the integration: sample
+          or drop 302013/302014 for known-good internal flow patterns, and
+          enrich low-side with interface->site and device->owner lookups while
+          the nameif labels still have local meaning. This is the file's
+          highest-volume, lowest-forensic-value dataset, so it is the first
+          place to drop _raw once the integration's per-message-ID parsing is
+          proven; set observer.name from the Cribl input metadata because
+          `logging device-id hostname` may not be configured on the appliance.
+        elastic: >
+          Ship raw and let the stock cisco_asa ingest pipeline parse, then add
+          an @custom pipeline that derives event.severity from
+          log.syslog.severity.code by lookup instead of keeping the verbatim
+          (inverted) copy, and that copies cisco.asa.source_interface and
+          cisco.asa.destination_interface into observer.ingress.interface.name
+          and observer.egress.interface.name. Convert the hh:mm:ss teardown
+          duration to nanoseconds for event.duration and back-derive
+          event.start, disambiguate identity-firewall user from security group
+          tag before writing source.user.name, and add a custom-namespace
+          index template mapping cisco.asa.connection_id as a keyword so
+          Built/Teardown pairs can be joined.
+        relay: >
+          Low-side instances cross the guard: use the thin envelope ({_dataId,
+          @timestamp, host, _raw}) and hybrid parsing, and give the guard
+          destination a Persistent Queue plus a dead-letter route rather than
+          Block. The content-filter friction here is the unparsed free-text
+          tail and the parenthesised identity-firewall user strings: bound
+          their length and constrain them to ASCII low-side, and reconcile
+          low-side against high-side counts per hour, since the crossing is
+          at-most-once with no acknowledgement.
+      direct:
+        parse_location: high
+        cribl: >
+          Put a volume-reduction pipeline in front of the integration: sample
+          or drop 302013/302014 for known-good internal flow patterns, and
+          enrich near the source with interface->site and device->owner
+          lookups while the nameif labels still have local meaning. This is
+          the file's highest-volume, lowest-forensic-value dataset, so it is
+          the first place to drop _raw once the integration's per-message-ID
+          parsing is proven; set observer.name from the Cribl input metadata
+          because `logging device-id hostname` may not be configured on the
+          appliance.
+        elastic: >
+          Ship raw and let the stock cisco_asa ingest pipeline parse, then add
+          an @custom pipeline that derives event.severity from
+          log.syslog.severity.code by lookup instead of keeping the verbatim
+          (inverted) copy, and that copies cisco.asa.source_interface and
+          cisco.asa.destination_interface into observer.ingress.interface.name
+          and observer.egress.interface.name. Convert the hh:mm:ss teardown
+          duration to nanoseconds for event.duration and back-derive
+          event.start, disambiguate identity-firewall user from security group
+          tag before writing source.user.name, and add a custom-namespace
+          index template mapping cisco.asa.connection_id as a keyword so
+          Built/Teardown pairs can be joined.
+  - format: netflow
+    enable: >
+      Point the appliance at a NetFlow collector and bind flow export to
+      traffic through Modular Policy Framework. Global config: `flow-export
+      destination <nameif> <collector-ip> <udp-port>` (default collector UDP
+      port 2055 on modern releases; the legacy NFC used 9999) and `flow-export
+      template timeout-rate 1` so the v9 templates are re-sent each minute
+      rather than every 30. Then, in the global policy, `policy-map
+      global_policy / class class-default / flow-export event-type {all |
+      flow-create | flow-teardown} destination <collector-ip>` selects which
+      lifecycle events are exported (use flow-create + flow-teardown, or
+      `all`, for this dataset). Because NSEL and the 302xxx syslogs then carry
+      the same events, disable the now-redundant syslogs to save the appliance
+      CPU: either `logging flow-export-syslogs disable` (turns off the whole
+      redundant set at once) or the explicit `no logging message 302013 /
+      302014 / 302015 / 302016 / 302020 / 302021`. Optionally `flow-export
+      delay flow-create <seconds>` suppresses the flow-create record for
+      short-lived flows so only the extended flow-teardown (which carries all
+      creation fields plus NF_F_FLOW_CREATE_TIME_MSEC) is sent.
+    references:
+    - >-
+      https://www.cisco.com/c/en/us/td/docs/security/asa/special/netflow/asa_netflow.html
+    - https://www.ntop.org/wp-content/uploads/2010/01/netflow-ASA.pdf
+    - https://www.ntop.org/wp-content/uploads/2010/01/white_paper_cisco_nsel.pdf
+    - >-
+      https://www.cisco.com/c/en/us/td/docs/security/asa/asa916/configuration/general/asa-916-general-config/monitor-nsel.html
+    - >-
+      https://docs.manage.security.cisco.com/c_netflow-secure-event-logging-nsel-for-asa-devices.html
+    parsing:
+      mechanism: elastic-integration
+      artifact: Elastic NetFlow Records integration (netflow), data stream logs-netflow.log
+      notes: >
+        NSEL is binary NetFlow v9 over UDP, so it needs a NetFlow decoder, not
+        a syslog line parser - the stock cisco_asa integration cannot read it.
+        An Elastic Agent netflow input (the NetFlow Records integration)
+        decodes the IANA-standard elements (8/12/7/11/4/176/177/10/14) into
+        netflow.* automatically, but the ASA enterprise-specific elements -
+        NF_F_FW_EVENT (40005), NF_F_FW_EXT_EVENT (33002), NF_F_XLATE_*
+        (40001-40004), NF_F_INGRESS/EGRESS_ACL_ID (33000/33001) and
+        NF_F_USERNAME (40000) - arrive only as raw template fields and require
+        a custom ingest pipeline to reach ECS. There is no packaged ASA-NSEL
+        pack for Cribl and Cribl Stream does not natively decode binary
+        NetFlow v9, so on a Cribl-first path a NetFlow collector or the
+        Elastic Agent input must terminate the UDP stream first.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          The hard constraint is that NSEL is binary UDP NetFlow - a CDS
+          content filter cannot inspect an opaque binary NetFlow payload, and
+          the v9 template packets (which define how to decode the data
+          records) are sent on a separate cadence from the data, so a naive
+          byte relay would strand data records whose template never crossed.
+          Decode NSEL to structured records LOW-SIDE first (Elastic Agent
+          netflow input or a NetFlow collector in the low enclave), map the
+          enterprise elements to the cisco.asa.* names below, then hand the
+          resulting NDJSON to Cribl for the crossing. Do the interface-ifIndex
+          and ACL-id decode low-side too, while the appliance is reachable for
+          the `show interface` / `show access-list` lookups that resolve them.
+        elastic: >
+          Run the netflow integration for the standard sockets and add an
+          @custom pipeline that: sets event.action / event.type /
+          event.outcome from NF_F_FW_EVENT (1=flow-create -> connection
+          created, 2=flow-delete -> connection ended); derives
+          network.transport from the numeric network.iana_number; converts
+          NF_F_EVENT_TIME_MSEC (ms since 1970) to @timestamp and, on extended
+          teardown, derives event.duration from NF_F_EVENT_TIME_MSEC minus
+          NF_F_FLOW_CREATE_TIME_MSEC with event.start set from the latter; and
+          maps the 12-byte NF_F_INGRESS/EGRESS_ACL_ID hashes to the
+          cisco.asa.* keyword customs. Keep cisco.asa.connection_id
+          (NF_F_CONN_ID) as a keyword so the create and teardown records for
+          one flow can be joined, exactly as for the syslog form.
+        relay: >
+          Cross NDJSON, never the raw NetFlow - the binary form is both
+          un-inspectable at the guard and template-dependent. Once decoded,
+          the content-inspection surface shrinks versus the syslog form: the
+          only free-text value NSEL carries is NF_F_USERNAME (the AAA /
+          identity -firewall principal), so length-cap and ASCII-constrain
+          that one field low-side and the rest of the record is fixed-width
+          typed values. Use a Persistent Queue and a dead-letter route rather
+          than Block, and reconcile low-side vs high-side record counts per
+          hour since the crossing is at-most-once with no acknowledgement.
+      direct:
+        parse_location: high
+        cribl: >
+          For a high-side ASA with no guard, terminate NSEL directly at an
+          Elastic Agent netflow input (simplest) or a NetFlow collector
+          feeding Cribl; there is little reason to interpose Cribl for binary
+          NetFlow beyond routing. The one decision that matters is not
+          double-counting: pick NSEL or the 302xxx syslogs as the
+          authoritative connection feed per appliance and disable the other,
+          joining on NF_F_CONN_ID only during a brief cutover overlap.
+        elastic: >
+          Run the netflow integration for the standard sockets and add an
+          @custom pipeline that sets event.action / event.type / event.outcome
+          from NF_F_FW_EVENT (1=flow-create -> connection created,
+          2=flow-delete -> connection ended), derives network.transport from
+          the numeric network.iana_number, converts NF_F_EVENT_TIME_MSEC (ms
+          since 1970) to @timestamp and, on extended teardown, derives
+          event.duration from NF_F_EVENT_TIME_MSEC minus
+          NF_F_FLOW_CREATE_TIME_MSEC with event.start set from the latter, and
+          maps the 12-byte NF_F_INGRESS/EGRESS_ACL_ID hashes to the
+          cisco.asa.* keyword customs; keep cisco.asa.connection_id
+          (NF_F_CONN_ID) as a keyword so the create and teardown records for
+          one flow can be joined, exactly as for the syslog form. With no
+          boundary, retain the full NF_F_USERNAME value and treat NSEL as the
+          authoritative, higher-performance connection feed (the appliance
+          offloads the per-message-ID text parsing), accepting that the human
+          nameif labels and free-text teardown reasons are traded for the
+          numeric ifIndex and extended-event code that must be decoded
+          post-ingest.
+    fields:
+    - vendor: NF_F_CONN_ID
+      type: integer
+      description: NetFlow element 148 - appliance-assigned identifier of the unique flow.
+      ecs: null
+      status: unmapped
+      custom: cisco.asa.connection_id
+      notes: >
+        the only join key between a flow-create and its matching flow-teardown
+        record; the structured equivalent of the syslog connection_id, so it
+        shares the same custom namespace. No ECS equivalent.
+    - vendor: NF_F_SRC_ADDR_IPV4
+      type: ip
+      description: NetFlow element 8 - source (initiator) IPv4 address, pre-NAT.
+      ecs: source.ip
+      status: mapped
+    - vendor: NF_F_DST_ADDR_IPV4
+      type: ip
+      description: NetFlow element 12 - destination (responder) IPv4 address, pre-NAT.
+      ecs: destination.ip
+      status: mapped
+    - vendor: NF_F_SRC_ADDR_IPV6
+      type: ip
+      description: NetFlow element 27 - source IPv6 address on IPv6 flows.
+      ecs: source.ip
+      status: mapped
+      notes: IPv6 flow templates carry no xlate fields, since ASA NAT does not apply to IPv6
+    - vendor: NF_F_DST_ADDR_IPV6
+      type: ip
+      description: NetFlow element 28 - destination IPv6 address on IPv6 flows.
+      ecs: destination.ip
+      status: mapped
+    - vendor: NF_F_SRC_PORT
+      type: port
+      description: NetFlow element 7 - source port.
+      ecs: source.port
+      status: mapped
+    - vendor: NF_F_DST_PORT
+      type: port
+      description: NetFlow element 11 - destination port.
+      ecs: destination.port
+      status: mapped
+    - vendor: NF_F_PROTOCOL
+      type: integer
+      description: NetFlow element 4 - IP protocol number (1 byte).
+      ecs: network.iana_number
+      status: mapped
+      transform: >
+        NSEL sends the numeric IP protocol, not a name, so it maps directly to
+        network.iana_number; derive network.transport (tcp/udp/icmp) from it
+        by lookup rather than leaving transport blank.
+    - vendor: NF_F_XLATE_SRC_ADDR_IPV4
+      type: ip
+      description: NetFlow element 40001 - post-NAT (mapped) source IPv4 address.
+      ecs: source.nat.ip
+      status: mapped
+    - vendor: NF_F_XLATE_DST_ADDR_IPV4
+      type: ip
+      description: NetFlow element 40002 - post-NAT (mapped) destination IPv4 address.
+      ecs: destination.nat.ip
+      status: mapped
+    - vendor: NF_F_XLATE_SRC_PORT
+      type: port
+      description: NetFlow element 40003 - post-NAT (mapped) source port.
+      ecs: source.nat.port
+      status: mapped
+    - vendor: NF_F_XLATE_DST_PORT
+      type: port
+      description: NetFlow element 40004 - post-NAT (mapped) destination port.
+      ecs: destination.nat.port
+      status: mapped
+    - vendor: NF_F_SRC_INTF_ID
+      type: integer
+      description: NetFlow element 10 - ingress interface SNMP ifIndex.
+      ecs: observer.ingress.interface.id
+      status: partial
+      notes: >
+        NSEL sends the numeric SNMP ifIndex, NOT the nameif label the syslog
+        form carries; observer.ingress.interface.name requires decoding the
+        index against `show interface detail` or the IF-MIB. Map the raw
+        number to observer.ingress.interface.id and resolve the name low-side
+        while the appliance is reachable.
+    - vendor: NF_F_DST_INTF_ID
+      type: integer
+      description: NetFlow element 14 - egress interface SNMP ifIndex.
+      ecs: observer.egress.interface.id
+      status: partial
+      notes: same ifIndex-not-nameif decode gap as the ingress interface
+    - vendor: NF_F_FW_EVENT
+      type: integer
+      description: NetFlow element 40005 - high-level firewall event code.
+      ecs: event.action
+      status: mapped
+      transform: >
+        1 = flow created, 2 = flow deleted (teardown); this field is the
+        structured replacement for the 302xxx message-ID lookup and drives
+        event.action, event.type (connection/start vs connection/end) and
+        event.outcome. Value 3 (flow denied) belongs to the acl-deny dataset.
+    - vendor: NF_F_FW_EXT_EVENT
+      type: integer
+      description: NetFlow element 33002 - extended event code giving the teardown reason.
+      ecs: event.reason
+      status: partial
+      notes: >
+        on teardown the extended-event value (>2000) encodes why the flow was
+        terminated - the numeric equivalent of the syslog free-text reason
+        string. The set of codes is fluid and not fully enumerated in the
+        field reference, so decode via a maintained lookup and leave
+        event.reason unset (rather than guessed) for unknown codes.
+    - vendor: NF_F_EVENT_TIME_MSEC
+      type: timestamp
+      description: NetFlow element 323 - time the event occurred, ms since 00:00 UTC 1 Jan 1970.
+      ecs: '@timestamp'
+      status: mapped
+      notes: >
+        events are packed into NetFlow packets asynchronously and can arrive
+        out of order, so @timestamp must come from this per-event field, not
+        from packet arrival time.
+    - vendor: NF_F_FLOW_BYTES
+      type: integer
+      description: NetFlow element 85 - total bytes of the flow.
+      ecs: network.bytes
+      status: partial
+      notes: >
+        present on teardown; a single connection total (not split sent vs
+        received), so source.bytes and destination.bytes stay empty for this
+        dataset, matching the syslog form.
+    - vendor: NF_F_FLOW_CREATE_TIME_MSEC
+      type: timestamp
+      description: NetFlow element 152 - time the flow was created, ms since epoch.
+      ecs: event.start
+      status: mapped
+      notes: >
+        carried in the extended flow-teardown template so a single record can
+        cover a short-lived flow; event.duration = NF_F_EVENT_TIME_MSEC minus
+        this value.
+    - vendor: NF_F_INGRESS_ACL_ID
+      type: string
+      description: >-
+        NetFlow element 33000 - 12-byte ID of the ingress ACL that permitted
+        the flow (name-hash + ACE-id + extended-ACE-id triple).
+      ecs: null
+      status: unmapped
+      custom: cisco.asa.ingress_acl_id
+      notes: >
+        a hashed numeric identifier, NOT the human ACL name; recover the name
+        by splitting the 12 bytes into the three four-byte parts and matching
+        them against `show access-list` output. Present on permitted flows.
+    - vendor: NF_F_EGRESS_ACL_ID
+      type: string
+      description: NetFlow element 33001 - 12-byte ID of the egress ACL that permitted the flow.
+      ecs: null
+      status: unmapped
+      custom: cisco.asa.egress_acl_id
+      notes: same decode-against-show-access-list handling as the ingress ACL id
+    - vendor: NF_F_USERNAME / NF_F_USERNAME_MAX
+      type: string
+      description: >-
+        NetFlow element 40000 - AAA / identity-firewall username bound to the
+        flow (common 20-char and maximum 65-char template variants).
+      ecs: source.user.name
+      status: partial
+      notes: >
+        populated only when Identity Firewall or AAA cut-through is
+        configured; the appliance selects the 20-char or 65-char template per
+        flow, so a collector must key on the template ID to read the field
+        width correctly. The only free-text (content-inspection- relevant)
+        value NSEL emits.
+- id: acl-deny
+  name: ACL and access-control denies
+  description: >
+    The 106xxx message family — packets dropped by an access list or by a
+    security check. %ASA-4-106023 (deny by access-group) and %ASA-6-106100
+    (per-ACE permit/deny with hit counts) are the two the CSOC actually alerts
+    on; 106015/106021 cover TCP-flag and reverse-path drops. Distinct from the
+    connection dataset because these events never have a connection_id and
+    106100 carries an outcome token.
+  event_categories:
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same syslog listener as the connection dataset; separated only by
+        message ID. ACL names are site-specific free text and are the field a
+        guard content policy is most likely to constrain.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cisco_asa.log
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Same syslog listener as the connection dataset; separated only by
+        message ID.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cisco_asa.log
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: elastic-integration
+      artifact: Cisco ASA integration (cisco_asa), data stream logs-cisco_asa.log
+      notes: >
+        106023 is parsed by grok, 106100 by dissect; the two templates share
+        almost no token layout, so an ACL-deny detection cannot assume one set
+        of extracted fields across the family.
+    fields:
+    - vendor: message_id
+      type: string
+      description: Six-digit ASA syslog message number identifying the deny variant
+      ecs: event.code
+      status: mapped
+      transform: >
+        106023/106015/106021 are unconditional denies and the lookup table
+        sets event.action=firewall-rule with event.outcome=failure; 106100 is
+        the only member whose outcome comes from the message body instead.
+    - vendor: acl_ID
+      type: string
+      description: Name of the access list that matched the packet
+      ecs: rule.name
+      status: partial
+      notes: >
+        the access-list name from `by access-group "name"` (106023) or the
+        leading `access-list name` token (106100). The stock integration
+        renames this to cisco.asa.rule_name and leaves ECS rule.name empty, so
+        alert content keyed on rule.name needs a copy step. ASA gives no
+        stable numeric rule id, so rule.id has no source.
+    - vendor: '{permitted | denied | est-allowed}'
+      type: enum
+      description: Whether the matched ACE permitted or denied the packet
+      ecs: event.outcome
+      status: mapped
+      transform: >
+        106100 only; lowercased and translated to success/failure. Note that a
+        106100 "permitted" is an allow record living inside an otherwise
+        deny-only family — filtering the dataset by message ID alone will pull
+        in permits.
+    - vendor: protocol
+      type: enum
+      description: Named transport protocol of the denied packet
+      ecs: network.transport
+      status: partial
+      notes: >
+        for anything other than TCP/UDP/ICMP the ASA prints `protocol
+        <number>` instead of a name; that numeric form must go to
+        network.iana_number, so network.transport is null for GRE, ESP, and
+        similar drops.
+    - vendor: protocol <number>
+      type: integer
+      description: IANA protocol number printed when the protocol has no name
+      ecs: network.iana_number
+      status: mapped
+      notes: the numeric-protocol alternative form of the field above
+    - vendor: source_address
+      type: ip
+      description: Address the denied packet came from
+      ecs: source.ip
+      status: mapped
+    - vendor: source_port
+      type: port
+      description: Source port of the denied packet
+      ecs: source.port
+      status: partial
+      notes: optional in 106023 — omitted entirely for ICMP and for protocols without ports
+    - vendor: dest_address
+      type: ip
+      description: Address the denied packet was sent to
+      ecs: destination.ip
+      status: mapped
+    - vendor: dest_port
+      type: port
+      description: Destination port of the denied packet
+      ecs: destination.port
+      status: partial
+      notes: same optionality as source_port
+    - vendor: interface_name (src)
+      type: string
+      description: nameif label of the interface the denied packet arrived on
+      ecs: observer.ingress.interface.name
+      status: partial
+      notes: >-
+        stock integration lands it at cisco.asa.source_interface; same rename
+        gap as the connection dataset
+    - vendor: interface_name (dst)
+      type: string
+      description: nameif label of the interface the packet was headed for
+      ecs: observer.egress.interface.name
+      status: partial
+      notes: stock integration lands it at cisco.asa.destination_interface
+    - vendor: idfw_user
+      type: string
+      description: Identity Firewall user attributed to the source of the denied packet
+      ecs: source.user.name
+      status: partial
+      notes: >-
+        identity-firewall user or security group tag in the parenthesised slot
+        after the source socket; same user/SGT ambiguity as the connection
+        dataset
+    - vendor: sg_info
+      type: string
+      description: TrustSec security group tag name or number for the source
+      ecs: null
+      status: unmapped
+      custom: cisco.asa.source_user_security_group_tag_name
+      notes: TrustSec security group tag name/number; no ECS namespace for SGTs
+    - vendor: type / code
+      type: integer
+      description: ICMP type and code pair on ICMP denies
+      ecs: null
+      status: unmapped
+      custom: cisco.asa.icmp_type
+      notes: >
+        ICMP type and code, printed as a `type N, code M` pair on ICMP denies;
+        ECS has no icmp.* namespace so both halves stay custom
+        (cisco.asa.icmp_type / cisco.asa.icmp_code).
+    - vendor: hit-cnt
+      type: long
+      description: Number of packets that matched the ACE during the reporting interval
+      ecs: null
+      status: unmapped
+      custom: cisco.asa.hit_count
+      notes: >
+        106100 only — number of matches in the reporting interval. Because one
+        106100 line can represent many packets, naive event counting over this
+        dataset undercounts denies unless this multiplier is applied.
+    - vendor: hash codes
+      type: string
+      description: Trailing hex identifiers of the matched ACE and its ACL
+      ecs: null
+      status: unmapped
+      custom: cisco.asa.acl_hash
+      notes: >-
+        trailing hex tuple identifying the ACE and ACL objects internally;
+        useful only for correlating with `show access-list` output
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Exempt this family from the sampling applied to connection events
+          and keep _raw: denies are alert-bearing and 106100 lines are already
+          aggregated by the appliance. Split 106100 "permitted" records onto
+          their own route or tag them low-side so permits do not silently
+          inflate deny dashboards, and attach an access-list-name to
+          owning-site/owner lookup near the source, where site-specific ACL
+          names are still resolvable.
+        elastic: >
+          Keep the stock cisco_asa pipeline and add an @custom pipeline that
+          copies cisco.asa.rule_name into rule.name (leaving rule.id unset, as
+          ASA has no stable numeric id) and the source/destination interface
+          fields into observer.ingress.interface.name and
+          observer.egress.interface.name, and that runs the same
+          log.syslog.severity.code lookup for event.severity used elsewhere in
+          this file. Make sure numeric-protocol denies land in
+          network.iana_number with network.transport left null rather than
+          guessed, and add custom-namespace template mappings for
+          cisco.asa.hit_count (as a long, so deny volume can be summed rather
+          than event-counted), cisco.asa.icmp_type/icmp_code, acl_hash, and
+          the TrustSec security group tag field.
+        relay: >
+          Low-side instances cross the guard: use the thin envelope and hybrid
+          parsing behind a Persistent Queue and a dead-letter route.
+          Access-list names are the specific content-filter risk here: they
+          are site-chosen free text, so cap their length and normalise them to
+          ASCII low-side before the guard sees them, and reconcile per-hour
+          counts on both sides to detect silent drops of deny records.
+      direct:
+        parse_location: high
+        cribl: >
+          Exempt this family from the sampling applied to connection events
+          and keep _raw: denies are alert-bearing and 106100 lines are already
+          aggregated by the appliance. Split 106100 "permitted" records onto
+          their own route or tag them so permits do not silently inflate deny
+          dashboards, and attach an access-list-name to owning-site/owner
+          lookup near the source, where site-specific ACL names are still
+          resolvable.
+        elastic: >
+          Keep the stock cisco_asa pipeline and add an @custom pipeline that
+          copies cisco.asa.rule_name into rule.name (leaving rule.id unset, as
+          ASA has no stable numeric id) and the source/destination interface
+          fields into observer.ingress.interface.name and
+          observer.egress.interface.name, and that runs the same
+          log.syslog.severity.code lookup for event.severity used elsewhere in
+          this file. Make sure numeric-protocol denies land in
+          network.iana_number with network.transport left null rather than
+          guessed, and add custom-namespace template mappings for
+          cisco.asa.hit_count (as a long, so deny volume can be summed rather
+          than event-counted), cisco.asa.icmp_type/icmp_code, acl_hash, and
+          the TrustSec security group tag field.
+  - format: netflow
+    enable: >
+      Same NetFlow plumbing as the connection dataset - `flow-export
+      destination <nameif> <collector-ip> <udp-port>` and `flow-export
+      template timeout-rate 1` - then add the denied event type to the policy:
+      `policy-map global_policy / class class-default / flow-export event-type
+      flow-denied destination <collector-ip>` (or `event-type all`). Flow
+      filtering through MPF can scope denials to a specific ACL by matching
+      that traffic in its own class-map and exporting only that class, e.g. to
+      send ACL1 denials to a dedicated collector. Retire the redundant syslog
+      with `no logging message 106023` (or `logging flow-export-syslogs
+      disable` for the whole set); keep `logging message 106100` enabled
+      because NSEL does not reproduce the aggregated per-ACE hit-count
+      records.
+    references:
+    - >-
+      https://www.cisco.com/c/en/us/td/docs/security/asa/special/netflow/asa_netflow.html
+    - https://www.ntop.org/wp-content/uploads/2010/01/netflow-ASA.pdf
+    - https://www.ntop.org/wp-content/uploads/2010/01/white_paper_cisco_nsel.pdf
+    - >-
+      https://www.cisco.com/c/en/us/td/docs/security/asa/asa916/configuration/general/asa-916-general-config/monitor-nsel.html
+    parsing:
+      mechanism: elastic-integration
+      artifact: Elastic NetFlow Records integration (netflow), data stream logs-netflow.log
+      notes: >
+        Same decoder story as the connection dataset: the standard sockets and
+        protocol decode automatically, but NF_F_FW_EVENT (40005),
+        NF_F_FW_EXT_EVENT (33002) and NF_F_INGRESS/EGRESS_ACL_ID (33000/33001)
+        - the fields that actually make a denial a denial - need a custom
+        ingest pipeline. The extended-event code is the only thing that
+        distinguishes an ingress-ACL deny from an egress-ACL deny or a
+        no-TCP-SYN drop, so the pipeline's deny logic keys on it.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Decode the binary NetFlow low-side to structured records before the
+          crossing (a CDS cannot inspect binary NetFlow, and template packets
+          travel separately from data), then map the deny-specific enterprise
+          elements. This is alert-bearing traffic, so do not sample it.
+          Resolve the 12-byte ACL ids to their access-list names low-side via
+          `show access-list` while the appliance is reachable, since NSEL -
+          unlike the 106023 syslog - never carries the human ACL name, only
+          the hash.
+        elastic: >
+          netflow integration plus an @custom pipeline that sets
+          event.action=denied and event.outcome=failure from NF_F_FW_EVENT=3,
+          and translates NF_F_FW_EXT_EVENT into event.reason by lookup: 1001 =
+          denied by ingress ACL, 1002 = denied by egress ACL, 1003 = denied
+          connect to an interface service, 1004 = first TCP packet not a SYN.
+          Map the ingress/egress ACL-id hashes to cisco.asa.* keywords and
+          derive network.transport from network.iana_number; where the drop is
+          ICMP, keep NF_F_ICMP_TYPE/CODE in the cisco.asa.icmp_* customs since
+          ECS has no icmp namespace.
+        relay: >
+          Cross decoded NDJSON, not raw NetFlow. The denied template carries
+          no username and no free-text, so the content-inspection surface is
+          essentially just typed sockets plus the ACL-id hashes and numeric
+          event codes - low friction once decoded. Persistent Queue plus
+          dead-letter, and per-hour count reconciliation across the guard.
+      direct:
+        parse_location: high
+        cribl: >
+          Terminate NSEL at an Elastic Agent netflow input directly. Choose
+          one authoritative deny feed per appliance (NSEL flow-denied OR the
+          106023 syslog) to avoid double-counting denials, but keep 106100 on
+          syslog regardless - it has no NSEL form.
+        elastic: >
+          netflow integration plus an @custom pipeline that sets
+          event.action=denied and event.outcome=failure from NF_F_FW_EVENT=3,
+          and translates NF_F_FW_EXT_EVENT into event.reason by lookup: 1001 =
+          denied by ingress ACL, 1002 = denied by egress ACL, 1003 = denied
+          connect to an interface service, 1004 = first TCP packet not a SYN.
+          Map the ingress/egress ACL-id hashes to cisco.asa.* keywords and
+          derive network.transport from network.iana_number; where the drop is
+          ICMP, keep NF_F_ICMP_TYPE/CODE in the cisco.asa.icmp_* customs since
+          ECS has no icmp namespace. With no boundary, the only real tradeoff
+          to accept is the loss of the human ACL name in-record: budget for
+          the periodic `show access-list` decode job that turns the ACL-id
+          hashes back into rule.name, since detections and dashboards key on
+          the name.
+    fields:
+    - vendor: NF_F_SRC_ADDR_IPV4
+      type: ip
+      description: NetFlow element 8 - source IPv4 address of the denied packet.
+      ecs: source.ip
+      status: mapped
+      notes: NF_F_SRC_ADDR_IPV6 (element 27) is the IPv6-flow equivalent
+    - vendor: NF_F_DST_ADDR_IPV4
+      type: ip
+      description: NetFlow element 12 - destination IPv4 address of the denied packet.
+      ecs: destination.ip
+      status: mapped
+      notes: NF_F_DST_ADDR_IPV6 (element 28) is the IPv6-flow equivalent
+    - vendor: NF_F_SRC_PORT
+      type: port
+      description: NetFlow element 7 - source port of the denied packet.
+      ecs: source.port
+      status: mapped
+    - vendor: NF_F_DST_PORT
+      type: port
+      description: NetFlow element 11 - destination port of the denied packet.
+      ecs: destination.port
+      status: mapped
+    - vendor: NF_F_PROTOCOL
+      type: integer
+      description: NetFlow element 4 - IP protocol number of the denied packet.
+      ecs: network.iana_number
+      status: mapped
+      transform: >-
+        numeric protocol; derive network.transport by lookup, and it stays the
+        authoritative form for GRE/ESP/etc. that have no transport name
+    - vendor: NF_F_ICMP_TYPE
+      type: integer
+      description: >-
+        NetFlow element 176 - ICMP type on ICMP denies (177 = ICMP code;
+        178/179 = the IPv6 variants).
+      ecs: null
+      status: unmapped
+      custom: cisco.asa.icmp_type
+      notes: >-
+        type and code are separate elements; both stay custom
+        (cisco.asa.icmp_type / cisco.asa.icmp_code) because ECS has no icmp.*
+        namespace
+    - vendor: NF_F_SRC_INTF_ID
+      type: integer
+      description: >-
+        NetFlow element 10 - ingress interface SNMP ifIndex the denied packet
+        arrived on.
+      ecs: observer.ingress.interface.id
+      status: partial
+      notes: numeric ifIndex, not the nameif label; decode against show interface / IF-MIB
+    - vendor: NF_F_DST_INTF_ID
+      type: integer
+      description: NetFlow element 14 - egress interface SNMP ifIndex the packet was headed for.
+      ecs: observer.egress.interface.id
+      status: partial
+      notes: same ifIndex-decode gap as ingress
+    - vendor: NF_F_XLATE_SRC_ADDR_IPV4
+      type: ip
+      description: >-
+        NetFlow element 40001 - mapped source address, present when the denied
+        flow had a translation.
+      ecs: source.nat.ip
+      status: partial
+      notes: >-
+        the "IPv4 flow denied, no xlate fields present" template omits all
+        four xlate elements entirely, so NAT fields are absent for denies that
+        never reached translation
+    - vendor: NF_F_XLATE_DST_ADDR_IPV4
+      type: ip
+      description: >-
+        NetFlow element 40002 - mapped destination address (xlate-present
+        template only).
+      ecs: destination.nat.ip
+      status: partial
+      notes: >-
+        NF_F_XLATE_SRC_PORT (40003) and NF_F_XLATE_DST_PORT (40004) accompany
+        it in the same template
+    - vendor: NF_F_FW_EVENT
+      type: integer
+      description: >-
+        NetFlow element 40005 - high-level firewall event; value 3 = flow
+        denied for this dataset.
+      ecs: event.action
+      status: mapped
+      transform: >-
+        value 3 sets event.action and event.outcome=failure; the specific deny
+        cause comes from the extended event below
+    - vendor: NF_F_FW_EXT_EVENT
+      type: integer
+      description: >-
+        NetFlow element 33002 - extended event code identifying which check
+        denied the flow.
+      ecs: event.reason
+      status: partial
+      notes: >
+        1001 = ingress ACL, 1002 = egress ACL, 1003 = denied connect to an
+        interface service (e.g. SNMP from an unauthorized station), 1004 =
+        first TCP packet not a SYN; any value >1000 is a denial. Decode by
+        lookup and leave event.reason unset for unlisted codes rather than
+        guessing.
+    - vendor: NF_F_EVENT_TIME_MSEC
+      type: timestamp
+      description: NetFlow element 323 - time the deny event occurred, ms since epoch.
+      ecs: '@timestamp'
+      status: mapped
+      notes: >-
+        use this per-event time, not packet arrival, because denies and other
+        events share and reorder within NetFlow packets
+    - vendor: NF_F_INGRESS_ACL_ID
+      type: string
+      description: NetFlow element 33000 - 12-byte ID of the ingress ACL involved in the decision.
+      ecs: null
+      status: unmapped
+      custom: cisco.asa.ingress_acl_id
+      notes: >
+        on a 1001 ingress deny this identifies the ACE that dropped the
+        packet; split into the three four-byte parts and match against `show
+        access-list` to recover the ACL name and line. This is the field that
+        replaces the free-text access-list name the 106023 syslog prints - the
+        name itself is not in the NSEL record.
+    - vendor: NF_F_EGRESS_ACL_ID
+      type: string
+      description: NetFlow element 33001 - 12-byte ID of the egress ACL involved in the decision.
+      ecs: null
+      status: unmapped
+      custom: cisco.asa.egress_acl_id
+      notes: >-
+        on a 1002 egress deny this identifies the denying ACE; same decode
+        handling as the ingress id
+- id: vpn-aaa
+  name: VPN and AAA authentication
+  description: >
+    Remote-access authentication and session lifecycle: the 113xxx AAA family
+    (113004/113012 success, 113005/113015 rejection, 113019 session
+    disconnect) and the 722xxx AnyConnect/SVC family (722051 address
+    assignment, 722022/722023 connection established, 722041 tunnel-group
+    binding, 722055 client type). This is the dataset a SOC watches for
+    credential attacks against the VPN head-end.
+  event_categories:
+  - authentication
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same syslog listener as the other datasets. Usernames and assigned
+        tunnel addresses in this dataset are the most likely candidates for
+        guard-side redaction rules.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cisco_asa.log
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Same syslog listener as the other datasets.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cisco_asa.log
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: elastic-integration
+      artifact: Cisco ASA integration (cisco_asa), data stream logs-cisco_asa.log
+      notes: >
+        113xxx uses grok with an enumerated list of rejection reasons — a
+        reason string outside that enum (locale or release drift) fails the
+        pattern and the event arrives with only header fields. 722xxx uses a
+        shared "Group <g> User <u> IP <ip> <rest>" pattern where the remainder
+        lands in event.reason and is re-parsed per message ID.
+    fields:
+    - vendor: message_id
+      type: string
+      description: Six-digit ASA syslog message number identifying the AAA or VPN event
+      ecs: event.code
+      status: mapped
+      transform: >
+        drives event.action (logged-in / logon-failed /
+        client-vpn-disconnected) and event.outcome through the same static
+        lookup table used by the other datasets; the ASA text says
+        "Successful" or "Rejected" but the integration does not read it.
+    - vendor: user
+      type: string
+      description: Account name presented to the AAA subsystem
+      ecs: source.user.name
+      status: partial
+      notes: >
+        MAJOR CAVEAT — by default the ASA replaces the username with "*****"
+        on failed logins unless `no logging hide username` is configured, so
+        113005/113015 events frequently carry no usable principal. Confirm the
+        device config before building any brute-force or password-spray
+        detection on this field.
+    - vendor: reason
+      type: enum
+      description: Documented reason an authentication attempt was rejected
+      ecs: event.reason
+      status: mapped
+      notes: >-
+        rejection reason on 113005/113015 (Invalid password, User was not
+        found, Account has been disabled, AAA failure, ...)
+    - vendor: server
+      type: ip
+      description: Address of the AAA server that returned the decision
+      ecs: destination.ip
+      status: partial
+      notes: >
+        address of the RADIUS/LDAP/TACACS+ server that made the decision.
+        Mapping it to destination.ip is the integration's choice, but it
+        conflates "the AAA back end" with "the thing the user connected to";
+        server.address would be a truer fit and is worth a rename decision
+        before alerts are written.
+    - vendor: user IP
+      type: ip
+      description: Public address the authenticating client connected from
+      ecs: source.ip
+      status: partial
+      notes: >
+        the client's public address. Literal "None" appears when the ASA has
+        no peer address yet, and must be dropped rather than written to
+        source.ip (it will fail the ip mapping).
+    - vendor: Group
+      type: string
+      description: Group policy the remote-access session resolved to
+      ecs: source.user.group.name
+      status: mapped
+      notes: group policy the session resolved to, from the 722xxx "Group <name>" token
+    - vendor: TunnelGroup
+      type: string
+      description: Connection profile the VPN client selected
+      ecs: null
+      status: unmapped
+      custom: cisco.asa.tunnel_group
+      notes: >-
+        connection profile the client selected (722041); distinct from the
+        group policy and has no ECS home
+    - vendor: GroupPolicy
+      type: string
+      description: Group policy applied to the tunnel after profile selection
+      ecs: null
+      status: unmapped
+      custom: cisco.asa.group_policy
+      notes: applied group policy name, separate from the Group token above
+    - vendor: IPv4 Address
+      type: ip
+      description: Tunnel-interior address assigned to the VPN client
+      ecs: null
+      status: unmapped
+      custom: cisco.asa.assigned_ip
+      notes: >
+        the tunnel-interior address handed to the client by 722051. This is
+        the pivot that links VPN sessions to later internal traffic; ECS has
+        no "assigned address" concept, so correlation requires joining this
+        custom field against source.ip in the connection dataset.
+    - vendor: Session Type
+      type: enum
+      description: Tunnel protocol family of the disconnected session
+      ecs: null
+      status: unmapped
+      custom: cisco.asa.session_type
+      notes: 113019 — SSL, IPsec, AnyConnect-Parent, WebVPN, etc.
+    - vendor: Duration
+      type: string
+      description: Length of the VPN session formatted as hh mm ss
+      ecs: event.duration
+      status: partial
+      transform: 113019 session duration as hh:mm:ss; parse to nanoseconds
+    - vendor: Bytes xmt
+      type: bytes
+      description: Bytes the appliance transmitted to the client over the tunnel
+      ecs: source.bytes
+      status: mapped
+      notes: bytes transmitted over the tunnel, 113019 only
+    - vendor: Bytes rcv
+      type: bytes
+      description: Bytes the appliance received from the client over the tunnel
+      ecs: destination.bytes
+      status: mapped
+    - vendor: Reason (113019 disconnect)
+      type: enum
+      description: Documented reason the VPN session ended
+      ecs: event.reason
+      status: partial
+      notes: >
+        session termination reason (User Requested, Idle Timeout, Lost
+        Service, Max time exceeded). Shares event.reason with the
+        authentication rejection reason above, so a detection that reads
+        event.reason must scope itself by event.code or it will mix
+        "credential rejected" with "session ended normally".
+    - vendor: Client Type
+      type: string
+      description: VPN client product and version banner reported at connect
+      ecs: user_agent.original
+      status: partial
+      notes: >-
+        722055 client identification string; it is a Cisco product/version
+        banner rather than an HTTP User-Agent, so user_agent.* subfield
+        parsers will not decompose it
+    - vendor: aaa_type
+      type: enum
+      description: Which AAA operation the message reports
+      ecs: null
+      status: unmapped
+      custom: cisco.asa.aaa_type
+      notes: >-
+        authentication vs authorization vs accounting, extracted from 113004;
+        no ECS field distinguishes the three
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Never sample this dataset and keep _raw indefinitely: it is low
+          volume and is the evidence base for credential-attack detection.
+          Confirm `no logging hide username` on each appliance (otherwise
+          113005/113015 arrive with "*****" and brute-force detection is
+          impossible) and, if policy instead requires usernames to be
+          obscured, do the masking in Cribl with a reversible/consistent token
+          so successes and failures mask alike rather than relying on the
+          device default.
+        elastic: >
+          Add an @custom pipeline that drops the literal "None" client address
+          before it reaches source.ip, rewrites the AAA server address from
+          destination.ip to server.address so the back end is not conflated
+          with the connection target, and adds a catch-all branch for
+          rejection reasons outside the integration's enumerated grok list so
+          locale or release drift degrades to a header-only-plus-reason event
+          instead of a parse failure. Parse the 113019 hh:mm:ss session
+          duration to nanoseconds, and add custom-namespace mappings for
+          cisco.asa.tunnel_group, group_policy, assigned_ip (as ip, since it
+          is the join key to connection-event source.ip), session_type and
+          aaa_type; scope any event.reason detection by event.code so
+          disconnect reasons are not read as credential rejections.
+        relay: >
+          Usernames and assigned tunnel-interior addresses are the most likely
+          targets of a guard redaction rule. Low-side instances cross the
+          guard: apply the masking low-side before the crossing and cross with
+          the thin envelope behind a Persistent Queue and dead-letter route.
+          Client-type banners (722055) are unbounded vendor strings and should
+          be length-capped and ASCII-constrained to survive content
+          inspection.
+      direct:
+        parse_location: high
+        cribl: >
+          Never sample this dataset and keep _raw indefinitely: it is low
+          volume and is the evidence base for credential-attack detection.
+          Confirm `no logging hide username` on each appliance (otherwise
+          113005/113015 arrive with "*****" and brute-force detection is
+          impossible) and, if policy instead requires usernames to be
+          obscured, do the masking in Cribl with a reversible/consistent token
+          so successes and failures mask alike rather than relying on the
+          device default.
+        elastic: >
+          Add an @custom pipeline that drops the literal "None" client address
+          before it reaches source.ip, rewrites the AAA server address from
+          destination.ip to server.address so the back end is not conflated
+          with the connection target, and adds a catch-all branch for
+          rejection reasons outside the integration's enumerated grok list so
+          locale or release drift degrades to a header-only-plus-reason event
+          instead of a parse failure. Parse the 113019 hh:mm:ss session
+          duration to nanoseconds, and add custom-namespace mappings for
+          cisco.asa.tunnel_group, group_policy, assigned_ip (as ip, since it
+          is the join key to connection-event source.ip), session_type and
+          aaa_type; scope any event.reason detection by event.code so
+          disconnect reasons are not read as credential rejections.
+  - format: snmp-trap
+    enable: >
+      Raise the appliance's syslog-history level to the events you want
+      trapped (`logging history <0-7>` - e.g. `logging history 6` to include
+      the informational 113004/722xxx notices), enable the syslog trap with
+      `snmp-server enable traps syslog`, and add the SNMP manager as a trap
+      host: `snmp-server host <nameif> <manager-ip> [version 3 <user> |
+      community <string>] traps`. On modern ASA use SNMPv3 with a configured
+      `snmp-server group` / `snmp-server user` for auth+priv, since the trap
+      carries usernames and rejection reasons. The trap set corresponds to the
+      CISCO-SYSLOG-MIB clogMessageGenerated notification and is gated by
+      clogNotificationsEnabled internally; note this is a distinct control
+      from `logging trap`, which governs the plain syslog destination.
+    references:
+    - >-
+      https://www.cisco.com/c/en/us/support/docs/security/firepower-ngfw-virtual/215560-configure-snmp-syslog-traps-for-asa-and.html
+    - >-
+      https://www.cisco.com/c/en/us/td/docs/security/asa/asa916/configuration/general/asa-916-general-config/monitor-snmp.html
+    - https://web.mit.edu/outland/share/snmp/mibs/CISCO-SYSLOG-MIB.my
+    - https://oidref.com/1.3.6.1.4.1.9.9.41.2.0.1
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom ASA SNMP-trap (CISCO-SYSLOG-MIB) reparse pipeline
+      notes: >
+        Neither the stock cisco_asa integration nor any Cribl pack ingests
+        SNMP traps: a trap receiver (snmptrapd or an equivalent SNMP source)
+        must terminate the PDU and expose the varbinds first. The pipeline
+        then copies clogHistMsgText into event.original and re-runs the SAME
+        ASA per-message-ID grok/dissect the syslog-raw feed uses, because the
+        113xxx/722xxx body grammar is unchanged. The MIB metadata varbinds are
+        a small convenience; they do not remove the free-text parsing work,
+        and the 254-byte truncation means some long messages cannot be fully
+        parsed at all.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Terminate the trap on a low-side SNMP receiver, decode the varbinds,
+          and map clogHistMsgText to event.original. This dataset is the
+          evidence base for credential-attack detection, so do not sample it -
+          but flag the 254-byte truncation risk explicitly: 722xxx client-type
+          banners and tunnel-group strings can exceed it and will arrive with
+          a trailing '*', so where full fidelity matters prefer the syslog-raw
+          feed and treat the trap as a secondary/last-resort transport. Apply
+          the same username masking policy here as on the syslog path before
+          the crossing.
+        elastic: >
+          A custom logs-cisco_asa.log-compatible @custom pipeline that parses
+          clogHistMsgText with the existing per-ID patterns, then applies the
+          cisco.asa.* mappings from the syslog-raw dataset (tunnel_group,
+          group_policy, assigned_ip, session_type, aaa_type) plus the AAA
+          server.address rewrite and the "None" client-address drop. Convert
+          clogHistSeverity (SyslogSeverity enum 1-8) to
+          log.syslog.severity.code by subtracting one, since the MIB enum is
+          offset by one from the raw 0-7 syslog scale.
+        relay: >
+          The content-inspection risk is identical to the syslog feed -
+          usernames and assigned tunnel addresses in the free-text body - plus
+          the varbind envelope. Decode to NDJSON low-side, mask usernames
+          before the crossing, length-cap the client-type banner, and cross
+          with a Persistent Queue and dead-letter route. Reconcile per-hour
+          counts across the guard.
+      direct:
+        parse_location: high
+        cribl: >
+          For a high-side appliance, terminate the trap on an SNMP receiver
+          and forward the decoded varbinds; there is little advantage to the
+          trap over plain syslog here, so adopt it only where an existing SNMP
+          collection path is the reason. Do not run both the trap and the
+          syslog feed as authoritative for the same appliance - pick one to
+          avoid duplicate 113xxx/722xxx events.
+        elastic: >
+          A custom logs-cisco_asa.log-compatible @custom pipeline that parses
+          clogHistMsgText with the existing per-ID patterns, then applies the
+          cisco.asa.* mappings from the syslog-raw dataset (tunnel_group,
+          group_policy, assigned_ip, session_type, aaa_type) plus the AAA
+          server.address rewrite and the "None" client-address drop, and
+          converts clogHistSeverity (SyslogSeverity enum 1-8) to
+          log.syslog.severity.code by subtracting one, since the MIB enum is
+          offset by one from the raw 0-7 syslog scale. Retain full username
+          values; accept that the 254-byte truncation is unavoidable in this
+          transport and alert on truncated (trailing-'*') records so an
+          analyst knows when a 722xxx string was clipped.
+    fields:
+    - vendor: clogHistMsgText
+      type: string
+      description: >-
+        CISCO-SYSLOG-MIB - the full text of the syslog message, truncated to
+        254 bytes with a trailing '*' if longer.
+      ecs: event.original
+      status: partial
+      notes: >
+        carries the entire 113xxx/722xxx sentence; every credential, tunnel
+        and reason field still has to be parsed out of it with the same
+        per-message-ID grammar as syslog-raw, and the 254-byte cap can clip
+        long AnyConnect client-type / tunnel-group strings.
+    - vendor: clogHistMsgName
+      type: string
+      description: CISCO-SYSLOG-MIB - textual identifier of the message type (facility + mnemonic).
+      ecs: event.code
+      status: partial
+      notes: >
+        a name (facility+mnemonic), not the bare 6-digit number; the numeric
+        event.code (113005, 722051, ...) usually still has to be read from the
+        message text, so treat this as a hint and confirm against the parsed
+        body.
+    - vendor: clogHistFacility
+      type: string
+      description: 'CISCO-SYSLOG-MIB - name of the facility that generated the message (e.g. ''SYS'').'
+      ecs: log.syslog.facility.name
+      status: mapped
+    - vendor: clogHistSeverity
+      type: integer
+      description: 'CISCO-SYSLOG-MIB - SyslogSeverity enum: emergency(1)..debug(8).'
+      ecs: log.syslog.severity.code
+      status: partial
+      transform: >
+        the MIB enum is 1-8 (emergency=1), offset by one from the raw syslog
+        0-7 severity scale; subtract one before writing
+        log.syslog.severity.code and set log.syslog.severity.name from the
+        same value.
+    - vendor: clogHistTimestamp
+      type: integer
+      description: >-
+        CISCO-SYSLOG-MIB - value of sysUpTime (device-uptime ticks) when the
+        message was generated.
+      ecs: null
+      status: unmapped
+      custom: cisco.asa.snmp.sysuptime
+      notes: >
+        device-uptime ticks, NOT wall-clock time, so it cannot populate
+        @timestamp directly; @timestamp must come from the trap-receiver
+        arrival time (or be reconstructed from sysUpTime plus the agent boot
+        time). Keep the raw ticks for drift analysis.
+    - vendor: clogHistIndex
+      type: integer
+      description: >-
+        CISCO-SYSLOG-MIB - monotonically increasing index of the message in
+        the syslog history table.
+      ecs: null
+      status: unmapped
+      custom: cisco.asa.snmp.history_index
+      notes: >-
+        useful only for detecting gaps/duplicates in the trap stream, since
+        traps are unacknowledged UDP
+- id: device-admin
+  name: Device administration and configuration
+  description: >
+    Thin starter for management-plane activity — 605005/605004 console and
+    SSH/HTTPS login permitted or denied, 611101/611102 user authentication
+    result, 502103 privilege-level change, and 111009/111010 executed
+    configuration commands. Low volume, high value for insider-threat and
+    change-control monitoring.
+  event_categories:
+  - authentication
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same syslog listener as the other datasets. Executed-command strings
+        (111010) are unbounded free text and need length capping or inspection
+        before crossing.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cisco_asa.log
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Same syslog listener as the other datasets.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cisco_asa.log
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: elastic-integration
+      artifact: Cisco ASA integration (cisco_asa), data stream logs-cisco_asa.log
+      notes: >
+        Every message in this family has its own dissect pattern; note that
+        the integration writes the administrator to server.user.name for
+        111009/111010/502103 but to source.user.name for 605005, so a single
+        "who changed what" query needs both.
+    fields:
+    - vendor: message_id
+      type: string
+      description: Six-digit ASA syslog message number identifying the admin event
+      ecs: event.code
+      status: mapped
+      transform: >-
+        sets event.action (logged-in / logon-failed / configuration) and
+        event.outcome from the lookup table
+    - vendor: username (605005)
+      type: string
+      description: Administrator account named on a management login attempt
+      ecs: source.user.name
+      status: mapped
+      notes: the quoted user in `for user "name"` on a permitted/denied management login
+    - vendor: Uname (611101/611102)
+      type: string
+      description: Administrator account named on a user-authentication result
+      ecs: server.user.name
+      status: partial
+      notes: >
+        the same human being as the field above, but the integration writes it
+        to server.user.name. Normalize both into user.name (and related.user)
+        before writing detections, or admin activity will split across two
+        identity fields.
+    - vendor: source_address
+      type: ip
+      description: Address the administrator connected from
+      ecs: source.ip
+      status: mapped
+      notes: management client address; present on 605004/605005, 611101/611102 and 111010
+    - vendor: source_port
+      type: port
+      description: Client-side port of the management session
+      ecs: source.port
+      status: partial
+      notes: 605004/605005 only
+    - vendor: destination_address
+      type: ip
+      description: Appliance management address that accepted the session
+      ecs: destination.ip
+      status: mapped
+      notes: the ASA management interface address the admin connected to
+    - vendor: service
+      type: enum
+      description: Management service the administrator logged in over
+      ecs: network.protocol
+      status: mapped
+      notes: management service the login used (ssh, https, telnet, serial)
+    - vendor: interface_name
+      type: string
+      description: nameif label of the management interface used
+      ecs: observer.egress.interface.name
+      status: partial
+      notes: >-
+        nameif of the management interface; stock integration lands it at
+        cisco.asa.destination_interface
+    - vendor: cmd
+      type: string
+      description: Configuration command string the administrator executed
+      ecs: process.command_line
+      status: partial
+      notes: >
+        the executed configuration command from 111009/111010. The stock
+        integration stores it at cisco.asa.command_line_arguments; mapping it
+        to process.command_line is a convenience for reusing process-based
+        command detections, but no real OS process exists, so event.category
+        must stay configuration rather than process.
+    - vendor: privilege From / To
+      type: integer
+      description: Old and new EXEC privilege levels on a privilege change
+      ecs: null
+      status: unmapped
+      custom: cisco.asa.privilege
+      notes: >
+        502103 old and new privilege levels (cisco.asa.privilege.old / .new).
+        ECS has no privilege-level concept; escalation detection must compare
+        the two custom values.
+    - vendor: level
+      type: integer
+      description: Syslog severity digit carried in the message header
+      ecs: log.syslog.severity.code
+      status: partial
+      notes: >-
+        same header severity digit and same event.severity inversion caveat as
+        the connection dataset
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Route this family around any sampling and retain _raw permanently —
+          it is negligible volume and the primary insider-threat and
+          change-control evidence. Add a low-side redaction rule over
+          111009/111010 command strings for the commands that echo secrets
+          (`username ... password`, `snmp-server community`, `key`,
+          `pre-shared-key`) so cleartext credentials never leave the device
+          enclave, and cap the command string at a fixed byte length while
+          stripping control characters.
+        elastic: >
+          Add an @custom pipeline that normalises the administrator identity
+          into user.name and related.user from both server.user.name
+          (111009/111010/ 502103/611101) and source.user.name (605005), so
+          admin activity does not split across two identity fields, and that
+          applies the same log.syslog.severity.code lookup for event.severity.
+          Copy the management nameif into observer.egress.interface.name, keep
+          event.category as configuration for command events even though the
+          command text lands in process.command_line, and map
+          cisco.asa.privilege.old/.new as integers in the custom-namespace
+          template so escalation can be detected by comparing the two.
+        relay: >
+          Executed-command strings are unbounded free text and are the single
+          item most likely to trip a guard content policy, so cap and
+          normalise them low-side before the crossing. Low-side instances
+          cross the guard: use the thin envelope behind a Persistent Queue and
+          dead-letter route, and keep _raw across the guard for this dataset —
+          its forensic value outweighs its trivial volume.
+      direct:
+        parse_location: high
+        cribl: >
+          Route this family around any sampling and retain _raw permanently —
+          it is negligible volume and the primary insider-threat and
+          change-control evidence. Add a redaction rule over 111009/111010
+          command strings for the commands that echo secrets (`username ...
+          password`, `snmp-server community`, `key`, `pre-shared-key`) so
+          cleartext credentials never leave the device enclave, and cap the
+          command string at a fixed byte length while stripping control
+          characters.
+        elastic: >
+          Add an @custom pipeline that normalises the administrator identity
+          into user.name and related.user from both server.user.name
+          (111009/111010/ 502103/611101) and source.user.name (605005), so
+          admin activity does not split across two identity fields, and that
+          applies the same log.syslog.severity.code lookup for event.severity.
+          Copy the management nameif into observer.egress.interface.name, keep
+          event.category as configuration for command events even though the
+          command text lands in process.command_line, and map
+          cisco.asa.privilege.old/.new as integers in the custom-namespace
+          template so escalation can be detected by comparing the two.
+  - format: snmp-trap
+    enable: >
+      Same mechanism as the AAA/VPN dataset: set `logging history <level>` to
+      include the management-plane events (605005/611101 are severity 5/6;
+      111009/111010 configuration-command logging is severity 5, so `logging
+      history 5` or lower-numbered captures them), `snmp-server enable traps
+      syslog`, and `snmp-server host <nameif> <manager-ip> version 3 <user>
+      traps`. Because command strings can echo secrets, prefer SNMPv3
+      auth+priv so the trap contents are encrypted in transit, and apply the
+      same low-side command-string redaction the syslog path uses.
+    references:
+    - >-
+      https://www.cisco.com/c/en/us/support/docs/security/firepower-ngfw-virtual/215560-configure-snmp-syslog-traps-for-asa-and.html
+    - >-
+      https://www.cisco.com/c/en/us/td/docs/security/asa/asa916/configuration/general/asa-916-general-config/monitor-snmp.html
+    - https://web.mit.edu/outland/share/snmp/mibs/CISCO-SYSLOG-MIB.my
+    - https://oidref.com/1.3.6.1.4.1.9.9.41.2.0.1
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom ASA SNMP-trap (CISCO-SYSLOG-MIB) reparse pipeline
+      notes: >
+        A trap receiver terminates the PDU; the pipeline copies
+        clogHistMsgText to event.original and re-runs the same per-message-ID
+        dissect the syslog-raw device-admin feed uses. Note the syslog-raw
+        integration's split of the administrator across server.user.name
+        (111009/111010/ 502103/611101) and source.user.name (605005) is
+        unchanged here, since the body text is identical - the trap only
+        re-transports it.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Terminate the trap low-side, decode the varbinds, and re-parse
+          clogHistMsgText. This family is negligible volume and high value, so
+          keep every record - but the 254-byte truncation is a genuine risk
+          for 111010 command lines, so for change-control and insider-threat
+          evidence prefer the syslog-raw feed and use the trap only as a
+          backup transport. Redact secret-bearing command substrings
+          (`username ... password`, `snmp-server community`, `key`,
+          `pre-shared-key`) low-side before the crossing exactly as on the
+          syslog path.
+        elastic: >
+          Custom @custom pipeline that parses clogHistMsgText with the
+          existing per-ID patterns, normalises the administrator identity from
+          both server.user.name and source.user.name into user.name /
+          related.user, keeps event.category=configuration for 111009/111010
+          even though the command text lands in process.command_line, and
+          applies the clogHistSeverity minus-one conversion to
+          log.syslog.severity.code. Map cisco.asa.privilege.old/.new as
+          integers for 502103.
+        relay: >
+          Executed-command strings are the unbounded, content-inspection-
+          sensitive value here and are also the field most likely to be
+          truncated by the trap; cap and normalise them low-side, redact
+          secret-bearing commands, and cross decoded NDJSON behind a
+          Persistent Queue and dead-letter route. Alert on truncated
+          (trailing-'*') records so a clipped command line is visible as a
+          collection gap.
+      direct:
+        parse_location: high
+        cribl: >
+          Terminate the trap on an SNMP receiver and forward decoded varbinds.
+          Given the truncation risk on command strings, adopt the trap for
+          this dataset only where SNMP is the existing collection path;
+          otherwise the syslog-raw feed is strictly better. Do not run trap
+          and syslog as dual authoritative feeds for one appliance.
+        elastic: >
+          Custom @custom pipeline that parses clogHistMsgText with the
+          existing per-ID patterns, normalises the administrator identity from
+          both server.user.name and source.user.name into user.name /
+          related.user, keeps event.category=configuration for 111009/111010
+          even though the command text lands in process.command_line, and
+          applies the clogHistSeverity minus-one conversion to
+          log.syslog.severity.code; map cisco.asa.privilege.old/.new as
+          integers for 502103. Retain full command lines where they fit; alert
+          on trailing-'*' truncation so an analyst knows a 111010 command was
+          clipped by the 254-byte cap.
+    fields:
+    - vendor: clogHistMsgText
+      type: string
+      description: >-
+        CISCO-SYSLOG-MIB - full text of the management-plane message,
+        truncated to 254 bytes with a trailing '*' if longer.
+      ecs: event.original
+      status: partial
+      notes: >
+        contains the whole 605/611/111/502 sentence, including the executed
+        configuration command for 111010; the 254-byte cap frequently clips
+        long command lines, which is the single biggest fidelity loss of this
+        transport for this dataset.
+    - vendor: clogHistMsgName
+      type: string
+      description: CISCO-SYSLOG-MIB - textual message-type identifier (facility + mnemonic).
+      ecs: event.code
+      status: partial
+      notes: >-
+        the numeric 6-digit event.code (111010, 502103, 605005, ...) still
+        usually has to be read from the message text
+    - vendor: clogHistFacility
+      type: string
+      description: CISCO-SYSLOG-MIB - name of the generating facility.
+      ecs: log.syslog.facility.name
+      status: mapped
+    - vendor: clogHistSeverity
+      type: integer
+      description: CISCO-SYSLOG-MIB - SyslogSeverity enum emergency(1)..debug(8).
+      ecs: log.syslog.severity.code
+      status: partial
+      transform: >-
+        subtract one to convert the 1-8 MIB enum to the 0-7 syslog severity
+        code, then set log.syslog.severity.name from it
+    - vendor: clogHistTimestamp
+      type: integer
+      description: CISCO-SYSLOG-MIB - sysUpTime value (device-uptime ticks) at message generation.
+      ecs: null
+      status: unmapped
+      custom: cisco.asa.snmp.sysuptime
+      notes: >-
+        uptime ticks, not wall-clock; @timestamp must come from the
+        trap-receiver arrival time
+    - vendor: clogHistIndex
+      type: integer
+      description: CISCO-SYSLOG-MIB - monotonic index of the message in the history table.
+      ecs: null
+      status: unmapped
+      custom: cisco.asa.snmp.history_index
+      notes: gap/duplicate detection only, since traps are unacknowledged UDP

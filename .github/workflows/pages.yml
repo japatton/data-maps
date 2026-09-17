@@ -1,0 +1,102 @@
+name: pages
+on:
+  push:
+    branches: [main]
+
+jobs:
+  test-js:
+    runs-on: docker
+    container:
+      image: node:20-bookworm
+    steps:
+      # Node actions cannot run in this container (the runner does not inject
+      # its own node), so the checkout is a manual clone.  The server and the
+      # repository come from the run's own context rather than a literal, so
+      # nothing here names the instance this happens to be hosted on.  The
+      # token from the run itself is used so the clone works whether the
+      # repository is public or private.
+      - name: checkout
+        run: |
+          rm -rf .git ./* 2>/dev/null || true
+          host="${{ github.server_url }}"
+          host="${host#https://}"
+          git clone --depth 1 --branch "${GITHUB_REF_NAME:-main}" \
+            "https://x-access-token:${{ github.token }}@$host/${{ github.repository }}.git" .
+      # Pure Node, same as the GitLab job: the parity check crosses the two
+      # runtimes through the committed fixture, never through one image.
+      - run: node --version
+      - run: node --test studio/tests/*.test.js
+
+  build-deploy:
+    needs: [test-js]
+    runs-on: docker
+    container:
+      image: python:3.6-bullseye
+    steps:
+      - name: checkout
+        run: |
+          rm -rf .git ./* 2>/dev/null || true
+          host="${{ github.server_url }}"
+          host="${host#https://}"
+          git clone --depth 1 --branch "${GITHUB_REF_NAME:-main}" \
+            "https://x-access-token:${{ github.token }}@$host/${{ github.repository }}.git" .
+      - run: python3 --version
+      - run: pip3 install -r requirements.txt
+      - run: python3 -m unittest discover -s tests -v
+      # data/studio.yml carries example endpoints so that no deployment's
+      # values are committed; a site supplies its own here.  Only a non-empty
+      # secret is exported: an unset secret arrives as the empty string, and
+      # overlay_env takes any STUDIO_* name that is merely PRESENT, so
+      # exporting unconditionally would overwrite a good default with "".
+      - name: build
+        env:
+          S_REPO_API: ${{ secrets.STUDIO_REPOSITORY_API_URL }}
+          S_REPO_IDE: ${{ secrets.STUDIO_REPOSITORY_WEB_IDE_URL }}
+          S_LLM_URL: ${{ secrets.STUDIO_ANALYSIS_API_URL }}
+          S_LLM_MODEL: ${{ secrets.STUDIO_ANALYSIS_MODEL }}
+          S_HOSTS: ${{ secrets.STUDIO_ALLOWED_HOSTS }}
+        run: |
+          set -e
+          if [ -n "$S_REPO_API" ]; then export STUDIO_REPOSITORY_API_URL="$S_REPO_API"; fi
+          if [ -n "$S_REPO_IDE" ]; then export STUDIO_REPOSITORY_WEB_IDE_URL="$S_REPO_IDE"; fi
+          if [ -n "$S_LLM_URL" ]; then export STUDIO_ANALYSIS_API_URL="$S_LLM_URL"; fi
+          if [ -n "$S_LLM_MODEL" ]; then export STUDIO_ANALYSIS_MODEL="$S_LLM_MODEL"; fi
+          if [ -n "$S_HOSTS" ]; then export STUDIO_ALLOWED_HOSTS="$S_HOSTS"; fi
+          python3 -m datamaps.build
+      # The destination is three secrets rather than a literal, so the deploy
+      # target is a property of the site, not of this repository.  With none
+      # of them set the step is skipped and the build artifact simply stands.
+      - name: rsync to the pages root
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+        run: |
+          set -e
+          if [ -z "$DEPLOY_HOST" ] || [ -z "$DEPLOY_USER" ] || [ -z "$DEPLOY_PATH" ]; then
+            echo "no deploy target configured; built public/ and stopping here"
+            exit 0
+          fi
+          # Debian 11 reached end of life on 2026-08-31 and its last security
+          # Release file expired on 2026-09-07, so apt reports "Release file
+          # ... is expired" as an E: line on every run.  It still exits 0 and
+          # the install still succeeds from the main repository, but the
+          # message is alarming and permanent - that suite will never publish
+          # again.  Dropping it loses no updates because there are none left.
+          #
+          # This image cannot move off bullseye: python:3.6-bullseye was last
+          # built on 2021-12-22 and 3.6 never got a bookworm base, so bullseye
+          # is the newest it will ever have.  The 3.6 pin is deliberate - it is
+          # the oldest interpreter this project must support, so a
+          # compatibility break surfaces here rather than on a deployment that
+          # cannot move off it.
+          sed -i '/security.debian.org/d' /etc/apt/sources.list
+          which rsync ssh >/dev/null 2>&1 || (apt-get update -qq && apt-get install -y -qq openssh-client rsync)
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          rsync -az --delete \
+            -e "ssh -i ~/.ssh/deploy_key -o UserKnownHostsFile=$HOME/.ssh/known_hosts" \
+            public/ "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH"

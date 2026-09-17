@@ -1,0 +1,1870 @@
+id: workspace-one-uem
+name: Workspace ONE UEM / Intune (mobile)
+vendor: Omnissa (formerly VMware) / Microsoft
+versions: >-
+  Workspace ONE UEM 2306 - 2412 (SaaS and on-prem); Microsoft Intune via Azure
+  diagnostic settings
+draft: true
+references:
+- >-
+  https://docs.omnissa.com/bundle/TroubleshootingandLoggingGuide/page/SyslogIntegration.html
+- >-
+  https://docs.cloud.google.com/chronicle/docs/ingestion/default-parsers/vmware-workspaceone-uem
+- https://docs.cloud.google.com/chronicle/docs/ingestion/default-parsers/airwatch
+- https://docs.cyderes.cloud/parser-knowledge-base/vmware_workspace_one/
+- https://www.elastic.co/docs/reference/integrations/microsoft_intune
+- https://epr.elastic.co/package/microsoft_intune/0.1.0/
+datasets:
+- id: device-events
+  name: UEM device events (syslog)
+  description: >
+    Device-side MDM telemetry for GFE phones and tablets, forwarded from the
+    Workspace ONE UEM console over syslog (Groups & Settings > System >
+    Enterprise Integration > Syslog). Carries enrollment and unenrollment,
+    compliance evaluation, compromised-status (jailbreak/root) detection,
+    profile install and remove, managed application install and remove, and
+    device commands including device wipe and lock, together with the device
+    response. The wire format is NOT fixed: the console emits whatever the
+    administrator puts in the Message Content template, built from documented
+    lookup values, so the field set below is the conventional template
+    (EventType/Event/User/EnrollmentUser/EventSource/EventModule/
+    EventCategory/EventData) plus the device and assignment lookups most sites
+    add. Microsoft Intune is the alternative MDM platform in this estate and
+    is mapped separately below - its records arrive as Azure diagnostic JSON
+    with entirely different field names and are deliberately not merged into
+    this dataset.
+  event_categories:
+  - configuration
+  - iam
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Receives key/value syslog over TCP (TLS supported) from the UEM
+        console's syslog integration; a SaaS-hosted UEM tenant necessarily
+        lands on the low side and crosses.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-workspace_one_uem.device_events
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Receives key/value syslog over TCP (TLS supported) from the UEM
+        console's syslog integration.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-workspace_one_uem.device_events
+  formats:
+  - format: syslog-kv
+    parsing:
+      mechanism: cribl-pipeline
+      notes: >
+        No Elastic integration and no Cribl pack exists for Workspace ONE UEM
+        (checked the Elastic package registry and the Cribl Pack Dispensary -
+        the only adjacent package is the beta microsoft_intune integration
+        used by the Intune datasets below). A hand-built Cribl pipeline is
+        required, and because the syslog Message Content is an
+        administrator-authored template rather than a vendor-fixed grammar,
+        the pipeline must be written against this org's own template and
+        re-verified whenever an admin edits it.
+    fields:
+    - vendor: EventType
+      type: enum
+      description: top-level class of the syslog record - Device or Console
+      ecs: null
+      status: partial
+      custom: workspace_one.uem.event_type
+      transform: >
+        this is the value that selects which of the two UEM datasets a record
+        belongs to; the Cribl pipeline routes on it before parsing, and it is
+        retained as a custom field for audit
+    - vendor: Event
+      type: string
+      description: >-
+        name of the device event, for example InstallProfileRequested,
+        DeviceWipeRequested, CompromisedStatusChanged, EnrollmentComplete
+      ecs: event.action
+      status: mapped
+      transform: >
+        copied to event.action verbatim; there is no separate outcome column,
+        so event.outcome must be derived from the event name's
+        Requested/Complete/Failed/Denied suffix via a lookup table
+    - vendor: EventSource
+      type: enum
+      description: origin of the event - Device, Server, or API/Console
+      ecs: event.provider
+      status: mapped
+    - vendor: EventModule
+      type: string
+      description: >-
+        UEM console module that raised the event (Devices, Dashboard,
+        Applications, Profiles)
+      ecs: null
+      status: unmapped
+      custom: workspace_one.uem.event_module
+      notes: >
+        ECS event.module is reserved for the Elastic package/integration name,
+        so the vendor's console module stays custom to avoid colliding with
+        that convention
+    - vendor: EventCategory
+      type: enum
+      description: >-
+        vendor grouping for the event (Command, Compliance, Enrollment,
+        System, Security)
+      ecs: null
+      status: partial
+      custom: workspace_one.uem.event_category
+      transform: >
+        this is the input to the ECS event.category decision, not an ECS
+        category value itself; it needs an explicit lookup table mapping each
+        vendor category to the closed ECS vocabulary
+    - vendor: EventData
+      type: string
+      description: >-
+        free-text detail blob whose content varies per event, carrying nested
+        pairs such as Device Friendly Name and Profile
+      ecs: message
+      status: partial
+      notes: >
+        single unbounded free-text field concatenating per-event detail with
+        its own inner key/value syntax; needs a second per-Event extraction
+        pass before its contents are queryable, and it is the field most
+        likely to breach a content-filter length policy
+    - vendor: User
+      type: string
+      description: console or admin account that initiated the action
+      ecs: user.name
+      status: mapped
+    - vendor: EnrollmentUser
+      type: string
+      description: directory account the device is enrolled to (the device owner)
+      ecs: user.target.name
+      status: partial
+      notes: >
+        the enrollment user owns the device the action targets; ECS
+        user.target models a user acted upon, so this is a close but inexact
+        fit - the object actually acted upon is the device, not the account
+    - vendor: FriendlyName
+      type: string
+      description: human-readable device name assigned in the UEM console
+      ecs: host.name
+      status: mapped
+      notes: >
+        host.* must describe the managed device; the syslog relay hostname is
+        the UEM console and belongs on observer.name
+    - vendor: Device
+      type: string
+      description: >-
+        device identifier rendered by templates that use the Device lookup
+        instead of FriendlyName
+      ecs: host.name
+      status: partial
+      notes: >
+        the two lookups are alternates depending on the console template - the
+        pipeline must coalesce Device and FriendlyName into one host.name
+        rather than mapping whichever happens to be present
+    - vendor: DeviceUdid
+      type: string
+      description: unique device identifier (UDID) for the enrolled device
+      ecs: device.id
+      status: mapped
+      transform: >
+        also copied to host.id so device-centric MDM records join host-centric
+        endpoint data on a single key
+    - vendor: DeviceSerialNumber
+      type: string
+      description: hardware serial number of the enrolled device
+      ecs: null
+      status: unmapped
+      custom: workspace_one.uem.device.serial_number
+      notes: >
+        ECS 9.4 has beta device.serial_number; adopt when GA. Serial is the
+        property tag key for GFE reconciliation, so it is worth carrying even
+        unmapped.
+    - vendor: OwnershipType
+      type: enum
+      description: >-
+        ownership classification of the device - Corporate-Dedicated,
+        Corporate-Shared, or Employee Owned
+      ecs: null
+      status: unmapped
+      custom: workspace_one.uem.device.ownership
+      notes: >
+        separates GFE from BYOD; no ECS field carries device ownership, and
+        this is the primary scoping filter for CSOC mobile alerting
+    - vendor: ProfileName
+      type: string
+      description: name of the configuration profile installed on or removed from the device
+      ecs: null
+      status: unmapped
+      custom: workspace_one.uem.profile.name
+      notes: >
+        deliberately not mapped to rule.name - a configuration profile is a
+        settings payload pushed to a device, not a detection rule, per the
+        repo's rule.* convention
+    - vendor: Application
+      type: string
+      description: managed application involved in an app install, update, or removal event
+      ecs: package.name
+      status: partial
+      notes: >
+        the console renders the application display name, not the iOS bundle
+        id or Android package name, so package.name holds a human label until
+        the bundle identifier is added to the template
+    - vendor: ApplicationUUID
+      type: string
+      description: UEM-internal UUID of the managed application record
+      ecs: null
+      status: unmapped
+      custom: workspace_one.uem.application.uuid
+    - vendor: SmartGroupName
+      type: string
+      description: >-
+        assignment (smart) group through which the profile or application
+        assignment resolved
+      ecs: group.name
+      status: mapped
+    - vendor: OriginatingOrganizationGroup
+      type: string
+      description: UEM organization group (OG) in which the event originated
+      ecs: organization.name
+      status: partial
+      notes: >
+        an OG is a UEM tenancy/delegation node rather than a corporate
+        organization name; mapped so OG-scoped queries work, but the semantics
+        are narrower than ECS intends
+    - vendor: EventTimestamp
+      type: timestamp
+      description: console-local time the event was recorded, rendered by the message template
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        rendered in the console's locale and timezone (for example "May 21,
+        2025 13:53:26") and must be parsed with an explicit timezone; the
+        syslog header timestamp reflects relay time and is not authoritative
+        for event time
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Own the parse here: pin the console's Message Content template in
+          change control, then build the key/value extraction plus the
+          per-Event second pass that cracks the EventData blob open, and add a
+          dead-letter route so a template edit surfaces as visible failures
+          rather than silently empty fields. Do the derivations that have no
+          vendor column - event.outcome from the Event name's
+          Requested/Failed/Complete suffix, the EventCategory-to-ECS-category
+          lookup, and the EnrollmentUser-to-directory-identity resolution -
+          low-side where the UEM organization-group context is cheapest, cap
+          EventData length, and validate against a Schema Library schema
+          before the destination.
+        elastic: >
+          Ship pre-shaped documents into logs-workspace_one_uem.device_events
+          with a custom ingest pipeline that only fills gaps: coalesce Device
+          and FriendlyName into a single host.name, copy device.id from
+          DeviceUdid into host.id for host-centric correlation, and parse the
+          locale-rendered event timestamp with an explicit timezone rather
+          than trusting the syslog header. Add explicitly typed
+          custom-namespace index-template mappings for workspace_one.uem.* -
+          event_type, event_module, event_category, device.serial_number,
+          device.ownership, profile.name, application.uuid - so
+          ownership-scoped and profile-scoped hunting works without dynamic
+          mapping.
+        relay: >
+          Low-side instances cross the guard, and full ECS-shaped JSON should
+          cross rather than raw syslog, because no Elastic-side integration
+          exists to reconstitute a thin envelope. EventData is the
+          content-filter problem on this route: it is unbounded free text that
+          concatenates device names, profile names and admin-entered strings,
+          so enforce a hard length cap and an allowlisted key set low-side and
+          hold the JSON to two levels of nesting. Treat the crossing as
+          at-most-once and reconcile low-side versus high-side event counts
+          per hour per Event name.
+      direct:
+        parse_location: low
+        cribl: >
+          Own the parse here: pin the console's Message Content template in
+          change control, then build the key/value extraction plus the
+          per-Event second pass that cracks the EventData blob open, and add a
+          dead-letter route so a template edit surfaces as visible failures
+          rather than silently empty fields. Do the derivations that have no
+          vendor column - event.outcome from the Event name's
+          Requested/Failed/Complete suffix, the EventCategory-to-ECS-category
+          lookup, and the EnrollmentUser-to-directory-identity resolution -
+          where the UEM organization-group context is cheapest, cap EventData
+          length, and validate against a Schema Library schema before the
+          destination.
+        elastic: >
+          Ship pre-shaped documents into logs-workspace_one_uem.device_events
+          with a custom ingest pipeline that only fills gaps: coalesce Device
+          and FriendlyName into a single host.name, copy device.id from
+          DeviceUdid into host.id for host-centric correlation, and parse the
+          locale-rendered event timestamp with an explicit timezone rather
+          than trusting the syslog header. Add explicitly typed
+          custom-namespace index-template mappings for workspace_one.uem.* -
+          event_type, event_module, event_category, device.serial_number,
+          device.ownership, profile.name, application.uuid - so
+          ownership-scoped and profile-scoped hunting works without dynamic
+          mapping.
+  - format: webhook
+    enable: >
+      In the console go to Groups & Settings > All Settings > System >
+      Advanced > API > Event Notifications and add a rule: give it a target
+      name, the listener Target URL, choose Format JSON (preferred over XML
+      for a Cribl HTTP Source), set optional Basic authentication, and select
+      the events to emit - Device Enrollment, Device Unenrollment, Compromised
+      Status, Compliance Status, Device Wipe, Device Delete, and Device
+      Friendly Name change. The rule is scoped to the organization group it is
+      created in, so create it at the OG whose devices you intend to cover.
+      Each fired event is a single HTTP POST carrying one flat object with the
+      fields below; a SaaS-hosted tenant necessarily posts from the low side
+      and the listener must be reachable there.
+    references:
+    - >-
+      https://docs.omnissa.com/bundle/SystemSettingsV2306/page/EventNotificationsSystemSettings.html
+    - https://blog.davidpacold.com/ws1-uem-event-notifications
+    - https://www.euctechtopics.com/event-notifications-webhooks-in-workspace-one-uem/
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        custom Event Notifications pipeline (Cribl HTTP Source) landing in
+        logs-workspace_one_uem.device_events
+      notes: >
+        No Elastic integration and no Cribl pack parses Workspace ONE UEM, so
+        a Cribl HTTP Source receives the POST and a hand-built pipeline shapes
+        it - but the vendor-fixed payload means the pipeline is a stable
+        field-rename map rather than the template-tracking parser the syslog
+        feed needs. The trade against the syslog feed is coverage: the webhook
+        carries device lifecycle events only and omits the profile/application
+        install/remove and per-command response detail the EventData blob
+        carries on the syslog stream, so it complements rather than replaces
+        the syslog feed if both device-command auditing and lifecycle push are
+        needed.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Terminate the webhook on a low-side Cribl HTTP Source (the SaaS
+          tenant posts to the low enclave) and own the parse here: the payload
+          is already flat JSON, so the work is renaming to ECS, deriving
+          event.outcome from the EventType name because there is no outcome
+          field, normalizing CompromisedStatus and ComplianceStatus into
+          stable booleans/verbs so the compromised-device and compliance-drift
+          conditions are directly alertable, and masking PhoneNumber,
+          DeviceIMEI and SerialNumber before anything leaves the low side.
+          Validate against a Schema Library schema and add a dead-letter route
+          so a payload the vendor reshapes on upgrade surfaces as visible
+          failures. Because the POST is fire-and-forget with no delivery
+          receipt, run an idempotency key on (Udid, EventType, EventTime) so a
+          retried notification does not double-count.
+        elastic: >
+          Ship pre-shaped documents into logs-workspace_one_uem.device_events
+          with a custom ingest pipeline that only fills gaps: copy device.id
+          from Udid into host.id for host-centric correlation so webhook and
+          syslog device records join on one key, and parse EventTime with an
+          explicit timezone rather than trusting the receive time. Add
+          explicitly typed index-template mappings for the
+          workspace_one.uem.device.* custom namespace - compromised_status,
+          compliance_status, ownership, serial_number - so ownership-scoped
+          and compromise-scoped hunting works without dynamic mapping,
+          matching the mappings the syslog feed already needs.
+        relay: >
+          Full ECS-shaped JSON should cross rather than the raw webhook body,
+          because no Elastic-side integration exists to reconstitute a thin
+          envelope. The content-filter risk on this feed is the subscriber
+          identifiers - PhoneNumber, DeviceIMEI, SerialNumber, AssetNumber -
+          on government-furnished handsets: mask or drop them low-side before
+          the guard per the stated requirement, hold the JSON to two levels of
+          nesting (the payload is already flat, so this is free), and
+          allowlist the key set. Treat the crossing as at-most-once and
+          reconcile low-side versus high-side counts per hour per EventType.
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side tenant whose listener is reachable without the
+          guard, the HTTP Source and field-rename shaping are identical
+          without the masking and dead-letter discipline the crossing forces.
+          The decision that matters is deduplication against the syslog device
+          feed if both are collected: key on Udid plus EventType so a
+          device-wipe seen on both the webhook and the syslog stream is
+          recognized as one event rather than two.
+        elastic: >
+          Ship pre-shaped documents into logs-workspace_one_uem.device_events
+          with a custom ingest pipeline that copies device.id from Udid into
+          host.id for host-centric correlation so webhook and syslog device
+          records join on one key, and parses EventTime with an explicit
+          timezone rather than trusting the receive time; add explicitly typed
+          index-template mappings for the workspace_one.uem.device.* custom
+          namespace - compromised_status, compliance_status, ownership,
+          serial_number - so ownership-scoped and compromise-scoped hunting
+          works without dynamic mapping. With no boundary, retain PhoneNumber
+          and DeviceIMEI for the asset reconciliation they enable rather than
+          masking them, and treat the webhook as the low-latency lifecycle
+          signal (it fires on the event) while the syslog feed remains the
+          source for the richer profile/application/command detail the webhook
+          omits.
+    fields:
+    - vendor: EventId
+      type: integer
+      description: numeric identifier the console assigns to the event notification
+      ecs: event.code
+      status: partial
+      transform: >
+        a small numeric code tied to the event type rather than a globally
+        unique instance id, so it is carried as event.code, not event.id; the
+        human EventType name is the more reliable action key
+    - vendor: EventType
+      type: string
+      description: >-
+        name of the device event, for example MDM Enrollment Complete, Device
+        Compromised Status Changed, Compliance Status Changed, Device Wipe
+      ecs: event.action
+      status: mapped
+      transform: >
+        copied to event.action; there is no outcome field, so event.outcome
+        must be derived from the event name via a lookup table, as on the
+        syslog feed
+    - vendor: DeviceId
+      type: integer
+      description: Workspace ONE UEM internal numeric device record id (not the UDID)
+      ecs: null
+      status: unmapped
+      custom: workspace_one.uem.device.uem_id
+      notes: >
+        the id used to call back into the REST API for device detail; distinct
+        from the UDID that carries the durable device identity
+    - vendor: DeviceFriendlyName
+      type: string
+      description: human-readable device name assigned in the UEM console
+      ecs: host.name
+      status: mapped
+      notes: >
+        host.* must describe the managed device; the webhook listener host is
+        the collector and belongs on observer.name, not host.name
+    - vendor: EnrollmentEmailAddress
+      type: string
+      description: email address of the enrollment user the device belongs to
+      ecs: user.target.email
+      status: partial
+      notes: >
+        the enrollment user owns the device the event targets; ECS user.target
+        models a user acted upon, the same close-but-inexact fit the syslog
+        EnrollmentUser mapping carries
+    - vendor: EnrollmentUserName
+      type: string
+      description: directory account name the device is enrolled to (the device owner)
+      ecs: user.target.name
+      status: partial
+      notes: >-
+        mapped to user.target.name to match the syslog-kv stream's treatment
+        of the enrollment user as the acted-upon account
+    - vendor: EnrollmentUserId
+      type: integer
+      description: Workspace ONE UEM internal numeric id of the enrollment user
+      ecs: null
+      status: unmapped
+      custom: workspace_one.uem.enrollment_user_id
+    - vendor: EventTime
+      type: timestamp
+      description: time the device event was recorded
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        rendered in the console's timezone; parse with an explicit timezone
+        rather than relying on the HTTP receive time at the listener
+    - vendor: EnrollmentStatus
+      type: enum
+      description: >-
+        enrollment state of the device, for example Enrolled, Unenrolled,
+        EnterpriseWipePending
+      ecs: null
+      status: unmapped
+      custom: workspace_one.uem.enrollment_status
+    - vendor: CompromisedStatus
+      type: string
+      description: whether the device is compromised (jailbroken or rooted)
+      ecs: null
+      status: partial
+      custom: workspace_one.uem.device.compromised_status
+      transform: >
+        the jailbreak/root signal; normalize the True/False/empty value to a
+        stable boolean so the compromised-device condition is directly
+        alertable rather than a string comparison
+    - vendor: CompromisedTimeStamp
+      type: timestamp
+      description: 'time the device''s compromised status last changed'
+      ecs: null
+      status: unmapped
+      custom: workspace_one.uem.device.compromised_timestamp
+    - vendor: ComplianceStatus
+      type: enum
+      description: compliance verdict for the device, for example Compliant or NonCompliant
+      ecs: null
+      status: partial
+      custom: workspace_one.uem.device.compliance_status
+      transform: >
+        needs a lookup to drive event.outcome on compliance-change events,
+        which carry no outcome field of their own
+    - vendor: PhoneNumber
+      type: string
+      description: phone number associated with the device where available
+      ecs: null
+      status: unmapped
+      custom: workspace_one.uem.device.phone_number
+      notes: >-
+        subscriber PII on government-furnished handsets; the strongest
+        candidate for a low-side masking rule on this feed
+    - vendor: Udid
+      type: string
+      description: unique device identifier (UDID) of the enrolled device
+      ecs: device.id
+      status: mapped
+      transform: >
+        also copied to host.id so webhook device records join the syslog
+        device stream and host-centric endpoint data on a single key
+    - vendor: SerialNumber
+      type: string
+      description: hardware serial number of the enrolled device
+      ecs: null
+      status: unmapped
+      custom: workspace_one.uem.device.serial_number
+      notes: >
+        ECS 9.4 has beta device.serial_number; adopt when GA. Serial is the
+        property-tag key for GFE reconciliation, so it is worth carrying even
+        unmapped, matching the syslog feed's treatment.
+    - vendor: MACAddress
+      type: mac
+      description: Wi-Fi MAC address of the device
+      ecs: host.mac
+      status: partial
+      transform: >-
+        reported without separators; normalize to the ECS uppercase
+        hyphen-separated form (RFC 7042, for example 00-00-5E-00-53-23) before
+        indexing
+    - vendor: DeviceIMEI
+      type: string
+      description: International Mobile Equipment Identity of the device where applicable
+      ecs: null
+      status: unmapped
+      custom: workspace_one.uem.device.imei
+      notes: >-
+        subscriber hardware identifier; treat as sensitive and mask low-side
+        unless a stated requirement needs it
+    - vendor: AssetNumber
+      type: string
+      description: asset or property tag recorded against the device in the console
+      ecs: null
+      status: unmapped
+      custom: workspace_one.uem.device.asset_number
+      notes: >-
+        the government-furnished-equipment reconciliation tag; not present on
+        the syslog template's conventional field set
+    - vendor: Platform
+      type: string
+      description: device platform label, for example Apple, Android, or WindowsRt
+      ecs: null
+      status: unmapped
+      custom: workspace_one.uem.device.platform
+      notes: >
+        coarse platform label kept custom because host.os.type needs a mapping
+        and the Apple value is ambiguous between iOS and macOS; the version
+        number arrives separately in OperatingSystem
+    - vendor: OperatingSystem
+      type: string
+      description: operating system version string reported for the device, for example 12.4.5
+      ecs: host.os.version
+      status: mapped
+      notes: >-
+        the payload carries the version number here; the platform family is
+        the separate Platform field
+- id: console-events
+  name: UEM console audit events (syslog)
+  description: >
+    Administrator-side audit trail from the same syslog integration, selected
+    by setting EventType to Console. Covers console login sessions and failed
+    logins, administrator account and role changes, organization-group and
+    smart-group membership changes, system settings changes, and the
+    console/API request behind each action. This is the accountability record
+    for who wiped, unenrolled, or re-profiled a government-furnished device,
+    so it is the natural pair to the device event stream above and should be
+    routed to the same enclave.
+  event_categories:
+  - authentication
+  - iam
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same syslog listener and same admin-authored Message Content template
+        as the device stream.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-workspace_one_uem.console_events
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Same syslog listener and same admin-authored Message Content template
+        as the device stream.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-workspace_one_uem.console_events
+  formats:
+  - format: syslog-kv
+    parsing:
+      mechanism: cribl-pipeline
+      notes: >
+        Shares the hand-built Cribl pipeline with the device stream and
+        branches on EventType; no vendor-supplied Elastic integration or Cribl
+        pack exists for either.
+    fields:
+    - vendor: EventType
+      type: enum
+      description: top-level class of the syslog record - Console for this dataset
+      ecs: null
+      status: partial
+      custom: workspace_one.uem.event_type
+      transform: routing key the pipeline branches on before parsing
+    - vendor: Event
+      type: string
+      description: >-
+        name of the console action, for example Login, LoginFailed,
+        AdminAccountCreated, SystemSettingChanged
+      ecs: event.action
+      status: mapped
+      transform: >
+        copied verbatim to event.action; event.outcome must be derived from
+        the Failed/Denied variants of the name because the console template
+        exposes no outcome lookup value
+    - vendor: AdminAccount
+      type: string
+      description: console administrator account that performed the audited action
+      ecs: user.name
+      status: mapped
+    - vendor: User
+      type: string
+      description: user account affected by an administrator account-management action
+      ecs: user.target.name
+      status: mapped
+    - vendor: LoginSessionID
+      type: string
+      description: 'identifier of the administrator''s console login session'
+      ecs: null
+      status: unmapped
+      custom: workspace_one.uem.login_session_id
+      notes: >
+        ECS 9.4 has no session.* namespace, so this stays custom; it is the
+        only key that stitches an admin's actions back to one login
+    - vendor: MessageText
+      type: string
+      description: rendered human-readable description of the console action
+      ecs: message
+      status: mapped
+    - vendor: LogDescription
+      type: string
+      description: secondary descriptive text for the audited change
+      ecs: null
+      status: partial
+      custom: workspace_one.uem.log_description
+      notes: >
+        overlaps MessageText depending on which template the console uses;
+        coalesce one of the two into message and keep the other custom rather
+        than mapping both to message
+    - vendor: Severity
+      type: enum
+      description: console event severity - Information, Warning, or Critical
+      ecs: event.severity
+      status: partial
+      transform: >
+        three string labels needing a lookup to the ECS numeric scale
+        (Information low, Warning medium, Critical high); the ordering is
+        conventional, not inverted, so no reversal is required
+    - vendor: Request Url
+      type: string
+      description: 'console or REST API URL the administrator''s request targeted'
+      ecs: url.original
+      status: mapped
+      notes: >
+        the vendor lookup value contains a literal space in its name, so the
+        pipeline must rename it to a safe key before any downstream reference;
+        strip query strings, which can carry session tokens
+    - vendor: EventCategory
+      type: enum
+      description: vendor grouping for the console event (Login, Admin, System, Group Management)
+      ecs: null
+      status: partial
+      custom: workspace_one.uem.event_category
+      transform: >
+        input to the ECS event.category decision via lookup, not an ECS
+        category value itself
+    - vendor: EventModule
+      type: string
+      description: console module the action was performed in
+      ecs: null
+      status: unmapped
+      custom: workspace_one.uem.event_module
+      notes: >-
+        kept custom for the same reason as the device stream - ECS
+        event.module names the Elastic package
+    - vendor: EventSource
+      type: enum
+      description: origin of the console event - Console, Server, or API
+      ecs: event.provider
+      status: mapped
+    - vendor: GroupName
+      type: string
+      description: organization or smart group the administrator acted within
+      ecs: group.name
+      status: mapped
+    - vendor: GroupManagementData
+      type: string
+      description: detail of the group membership or assignment change that was made
+      ecs: null
+      status: unmapped
+      custom: workspace_one.uem.group_management_data
+      notes: >-
+        free-text change detail; the closest thing this feed has to a
+        before/after record of a privilege change
+    - vendor: OriginatingOrganizationGroup
+      type: string
+      description: UEM organization group in which the console event originated
+      ecs: organization.name
+      status: partial
+      notes: same OG-versus-organization semantic gap as the device stream
+    - vendor: EventTimestamp
+      type: timestamp
+      description: console-local time the administrator action was recorded
+      ecs: '@timestamp'
+      status: partial
+      transform: >-
+        locale-rendered console time; parse with an explicit timezone rather
+        than relying on the syslog header
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Branch on EventType at the front of the shared pipeline so console
+          records get their own extraction, and normalize the vendor's
+          space-bearing key "Request Url" into a safe field name at the very
+          first step before anything downstream tries to reference it. Convert
+          the Information/Warning/Critical Severity label to the ECS numeric
+          scale here, derive event.outcome from the Event name because there
+          is no outcome column, and coalesce MessageText and LogDescription
+          into a single message so the two templates in use do not produce two
+          different shapes.
+        elastic: >
+          Land in logs-workspace_one_uem.console_events with a custom ingest
+          pipeline that enforces the split between the acting admin
+          (AdminAccount to user.name) and the account acted upon (User to
+          user.target.name), since the authentication and iam alerting
+          profiles both key off that pair. Map
+          workspace_one.uem.login_session_id as keyword in the index template
+          so admin sessions can be stitched end to end, and treat the missing
+          admin source IP as a known gap the authentication profile cannot
+          satisfy from this feed alone - correlate against the reverse proxy
+          or VPN logs instead of inventing a value.
+        relay: >
+          Full ECS-shaped JSON should cross rather than raw syslog, matching
+          the device stream so the guard sees one schema for both UEM
+          datasets. The content-filter risk here is admin-entered free text -
+          MessageText, LogDescription, and GroupManagementData all carry
+          operator-typed strings and full request URLs with query strings - so
+          cap their length, strip query parameters low-side, and allowlist the
+          key set before the crossing.
+      direct:
+        parse_location: low
+        cribl: >
+          Branch on EventType at the front of the shared pipeline so console
+          records get their own extraction, and normalize the vendor's
+          space-bearing key "Request Url" into a safe field name at the very
+          first step before anything downstream tries to reference it. Convert
+          the Information/Warning/Critical Severity label to the ECS numeric
+          scale here, derive event.outcome from the Event name because there
+          is no outcome column, and coalesce MessageText and LogDescription
+          into a single message so the two templates in use do not produce two
+          different shapes.
+        elastic: >
+          Land in logs-workspace_one_uem.console_events with a custom ingest
+          pipeline that enforces the split between the acting admin
+          (AdminAccount to user.name) and the account acted upon (User to
+          user.target.name), since the authentication and iam alerting
+          profiles both key off that pair. Map
+          workspace_one.uem.login_session_id as keyword in the index template
+          so admin sessions can be stitched end to end, and treat the missing
+          admin source IP as a known gap the authentication profile cannot
+          satisfy from this feed alone - correlate against the reverse proxy
+          or VPN logs instead of inventing a value.
+- id: intune-audit
+  name: Intune audit logs (Azure diagnostic settings)
+  description: >
+    The Microsoft Intune half of the mobile estate. Intune has no syslog
+    output; audit records leave the tenant through Azure diagnostic settings
+    as JSON on an Event Hub and are collected by the Elastic microsoft_intune
+    integration (azure-eventhub input). Records cover administrator
+    create/update/delete operations on devices, configuration profiles,
+    compliance policies and applications, including remote wipe and retire.
+    Field names are Azure diagnostic-record keys and share nothing with the
+    Workspace ONE lookup values above - the two platforms are mapped
+    separately on purpose.
+  event_categories:
+  - configuration
+  - iam
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Cribl reads the Azure Event Hub (or the Elastic Agent does and Cribl
+        relays). On the guarded path the Event Hub pull necessarily happens on
+        the low side, because the high side has no path to the commercial or
+        GCC High Azure endpoint.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-microsoft_intune.audit
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Cribl reads the Azure Event Hub (or the Elastic Agent does and Cribl
+        relays).
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-microsoft_intune.audit
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: Microsoft Intune integration
+      notes: >
+        The microsoft_intune package is at 0.1.0 and marked beta in the
+        Elastic package registry, so its field names under
+        microsoft_intune.audit.* are not yet stable; pin the package version
+        and re-check the mapping on every upgrade.
+    fields:
+    - vendor: time
+      type: timestamp
+      description: Azure diagnostic-record timestamp for the audit entry
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: operationName
+      type: string
+      description: >-
+        name of the Intune operation performed, for example Patch
+        ManagedDevice or Delete DeviceConfiguration
+      ecs: event.action
+      status: mapped
+    - vendor: category
+      type: string
+      description: diagnostic log category, always AuditLogs for this stream
+      ecs: null
+      status: unmapped
+      custom: microsoft_intune.audit.category
+      notes: >-
+        constant per stream; retained to distinguish audit records from device
+        records on a shared Event Hub
+    - vendor: resultType
+      type: enum
+      description: high-level result of the operation - Success or Failure
+      ecs: event.outcome
+      status: mapped
+      transform: >-
+        lowercased to the ECS success/failure vocabulary; this field, not the
+        numeric ActivityResultStatus, is the outcome source
+    - vendor: resultDescription
+      type: string
+      description: textual description of the operation result when the service supplies one
+      ecs: event.reason
+      status: mapped
+    - vendor: correlationId
+      type: string
+      description: correlation identifier linking related operations across Microsoft services
+      ecs: null
+      status: unmapped
+      custom: microsoft_intune.audit.correlation_id
+    - vendor: tenantId
+      type: string
+      description: Entra ID tenant the audit record belongs to
+      ecs: cloud.account.id
+      status: mapped
+    - vendor: identity
+      type: string
+      description: >-
+        identity that initiated the operation, either a user principal name or
+        an application identity
+      ecs: null
+      status: partial
+      custom: microsoft_intune.audit.identity
+      notes: >
+        duplicates properties.Actor.UPN for user-initiated operations but
+        holds an app identity for service-initiated ones, so it is not safe as
+        the user.name source; kept custom as the fallback
+    - vendor: properties.Actor.UPN
+      type: string
+      description: user principal name of the administrator who initiated the operation
+      ecs: user.name
+      status: partial
+      notes: >
+        empty whenever the operation was initiated by an application or
+        service principal rather than an administrator - including
+        automation-driven remote wipe and retire - so user.name is null on
+        that share of records and the app actor is only visible through
+        microsoft_intune.audit.identity and the Actor application fields
+    - vendor: properties.Actor.ObjectId
+      type: string
+      description: Entra object ID of the initiating user or application
+      ecs: user.id
+      status: partial
+      custom: microsoft_intune.audit.actor.object_id
+      notes: >
+        the object id of whichever principal initiated the operation, so it
+        has to be branched on the actor type rather than copied: it takes
+        user.id only when Actor.UPN is populated and the actor is a user
+        principal, and on service-initiated operations the service-principal
+        object id is withheld from user.id and stays at
+        microsoft_intune.audit.actor.object_id, matching the Graph pull's
+        separate actor.userId and actor.applicationId treatment of the same
+        split
+    - vendor: properties.Actor.ApplicationName
+      type: string
+      description: human-readable name of the application that initiated the action
+      ecs: null
+      status: unmapped
+      custom: microsoft_intune.audit.actor.application_name
+    - vendor: properties.Actor.IsDelegatedAdmin
+      type: boolean
+      description: whether a delegated (partner) administrator performed the action
+      ecs: null
+      status: unmapped
+      custom: microsoft_intune.audit.actor.is_delegated_admin
+      notes: >-
+        no ECS equivalent; a true value on a wipe or policy change is a
+        high-signal CSOC condition worth alerting on directly
+    - vendor: properties.ActivityType
+      type: string
+      description: numeric code for the type of activity performed
+      ecs: null
+      status: partial
+      custom: microsoft_intune.audit.activity_type
+      transform: >-
+        numeric code requiring a lookup table to a readable verb; distinct
+        from operationName and not interchangeable with it
+    - vendor: properties.ActivityResultStatus
+      type: string
+      description: numeric status code representing the outcome of the activity
+      ecs: null
+      status: partial
+      custom: microsoft_intune.audit.activity_result_status
+      notes: >-
+        numeric and undocumented per-code; resultType is the field that should
+        drive event.outcome
+    - vendor: properties.AuditEventId
+      type: string
+      description: unique identifier of the audit event generated by Intune
+      ecs: event.id
+      status: mapped
+    - vendor: properties.TargetDisplayNames
+      type: string
+      description: display names of the Intune objects targeted by the operation
+      ecs: null
+      status: partial
+      custom: microsoft_intune.audit.target_display_names
+      transform: >
+        array-valued; when the target is a managed device the value should
+        also be copied to host.name so device-scoped queries reach admin
+        actions
+    - vendor: properties.TargetObjectIds
+      type: string
+      description: object IDs of the Intune resources targeted by the operation
+      ecs: null
+      status: unmapped
+      custom: microsoft_intune.audit.target_object_ids
+    - vendor: properties.Targets
+      type: string
+      description: >-
+        nested target array carrying modified-property name, old value, and
+        new value for configuration changes
+      ecs: null
+      status: partial
+      custom: microsoft_intune.audit.targets
+      notes: >
+        array of objects nested three levels deep; the before/after pair is
+        the most useful part of the record and the main thing that must be
+        flattened before it can be queried or content-filtered
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Keep Cribl as a pass-through for this route and let the
+          integration's ingest pipeline parse - the low-side work is the Event
+          Hub checkpoint/consumer-group configuration, Persistent Queue
+          backpressure on the Elastic destination, and dropping the diagnostic
+          envelope's empty properties before they inflate volume. Do not
+          hand-parse the Azure record shape in Cribl in parallel with the
+          integration; one parser owns this stream.
+        elastic: >
+          The stock microsoft_intune integration is the parser; add a
+          logs-microsoft_intune.audit@custom pipeline that resolves the
+          numeric ActivityType and ActivityResultStatus codes through a lookup
+          into readable verbs and keeps event.outcome driven off resultType
+          rather than either numeric code. Flatten the nested Targets
+          modified-property triples into a queryable before/after pair, and
+          pin the beta package version with explicit index-template mappings
+          for the microsoft_intune.audit.* fields the map carries so a package
+          upgrade cannot silently re-shape them. Branch the actor on the actor
+          type so user.name and user.id carry only the administrator-initiated
+          records and the service-principal object id lands in
+          microsoft_intune.audit.actor.object_id rather than in user.id.
+        relay: >
+          On the guarded crossing, switch to the thin-envelope hybrid rather
+          than parsing low-side: a good Elastic integration exists, so carry
+          {_dataId, "@timestamp", host, _raw} across and let the ingest
+          pipeline extract on the high side. The constraint to fix first is
+          nesting - the Azure record is three or more levels deep under
+          properties.Targets and properties.Actor, so flatten to two levels
+          with short ASCII keys before the crossing.
+      direct:
+        parse_location: high
+        cribl: >
+          Keep Cribl as a pass-through for this route and let the
+          integration's ingest pipeline parse - Cribl's work is the Event Hub
+          checkpoint/consumer-group configuration, Persistent Queue
+          backpressure on the Elastic destination, and dropping the diagnostic
+          envelope's empty properties before they inflate volume. Do not
+          hand-parse the Azure record shape in Cribl in parallel with the
+          integration; one parser owns this stream.
+        elastic: >
+          The stock microsoft_intune integration is the parser; add a
+          logs-microsoft_intune.audit@custom pipeline that resolves the
+          numeric ActivityType and ActivityResultStatus codes through a lookup
+          into readable verbs and keeps event.outcome driven off resultType
+          rather than either numeric code. Flatten the nested Targets
+          modified-property triples into a queryable before/after pair, and
+          pin the beta package version with explicit index-template mappings
+          for the microsoft_intune.audit.* fields the map carries so a package
+          upgrade cannot silently re-shape them. Branch the actor on the actor
+          type so user.name and user.id carry only the administrator-initiated
+          records and the service-principal object id lands in
+          microsoft_intune.audit.actor.object_id rather than in user.id.
+  - format: api-pull
+    enable: >
+      Register an Entra app granted the DeviceManagementApps.Read.All
+      application permission and GET
+      https://graph.microsoft.com/v1.0/deviceManagement/auditEvents, paging
+      with $top and bounding the window with a $filter on activityDateTime
+      (for example activityDateTime gt 2026-01-01T00:00:00Z); follow
+      @odata.nextLink to page. For a US Government tenant use the Graph
+      national-cloud host graph.microsoft.us with tokens from
+      login.microsoftonline.us. The response is a value array of auditEvent
+      objects; the audit trail is retained for 30 days, so poll on a cadence
+      inside that horizon and checkpoint on the maximum activityDateTime seen.
+    references:
+    - >-
+      https://learn.microsoft.com/en-us/graph/api/resources/intune-auditing-auditevent?view=graph-rest-1.0
+    - >-
+      https://learn.microsoft.com/en-us/graph/api/intune-auditing-auditevent-list?view=graph-rest-1.0
+    - >-
+      https://learn.microsoft.com/en-us/graph/api/resources/intune-auditing-auditactor?view=graph-rest-1.0
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        custom Graph audit pull pipeline (Cribl REST Collector) landing in
+        logs-microsoft_intune.audit
+      notes: >
+        The microsoft_intune integration's azure-eventhub input parses the
+        diagnostic-record envelope, not the Graph auditEvent shape, so the
+        pull path cannot reuse it - a Cribl REST Collector polls the endpoint
+        and a pipeline maps the Graph field names before the destination. The
+        operational trade against the Event Hub feed is completeness and
+        latency: the pull is a point-in-time query over a 30-day retention
+        window under Graph throttling, so it is a gap-fill or
+        lower-volume-tenant path, but it recovers the admin source IP the
+        diagnostic feed omits.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          A Cribl REST Collector runs the Graph query low-side (the tenant is
+          in commercial or GCC High Azure, reachable only from the low
+          enclave), checkpoints on the maximum activityDateTime, and owns the
+          parse because no integration can reconstitute the Graph shape
+          high-side: lift actor.* and resources[].* to top-level ECS fields,
+          lowercase activityResult into the event.outcome vocabulary, and
+          flatten the resources[].modifiedProperties before/after triples into
+          a queryable pair. Run the Elastic destination on Persistent Queue
+          backpressure and gate the guard destination with schema validation
+          plus a dead-letter route.
+        elastic: >
+          Land in logs-microsoft_intune.audit with a custom ingest pipeline
+          that keeps event.outcome driven off activityResult rather than any
+          numeric code, copies actor.ipAddress to source.ip so the
+          authentication and iam profiles gain the admin origin the Event Hub
+          feed cannot supply, and copies a resource displayName to host.name
+          when the modified resource is a managed device. Pin explicit
+          index-template mappings for the microsoft_intune.audit.* custom
+          namespace so a field-name difference from the diagnostic feed does
+          not create a second dynamic-mapped shape for the same stream.
+        relay: >
+          Full ECS-shaped JSON should cross rather than the raw Graph object,
+          because the high side has no parser for the auditEvent shape. The
+          nesting is the content-filter constraint - actor is an object and
+          resources is an array of objects with a further modifiedProperties
+          array - so flatten to two levels with short ASCII keys and allowlist
+          the key set before the crossing, and cap the modifiedProperties
+          values, which carry operator-entered configuration strings. Treat
+          the crossing as at-most-once and reconcile per hour on the
+          auditEvent id.
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side tenant reachable without the guard, the REST
+          Collector and field mapping are identical without the length-capping
+          and dead-letter discipline. The decision that matters is throttling
+          against the managed-device pull that shares the same app
+          registration: stagger the queries and keep $select tight so a
+          backfill does not exhaust the tenant's Graph request budget.
+        elastic: >
+          Land in logs-microsoft_intune.audit with a custom ingest pipeline
+          that keeps event.outcome driven off activityResult rather than any
+          numeric code, copies actor.ipAddress to source.ip so the
+          authentication and iam profiles gain the admin origin the Event Hub
+          feed cannot supply, and copies a resource displayName to host.name
+          when the modified resource is a managed device; pin explicit
+          index-template mappings for the microsoft_intune.audit.* custom
+          namespace so a field-name difference from the diagnostic feed does
+          not create a second dynamic-mapped shape for the same stream. With
+          no boundary, retain the full resources array and the actor
+          userPermissions for the privilege context they add; treat this pull
+          as complementary to the Event Hub feed, since it recovers the source
+          IP and can backfill the last 30 days after an Event Hub checkpoint
+          lapses past hub retention.
+    fields:
+    - vendor: id
+      type: string
+      description: unique identifier of the audit event
+      ecs: event.id
+      status: mapped
+    - vendor: displayName
+      type: string
+      description: display name of the audit event
+      ecs: null
+      status: unmapped
+      custom: microsoft_intune.audit.display_name
+    - vendor: activity
+      type: string
+      description: friendly name of the activity that was performed
+      ecs: message
+      status: mapped
+      notes: the human-readable activity description; distinct from the machine activityType
+    - vendor: activityType
+      type: string
+      description: >-
+        the type of activity that was being performed, for example Patch
+        ManagedDevice or Delete DeviceConfiguration
+      ecs: event.action
+      status: mapped
+      notes: 'the operation identity, the Graph analog of the diagnostic feed''s operationName'
+    - vendor: activityOperationType
+      type: string
+      description: the HTTP operation type of the activity, for example Create, Delete, or Patch
+      ecs: null
+      status: unmapped
+      custom: microsoft_intune.audit.activity_operation_type
+      notes: >-
+        the verb class of the action; kept custom rather than forced onto
+        http.request.method because the values are semantic operation names,
+        not literal HTTP methods
+    - vendor: activityResult
+      type: enum
+      description: the result of the activity, for example Success or Failure
+      ecs: event.outcome
+      status: mapped
+      transform: >-
+        lowercased to the ECS success/failure vocabulary; this string, not a
+        numeric code, is the outcome source on the Graph shape
+    - vendor: activityDateTime
+      type: timestamp
+      description: the UTC date and time when the activity was performed
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: correlationId
+      type: string
+      description: client request id used to correlate related activity across the system
+      ecs: null
+      status: unmapped
+      custom: microsoft_intune.audit.correlation_id
+    - vendor: componentName
+      type: string
+      description: name of the Intune component that raised the audit event
+      ecs: null
+      status: unmapped
+      custom: microsoft_intune.audit.component_name
+    - vendor: category
+      type: string
+      description: audit category of the event
+      ecs: null
+      status: unmapped
+      custom: microsoft_intune.audit.category
+    - vendor: actor.userPrincipalName
+      type: string
+      description: user principal name of the administrator who initiated the operation
+      ecs: user.name
+      status: mapped
+    - vendor: actor.userId
+      type: string
+      description: Entra user id of the initiating administrator
+      ecs: user.id
+      status: mapped
+    - vendor: actor.ipAddress
+      type: string
+      description: IP address the initiating request came from
+      ecs: source.ip
+      status: mapped
+      notes: >
+        the admin source IP the diagnostic-settings feed does not carry;
+        recovering it is the main analytical reason to run this pull alongside
+        the Event Hub feed
+    - vendor: actor.type
+      type: string
+      description: actor type indicating whether a user or an application initiated the operation
+      ecs: null
+      status: unmapped
+      custom: microsoft_intune.audit.actor.type
+    - vendor: actor.applicationId
+      type: string
+      description: Entra application id of the initiating application
+      ecs: null
+      status: unmapped
+      custom: microsoft_intune.audit.actor.application_id
+    - vendor: actor.applicationDisplayName
+      type: string
+      description: human-readable name of the application that initiated the action
+      ecs: null
+      status: unmapped
+      custom: microsoft_intune.audit.actor.application_name
+    - vendor: actor.servicePrincipalName
+      type: string
+      description: service principal name when a service identity initiated the operation
+      ecs: null
+      status: unmapped
+      custom: microsoft_intune.audit.actor.service_principal_name
+    - vendor: actor.userPermissions
+      type: string
+      description: list of permissions the actor held when the audited action was performed
+      ecs: null
+      status: unmapped
+      custom: microsoft_intune.audit.actor.user_permissions
+      notes: >-
+        array-valued privilege context with no ECS home; useful for spotting
+        an action taken under an unexpectedly broad permission set
+    - vendor: resources.displayName
+      type: string
+      description: display name of an Intune object modified by the operation
+      ecs: null
+      status: partial
+      custom: microsoft_intune.audit.resource.display_name
+      transform: >
+        array-valued; when the modified resource is a managed device the value
+        should also be copied to host.name so device-scoped queries reach
+        admin actions
+    - vendor: resources.type
+      type: string
+      description: type of the Intune resource modified by the operation
+      ecs: null
+      status: unmapped
+      custom: microsoft_intune.audit.resource.type
+    - vendor: resources.resourceId
+      type: string
+      description: identifier of the Intune resource modified by the operation
+      ecs: null
+      status: unmapped
+      custom: microsoft_intune.audit.resource.id
+    - vendor: resources.modifiedProperties
+      type: string
+      description: >-
+        per-resource array of modified-property name, old value, and new value
+        for configuration changes
+      ecs: null
+      status: partial
+      custom: microsoft_intune.audit.resource.modified_properties
+      notes: >
+        the before/after triple is the most useful part of the record and the
+        main thing that must be flattened before it can be queried or
+        content-filtered, mirroring the diagnostic feed's properties.Targets
+- id: intune-managed-device
+  name: Intune managed device records (Azure diagnostic settings)
+  description: >
+    Thin starter for the Intune device inventory and state stream on the same
+    Event Hub, collected by the microsoft_intune integration's managed_device
+    data stream. Each record is a device state snapshot rather than an action,
+    and it carries the two signals a CSOC most wants from mobile MDM - the
+    jailbreak/root indicator and the compliance verdict - alongside hardware
+    and ownership context for government-furnished handsets.
+  event_categories:
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same Azure Event Hub as the audit stream, separated by the diagnostic
+        category.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-microsoft_intune.managed_device
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Same Azure Event Hub as the audit stream, separated by the diagnostic
+        category.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-microsoft_intune.managed_device
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: Microsoft Intune integration
+      notes: beta package 0.1.0, same version-pinning caveat as the audit stream
+    fields:
+    - vendor: operationName
+      type: string
+      description: name of the operation that produced the device record
+      ecs: event.action
+      status: mapped
+    - vendor: resultType
+      type: enum
+      description: result status of the record-producing operation
+      ecs: event.outcome
+      status: mapped
+      transform: lowercased to the ECS success/failure vocabulary
+    - vendor: properties.DeviceId
+      type: string
+      description: unique identifier of the managed device in Intune
+      ecs: device.id
+      status: mapped
+      transform: >-
+        also copied to host.id so Intune and Workspace ONE device records join
+        the same host-centric views
+    - vendor: properties.DeviceName
+      type: string
+      description: human-readable name assigned to the device
+      ecs: host.name
+      status: mapped
+    - vendor: properties.SerialNumber
+      type: string
+      description: hardware serial number reported by the device
+      ecs: null
+      status: unmapped
+      custom: microsoft_intune.managed_device.serial_number
+      notes: ECS 9.4 has beta device.serial_number; adopt when GA
+    - vendor: properties.JailBroken
+      type: string
+      description: indicates whether the device is jailbroken or rooted
+      ecs: null
+      status: partial
+      custom: microsoft_intune.managed_device.jail_broken
+      transform: >
+        tri-state string (True/False/Unknown) rather than a boolean; normalize
+        to a boolean plus an explicit unknown so the compromised-device
+        condition is directly alertable
+    - vendor: properties.CompliantState
+      type: string
+      description: compliance status of the device as evaluated by Intune
+      ecs: null
+      status: partial
+      custom: microsoft_intune.managed_device.compliant_state
+      transform: >
+        compliance verdict string; needs a lookup to drive event.outcome on
+        compliance-evaluation records, which have no outcome column of their
+        own
+    - vendor: properties.OS
+      type: string
+      description: operating system platform of the device
+      ecs: host.os.name
+      status: mapped
+    - vendor: properties.OSVersion
+      type: string
+      description: version of the operating system installed on the device
+      ecs: host.os.version
+      status: mapped
+    - vendor: properties.Manufacturer
+      type: string
+      description: name of the device manufacturer
+      ecs: device.manufacturer
+      status: mapped
+    - vendor: properties.Model
+      type: string
+      description: hardware model identifier reported by the device
+      ecs: device.model.name
+      status: mapped
+    - vendor: properties.UPN
+      type: string
+      description: 'user principal name of the device''s primary user'
+      ecs: user.name
+      status: mapped
+    - vendor: properties.UserEmail
+      type: string
+      description: 'email address of the device''s primary user'
+      ecs: user.email
+      status: mapped
+    - vendor: properties.Ownership
+      type: enum
+      description: ownership type of the device - Corporate or Personal
+      ecs: null
+      status: unmapped
+      custom: microsoft_intune.managed_device.ownership
+      notes: >-
+        the Intune equivalent of Workspace ONE's OwnershipType; both need the
+        same custom field semantics to filter GFE from BYOD
+    - vendor: properties.WifiMacAddress
+      type: mac
+      description: Wi-Fi MAC address of the device
+      ecs: host.mac
+      status: partial
+      transform: >-
+        reported without separators; normalize to the ECS uppercase
+        hyphen-separated form (RFC 7042, for example 00-00-5E-00-53-23) before
+        indexing
+    - vendor: properties.IMEI
+      type: string
+      description: International Mobile Equipment Identity of the device where applicable
+      ecs: null
+      status: unmapped
+      custom: microsoft_intune.managed_device.imei
+      notes: >-
+        subscriber hardware identifier; treat as sensitive and mask low-side
+        unless a stated requirement needs it
+    - vendor: properties.PhoneNumber
+      type: string
+      description: phone number associated with the device where available
+      ecs: null
+      status: unmapped
+      custom: microsoft_intune.managed_device.phone_number
+      notes: >-
+        subscriber PII on government-furnished handsets; the strongest
+        candidate for a low-side masking rule
+    - vendor: properties.LastContact
+      type: timestamp
+      description: date and time the device last communicated with Intune
+      ecs: null
+      status: partial
+      custom: microsoft_intune.managed_device.last_contact
+      notes: >
+        the staleness signal for detecting devices that have gone dark; not
+        mapped to @timestamp, which reflects the record export time rather
+        than device check-in
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Pass through to the integration and keep low-side work to Event Hub
+          consumption and Persistent Queue backpressure, but do the privacy
+          work here: mask or drop PhoneNumber, IMEI, and MEID before the
+          records leave the low side unless a stated requirement needs them,
+          since these are subscriber identifiers on government-furnished
+          handsets. This is a state snapshot rather than an event stream, so
+          also suppress unchanged repeats low-side rather than paying to index
+          every refresh.
+        elastic: >
+          Parse with the stock microsoft_intune integration and add a
+          logs-microsoft_intune.managed_device@custom pipeline that normalizes
+          the tri-state JailBroken string into a stable boolean plus an
+          explicit unknown, and turns CompliantState into a clean
+          event.outcome so compliance drift is alertable rather than a string
+          comparison. Normalize WifiMacAddress to the ECS uppercase
+          hyphen-separated form, and map the microsoft_intune.managed_device.*
+          custom fields as keyword in the index template so ownership and
+          encryption state can be filtered.
+        relay: >
+          Thin-envelope hybrid on the guarded crossing, matching the audit
+          stream so both Intune datasets present one envelope shape. These
+          records are wide and carry subscriber identifiers, so the redaction
+          decided low-side is what actually crosses - do the masking before
+          the guard, not after, and keep the JSON to two levels with an
+          allowlisted key set.
+      direct:
+        parse_location: high
+        cribl: >
+          Pass through to the integration and keep Cribl's work to Event Hub
+          consumption and Persistent Queue backpressure, but do the privacy
+          work here: mask or drop PhoneNumber, IMEI, and MEID before indexing
+          unless a stated requirement needs them, since these are subscriber
+          identifiers on government-furnished handsets and masking them by
+          default remains the right posture for GFE. This is a state snapshot
+          rather than an event stream, so also suppress unchanged repeats
+          rather than paying to index every refresh.
+        elastic: >
+          Parse with the stock microsoft_intune integration and add a
+          logs-microsoft_intune.managed_device@custom pipeline that normalizes
+          the tri-state JailBroken string into a stable boolean plus an
+          explicit unknown, and turns CompliantState into a clean
+          event.outcome so compliance drift is alertable rather than a string
+          comparison. Normalize WifiMacAddress to the ECS uppercase
+          hyphen-separated form, and map the microsoft_intune.managed_device.*
+          custom fields as keyword in the index template so ownership and
+          encryption state can be filtered.
+  - format: api-pull
+    enable: >
+      Register an Entra app granted the
+      DeviceManagementManagedDevices.Read.All application permission and GET
+      https://graph.microsoft.com/v1.0/deviceManagement/managedDevices, paging
+      on @odata.nextLink; some sensitive columns (udid, ethernetMacAddress,
+      iccid) are non-default and require an individual GET on the device id
+      with an explicit $select. Supports $filter on lastSyncDateTime and
+      enrolledDateTime to scope a delta pull. For a US Government tenant use
+      the graph.microsoft.us national-cloud host with login.microsoftonline.us
+      tokens. Each record is a device state snapshot rather than an event, so
+      poll on a cadence and suppress unchanged repeats rather than indexing
+      every refresh.
+    references:
+    - >-
+      https://learn.microsoft.com/en-us/graph/api/resources/intune-devices-manageddevice?view=graph-rest-1.0
+    - >-
+      https://learn.microsoft.com/en-us/graph/api/intune-devices-manageddevice-list?view=graph-rest-1.0
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        custom Graph managed-device pull pipeline (Cribl REST Collector)
+        landing in logs-microsoft_intune.managed_device
+      notes: >
+        As with the audit pull, the microsoft_intune integration parses the
+        diagnostic-record shape and not the Graph managedDevice shape, so a
+        Cribl REST Collector polls the endpoint and a pipeline maps the
+        camelCase properties before the destination. This is a state snapshot,
+        so the pipeline's real work is change-suppression and subscriber-id
+        redaction rather than event extraction.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          A Cribl REST Collector runs the managedDevices query low-side (Graph
+          is reachable only from the low enclave on the guarded path) and owns
+          the parse because no integration reconstitutes the Graph shape
+          high-side. Do the privacy work here: mask or drop phoneNumber, imei,
+          meid and iccid before the records leave the low side unless a stated
+          requirement needs them, since these are subscriber identifiers on
+          government-furnished handsets. Suppress unchanged snapshots on a
+          content hash so a state refresh does not pay to cross the guard, and
+          gate the guard destination with schema validation and a dead-letter
+          route.
+        elastic: >
+          Land in logs-microsoft_intune.managed_device with a custom ingest
+          pipeline that normalizes the jailBroken string into a stable boolean
+          plus an explicit unknown, turns complianceState into a clean
+          event.outcome so compliance drift is alertable rather than a string
+          comparison, and normalizes wiFiMacAddress and ethernetMacAddress to
+          the ECS uppercase hyphen-separated host.mac array. Map the
+          microsoft_intune.managed_device.* custom fields as keyword so
+          ownership, encryption and the partner threat verdict can be
+          filtered, matching the mappings the diagnostic feed already needs.
+        relay: >
+          Full ECS-shaped JSON crosses, with the low-side redaction being what
+          actually crosses - do the masking of phoneNumber, imei, meid and
+          iccid before the guard, not after. These records are wide, so hold
+          the JSON to two levels with an allowlisted key set and drop the
+          inventory columns no stated requirement needs before the crossing
+          rather than carrying the full resource. Because the snapshot has no
+          natural event identity, reconcile per hour on the device id count.
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side tenant reachable without the guard, the REST
+          Collector and mapping are identical without the mandatory
+          subscriber-id masking, though masking the subscriber identifiers by
+          default remains the right posture for GFE. The governing decision is
+          Graph throttling shared with the audit pull: scope the query with
+          $filter on lastSyncDateTime and keep $select tight so a full
+          inventory sweep does not starve the audit pull.
+        elastic: >
+          Land in logs-microsoft_intune.managed_device with a custom ingest
+          pipeline that normalizes the jailBroken string into a stable boolean
+          plus an explicit unknown, turns complianceState into a clean
+          event.outcome so compliance drift is alertable rather than a string
+          comparison, and normalizes wiFiMacAddress and ethernetMacAddress to
+          the ECS uppercase hyphen-separated host.mac array; map the
+          microsoft_intune.managed_device.* custom fields as keyword so
+          ownership, encryption and the partner threat verdict can be
+          filtered. With no boundary, retain the wider inventory columns -
+          partnerReportedThreatState, isEncrypted, androidSecurityPatchLevel -
+          for the posture hunting they enable; treat this pull as the fuller
+          device inventory and the Event Hub managed_device stream as the
+          lower-latency change feed.
+    fields:
+    - vendor: id
+      type: string
+      description: unique identifier of the managed device in Intune
+      ecs: device.id
+      status: mapped
+      transform: >-
+        also copied to host.id so Intune and Workspace ONE device records join
+        the same host-centric views
+    - vendor: deviceName
+      type: string
+      description: human-readable name assigned to the device
+      ecs: host.name
+      status: mapped
+    - vendor: managedDeviceOwnerType
+      type: enum
+      description: ownership of the device - unknown, company, or personal
+      ecs: null
+      status: unmapped
+      custom: microsoft_intune.managed_device.ownership
+      notes: >-
+        the Graph spelling of the diagnostic feed's Ownership; the primary
+        filter separating GFE from BYOD
+    - vendor: complianceState
+      type: enum
+      description: >-
+        compliance state of the device - compliant, noncompliant, conflict,
+        error, inGracePeriod, configManager, or unknown
+      ecs: null
+      status: partial
+      custom: microsoft_intune.managed_device.compliant_state
+      transform: >-
+        needs a lookup to drive event.outcome on compliance-evaluation
+        records, which have no outcome column of their own
+    - vendor: jailBroken
+      type: string
+      description: whether the device is jailbroken or rooted
+      ecs: null
+      status: partial
+      custom: microsoft_intune.managed_device.jail_broken
+      transform: >
+        string rather than boolean (True/False/Unknown/empty); normalize to a
+        boolean plus an explicit unknown so the compromised-device condition
+        is directly alertable
+    - vendor: operatingSystem
+      type: string
+      description: operating system platform of the device, for example iOS or Android
+      ecs: host.os.name
+      status: mapped
+    - vendor: osVersion
+      type: string
+      description: operating system version installed on the device
+      ecs: host.os.version
+      status: mapped
+    - vendor: manufacturer
+      type: string
+      description: manufacturer of the device
+      ecs: device.manufacturer
+      status: mapped
+    - vendor: model
+      type: string
+      description: hardware model of the device
+      ecs: device.model.name
+      status: mapped
+    - vendor: serialNumber
+      type: string
+      description: hardware serial number of the device
+      ecs: null
+      status: unmapped
+      custom: microsoft_intune.managed_device.serial_number
+      notes: ECS 9.4 has beta device.serial_number; adopt when GA
+    - vendor: userPrincipalName
+      type: string
+      description: 'user principal name of the device''s primary user'
+      ecs: user.name
+      status: mapped
+    - vendor: emailAddress
+      type: string
+      description: 'email address of the device''s primary user'
+      ecs: user.email
+      status: mapped
+    - vendor: userDisplayName
+      type: string
+      description: 'display name of the device''s primary user'
+      ecs: user.full_name
+      status: mapped
+    - vendor: azureADDeviceId
+      type: string
+      description: unique identifier for the Entra ID (Azure AD) device object
+      ecs: null
+      status: unmapped
+      custom: microsoft_intune.managed_device.azure_ad_device_id
+      notes: >-
+        the Entra device GUID; the join key back to Entra sign-in records and
+        to Defender for Endpoint host identity
+    - vendor: wiFiMacAddress
+      type: mac
+      description: Wi-Fi MAC address of the device
+      ecs: host.mac
+      status: partial
+      transform: >-
+        reported without separators; normalize to the ECS uppercase
+        hyphen-separated form (RFC 7042, for example 00-00-5E-00-53-23) and
+        append to the host.mac array
+    - vendor: ethernetMacAddress
+      type: mac
+      description: Ethernet MAC address of the device
+      ecs: host.mac
+      status: partial
+      transform: >
+        non-default column requiring an explicit $select; normalize to the ECS
+        uppercase hyphen-separated form (RFC 7042, for example
+        00-00-5E-00-53-23) and append to the host.mac array alongside
+        wiFiMacAddress rather than overwriting it
+    - vendor: imei
+      type: string
+      description: International Mobile Equipment Identity of the device
+      ecs: null
+      status: unmapped
+      custom: microsoft_intune.managed_device.imei
+      notes: >-
+        subscriber hardware identifier; treat as sensitive and mask low-side
+        unless a stated requirement needs it
+    - vendor: meid
+      type: string
+      description: Mobile Equipment Identifier of the device
+      ecs: null
+      status: unmapped
+      custom: microsoft_intune.managed_device.meid
+      notes: >-
+        subscriber hardware identifier not present on the diagnostic snapshot;
+        mask low-side with imei and phoneNumber
+    - vendor: iccid
+      type: string
+      description: 'Integrated Circuit Card Identifier of the device''s SIM'
+      ecs: null
+      status: unmapped
+      custom: microsoft_intune.managed_device.iccid
+      notes: >-
+        non-default SIM identifier requiring an explicit $select; sensitive
+        subscriber id, mask low-side
+    - vendor: phoneNumber
+      type: string
+      description: phone number associated with the device where available
+      ecs: null
+      status: unmapped
+      custom: microsoft_intune.managed_device.phone_number
+      notes: >-
+        subscriber PII on government-furnished handsets; the strongest
+        candidate for a low-side masking rule
+    - vendor: subscriberCarrier
+      type: string
+      description: 'mobile carrier the device''s SIM subscribes to'
+      ecs: null
+      status: unmapped
+      custom: microsoft_intune.managed_device.subscriber_carrier
+    - vendor: managementAgent
+      type: enum
+      description: >-
+        management channel of the device, for example mdm, easMdm, jamf, or
+        configurationManagerClient
+      ecs: null
+      status: unmapped
+      custom: microsoft_intune.managed_device.management_agent
+    - vendor: deviceEnrollmentType
+      type: enum
+      description: >-
+        enrollment type of the device, for example userEnrollment,
+        appleUserEnrollment, or windowsAutoEnrollment
+      ecs: null
+      status: unmapped
+      custom: microsoft_intune.managed_device.enrollment_type
+    - vendor: isEncrypted
+      type: boolean
+      description: device encryption status
+      ecs: null
+      status: unmapped
+      custom: microsoft_intune.managed_device.is_encrypted
+      notes: >-
+        encryption posture the diagnostic snapshot does not carry; a direct
+        compliance-posture filter
+    - vendor: isSupervised
+      type: boolean
+      description: whether the device is supervised
+      ecs: null
+      status: unmapped
+      custom: microsoft_intune.managed_device.is_supervised
+    - vendor: partnerReportedThreatState
+      type: enum
+      description: >-
+        threat state reported by a Mobile Threat Defense partner - for example
+        secured, compromised, or highSeverity
+      ecs: null
+      status: partial
+      custom: microsoft_intune.managed_device.partner_reported_threat_state
+      notes: >
+        a second compromise signal alongside jailBroken, sourced from an MTD
+        partner rather than the platform; a compromised or highSeverity value
+        is a high-signal CSOC condition worth alerting on directly
+    - vendor: androidSecurityPatchLevel
+      type: string
+      description: Android security patch level reported by the device
+      ecs: null
+      status: unmapped
+      custom: microsoft_intune.managed_device.android_security_patch_level
+      notes: patch-currency signal for Android GFE not present on the diagnostic snapshot
+    - vendor: enrolledDateTime
+      type: timestamp
+      description: time the device was enrolled into Intune
+      ecs: null
+      status: unmapped
+      custom: microsoft_intune.managed_device.enrolled_date_time
+    - vendor: lastSyncDateTime
+      type: timestamp
+      description: time the device last completed a successful sync with Intune
+      ecs: null
+      status: partial
+      custom: microsoft_intune.managed_device.last_sync_date_time
+      notes: >
+        the staleness signal for detecting devices that have gone dark; not
+        mapped to @timestamp, which reflects the pull time rather than device
+        check-in, mirroring the diagnostic feed's LastContact

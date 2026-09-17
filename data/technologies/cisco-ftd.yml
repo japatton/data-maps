@@ -1,0 +1,2303 @@
+id: cisco-ftd
+name: Cisco Secure Firewall Threat Defense (FTD)
+vendor: Cisco
+versions: FTD 7.0, 7.2, 7.4 (managed by FMC 7.x)
+draft: true
+references:
+- >-
+  https://www.cisco.com/c/en/us/td/docs/security/firepower/Syslogs/b_fptd_syslog_guide/security-event-syslog-messages.html
+- >-
+  https://www.cisco.com/c/en/us/td/docs/security/secure-firewall/management-center/admin/730/management-center-admin-73/health-audit-syslog.html
+- https://www.elastic.co/docs/reference/integrations/cisco_ftd
+- https://github.com/elastic/integrations/tree/main/packages/cisco_ftd
+datasets:
+- id: connection
+  name: Connection event (430002/430003)
+  description: >
+    Snort-side connection events emitted at the beginning (%FTD-6-430002) and
+    end (%FTD-6-430003) of a flow that matched an access control policy. These
+    are the security-event syslogs, sent either directly by the device or
+    relayed by FMC, and carry a comma-separated key=value payload after the
+    message ID. This is the highest-volume FTD dataset and the one that
+    carries URL filtering, DNS, TLS, and Security Intelligence context.
+  event_categories:
+  - network
+  - dns
+  - web
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Device/FMC syslog lands on a Cribl syslog source in this hop.
+        Connection events are the volume driver here, so the sampling/drop
+        decision belongs in this hop.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cisco_ftd.log
+      notes: >
+        the Elastic cisco_ftd integration ships a single "log" data stream;
+        connection, intrusion, and file events are separated by
+        cisco.ftd.message_id rather than by data stream
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Device/FMC syslog lands on a Cribl syslog source in this hop.
+        Connection events are the volume driver here, so the sampling/drop
+        decision belongs in this hop.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cisco_ftd.log
+      notes: >
+        the Elastic cisco_ftd integration ships a single "log" data stream;
+        connection, intrusion, and file events are separated by
+        cisco.ftd.message_id rather than by data stream
+  formats:
+  - format: syslog-kv
+    parsing:
+      mechanism: elastic-integration
+      artifact: Cisco FTD integration (cisco_ftd)
+      notes: >
+        The integration's default ingest pipeline splits the security-event
+        key=value payload and copies known keys to ECS, keeping the raw pairs
+        under cisco.ftd.security_event.*. Unknown/newer keys survive as
+        flattened cisco.ftd.security fields rather than being dropped.
+    fields:
+    - vendor: SrcIP
+      type: ip
+      description: IP address of the host that initiated the flow
+      ecs: source.ip
+      status: mapped
+    - vendor: DstIP
+      type: ip
+      description: IP address of the host that responded to the flow
+      ecs: destination.ip
+      status: mapped
+    - vendor: SrcPort
+      type: port
+      description: transport-layer port on the initiator side
+      ecs: source.port
+      status: mapped
+    - vendor: DstPort
+      type: port
+      description: transport-layer port on the responder side
+      ecs: destination.port
+      status: mapped
+    - vendor: Protocol
+      type: enum
+      description: IP transport protocol carrying the flow
+      ecs: network.transport
+      status: mapped
+      transform: >
+        emitted as the IANA protocol name (tcp/udp/icmp) in current releases
+        but as a numeric protocol number by some older FMC-relayed events;
+        normalize to lowercase names before use
+    - vendor: IngressInterface
+      type: string
+      description: name of the FTD interface the flow entered on
+      ecs: observer.ingress.interface.name
+      status: mapped
+    - vendor: EgressInterface
+      type: string
+      description: name of the FTD interface the flow left on
+      ecs: observer.egress.interface.name
+      status: mapped
+    - vendor: ACPolicy
+      type: string
+      description: name of the access control policy that owns the matching rule
+      ecs: rule.ruleset
+      status: mapped
+    - vendor: AccessControlRuleName
+      type: string
+      description: name of the access control rule the flow matched
+      ecs: rule.name
+      status: mapped
+    - vendor: AccessControlRuleAction
+      type: enum
+      description: disposition the matching access control rule applied to the flow
+      ecs: event.action
+      status: mapped
+      transform: >
+        values are Allow/Trust/Block/Block with reset/Interactive Block/
+        Interactive Block with reset/Monitor; copied verbatim to event.action,
+        and the same value must drive a lookup to event.outcome
+        (Allow/Trust/Monitor -> success, Block* -> failure). There is no
+        separate outcome key in the message.
+    - vendor: InitiatorBytes
+      type: bytes
+      description: total bytes sent by the flow initiator
+      ecs: source.bytes
+      status: mapped
+      notes: initiator = the side that opened the flow, which is the ECS source
+    - vendor: ResponderBytes
+      type: bytes
+      description: total bytes sent by the flow responder
+      ecs: destination.bytes
+      status: mapped
+    - vendor: ConnectionDuration
+      type: integer
+      description: elapsed lifetime of the flow in whole seconds
+      ecs: event.duration
+      status: partial
+      transform: >
+        vendor emits whole seconds and only on the end-of-connection message
+        (430003); ECS event.duration is nanoseconds, so multiply by 1e9.
+        Start-of-connection events (430002) have no duration at all, so any
+        dashboard averaging this field must filter on message_id first.
+    - vendor: ApplicationProtocol
+      type: string
+      description: application-layer protocol identified by App-ID (HTTP, DNS, SSL, ...)
+      ecs: network.protocol
+      status: mapped
+    - vendor: WebApplication
+      type: string
+      description: web application detected inside the flow (e.g. Google Drive)
+      ecs: network.application
+      status: partial
+      notes: >
+        the separate Client key also targets network.application, so the two
+        collide and the integration can produce an array — pick one as
+        authoritative in the pipeline
+    - vendor: URL
+      type: string
+      description: full URL requested over the flow
+      ecs: url.original
+      status: partial
+      notes: >
+        only populated when URL filtering or TLS/SSL decryption is enabled on
+        the matching rule; absent for the majority of flows, so the web
+        alerting profile is only satisfied on the decrypted subset
+    - vendor: URLCategory
+      type: string
+      description: Cisco Talos content category assigned to the requested URL
+      ecs: null
+      status: unmapped
+      custom: cisco.ftd.security_event.url_category
+      notes: vendor-specific category taxonomy; no ECS equivalent
+    - vendor: DNSQuery
+      type: string
+      description: domain name queried on a DNS flow
+      ecs: dns.question.name
+      status: partial
+      notes: >
+        present only on flows the DNS preprocessor inspected; connection
+        events are not a substitute for a real DNS log source, and there is no
+        matching answer/resolved-IP key
+    - vendor: SSLServerName
+      type: string
+      description: hostname the client asked for in the TLS ClientHello of an encrypted flow
+      ecs: tls.client.server_name
+      status: partial
+      notes: >
+        one of the SSL/TLS keys 430002/430003 carry (alongside SSLVersion,
+        SSLCipherSuite, SSLActualAction, SSLFlowStatus and the certificate
+        keys), present whenever the SSL policy saw the handshake. The stock
+        integration sends it to server.domain, so an @custom pipeline has to
+        move it to tls.client.server_name, the ECS field for the SNI.
+    - vendor: User
+      type: string
+      description: identity-policy user associated with the initiator of the flow
+      ecs: user.name
+      status: partial
+      transform: >
+        arrives as "REALM\\username" (or "No Authentication Required") from
+        the identity policy; the realm prefix must be split off into
+        user.domain before user.name is comparable with the AD sources
+    - vendor: NAT_InitiatorIP
+      type: ip
+      description: post-NAT translated address of the flow initiator
+      ecs: source.nat.ip
+      status: mapped
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Route the syslog source on message ID so 430002/430003 reach the
+          security-event path and LINA messages do not, and make this the hop
+          that owns the volume decision (sample or drop start-of-connection
+          430002 events rather than the end-of-connection 430003 records that
+          carry byte counts and duration). No security-event key identifies
+          the emitting firewall, so stamp observer.name/observer.hostname from
+          the syslog header plus a device-to-site/owner lookup here, and run
+          the Elastic Bulk destination with a Persistent Queue rather than
+          Block.
+        elastic: >
+          Keep the stock cisco_ftd integration as the parser and put the fixes
+          in an @custom pipeline: derive event.outcome from
+          AccessControlRuleAction (Allow/Trust/Monitor to success, every Block
+          variant to failure), convert ConnectionDuration seconds to
+          nanoseconds for event.duration, and pick one authoritative source
+          for network.application so WebApplication and Client stop producing
+          an array. Move SSLServerName off the stock server.domain onto
+          tls.client.server_name, the ECS field for the ClientHello SNI. Split
+          the "REALM\\username" identity into user.domain plus user.name, and
+          add index-template mappings for the custom fields the map keeps out
+          of ECS, notably the Talos url_category keyword.
+        relay: >
+          Low-side instances cross the guard: hybrid on a thin {_dataId,
+          @timestamp, host, _raw} envelope with the integration still doing
+          extraction high-side. URL and DNSQuery are the unbounded,
+          attacker-influenced values most likely to trip content filtering, so
+          cap their length and normalize unicode before the guard destination,
+          validate the envelope with C.Schema(...) into a low-side dead-letter
+          route, and drop _raw first on this dataset — it is the volume driver
+          with the lowest per-event forensic value.
+      direct:
+        parse_location: high
+        cribl: >
+          Route the syslog source on message ID so 430002/430003 reach the
+          security-event path and LINA messages do not, and make this the hop
+          that owns the volume decision (sample or drop start-of-connection
+          430002 events rather than the end-of-connection 430003 records that
+          carry byte counts and duration). No security-event key identifies
+          the emitting firewall, so stamp observer.name/observer.hostname from
+          the syslog header plus a device-to-site/owner lookup here, and run
+          the Elastic Bulk destination with a Persistent Queue rather than
+          Block.
+        elastic: >
+          Keep the stock cisco_ftd integration as the parser and put the fixes
+          in an @custom pipeline: derive event.outcome from
+          AccessControlRuleAction (Allow/Trust/Monitor to success, every Block
+          variant to failure), convert ConnectionDuration seconds to
+          nanoseconds for event.duration, and pick one authoritative source
+          for network.application so WebApplication and Client stop producing
+          an array. Move SSLServerName off the stock server.domain onto
+          tls.client.server_name, the ECS field for the ClientHello SNI. Split
+          the "REALM\\username" identity into user.domain plus user.name, and
+          add index-template mappings for the custom fields the map keeps out
+          of ECS, notably the Talos url_category keyword.
+  - format: estreamer
+    enable: >
+      eStreamer streams from the FMC, not the device. In the FMC web UI go to
+      System > Integration > eStreamer, and on the eStreamer Event
+      Configuration pane tick the event types to export - for this dataset
+      "Connection Events" (and, if the packet payloads are wanted, "Packet
+      Data"). Then on the eStreamer Clients tab click Create Client, enter the
+      collector host's IP address and a certificate password, Save, and
+      download the generated PKCS#12 certificate. Point the eStreamer client
+      (Cisco eNcore, or a SIEM connector) at the FMC management IP on TCP 8302
+      with that certificate. There is no device-side syslog toggle to change;
+      eStreamer and the 4300xx syslogs can run concurrently, so pick one as
+      the authoritative connection feed to avoid double counting.
+    references:
+    - >-
+      https://www.cisco.com/c/en/us/td/docs/security/firepower/60/api/eStreamer/EventStreamerIntegrationGuide/ConfiguringEstreamer.html
+    - >-
+      https://www.cisco.com/c/en/us/td/docs/security/firepower/720/api/eStreamer/EventStreamerIntegrationGuide.pdf
+    - >-
+      https://www.cisco.com/c/en/us/support/docs/security/firepower-ngfw/215631-understand-estreamer-and-troubleshoot-en.html
+    - https://github.com/CiscoSecurity/fp-05-firepower-cef-connector-arcsight
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: eStreamer eNcore client + custom Firepower eStreamer reparse pipeline
+      notes: >
+        eStreamer is a binary length-typed record protocol over SSL, not a
+        syslog line, so the stock cisco_ftd Elastic integration cannot read it
+        and Cribl has no native eStreamer decoder. A client (Cisco eNcore, or
+        a SIEM-specific connector) must terminate the 8302 SSL stream, decode
+        the binary blocks, and - critically - resolve the numeric IDs/UUIDs
+        (policy, rule, zone, interface, application, user, Security
+        Intelligence list) against the FMC metadata records eStreamer sends
+        alongside the events, because the connection record itself carries
+        only the identifiers. eNcore emits the resolved events as key-value,
+        CEF or JSON; the downstream pipeline then maps those names to ECS.
+        None of the packaged cisco_ftd content applies to that output, so the
+        reparse is custom.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          The hard constraint is that a CDS content filter cannot inspect the
+          opaque binary eStreamer stream, and the metadata records that name
+          the UUIDs arrive interleaved with the event records - a naive byte
+          relay would strand events whose metadata never crossed. Terminate
+          eStreamer with eNcore LOW-SIDE, do the full ID/UUID-to-name
+          resolution there while the FMC metadata is reachable, and hand the
+          resulting NDJSON to Cribl for the crossing. This is the volume
+          driver, so keep the sampling/drop decision here exactly as on the
+          syslog path (thin the connection records, not the intrusion or
+          malware ones), and stamp observer.name/observer.hostname from the
+          reporting device id since the record identifies the sensor only by a
+          numeric deviceId.
+        elastic: >
+          Run a custom @custom pipeline (there is no stock integration for the
+          eStreamer output) that maps the resolved eNcore field names to ECS:
+          initiatorIpAddress/responderIpAddress to source.ip/destination.ip,
+          the transmitted-byte and packet counters to source.bytes/
+          destination.bytes and source.packets/destination.packets, ruleAction
+          to event.action with a lookup to event.outcome, and
+          firstPacketTimestamp/lastPacketTimestamp to event.start/event.end so
+          event.duration is derivable. Fold the three application ids
+          (applicationId, webApplicationId, clientApplicationId) onto distinct
+          targets so they stop colliding into an array, and add index-template
+          mappings for the eStreamer-only customs (connection join key,
+          Security Intelligence list, IOC count, url_category).
+        relay: >
+          Cross resolved NDJSON, never the raw eStreamer stream - the binary
+          form is both un-inspectable at the guard and metadata-dependent.
+          Once resolved, the free-text content-inspection surface is the same
+          handful of attacker-influenced values as the syslog form (URL,
+          dnsQuery, sslServerName, the resolved username): length-cap and
+          unicode-normalize those low-side, validate the envelope with
+          C.Schema(...) into a low-side dead-letter route, and drop the
+          packet-payload cs1 field first since it is the largest and lowest
+          per-event forensic value on this dataset. Reconcile low-side and
+          high-side counts per hour, as the crossing is at-most-once.
+      direct:
+        parse_location: hybrid
+        cribl: >
+          For a high-side FMC with no guard, still terminate eStreamer at an
+          eNcore client (nothing downstream decodes the binary form) and let
+          it resolve the metadata, then forward the NDJSON to Cribl for
+          routing only. The decision that matters is not double-counting:
+          choose eStreamer OR the 4300xx syslog as the authoritative
+          connection feed per sensor and disable the other, joining on the
+          connection counter during a brief cutover overlap.
+        elastic: >
+          Run a custom @custom pipeline (there is no stock integration for the
+          eStreamer output) that maps the resolved eNcore field names to ECS:
+          initiatorIpAddress/responderIpAddress to source.ip/destination.ip,
+          the transmitted-byte and packet counters to source.bytes/
+          destination.bytes and source.packets/destination.packets, ruleAction
+          to event.action with a lookup to event.outcome, and
+          firstPacketTimestamp/lastPacketTimestamp to event.start/event.end so
+          event.duration is derivable. Fold the three application ids
+          (applicationId, webApplicationId, clientApplicationId) onto distinct
+          targets so they stop colliding into an array, and add index-template
+          mappings for the eStreamer-only customs (connection join key,
+          Security Intelligence list, IOC count, url_category). With no
+          boundary, retain the full URL/username values and treat eStreamer as
+          the higher-fidelity connection feed - it resolves the numeric ids to
+          names and adds the impact/IOC and named Security Intelligence
+          context the 4300xx syslog only summarizes, and it carries the same
+          SSL/TLS session block the syslog does - accepting the operational
+          cost of running and monitoring the eNcore client and its
+          certificate.
+    fields:
+    - vendor: initiatorIpAddress
+      type: ip
+      description: eStreamer connection record - IP address of the flow initiator (the ECS source).
+      ecs: source.ip
+      status: mapped
+    - vendor: responderIpAddress
+      type: ip
+      description: >-
+        eStreamer connection record - IP address of the flow responder (the
+        ECS destination).
+      ecs: destination.ip
+      status: mapped
+    - vendor: originalClientIpAddress
+      type: ip
+      description: >-
+        eStreamer connection record - original client address behind a proxy
+        (from X-Forwarded-For / Via).
+      ecs: network.forwarded_ip
+      status: mapped
+      notes: populated only when an HTTP proxy was in path and the XFF/Via header was parsed
+    - vendor: initiatorPort
+      type: port
+      description: eStreamer connection record - initiator transport port.
+      ecs: source.port
+      status: mapped
+    - vendor: responderPort
+      type: port
+      description: eStreamer connection record - responder transport port.
+      ecs: destination.port
+      status: mapped
+    - vendor: protocol
+      type: integer
+      description: eStreamer connection record - IP protocol number of the flow.
+      ecs: network.iana_number
+      status: partial
+      transform: >
+        eStreamer carries the numeric IP protocol, not the IANA name the
+        4300xx syslog prints; map the number to network.iana_number and derive
+        network.transport (tcp/udp/icmp) from it by lookup.
+    - vendor: ruleAction
+      type: integer
+      description: >-
+        eStreamer connection record - access control rule disposition
+        (numeric, resolved to Allow/Trust/Block/Monitor... via metadata).
+      ecs: event.action
+      status: partial
+      transform: >
+        arrives as a numeric action code that eNcore resolves to the same
+        Allow/Trust/Block/Monitor vocabulary the syslog AccessControlRule
+        Action carries; the resolved value must also drive event.outcome
+        (Allow/Trust/Monitor to success, every Block variant to failure).
+    - vendor: ruleReason
+      type: integer
+      description: >-
+        eStreamer connection record - reason bitmask/enum (IP Block, DNS
+        Block, URL Block, Intrusion Block, File Block, SecIntel...).
+      ecs: event.reason
+      status: partial
+      notes: >
+        resolved to a reason string by the client; it is the eStreamer
+        equivalent of why a flow was acted on and is the field that
+        distinguishes a Security Intelligence block from an ACL block.
+    - vendor: policyRevision
+      type: string
+      description: >-
+        eStreamer connection record - UUID/revision of the access control
+        policy that owns the matching rule.
+      ecs: rule.ruleset
+      status: partial
+      notes: >
+        the raw record carries a UUID; the client resolves it to the policy
+        name via the FMC metadata cache, so rule.ruleset is populated only
+        after that resolution - unresolved events carry the UUID only.
+    - vendor: ruleId
+      type: string
+      description: eStreamer connection record - id of the access control rule the flow matched.
+      ecs: rule.name
+      status: partial
+      notes: >-
+        numeric/UUID id resolved to the rule name via metadata, same
+        resolution dependency as the policy
+    - vendor: ingressZone
+      type: string
+      description: eStreamer connection record - UUID of the ingress security zone.
+      ecs: observer.ingress.zone
+      status: partial
+      notes: UUID resolved to the zone name via metadata
+    - vendor: egressZone
+      type: string
+      description: eStreamer connection record - UUID of the egress security zone.
+      ecs: observer.egress.zone
+      status: partial
+      notes: UUID resolved to the zone name via metadata
+    - vendor: ingressInterface
+      type: string
+      description: eStreamer connection record - UUID of the ingress interface.
+      ecs: observer.ingress.interface.name
+      status: partial
+      notes: UUID resolved to the nameif interface label via metadata
+    - vendor: egressInterface
+      type: string
+      description: eStreamer connection record - UUID of the egress interface.
+      ecs: observer.egress.interface.name
+      status: partial
+      notes: UUID resolved to the nameif interface label via metadata
+    - vendor: initiatorTransmittedBytes
+      type: integer
+      description: eStreamer connection record - bytes sent by the initiator.
+      ecs: source.bytes
+      status: mapped
+    - vendor: responderTransmittedBytes
+      type: integer
+      description: eStreamer connection record - bytes sent by the responder.
+      ecs: destination.bytes
+      status: mapped
+    - vendor: initiatorTransmittedPackets
+      type: integer
+      description: >-
+        eStreamer connection record - packets sent by the initiator (no syslog
+        equivalent).
+      ecs: source.packets
+      status: mapped
+    - vendor: responderTransmittedPackets
+      type: integer
+      description: >-
+        eStreamer connection record - packets sent by the responder (no syslog
+        equivalent).
+      ecs: destination.packets
+      status: mapped
+    - vendor: firstPacketTimestamp
+      type: timestamp
+      description: eStreamer connection record - epoch seconds of the first packet of the flow.
+      ecs: event.start
+      status: mapped
+    - vendor: lastPacketTimestamp
+      type: timestamp
+      description: eStreamer connection record - epoch seconds of the last packet of the flow.
+      ecs: event.end
+      status: mapped
+      notes: >-
+        event.duration = event.end minus event.start; the connection record
+        gives both endpoints, unlike the 430002 start-of-connection syslog
+    - vendor: userId
+      type: integer
+      description: eStreamer connection record - id of the identity-policy user on the flow.
+      ecs: user.name
+      status: partial
+      transform: >
+        numeric user id resolved to "REALM\\username" via the FMC realm
+        metadata; split the realm prefix into user.domain before user.name is
+        comparable with the AD sources, as on the syslog feed.
+    - vendor: applicationId
+      type: integer
+      description: eStreamer connection record - App-ID application-protocol id (HTTP/DNS/SSL...).
+      ecs: network.protocol
+      status: partial
+      notes: numeric App-ID resolved to the protocol name via metadata
+    - vendor: webApplicationId
+      type: integer
+      description: eStreamer connection record - detected web application id (e.g. Google Drive).
+      ecs: network.application
+      status: partial
+      notes: >
+        resolved to the web-application name via metadata; keep this as the
+        single authoritative source for network.application and route the
+        client application id below to a custom field so the two stop
+        colliding into an array.
+    - vendor: clientApplicationId
+      type: integer
+      description: eStreamer connection record - detected client application id (browser/agent).
+      ecs: null
+      status: unmapped
+      custom: cisco.ftd.estreamer.client_application
+      notes: >-
+        kept off network.application so it does not collide with the web
+        application; resolved to a name via metadata
+    - vendor: clientUrl.data
+      type: string
+      description: eStreamer connection record - full requested URL.
+      ecs: url.original
+      status: partial
+      notes: >-
+        populated only when URL filtering or TLS decryption inspected the
+        flow, same limitation as the syslog URL key
+    - vendor: urlCategory
+      type: integer
+      description: eStreamer connection record - Cisco Talos content category of the URL.
+      ecs: null
+      status: unmapped
+      custom: cisco.ftd.estreamer.url_category
+      notes: >-
+        resolved to the Talos category name; vendor taxonomy with no ECS
+        equivalent, the same custom home as the syslog url_category
+    - vendor: dnsQuery.data
+      type: string
+      description: eStreamer connection record - domain name queried on a DNS flow.
+      ecs: dns.question.name
+      status: partial
+      notes: >-
+        present only on DNS-preprocessor-inspected flows; the record carries
+        dnsRecordType/dnsResponseType/dnsTtl alongside but no resolved answer
+        address
+    - vendor: sslServerName
+      type: string
+      description: eStreamer connection record - TLS SNI / server name from the ClientHello.
+      ecs: tls.client.server_name
+      status: mapped
+      notes: >
+        the connection statistics block documents this as the name provided in
+        the server name indication of the SSL ClientHello, which is exactly
+        what ECS calls tls.client.server_name; there is no tls.server.name
+        key. The 4300xx syslog carries the same value under SSLServerName.
+        Populate destination.domain or server.domain in addition only if a
+        normalized host key is wanted alongside the SNI.
+    - vendor: sslCertificateFingerprint
+      type: string
+      description: eStreamer connection record - SHA-1 fingerprint of the server certificate.
+      ecs: tls.server.hash.sha1
+      status: mapped
+      notes: >-
+        one of several SSL/TLS decryption fields (sslVersion, sslCipherSuite,
+        sslActualAction, sslFlowStatus) the eStreamer form adds over the
+        syslog
+    - vendor: httpResponse
+      type: integer
+      description: eStreamer connection record - HTTP status code returned on the flow.
+      ecs: http.response.status_code
+      status: partial
+      notes: present only on HTTP flows the preprocessor decoded
+    - vendor: connectionCounter
+      type: integer
+      description: >-
+        eStreamer connection record - per-sensor counter that, with the
+        instance id and timestamp, uniquely identifies the flow.
+      ecs: null
+      status: unmapped
+      custom: cisco.ftd.estreamer.connection_id
+      notes: >
+        the stable join key that ties a connection record to its intrusion,
+        file and malware records - the eStreamer feature the syslog form has
+        no equivalent of; keep it as a keyword so the event families can be
+        correlated.
+    - vendor: iocNumber
+      type: integer
+      description: >-
+        eStreamer connection record - count of indications of compromise
+        associated with the flow's hosts.
+      ecs: null
+      status: unmapped
+      custom: cisco.ftd.estreamer.num_ioc
+    - vendor: securityIntelligenceList1
+      type: string
+      description: >-
+        eStreamer connection record - UUID of the Security Intelligence
+        list/feed that matched (source or destination).
+      ecs: null
+      status: unmapped
+      custom: cisco.ftd.estreamer.security_intelligence_list
+      notes: >-
+        resolved to the feed/list name via metadata; identifies which SI feed
+        drove a block, which the syslog only summarizes
+    - vendor: initiatorCountry
+      type: integer
+      description: eStreamer connection record - geolocation country of the initiator.
+      ecs: source.geo.country_iso_code
+      status: partial
+      notes: >
+        carried as a numeric GeoDB country id the client resolves to a
+        country; map to the ISO code once resolved (responderCountry maps to
+        destination.geo.country_iso_code the same way).
+    - vendor: vlanId
+      type: integer
+      description: eStreamer connection record - 802.1Q VLAN id of the flow.
+      ecs: network.vlan.id
+      status: mapped
+  - format: netflow
+    enable: >
+      Through FMC 7.3 NSEL is configured with FlexConfig: copy the predefined
+      FlexConfig objects Netflow_Set_Parameters, Netflow_Add_Destination and
+      Netflow_Event_Types (they are read-only) and set the text objects -
+      netflow_Destination (collector interface / IP / UDP port, default 2055),
+      netflow_Parameters (template timeout and refresh) and
+      netflow_Event_Types (which of all / flow-create / flow-denied /
+      flow-teardown to export) - then assign the FlexConfig policy to the
+      device under Devices > FlexConfig. From FMC 7.4 NetFlow is native under
+      Devices > Platform Settings > NetFlow (up to five collectors). In either
+      case, to avoid double-counting disable the now-redundant flow syslogs
+      (the LINA 302xxx equivalents) so NSEL is the sole flow feed.
+    references:
+    - >-
+      https://www.cisco.com/c/en/us/support/docs/quality-of-service-qos/netflow/216126-configure-netflow-secure-event-logging-o.html
+    - https://www.plixer.com/blog/cisco-firepower-ftd-netflow-configuration/
+    - >-
+      https://www.cisco.com/c/en/us/td/docs/security/asa/special/netflow/asa_netflow.html
+    parsing:
+      mechanism: elastic-integration
+      artifact: Elastic NetFlow Records integration (netflow), data stream logs-netflow.log
+      notes: >
+        NSEL is binary NetFlow v9 over UDP, so it needs a NetFlow decoder, not
+        the syslog-line cisco_ftd integration. An Elastic Agent netflow input
+        decodes the IANA-standard elements (8/12/7/11/4/10/14) into netflow.*
+        automatically, but the ASA/FTD enterprise elements - NF_F_FW_EVENT
+        (40005), NF_F_FW_EXT_EVENT (33002), NF_F_XLATE_* (40001-40004),
+        NF_F_INGRESS/EGRESS_ACL_ID (33000/33001), NF_F_USERNAME (40000) -
+        arrive as raw template fields and need a custom ingest pipeline to
+        reach ECS. Cribl does not natively decode binary NetFlow, so on a
+        Cribl-first path a collector or the Elastic Agent input must terminate
+        the UDP stream first.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          A CDS content filter cannot inspect opaque binary NetFlow, and the
+          v9 template packets travel on a separate cadence from the data
+          records, so decode NSEL to structured records LOW-SIDE (Elastic
+          Agent netflow input or a NetFlow collector in the low enclave)
+          before the crossing. Do the ifIndex-to-nameif and ACL-id decode
+          low-side too, while the device is reachable for the show-interface /
+          show-access-list lookups. Because NSEL is the thin L3/L4 view, it is
+          cheaper to sample than the eStreamer or syslog connection feed, but
+          decide sampling here as with the other connection forms.
+        elastic: >
+          Run the netflow integration for the standard sockets and add an
+          @custom pipeline that sets event.action/event.type/event.outcome
+          from NF_F_FW_EVENT (1 flow-create, 2 flow-teardown, 3 flow-denied),
+          derives network.transport from network.iana_number, converts
+          NF_F_EVENT_TIME_MSEC to @timestamp and derives event.duration on
+          extended teardown from NF_F_FLOW_CREATE_TIME_MSEC, and maps the
+          12-byte ACL-id hashes to the cisco.ftd.nsel.* customs. Keep the
+          connection id as a keyword so create and teardown records for one
+          flow can be joined.
+        relay: >
+          Cross decoded NDJSON, never raw NetFlow - it is un-inspectable at
+          the guard and template-dependent. Once decoded the only free-text
+          value NSEL carries is NF_F_USERNAME (present only under Identity
+          Firewall), so length-cap and ASCII-constrain that one field low-side
+          and the rest of the record is fixed-width typed values. Persistent
+          Queue plus dead-letter, and per-hour count reconciliation across the
+          guard.
+      direct:
+        parse_location: high
+        cribl: >
+          For a high-side FTD with no guard, terminate NSEL at an Elastic
+          Agent netflow input directly; there is little reason to interpose
+          Cribl for binary NetFlow beyond routing. Pick NSEL or the flow
+          syslogs as the authoritative flow feed per device and disable the
+          other.
+        elastic: >
+          Run the netflow integration for the standard sockets and add an
+          @custom pipeline that sets event.action/event.type/event.outcome
+          from NF_F_FW_EVENT (1 flow-create, 2 flow-teardown, 3 flow-denied),
+          derives network.transport from network.iana_number, converts
+          NF_F_EVENT_TIME_MSEC to @timestamp and derives event.duration on
+          extended teardown from NF_F_FLOW_CREATE_TIME_MSEC, and maps the
+          12-byte ACL-id hashes to the cisco.ftd.nsel.* customs. Keep the
+          connection id as a keyword so create and teardown records for one
+          flow can be joined. With no boundary, accept that NSEL is the L3/L4
+          view only: if URL/DNS/application/user context is required, NSEL
+          cannot replace the 4300xx syslog or eStreamer, so run it as a
+          high-performance flow record alongside, not instead of, a Snort
+          feed.
+    fields:
+    - vendor: NF_F_CONN_ID
+      type: integer
+      description: NetFlow element 148 - device-assigned identifier of the unique flow.
+      ecs: null
+      status: unmapped
+      custom: cisco.ftd.nsel.connection_id
+      notes: >-
+        the only join key between a flow-create and its matching flow-teardown
+        record; no ECS equivalent
+    - vendor: NF_F_SRC_ADDR_IPV4
+      type: ip
+      description: NetFlow element 8 - source (initiator) IPv4 address, pre-NAT.
+      ecs: source.ip
+      status: mapped
+      notes: NF_F_SRC_ADDR_IPV6 (element 27) is the IPv6-flow equivalent
+    - vendor: NF_F_DST_ADDR_IPV4
+      type: ip
+      description: NetFlow element 12 - destination (responder) IPv4 address, pre-NAT.
+      ecs: destination.ip
+      status: mapped
+      notes: NF_F_DST_ADDR_IPV6 (element 28) is the IPv6-flow equivalent
+    - vendor: NF_F_SRC_PORT
+      type: port
+      description: NetFlow element 7 - source port.
+      ecs: source.port
+      status: mapped
+    - vendor: NF_F_DST_PORT
+      type: port
+      description: NetFlow element 11 - destination port.
+      ecs: destination.port
+      status: mapped
+    - vendor: NF_F_PROTOCOL
+      type: integer
+      description: NetFlow element 4 - IP protocol number.
+      ecs: network.iana_number
+      status: mapped
+      transform: >-
+        numeric protocol; derive network.transport (tcp/udp/icmp) by lookup
+        rather than leaving transport blank
+    - vendor: NF_F_XLATE_SRC_ADDR_IPV4
+      type: ip
+      description: NetFlow element 40001 - post-NAT (mapped) source IPv4 address.
+      ecs: source.nat.ip
+      status: mapped
+    - vendor: NF_F_XLATE_DST_ADDR_IPV4
+      type: ip
+      description: NetFlow element 40002 - post-NAT (mapped) destination IPv4 address.
+      ecs: destination.nat.ip
+      status: mapped
+    - vendor: NF_F_XLATE_SRC_PORT
+      type: port
+      description: NetFlow element 40003 - post-NAT (mapped) source port.
+      ecs: source.nat.port
+      status: mapped
+    - vendor: NF_F_XLATE_DST_PORT
+      type: port
+      description: NetFlow element 40004 - post-NAT (mapped) destination port.
+      ecs: destination.nat.port
+      status: mapped
+    - vendor: NF_F_SRC_INTF_ID
+      type: integer
+      description: NetFlow element 10 - ingress interface SNMP ifIndex.
+      ecs: observer.ingress.interface.id
+      status: partial
+      notes: >
+        NSEL sends the numeric ifIndex, NOT the nameif label the syslog
+        carries; resolve observer.ingress.interface.name low-side against show
+        interface / the IF-MIB while the device is reachable.
+    - vendor: NF_F_DST_INTF_ID
+      type: integer
+      description: NetFlow element 14 - egress interface SNMP ifIndex.
+      ecs: observer.egress.interface.id
+      status: partial
+      notes: same ifIndex-not-nameif decode gap as the ingress interface
+    - vendor: NF_F_FW_EVENT
+      type: integer
+      description: NetFlow element 40005 - high-level firewall event code.
+      ecs: event.action
+      status: mapped
+      transform: >
+        1 = flow created, 2 = flow deleted (teardown), 3 = flow denied; this
+        is the structured replacement for the 302xxx/430003 disposition and
+        drives event.action, event.type (connection/start vs connection/end)
+        and event.outcome.
+    - vendor: NF_F_FW_EXT_EVENT
+      type: integer
+      description: NetFlow element 33002 - extended event code giving the teardown or deny reason.
+      ecs: event.reason
+      status: partial
+      notes: >
+        on teardown the value encodes why the flow ended; on a deny (>1000) it
+        encodes which check dropped it (1001 ingress ACL, 1002 egress ACL...).
+        The code set is fluid, so decode via a maintained lookup and leave
+        event.reason unset for unknown codes.
+    - vendor: NF_F_EVENT_TIME_MSEC
+      type: timestamp
+      description: NetFlow element 323 - time the event occurred, ms since 1 Jan 1970 UTC.
+      ecs: '@timestamp'
+      status: mapped
+      notes: >-
+        events are packed asynchronously and can arrive out of order, so
+        @timestamp must come from this per-event field, not packet arrival
+    - vendor: NF_F_FLOW_CREATE_TIME_MSEC
+      type: timestamp
+      description: >-
+        NetFlow element 152 - time the flow was created, ms since epoch
+        (extended teardown template).
+      ecs: event.start
+      status: mapped
+      notes: >-
+        event.duration = NF_F_EVENT_TIME_MSEC minus this value on the extended
+        flow-teardown record
+    - vendor: NF_F_FLOW_BYTES
+      type: integer
+      description: NetFlow element 85 - total bytes of the flow (teardown).
+      ecs: network.bytes
+      status: partial
+      notes: >-
+        a single connection total, not split sent vs received, so source.bytes
+        and destination.bytes stay empty for the NSEL form
+    - vendor: NF_F_INGRESS_ACL_ID
+      type: string
+      description: >-
+        NetFlow element 33000 - 12-byte id of the ingress ACL that acted on
+        the flow (name-hash + ACE-id + extended-ACE-id).
+      ecs: null
+      status: unmapped
+      custom: cisco.ftd.nsel.ingress_acl_id
+      notes: >-
+        a hashed identifier, NOT the human ACL name; recover the name by
+        splitting the 12 bytes into three four-byte parts and matching show
+        access-list output
+    - vendor: NF_F_EGRESS_ACL_ID
+      type: string
+      description: NetFlow element 33001 - 12-byte id of the egress ACL that acted on the flow.
+      ecs: null
+      status: unmapped
+      custom: cisco.ftd.nsel.egress_acl_id
+      notes: same decode-against-show-access-list handling as the ingress ACL id
+    - vendor: NF_F_USERNAME
+      type: string
+      description: NetFlow element 40000 - Identity Firewall username bound to the flow.
+      ecs: source.user.name
+      status: partial
+      notes: >-
+        populated only when Identity Firewall / AAA is configured; the only
+        free-text value NSEL emits
+- id: intrusion
+  name: Intrusion event (430001)
+  description: >
+    %FTD-1-430001 security events raised when the Snort intrusion policy
+    matches traffic. Carries the Snort signature identity (GID/SID/
+    Revision/Message), the classification and priority, and the inline result
+    that says whether the packet was actually dropped.
+  event_categories:
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Unlike connection events, intrusion events are low-volume and should
+        not be sampled.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cisco_ftd.log
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Unlike connection events, intrusion events are low-volume and should
+        not be sampled.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cisco_ftd.log
+  formats:
+  - format: syslog-kv
+    parsing:
+      mechanism: elastic-integration
+      artifact: Cisco FTD integration (cisco_ftd)
+    fields:
+    - vendor: SrcIP
+      type: ip
+      description: IP address of the host that sent the offending traffic
+      ecs: source.ip
+      status: mapped
+    - vendor: DstIP
+      type: ip
+      description: IP address targeted by the offending traffic
+      ecs: destination.ip
+      status: mapped
+    - vendor: SrcPort
+      type: port
+      description: transport-layer port on the attacker side
+      ecs: source.port
+      status: mapped
+    - vendor: DstPort
+      type: port
+      description: transport-layer port on the target side
+      ecs: destination.port
+      status: mapped
+    - vendor: Protocol
+      type: enum
+      description: IP transport protocol of the inspected packet
+      ecs: network.transport
+      status: mapped
+    - vendor: GID
+      type: integer
+      description: Snort generator ID identifying which engine component raised the event
+      ecs: null
+      status: unmapped
+      custom: cisco.ftd.security_event.gid
+      notes: >
+        1 = text rules, 3 = shared object rules, 138/119/... = preprocessors.
+        The Elastic integration currently writes this to service.id, which is
+        semantically wrong; keep it as a custom field and treat GID+SID
+        together as the signature key.
+    - vendor: SID
+      type: integer
+      description: Snort signature ID of the rule that fired
+      ecs: rule.id
+      status: mapped
+      notes: only unique in combination with GID
+    - vendor: Revision
+      type: integer
+      description: revision number of the firing Snort rule
+      ecs: rule.version
+      status: mapped
+    - vendor: Message
+      type: string
+      description: Snort rule msg string naming the detected activity
+      ecs: rule.name
+      status: partial
+      notes: >
+        this is the signature name (e.g. "SERVER-WEBAPP ... attempt"), not a
+        free-text log line, so it belongs on rule.name beside the SID,
+        revision, classification and intrusion policy that describe the same
+        Snort rule. The stock integration writes it to message, so an @custom
+        pipeline has to copy it onto rule.name.
+    - vendor: Classification
+      type: string
+      description: Snort classtype describing the attack category
+      ecs: rule.category
+      status: partial
+      notes: >
+        free text such as "Attempted Administrator Privilege Gain"; useful for
+        triage grouping but not a controlled ECS vocabulary
+    - vendor: Priority
+      type: integer
+      description: Snort rule priority ranking of the event
+      ecs: event.severity
+      status: partial
+      transform: >
+        Snort priority is 1 (high) to 3 (low) — inverted relative to ECS's
+        convention that higher event.severity is more severe; needs an
+        explicit lookup, not a copy
+    - vendor: InlineResult
+      type: enum
+      description: whether the intrusion policy actually stopped the traffic
+      ecs: event.outcome
+      status: partial
+      transform: >
+        values Blocked/Would Block/Dropped/Would Drop/Passed/Partially
+        Dropped; "Would Block"/"Would Drop" mean the policy was in
+        detection-only mode and the traffic was NOT stopped — mapping them to
+        failure without that nuance produces false confidence in CSOC
+        dashboards
+    - vendor: IntrusionPolicy
+      type: string
+      description: name of the intrusion policy that contained the firing rule
+      ecs: rule.ruleset
+      status: mapped
+    - vendor: AccessControlRuleName
+      type: string
+      description: access control rule that invoked the intrusion policy
+      ecs: null
+      status: unmapped
+      custom: cisco.ftd.security_event.access_control_rule_name
+      notes: >
+        Cisco documents this as the access control rule that invoked the
+        intrusion policy - a different rule object from the Snort signature
+        that fired, which is what rule.id, rule.version, rule.name,
+        rule.category and rule.ruleset describe on this dataset. Two rules
+        cannot share one rule.* object, so the access control rule stays
+        custom here; on the connection dataset, where it is the rule that
+        fired, it keeps rule.name.
+    - vendor: IngressZone
+      type: string
+      description: security zone the inspected traffic entered from
+      ecs: observer.ingress.zone
+      status: mapped
+    - vendor: EgressZone
+      type: string
+      description: security zone the inspected traffic was headed to
+      ecs: observer.egress.zone
+      status: mapped
+    - vendor: NumIOC
+      type: integer
+      description: count of indications of compromise FMC has attached to the host
+      ecs: null
+      status: unmapped
+      custom: cisco.ftd.security_event.num_ioc
+    - vendor: ApplicationProtocol
+      type: string
+      description: application-layer protocol of the inspected flow
+      ecs: network.protocol
+      status: mapped
+    - vendor: HTTPResponse
+      type: integer
+      description: HTTP status code returned on the inspected flow
+      ecs: http.response.status_code
+      status: partial
+      notes: only present when the event fired on an HTTP flow the preprocessor decoded
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Exempt 430001 from whatever sampling or drop rule the connection
+          events get — this stream is low volume and every event is alertable
+          — and keep _raw for it, since intrusion records are the forensically
+          valuable class. Apply the same message-ID routing, observer identity
+          stamping from the syslog header, and Persistent Queue backpressure
+          on the Elastic destination as the connection hop.
+        elastic: >
+          Override the stock integration with an @custom pipeline that stops
+          writing GID to service.id, keeps it as cisco.ftd.security_event.gid,
+          and builds a composite GID:SID signature key since SID alone is not
+          unique. Convert the inverted Snort Priority (1 high to 3 low) to
+          event.severity through an explicit lookup, and derive event.outcome
+          from InlineResult so that "Would Block"/"Would Drop" are recorded as
+          traffic that was NOT stopped rather than as blocked. Keep rule.*
+          describing the Snort signature alone - copy Message onto rule.name
+          beside rule.id/rule.version/rule.category from
+          SID/Revision/Classification, and route AccessControlRuleName to
+          cisco.ftd.security_event.access_control_rule_name rather than
+          rule.name, since the access control rule is a second rule on the
+          same record. Add mappings for num_ioc and access_control_rule_name.
+        relay: >
+          Low-side instances cross the guard: use the same thin envelope as
+          the connection dataset but carry _raw across for this stream —
+          signature Message and Classification are bounded vendor-controlled
+          strings with little content-filter friction, so the payload is cheap
+          to pass whole. Because the crossing is at-most-once with no
+          acknowledgements, a silent drop of a low-volume IDS event is
+          invisible: reconcile low-side and high-side counts per hour for this
+          dataset specifically.
+      direct:
+        parse_location: high
+        cribl: >
+          Exempt 430001 from whatever sampling or drop rule the connection
+          events get — this stream is low volume and every event is alertable
+          — and keep _raw for it, since intrusion records are the forensically
+          valuable class. Apply the same message-ID routing, observer identity
+          stamping from the syslog header, and Persistent Queue backpressure
+          on the Elastic destination as the connection hop.
+        elastic: >
+          Override the stock integration with an @custom pipeline that stops
+          writing GID to service.id, keeps it as cisco.ftd.security_event.gid,
+          and builds a composite GID:SID signature key since SID alone is not
+          unique. Convert the inverted Snort Priority (1 high to 3 low) to
+          event.severity through an explicit lookup, and derive event.outcome
+          from InlineResult so that "Would Block"/"Would Drop" are recorded as
+          traffic that was NOT stopped rather than as blocked. Keep rule.*
+          describing the Snort signature alone - copy Message onto rule.name
+          beside rule.id/rule.version/rule.category from
+          SID/Revision/Classification, and route AccessControlRuleName to
+          cisco.ftd.security_event.access_control_rule_name rather than
+          rule.name, since the access control rule is a second rule on the
+          same record. Add mappings for num_ioc and access_control_rule_name.
+  - format: estreamer
+    enable: >
+      On the FMC under System > Integration > eStreamer, on the eStreamer
+      Event Configuration pane tick "Intrusion Events" (and "Packet Data" to
+      also receive the triggering packet). Create the eStreamer client with
+      its host IP and certificate password on the eStreamer Clients tab,
+      download the PKCS#12 certificate, and connect the client (eNcore or a
+      SIEM connector) to the FMC management IP on TCP 8302. Intrusion events
+      reach eStreamer regardless of the device-side syslog setting, so run
+      eStreamer OR the 430001 syslog as the authoritative IPS feed, not both.
+    references:
+    - >-
+      https://www.cisco.com/c/en/us/td/docs/security/firepower/60/api/eStreamer/EventStreamerIntegrationGuide/ConfiguringEstreamer.html
+    - >-
+      https://www.cisco.com/c/en/us/td/docs/security/firepower/720/api/eStreamer/EventStreamerIntegrationGuide.pdf
+    - https://github.com/CiscoSecurity/fp-05-firepower-cef-connector-arcsight
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: eStreamer eNcore client + custom Firepower eStreamer reparse pipeline
+      notes: >
+        Same decoder story as the connection dataset: a client (eNcore or a
+        SIEM connector) terminates the binary 8302 stream, resolves the
+        generatorId/renderedId to the Snort rule message and the
+        classificationId to the classtype via the FMC metadata records, then
+        emits KV/CEF/JSON that a custom pipeline maps to ECS. The stock
+        cisco_ftd integration does not apply to that output.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Terminate eStreamer with eNcore low-side and resolve the rule and
+          classification metadata there. This stream is low volume and every
+          event is alertable, so do NOT sample it and keep the Packet Data
+          record for forensic value. Stamp observer.name/hostname from the
+          numeric deviceId as on the other datasets. If both eStreamer and the
+          430001 syslog are briefly running, dedupe on the connection join key
+          plus GID:SID before the crossing.
+        elastic: >
+          A custom @custom pipeline that maps the resolved output: build a
+          composite GID:SID signature key (SID alone is not unique), map SID
+          to rule.id, renderedId/message to rule.name, classificationId to
+          rule.category, and convert the Snort priorityId (1 high to 3 low) to
+          event.severity by lookup. Derive event.outcome from the blocked
+          field (0 Alerted, 1 Blocked, 2 Would Be Blocked - the last means the
+          packet was NOT stopped). Keep generatorId, impact/impactFlags and
+          iocNumber as customs rather than forcing them into service.id, and
+          land the resolved accessControlRuleId on
+          cisco.ftd.estreamer.access_control_rule_id so rule.* stays one
+          object - the Snort signature - instead of colliding the access
+          control rule name into rule.name.
+        relay: >
+          Cross resolved NDJSON. The signature message and classification are
+          bounded vendor strings with little content-filter friction, but the
+          Packet Data payload is arbitrary attacker bytes: if it is carried,
+          hex-encode and length-cap it low-side, or drop it before the guard
+          and keep only the metadata. Validate the envelope and reconcile
+          low-side/high-side counts per hour, since a silent drop of a
+          low-volume IDS event is invisible on an at-most-once crossing.
+      direct:
+        parse_location: hybrid
+        cribl: >
+          High-side FMC: terminate eStreamer at eNcore (nothing else decodes
+          it) and forward the resolved NDJSON to Cribl for routing. Choose
+          eStreamer or the 430001 syslog as the single authoritative IPS feed
+          per sensor to avoid duplicate alerts.
+        elastic: >
+          A custom @custom pipeline that maps the resolved output: build a
+          composite GID:SID signature key (SID alone is not unique), map SID
+          to rule.id, renderedId/message to rule.name, classificationId to
+          rule.category, and convert the Snort priorityId (1 high to 3 low) to
+          event.severity by lookup. Derive event.outcome from the blocked
+          field (0 Alerted, 1 Blocked, 2 Would Be Blocked - the last means the
+          packet was NOT stopped). Keep generatorId, impact/impactFlags and
+          iocNumber as customs rather than forcing them into service.id, and
+          land the resolved accessControlRuleId on
+          cisco.ftd.estreamer.access_control_rule_id so rule.* stays one
+          object - the Snort signature - instead of colliding the access
+          control rule name into rule.name. With no boundary, treat eStreamer
+          as the richer IPS feed: the impact score, IOC count, connection join
+          key and packet payload it adds over the syslog are exactly the
+          fields a SOC uses to triage and pivot from an intrusion alert.
+    fields:
+    - vendor: sourceIpAddress
+      type: ip
+      description: eStreamer intrusion record - address that sent the offending traffic.
+      ecs: source.ip
+      status: mapped
+    - vendor: destinationIpAddress
+      type: ip
+      description: eStreamer intrusion record - address targeted by the offending traffic.
+      ecs: destination.ip
+      status: mapped
+    - vendor: sourcePortOrIcmpType
+      type: port
+      description: eStreamer intrusion record - source port, or ICMP type on ICMP events.
+      ecs: source.port
+      status: partial
+      notes: >-
+        doubles as the ICMP type when ipProtocolId is ICMP, so an ICMP event
+        carries a type here, not a port
+    - vendor: destinationPortOrIcmpType
+      type: port
+      description: eStreamer intrusion record - destination port, or ICMP code on ICMP events.
+      ecs: destination.port
+      status: partial
+      notes: doubles as the ICMP code when the protocol is ICMP
+    - vendor: ipProtocolId
+      type: integer
+      description: eStreamer intrusion record - IP protocol number of the inspected packet.
+      ecs: network.iana_number
+      status: partial
+      transform: numeric protocol; derive network.transport by lookup
+    - vendor: generatorId
+      type: integer
+      description: >-
+        eStreamer intrusion record - Snort generator id (GID) identifying the
+        engine component that raised the event.
+      ecs: null
+      status: unmapped
+      custom: cisco.ftd.estreamer.gid
+      notes: >
+        1 text rules, 3 shared-object rules, 138/119/... preprocessors; keep
+        it as a custom and treat GID+SID as the signature key rather than
+        writing it to service.id as the packaged content does.
+    - vendor: renderedId
+      type: integer
+      description: eStreamer intrusion record - Snort signature id (SID) of the firing rule.
+      ecs: rule.id
+      status: mapped
+      notes: >
+        only unique in combination with the generatorId. renderedId is eNcore
+        output-layer terminology - a computed alias the client emits, not a
+        raw eStreamer wire field (the record carries the signature id as
+        ruleId / signatureId); pin the exact field name against a live eNcore
+        sample before mapping.
+    - vendor: ruleRevision
+      type: integer
+      description: eStreamer intrusion record - revision number of the firing Snort rule.
+      ecs: rule.version
+      status: mapped
+    - vendor: '@computed.message'
+      type: string
+      description: >-
+        eStreamer intrusion record - rule message string, resolved from the
+        rule metadata.
+      ecs: rule.name
+      status: partial
+      notes: >
+        eStreamer identifies the rule by generatorId+renderedId; the human
+        message is looked up from the rule metadata records. rule.name is the
+        natural target here, as it is for the syslog form's Message key: the
+        signature message is the name of the same Snort rule that rule.id,
+        rule.version, rule.category and rule.ruleset describe.
+    - vendor: classificationId
+      type: integer
+      description: >-
+        eStreamer intrusion record - Snort classification id, resolved to the
+        classtype text.
+      ecs: rule.category
+      status: partial
+      notes: >-
+        numeric id resolved to a classtype such as "Attempted Administrator
+        Privilege Gain"; not a controlled ECS vocabulary
+    - vendor: priorityId
+      type: integer
+      description: eStreamer intrusion record - Snort rule priority ranking.
+      ecs: event.severity
+      status: partial
+      transform: >
+        Snort priority is 1 (high) to 3 (low), inverted relative to ECS where
+        higher event.severity is more severe; needs an explicit lookup, not a
+        copy.
+    - vendor: blocked
+      type: integer
+      description: >-
+        eStreamer intrusion record - inline result flag (0 alerted, 1 blocked,
+        2 would-be-blocked).
+      ecs: event.outcome
+      status: partial
+      transform: >
+        the numeric equivalent of the syslog InlineResult; value 2 (would be
+        blocked) means detection-only mode and traffic that was NOT stopped -
+        mapping it to failure without that nuance produces false confidence.
+    - vendor: impact
+      type: integer
+      description: >-
+        eStreamer intrusion record - impact level (1 vulnerable .. 4 unknown
+        target) FMC assigns from host-profile correlation.
+      ecs: null
+      status: unmapped
+      custom: cisco.ftd.estreamer.impact
+      notes: >
+        the eStreamer-only triage field the 430001 syslog lacks; combined with
+        priority it is how the SOC ranks which alerts hit vulnerable hosts.
+        Kept custom (also feeds the eNcore severity calculation).
+    - vendor: impactFlags
+      type: integer
+      description: >-
+        eStreamer intrusion record - bitmask of the correlation inputs behind
+        the impact score.
+      ecs: null
+      status: unmapped
+      custom: cisco.ftd.estreamer.impact_flags
+    - vendor: policyUuid
+      type: string
+      description: >-
+        eStreamer intrusion record - UUID of the intrusion policy that
+        contained the firing rule.
+      ecs: rule.ruleset
+      status: partial
+      notes: UUID resolved to the intrusion policy name via metadata
+    - vendor: accessControlRuleId
+      type: string
+      description: >-
+        eStreamer intrusion record - id of the access control rule that
+        invoked the intrusion policy.
+      ecs: null
+      status: unmapped
+      custom: cisco.ftd.estreamer.access_control_rule_id
+      notes: >
+        resolved to the AC rule name via metadata. It is the rule that invoked
+        the intrusion policy, not the Snort rule that fired, so it stays out
+        of rule.*, which on this dataset describes the signature
+        (generatorId+renderedId, revision, classification, intrusion policy) -
+        and it leaves rule.name to the resolved rule message. Same treatment
+        as AccessControlRuleName on the syslog form.
+    - vendor: interfaceIngressUuid
+      type: string
+      description: eStreamer intrusion record - UUID of the ingress interface.
+      ecs: observer.ingress.interface.name
+      status: partial
+      notes: UUID resolved to the nameif label via metadata
+    - vendor: interfaceEgressUuid
+      type: string
+      description: eStreamer intrusion record - UUID of the egress interface.
+      ecs: observer.egress.interface.name
+      status: partial
+      notes: UUID resolved to the nameif label via metadata
+    - vendor: securityZoneIngressUuid
+      type: string
+      description: eStreamer intrusion record - UUID of the ingress security zone.
+      ecs: observer.ingress.zone
+      status: partial
+      notes: UUID resolved to the zone name via metadata
+    - vendor: securityZoneEgressUuid
+      type: string
+      description: eStreamer intrusion record - UUID of the egress security zone.
+      ecs: observer.egress.zone
+      status: partial
+      notes: UUID resolved to the zone name via metadata
+    - vendor: applicationId
+      type: integer
+      description: >-
+        eStreamer intrusion record - App-ID application-protocol id of the
+        inspected flow.
+      ecs: network.protocol
+      status: partial
+      notes: numeric App-ID resolved to a name via metadata
+    - vendor: userId
+      type: integer
+      description: eStreamer intrusion record - id of the identity-policy user on the flow.
+      ecs: user.name
+      status: partial
+      transform: >-
+        numeric id resolved to "REALM\\username" via the realm metadata; split
+        the realm into user.domain
+    - vendor: connectionCounter
+      type: integer
+      description: >-
+        eStreamer intrusion record - connection join key tying the alert to
+        its connection/file records.
+      ecs: null
+      status: unmapped
+      custom: cisco.ftd.estreamer.connection_id
+      notes: >-
+        with connectionInstanceId and connectionTimestamp, joins the intrusion
+        event to the flow that carried it - the syslog form has no equivalent
+    - vendor: iocNumber
+      type: integer
+      description: >-
+        eStreamer intrusion record - count of indications of compromise
+        attached to the host.
+      ecs: null
+      status: unmapped
+      custom: cisco.ftd.estreamer.num_ioc
+    - vendor: httpResponse
+      type: integer
+      description: >-
+        eStreamer intrusion record - HTTP status code, when the event fired on
+        a decoded HTTP flow.
+      ecs: http.response.status_code
+      status: partial
+      notes: present only on HTTP flows the preprocessor decoded
+    - vendor: vlanId
+      type: integer
+      description: eStreamer intrusion record - 802.1Q VLAN id of the inspected packet.
+      ecs: network.vlan.id
+      status: mapped
+- id: file-malware
+  name: File and malware event (430004/430005)
+  description: >
+    %FTD-6-430004 file events (a file policy matched a transferred file) and
+    %FTD-1-430005 malware events (the file received a malware disposition from
+    AMP cloud lookup, Spero analysis, or the dynamic analysis sandbox). Both
+    share a key set; malware events add the disposition, threat name, and
+    threat score.
+  event_categories:
+  - file
+  - malware
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        File names and URIs are attacker-controlled free text and are the
+        fields most likely to be length-capped or filtered at the boundary.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cisco_ftd.log
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        File names and URIs are attacker-controlled free text; normalize and
+        length-cap them in this hop so a hostile filename cannot distort
+        downstream parsing.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cisco_ftd.log
+  formats:
+  - format: syslog-kv
+    parsing:
+      mechanism: elastic-integration
+      artifact: Cisco FTD integration (cisco_ftd)
+      notes: >
+        the integration parses these with the same security-event key=value
+        splitter as connection/intrusion events; file-specific keys land under
+        cisco.ftd.security_event.file_*
+    fields:
+    - vendor: FileName
+      type: string
+      description: name of the file observed in the transfer
+      ecs: file.name
+      status: mapped
+    - vendor: FileSHA256
+      type: string
+      description: SHA-256 hash of the transferred file
+      ecs: file.hash.sha256
+      status: mapped
+    - vendor: FileSize
+      type: long
+      description: size of the transferred file as reported by FMC
+      ecs: file.size
+      status: partial
+      transform: >
+        FMC reports file size in kilobytes (KB) while ECS file.size is bytes;
+        multiply by 1024 or the value is off by three orders of magnitude in
+        every size-based rule
+    - vendor: FileType
+      type: enum
+      description: Cisco file-format label for the transferred file
+      ecs: null
+      status: unmapped
+      custom: cisco.ftd.security_event.file_type
+      notes: >
+        values such as PDF, MSEXE, ZIP; ECS file.type is a different
+        vocabulary (file/dir/symlink) and file.mime_type expects an IANA media
+        type, so neither is a safe target
+    - vendor: FileDirection
+      type: enum
+      description: whether the file was being downloaded or uploaded
+      ecs: network.direction
+      status: partial
+      transform: >
+        values Download/Upload describe the transfer relative to the protected
+        network; translate to inbound/outbound rather than copying, since ECS
+        network.direction is a closed vocabulary
+    - vendor: FileAction
+      type: enum
+      description: action the file policy took on the transfer
+      ecs: event.action
+      status: mapped
+      transform: >
+        values Detect/Block/Malware Cloud Lookup/Malware Block/Custom
+        Detection/Cloud Lookup Timeout; Block* values must also drive
+        event.outcome
+    - vendor: FilePolicy
+      type: string
+      description: name of the file policy that matched the transfer
+      ecs: rule.ruleset
+      status: mapped
+    - vendor: SHA_Disposition
+      type: enum
+      description: 'AMP cloud verdict for the file''s SHA-256'
+      ecs: null
+      status: partial
+      custom: cisco.ftd.security_event.sha_disposition
+      notes: >
+        values Malware/Clean/Unknown/Unavailable/Custom Detection. This is the
+        field the CSOC actually alerts on; it needs a lookup to event.outcome
+        and ideally to threat.indicator.confidence, and "Unavailable" must not
+        be silently treated as clean
+    - vendor: SperoDisposition
+      type: enum
+      description: verdict from Spero machine-learning analysis of the executable
+      ecs: null
+      status: unmapped
+      custom: cisco.ftd.security_event.spero_disposition
+    - vendor: FileSandboxStatus
+      type: enum
+      description: dynamic-analysis submission state for the file
+      ecs: null
+      status: unmapped
+      custom: cisco.ftd.security_event.file_sandbox_status
+      notes: values such as sent, not sent, analysis complete
+    - vendor: ThreatName
+      type: string
+      description: AMP detection name assigned to the malicious file
+      ecs: null
+      status: unmapped
+      custom: cisco.ftd.security_event.threat_name
+      notes: >
+        e.g. W32.GenericKD; only present on 430005 malware events, and the
+        string is vendor-specific rather than a normalized threat taxonomy.
+        Detection identity, not indicator identity: not threat.indicator.name,
+        which models an indicator supplied by a threat-intel provider rather
+        than a verdict the product reached itself. Not rule.name either —
+        rule.* on this dataset holds the file policy that fired, and a
+        detection name is what it found.
+    - vendor: ThreatScore
+      type: integer
+      description: dynamic-analysis threat score for the file
+      ecs: null
+      status: partial
+      custom: cisco.ftd.security_event.threat_score
+      notes: >
+        scale 0-100; would need a banded lookup to become a usable ECS
+        event.severity, and it is absent whenever the file was never submitted
+        to the sandbox
+    - vendor: URI
+      type: string
+      description: URI the file was transferred over
+      ecs: url.original
+      status: partial
+      notes: >
+        populated only for HTTP/decrypted-TLS transfers, empty for
+        SMB/FTP/SMTP file events. ECS 9.4 has beta file.origin_url; adopt when
+        GA — it is the right home for the FileDirection= Download case (the
+        URL the file was hosted at) but not for uploads, so url.original stays
+        for now.
+    - vendor: SrcIP
+      type: ip
+      description: IP address of the host that initiated the file transfer
+      ecs: source.ip
+      status: mapped
+    - vendor: DstIP
+      type: ip
+      description: IP address of the host on the far side of the file transfer
+      ecs: destination.ip
+      status: mapped
+    - vendor: ApplicationProtocol
+      type: string
+      description: application-layer protocol that carried the file
+      ecs: network.protocol
+      status: mapped
+    - vendor: User
+      type: string
+      description: identity-policy user associated with the file transfer
+      ecs: user.name
+      status: partial
+      transform: same "REALM\\username" split as the connection dataset
+    - vendor: ArchiveFileName
+      type: string
+      description: name of a file found inside an inspected archive
+      ecs: null
+      status: unmapped
+      custom: cisco.ftd.security_event.archive_file_name
+      notes: >
+        a single event can carry both the outer FileName and this inner name,
+        and mapping both to file.name produces an array
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Split 430004/430005 off the shared syslog source by message ID,
+          leave them unsampled, and stamp the missing device identity
+          (observer.name/hostname plus the device-to-owner lookup) here as
+          with the other security-event datasets. Normalize and length-cap the
+          attacker-controlled FileName, ArchiveFileName, and URI values at
+          this hop so a hostile filename cannot distort downstream parsing,
+          and keep _raw — malware events are forensic evidence.
+        elastic: >
+          An @custom pipeline on the cisco_ftd integration should multiply
+          FileSize by 1024 to turn FMC kilobytes into ECS bytes, drive
+          event.outcome from SHA_Disposition (Malware to failure, Clean to
+          success) while keeping "Unavailable" explicitly unknown rather than
+          clean, and also fold the Block variants of FileAction into
+          event.outcome. Translate FileDirection Download/Upload into the
+          closed network.direction vocabulary, band ThreatScore before any
+          severity use, and keep ArchiveFileName off file.name so the inner
+          and outer names do not collapse into an array. Add custom-namespace
+          mappings for file_type, spero_disposition, file_sandbox_status, and
+          threat_score.
+        relay: >
+          This is the dataset with the worst content-filter exposure on the
+          low-side crossing: FileName, ArchiveFileName, and URI are
+          attacker-supplied free text with unicode and path-like shapes that a
+          content filter will cap or reject. Cross as a thin envelope with
+          those values already bounded and ASCII-normalized low-side, validate
+          with C.Schema(...) immediately before the guard destination, and
+          dead-letter failures locally rather than letting a rejected malware
+          event vanish.
+      direct:
+        parse_location: high
+        cribl: >
+          Split 430004/430005 off the shared syslog source by message ID,
+          leave them unsampled, and stamp the missing device identity
+          (observer.name/hostname plus the device-to-owner lookup) here as
+          with the other security-event datasets. Normalize and length-cap the
+          attacker-controlled FileName, ArchiveFileName, and URI values at
+          this hop so a hostile filename cannot distort downstream parsing,
+          and keep _raw — malware events are forensic evidence.
+        elastic: >
+          An @custom pipeline on the cisco_ftd integration should multiply
+          FileSize by 1024 to turn FMC kilobytes into ECS bytes, drive
+          event.outcome from SHA_Disposition (Malware to failure, Clean to
+          success) while keeping "Unavailable" explicitly unknown rather than
+          clean, and also fold the Block variants of FileAction into
+          event.outcome. Translate FileDirection Download/Upload into the
+          closed network.direction vocabulary, band ThreatScore before any
+          severity use, and keep ArchiveFileName off file.name so the inner
+          and outer names do not collapse into an array. Add custom-namespace
+          mappings for file_type, spero_disposition, file_sandbox_status, and
+          threat_score.
+  - format: estreamer
+    enable: >
+      On the FMC under System > Integration > eStreamer, tick "File Events"
+      and "Malware Events" (aka Impact Flag / FireAMP) on the eStreamer Event
+      Configuration pane. Create the client on the eStreamer Clients tab with
+      its host IP and certificate password, download the PKCS#12 certificate,
+      and connect eNcore or a SIEM connector to the FMC management IP on TCP
+      8302. File/malware events reach eStreamer independent of the device
+      syslog, so run eStreamer OR the 430004/430005 syslog as the
+      authoritative file feed, not both.
+    references:
+    - >-
+      https://www.cisco.com/c/en/us/td/docs/security/firepower/60/api/eStreamer/EventStreamerIntegrationGuide/ConfiguringEstreamer.html
+    - >-
+      https://www.cisco.com/c/en/us/td/docs/security/firepower/720/api/eStreamer/EventStreamerIntegrationGuide.pdf
+    - https://github.com/CiscoSecurity/fp-05-firepower-cef-connector-arcsight
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: eStreamer eNcore client + custom Firepower eStreamer reparse pipeline
+      notes: >
+        A client (eNcore or a SIEM connector) terminates the binary 8302
+        stream and resolves the disposition, spero-disposition, file-type,
+        file-action and file-policy numeric ids to names via the FMC metadata
+        records, then emits KV/CEF/JSON that a custom pipeline maps to ECS.
+        The file-malware record (502) shares the file record (500) field
+        layout; the FireAMP record (125) carries the AMP-cloud detection name
+        and threat score. None of the packaged cisco_ftd content applies.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Terminate eStreamer with eNcore low-side and resolve the disposition
+          and file-type metadata there. Leave these unsampled - malware events
+          are forensic evidence - and normalize and length-cap the attacker-
+          controlled fileName, filePath, archiveName and uri values at this
+          hop so a hostile filename cannot distort downstream parsing. Stamp
+          the device identity from the numeric deviceId as on the other
+          datasets.
+        elastic: >
+          A custom @custom pipeline that maps shaHash to file.hash.sha256,
+          fileName to file.name, filePath to file.directory and fileSize to
+          file.size directly (the record is already in bytes, so unlike the
+          syslog form no KB-to-byte multiply is needed - encode that
+          difference explicitly so the two feeds do not disagree by 1024x).
+          Drive event.outcome from the resolved disposition (Malware to
+          failure, Clean to success, Unavailable kept unknown), fold the Block
+          variants of the resolved action into event.outcome, translate
+          direction to the closed network.direction vocabulary, and keep
+          archiveName off file.name. Map fileType, speroDisposition,
+          storage/analysis statuses and threatScore to cisco.ftd.estreamer.*
+          customs.
+        relay: >
+          This is the worst content-filter exposure on the crossing: fileName,
+          filePath, archiveName and uri are attacker-supplied free text with
+          unicode and path-like shapes a filter will cap or reject. Cross a
+          thin envelope with those values already bounded and ASCII-normalized
+          low-side, validate with C.Schema(...) immediately before the guard,
+          and dead-letter failures locally rather than letting a rejected
+          malware event vanish.
+      direct:
+        parse_location: hybrid
+        cribl: >
+          High-side FMC: terminate eStreamer at eNcore and forward resolved
+          NDJSON to Cribl for routing. Choose eStreamer or the 430004/430005
+          syslog as the single authoritative file feed per sensor.
+        elastic: >
+          A custom @custom pipeline that maps shaHash to file.hash.sha256,
+          fileName to file.name, filePath to file.directory and fileSize to
+          file.size directly (the record is already in bytes, so unlike the
+          syslog form no KB-to-byte multiply is needed - encode that
+          difference explicitly so the two feeds do not disagree by 1024x).
+          Drive event.outcome from the resolved disposition (Malware to
+          failure, Clean to success, Unavailable kept unknown), fold the Block
+          variants of the resolved action into event.outcome, translate
+          direction to the closed network.direction vocabulary, and keep
+          archiveName off file.name. Map fileType, speroDisposition,
+          storage/analysis statuses and threatScore to cisco.ftd.estreamer.*
+          customs. With no boundary, treat eStreamer as the richer file feed:
+          the parent process, archive SHA/depth, dynamic-analysis status and
+          connection join key it adds over the syslog are the fields that let
+          a SOC reconstruct how a malicious file arrived and what carried it.
+    fields:
+    - vendor: fileName.data
+      type: string
+      description: eStreamer file/malware record - name of the observed file.
+      ecs: file.name
+      status: mapped
+    - vendor: filePath.data
+      type: string
+      description: eStreamer malware record - path the file was seen at.
+      ecs: file.directory
+      status: partial
+      notes: >-
+        present on the FireAMP/malware record; absent on the network file
+        record where only the name is known
+    - vendor: shaHash
+      type: string
+      description: eStreamer file/malware record - SHA-256 hash of the file.
+      ecs: file.hash.sha256
+      status: mapped
+      notes: the FireAMP record calls the same value fileShaHash.data
+    - vendor: fileSize
+      type: long
+      description: eStreamer file/malware record - size of the file in BYTES.
+      ecs: file.size
+      status: mapped
+      notes: >
+        unlike the 430004/430005 syslog (which reports kilobytes), the
+        eStreamer record is already in bytes, so it maps to file.size with no
+        multiply - a real behavioural difference between the two feeds.
+    - vendor: fileTypeId
+      type: integer
+      description: >-
+        eStreamer file/malware record - Cisco file-format id (resolved to
+        PDF/MSEXE/ZIP...).
+      ecs: null
+      status: unmapped
+      custom: cisco.ftd.estreamer.file_type
+      notes: >-
+        Cisco taxonomy; ECS file.type is a different vocabulary
+        (file/dir/symlink) and file.mime_type expects an IANA media type, so
+        neither is safe
+    - vendor: direction
+      type: integer
+      description: >-
+        eStreamer file/malware record - transfer direction (download/upload)
+        relative to the protected network.
+      ecs: network.direction
+      status: partial
+      transform: >-
+        resolve to inbound/outbound rather than copying, since ECS
+        network.direction is a closed vocabulary
+    - vendor: action
+      type: integer
+      description: >-
+        eStreamer file/malware record - file-policy action (resolved to
+        Detect/Block/Malware Block/Cloud Lookup...).
+      ecs: event.action
+      status: partial
+      transform: >-
+        numeric action resolved via metadata; the Block variants must also
+        drive event.outcome
+    - vendor: accessControlPolicyUuid
+      type: string
+      description: >-
+        eStreamer file/malware record - UUID of the file/AC policy that
+        matched the transfer.
+      ecs: rule.ruleset
+      status: partial
+      notes: UUID resolved to the policy name via metadata
+    - vendor: disposition
+      type: integer
+      description: >-
+        eStreamer file/malware record - AMP-cloud disposition of the SHA
+        (resolved to Malware/Clean/Unknown/Unavailable/Custom).
+      ecs: null
+      status: partial
+      custom: cisco.ftd.estreamer.disposition
+      notes: >
+        the field the SOC alerts on; needs a lookup to event.outcome and
+        ideally threat.indicator.confidence, and Unavailable must not be
+        silently treated as clean. Resolved from a numeric id via metadata.
+    - vendor: speroDisposition
+      type: integer
+      description: >-
+        eStreamer file/malware record - verdict from Spero ML analysis of the
+        executable.
+      ecs: null
+      status: unmapped
+      custom: cisco.ftd.estreamer.spero_disposition
+    - vendor: fileStorageStatus
+      type: integer
+      description: eStreamer file record - whether the file was captured/stored by the device.
+      ecs: null
+      status: unmapped
+      custom: cisco.ftd.estreamer.file_storage_status
+      notes: >-
+        one of the capture/analysis status fields the eStreamer record adds
+        over the syslog
+    - vendor: fileAnalysisStatus
+      type: integer
+      description: >-
+        eStreamer file record - dynamic-analysis (sandbox) submission state
+        for the file.
+      ecs: null
+      status: unmapped
+      custom: cisco.ftd.estreamer.file_sandbox_status
+      notes: the eStreamer equivalent of the syslog FileSandboxStatus
+    - vendor: localMalwareAnalysisStatus
+      type: integer
+      description: eStreamer file record - local (on-box) malware analysis state.
+      ecs: null
+      status: unmapped
+      custom: cisco.ftd.estreamer.local_analysis_status
+    - vendor: threatScore
+      type: integer
+      description: eStreamer file/malware record - dynamic-analysis threat score (0-100).
+      ecs: null
+      status: partial
+      custom: cisco.ftd.estreamer.threat_score
+      notes: >
+        needs a banded lookup to become a usable event.severity, and is absent
+        whenever the file was never submitted to the sandbox; it also drives
+        the eNcore severity calculation.
+    - vendor: detectionName.data
+      type: string
+      description: eStreamer malware (FireAMP) record - AMP detection name assigned to the file.
+      ecs: null
+      status: unmapped
+      custom: cisco.ftd.estreamer.detection_name
+      notes: >-
+        e.g. W32.GenericKD; present on the FireAMP record only, and a
+        vendor-specific rather than normalized threat name. Detection
+        identity, not indicator identity: not threat.indicator.name, which
+        models an indicator supplied by a threat-intel provider. Same value as
+        the syslog route's ThreatName, so both land on the same concept under
+        their own format's namespace.
+    - vendor: parentFileName.data
+      type: string
+      description: >-
+        eStreamer malware record - name of the process that wrote/created the
+        file (endpoint context).
+      ecs: process.name
+      status: partial
+      notes: >-
+        present on FireAMP endpoint events; the network file record has no
+        parent-process context
+    - vendor: archiveSha
+      type: string
+      description: >-
+        eStreamer file record - SHA-256 of the parent archive an inner file
+        was found in.
+      ecs: null
+      status: unmapped
+      custom: cisco.ftd.estreamer.archive_sha
+    - vendor: archiveName
+      type: string
+      description: eStreamer file record - name of the parent archive an inner file was found in.
+      ecs: null
+      status: unmapped
+      custom: cisco.ftd.estreamer.archive_file_name
+      notes: >-
+        kept off file.name so the outer archive and inner file names do not
+        collapse into an array, as on the syslog form's ArchiveFileName
+    - vendor: archiveDepth
+      type: integer
+      description: eStreamer file record - nesting depth of the file within the archive.
+      ecs: null
+      status: unmapped
+      custom: cisco.ftd.estreamer.archive_depth
+    - vendor: uri.data
+      type: string
+      description: eStreamer file/malware record - URI the file was transferred over.
+      ecs: url.original
+      status: partial
+      notes: >-
+        populated only for HTTP / decrypted-TLS transfers, empty for
+        SMB/FTP/SMTP file events, same limitation as the syslog URI
+    - vendor: sourceIpAddress
+      type: ip
+      description: eStreamer file/malware record - address that initiated the transfer.
+      ecs: source.ip
+      status: mapped
+    - vendor: destinationIpAddress
+      type: ip
+      description: eStreamer file/malware record - address on the far side of the transfer.
+      ecs: destination.ip
+      status: mapped
+    - vendor: protocol
+      type: integer
+      description: eStreamer file/malware record - IP protocol number carrying the file.
+      ecs: network.iana_number
+      status: partial
+      transform: numeric protocol; derive network.transport by lookup
+    - vendor: applicationId
+      type: integer
+      description: >-
+        eStreamer file/malware record - App-ID application protocol that
+        carried the file.
+      ecs: network.protocol
+      status: partial
+      notes: numeric App-ID resolved to a name via metadata
+    - vendor: userId
+      type: integer
+      description: eStreamer file/malware record - id of the identity-policy user on the transfer.
+      ecs: user.name
+      status: partial
+      transform: numeric id resolved to "REALM\\username"; split the realm into user.domain
+    - vendor: connectionCounter
+      type: integer
+      description: >-
+        eStreamer file/malware record - connection join key tying the file
+        event to its flow.
+      ecs: null
+      status: unmapped
+      custom: cisco.ftd.estreamer.connection_id
+      notes: >-
+        with the connection instance and timestamp, joins the file event to
+        the connection that carried it
+- id: lina-vpn-aaa
+  name: LINA VPN and AAA syslog
+  description: >
+    Thin starter for the classic ASA-style (LINA engine) message stream that
+    FTD emits alongside the Snort security events — remote-access VPN session
+    setup, AAA authentication results, and management logins (%FTD-6-113004,
+    %FTD-6-113005, %FTD-6-605005, %FTD-6-722051, %FTD-6-746012). These are
+    free-text messages with positional variables, not key=value pairs, so they
+    parse very differently from the 4300xx datasets above.
+  event_categories:
+  - authentication
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        These messages share a syslog destination with the security events, so
+        the Cribl source must route on message ID, not on sender.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cisco_ftd.log
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        These messages share a syslog destination with the security events, so
+        the Cribl source must route on message ID, not on sender.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cisco_ftd.log
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: elastic-integration
+      artifact: Cisco FTD integration (cisco_ftd)
+      notes: >
+        the integration carries a per-message-ID grok pattern set for the LINA
+        messages; any message ID without a pattern falls through with only the
+        syslog header parsed and the body left in event.original
+    fields:
+    - vendor: message number
+      type: integer
+      description: six-digit LINA message ID identifying the event type
+      ecs: event.code
+      status: mapped
+      transform: >
+        extracted from the %FTD-<severity>-<id> tag; event.outcome is derived
+        from the ID itself (113004/605005 = success, 113005/605004 = failure)
+        because the message body has no outcome token of its own
+    - vendor: severity level
+      type: integer
+      description: syslog severity digit embedded in the %FTD message tag
+      ecs: event.severity
+      status: partial
+      transform: >
+        the digit is a syslog severity (0 emergency .. 7 debug) where LOWER is
+        more severe — inverted from the ECS convention, so it needs a lookup
+    - vendor: user
+      type: string
+      description: account name presented to the AAA server or VPN headend
+      ecs: source.user.name
+      status: mapped
+    - vendor: server
+      type: ip
+      description: address of the AAA server that processed the request
+      ecs: destination.address
+      status: partial
+      notes: >
+        present in 113004/113005; it is the authentication back end, not the
+        resource the user reached, so reusing destination.* is a compromise
+    - vendor: src_ip
+      type: ip
+      description: address the login or VPN session originated from
+      ecs: source.ip
+      status: mapped
+    - vendor: src_port
+      type: port
+      description: source port of the originating session
+      ecs: source.port
+      status: mapped
+    - vendor: dst_ip
+      type: ip
+      description: address of the FTD interface that received the session
+      ecs: destination.ip
+      status: mapped
+    - vendor: service
+      type: enum
+      description: management service the login targeted (ssh, https, serial)
+      ecs: null
+      status: unmapped
+      custom: cisco.ftd.lina.service
+      notes: appears in the 605004/605005 management-login messages
+    - vendor: Group
+      type: string
+      description: tunnel or WebVPN group the VPN user belongs to
+      ecs: null
+      status: unmapped
+      custom: cisco.ftd.webvpn.group_name
+      notes: appears in the 722051 address-assignment message
+    - vendor: IPv4 Address
+      type: ip
+      description: address assigned to the VPN client from the pool
+      ecs: null
+      status: unmapped
+      custom: cisco.ftd.assigned_ip
+      notes: >
+        there is no ECS field for an assigned tunnel address, and overloading
+        source.ip would destroy the link to the client's real address
+    - vendor: reason
+      type: string
+      description: free-text explanation of an authentication failure
+      ecs: event.reason
+      status: partial
+      notes: present on only some AAA failure messages
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Fan the shared syslog destination out on the %FTD-<severity>-<id>
+          tag rather than on sender, so the free-text LINA stream never
+          reaches the key=value security-event pipeline. Mask any
+          credential-bearing text in AAA failure bodies before it leaves the
+          low side, stamp the device identity the messages do not carry, and
+          always keep _raw here since a message ID with no grok pattern is
+          unrecoverable without it.
+        elastic: >
+          Let the integration's per-message-ID grok set do the parsing and add
+          an @custom pipeline for the derivations it does not make: invert the
+          syslog severity digit (0 most severe) into ECS event.severity via
+          lookup, and derive event.outcome from event.code itself
+          (113004/605005 success, 113005/605004 failure) because these bodies
+          carry no outcome token. Add mappings for cisco.ftd.lina.service,
+          cisco.ftd.webvpn.group_name, and cisco.ftd.assigned_ip, and keep the
+          assigned tunnel address out of source.ip.
+        relay: >
+          Low-side instances cross the guard: the friction here is that any
+          message ID without a pattern crosses as arbitrary free text of
+          unknown shape, as does the failure `reason` string — bound both
+          lengths low-side and validate the envelope before the guard
+          destination. Reconcile low-side and high-side counts per message ID
+          rather than per dataset, so a filter rejecting one unpatterned
+          message type is visible.
+      direct:
+        parse_location: high
+        cribl: >
+          Fan the shared syslog destination out on the %FTD-<severity>-<id>
+          tag rather than on sender, so the free-text LINA stream never
+          reaches the key=value security-event pipeline. Mask any
+          credential-bearing text in AAA failure bodies in this hop, stamp the
+          device identity the messages do not carry, and always keep _raw here
+          since a message ID with no grok pattern is unrecoverable without it.
+        elastic: >
+          Let the integration's per-message-ID grok set do the parsing and add
+          an @custom pipeline for the derivations it does not make: invert the
+          syslog severity digit (0 most severe) into ECS event.severity via
+          lookup, and derive event.outcome from event.code itself
+          (113004/605005 success, 113005/605004 failure) because these bodies
+          carry no outcome token. Add mappings for cisco.ftd.lina.service,
+          cisco.ftd.webvpn.group_name, and cisco.ftd.assigned_ip, and keep the
+          assigned tunnel address out of source.ip.
+  - format: snmp-trap
+    enable: >
+      Configured through FMC Platform Settings, not ASA CLI. Under Devices >
+      Platform Settings > SNMP enable SNMP, add an SNMPv3 user/group (auth+
+      priv, since the trapped messages carry usernames and reasons), add the
+      SNMP manager as a Management Host of type trap, and on the SNMP Traps
+      tab enable the "Syslog" trap. Then under Platform Settings > Syslog >
+      Logging Destinations add a destination of type "SNMP Trap" and use the
+      Logging Setup / Event Lists to scope which message IDs and severities go
+      to it (the FTD equivalent of the ASA `logging history` level - e.g.
+      include the informational 113004/722051/746012 notices). This is a
+      distinct control from the plain syslog logging destination.
+    references:
+    - >-
+      https://www.cisco.com/c/en/us/support/docs/security/firepower-ngfw-virtual/215560-configure-snmp-syslog-traps-for-asa-and.html
+    - >-
+      https://www.cisco.com/c/en/us/td/docs/security/firepower/623/configuration/guide/fpmc-config-guide-v623/platform_settings_for_firepower_threat_defense.html
+    - https://web.mit.edu/outland/share/snmp/mibs/CISCO-SYSLOG-MIB.my
+    - https://oidref.com/1.3.6.1.4.1.9.9.41.2.0.1
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom FTD SNMP-trap (CISCO-SYSLOG-MIB) reparse pipeline
+      notes: >
+        Neither the stock cisco_ftd integration nor any Cribl pack ingests
+        SNMP traps: a trap receiver (snmptrapd or an equivalent SNMP source)
+        must terminate the PDU and expose the varbinds first. The pipeline
+        then copies clogHistMsgText into event.original and re-runs the SAME
+        FTD LINA per-message-ID grok/dissect the syslog-raw feed uses, because
+        the 113xxx/722xxx body grammar is unchanged. The MIB metadata varbinds
+        are a small convenience; they do not remove the free-text parsing
+        work, and the 254-byte truncation means some long messages cannot be
+        fully parsed at all.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Terminate the trap on a low-side SNMP receiver, decode the varbinds,
+          and map clogHistMsgText to event.original. This dataset is the
+          evidence base for credential-attack detection, so do not sample it -
+          but flag the 254-byte truncation risk explicitly: 722xxx client-type
+          banners and tunnel-group strings can exceed it and arrive with a
+          trailing '*', so where full fidelity matters prefer the syslog-raw
+          feed and treat the trap as a secondary transport. Mask any
+          credential- bearing text in AAA failure bodies before the crossing,
+          as on the syslog path.
+        elastic: >
+          A custom logs-cisco_ftd.log-compatible @custom pipeline that parses
+          clogHistMsgText with the existing per-ID LINA patterns, then applies
+          the same derivations as the syslog-raw feed: invert the syslog
+          severity digit to event.severity, derive event.outcome from the
+          message id (113004/605005 success, 113005/605004 failure), and
+          populate cisco.ftd.lina.service, cisco.ftd.webvpn.group_name and
+          cisco.ftd.assigned_ip. Convert clogHistSeverity (the MIB
+          SyslogSeverity enum 1-8) to log.syslog.severity.code by subtracting
+          one, since the enum is offset by one from the raw 0-7 scale.
+        relay: >
+          The content-inspection risk is identical to the syslog feed -
+          usernames and assigned tunnel addresses in the free-text body - plus
+          the varbind envelope. Decode to NDJSON low-side, mask usernames and
+          bound the failure reason and client-type banner lengths before the
+          crossing, and cross with a Persistent Queue and dead-letter route.
+          Reconcile per-message-ID counts across the guard, so a filter
+          rejecting one unpatterned message type is visible.
+      direct:
+        parse_location: high
+        cribl: >
+          For a high-side FTD, terminate the trap on an SNMP receiver and
+          forward the decoded varbinds; there is little advantage to the trap
+          over plain syslog here, so adopt it only where an existing SNMP
+          collection path is the reason. Do not run both the trap and the
+          syslog feed as authoritative for the same device.
+        elastic: >
+          A custom logs-cisco_ftd.log-compatible @custom pipeline that parses
+          clogHistMsgText with the existing per-ID LINA patterns, then applies
+          the standard derivations: invert the syslog severity digit to
+          event.severity, derive event.outcome from the message id
+          (113004/605005 success, 113005/605004 failure), and populate
+          cisco.ftd.lina.service, cisco.ftd.webvpn.group_name and
+          cisco.ftd.assigned_ip. Convert clogHistSeverity (the MIB
+          SyslogSeverity enum 1-8) to log.syslog.severity.code by subtracting
+          one, since the enum is offset by one from the raw 0-7 scale. Retain
+          full username values; accept that the 254-byte truncation is
+          unavoidable in this transport and alert on truncated (trailing-'*')
+          records so an analyst knows when a 722xxx string was clipped.
+    fields:
+    - vendor: clogHistMsgText
+      type: string
+      description: >-
+        CISCO-SYSLOG-MIB - the full text of the LINA syslog message, truncated
+        to 254 bytes with a trailing '*' if longer.
+      ecs: event.original
+      status: partial
+      notes: >
+        carries the entire 113xxx/605xxx/722xxx sentence; every credential,
+        tunnel and reason field still has to be parsed out of it with the same
+        per-message-ID grammar as syslog-raw, and the 254-byte cap can clip
+        long AnyConnect/Secure Client client-type and tunnel-group strings.
+    - vendor: clogHistMsgName
+      type: string
+      description: CISCO-SYSLOG-MIB - textual identifier of the message type (facility + mnemonic).
+      ecs: event.code
+      status: partial
+      notes: >
+        a name (facility+mnemonic), not the bare 6-digit number; the numeric
+        event.code (113005, 722051, ...) usually still has to be read from the
+        message text, so treat this as a hint and confirm against the parsed
+        body.
+    - vendor: clogHistFacility
+      type: string
+      description: CISCO-SYSLOG-MIB - name of the facility that generated the message.
+      ecs: log.syslog.facility.name
+      status: mapped
+    - vendor: clogHistSeverity
+      type: integer
+      description: 'CISCO-SYSLOG-MIB - SyslogSeverity enum: emergency(1)..debug(8).'
+      ecs: log.syslog.severity.code
+      status: partial
+      transform: >
+        the MIB enum is 1-8 (emergency=1), offset by one from the raw syslog
+        0-7 severity scale; subtract one before writing
+        log.syslog.severity.code and set log.syslog.severity.name from the
+        same value.
+    - vendor: clogHistTimestamp
+      type: integer
+      description: >-
+        CISCO-SYSLOG-MIB - value of sysUpTime (device-uptime ticks) when the
+        message was generated.
+      ecs: null
+      status: unmapped
+      custom: cisco.ftd.snmp.sysuptime
+      notes: >
+        device-uptime ticks, NOT wall-clock time, so it cannot populate
+        @timestamp directly; @timestamp must come from the trap-receiver
+        arrival time (or be reconstructed from sysUpTime plus the agent boot
+        time). Keep the raw ticks for drift analysis.
+    - vendor: clogHistIndex
+      type: integer
+      description: >-
+        CISCO-SYSLOG-MIB - monotonically increasing index of the message in
+        the syslog history table.
+      ecs: null
+      status: unmapped
+      custom: cisco.ftd.snmp.history_index
+      notes: >-
+        useful only for detecting gaps/duplicates in the trap stream, since
+        traps are unacknowledged UDP

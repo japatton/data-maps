@@ -1,0 +1,445 @@
+id: checkpoint
+name: Check Point Security Gateway
+vendor: Check Point
+versions: >-
+  Check Point R80.20 and later, exported by Log Exporter; Quantum Security
+  Gateway and the Management Server
+draft: true
+references:
+- https://github.com/elastic/integrations/tree/main/packages/checkpoint
+- https://www.elastic.co/docs/reference/integrations/checkpoint
+- https://sc1.checkpoint.com/documents/App_for_Splunk/html_frameset.htm
+datasets:
+- id: security-log
+  name: Gateway security log
+  description: |
+    One stream carrying every blade the gateway runs - firewall, application control, URL filtering, IPS, anti-bot, anti-virus, threat emulation and DLP. That is the defining fact about this feed and the thing that makes it awkward: the schema is the union of every blade's fields, and which ones appear on a given record depends entirely on which blade wrote it. A connection accept and a DLP incident arrive on the same wire, share an envelope, and otherwise have almost nothing in common.
+    The practical consequence is that field presence is the discriminator. There is no single reliable type field that says which blade produced a record, so a pipeline routes on which fields are populated, and a detection written against a field the blade in question does not emit matches nothing rather than erroring.
+    Fills the last major firewall gap in the catalogue - Palo Alto, Cisco ASA and FTD, Fortinet, Juniper SRX and the F5 estate were all present and Check Point was not.
+  event_categories:
+  - network
+  - malware
+  - web
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Receives semicolon-delimited key=value from Log Exporter. Highest
+        record count of any firewall feed in the catalogue at typical gateway
+        throughput, and the blade mix decides how wide each record is - a DLP
+        or threat-emulation record carries many times the fields of a
+        connection accept. Log Exporter also has CEF and LEEF targets for
+        SIEMs that require them. Both force the blade-specific fields through
+        a fixed extension dictionary, and the union of blades here is far
+        wider than any dictionary anticipates.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes. URLs, mail subjects and DLP file names are the
+        free-text content on this feed, and they arrive only on the
+        higher-blade records - so a content-filter policy written against a
+        sample of connection logs will not have seen them.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-checkpoint.firewall
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Receives semicolon-delimited key=value from Log Exporter.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-checkpoint.firewall
+  formats:
+  - format: syslog-kv
+    parsing:
+      mechanism: elastic-integration
+      artifact: elastic/integrations checkpoint, data stream firewall
+      notes: |
+        The integration parses the key=value pairs into checkpoint.* and then promotes roughly ninety-five of them to ECS. The field table below records those promotions and, where several vendor fields compete for one ECS field, which one should win.
+        That competition is the main thing to understand here. Because each blade named the same concept differently, the integration maps five distinct vendor fields onto rule.name, three onto message, and two each onto source.ip, url.original, rule.category, rule.ruleset, rule.id, rule.uuid and network.application. They do not collide in practice - a record carries the field belonging to its own blade - but a hand-built pipeline that applies the renames in the wrong order will let a later empty field overwrite an earlier populated one.
+    fields:
+    - vendor: time
+      type: timestamp
+      description: when the gateway logged the record
+      ecs: '@timestamp'
+      status: partial
+      transform: epoch or gateway-local string, depending on exporter settings
+      notes: >-
+        Log Exporter can emit epoch milliseconds or a formatted local string;
+        which one is a configuration choice on the exporter, so confirm it per
+        deployment rather than assuming
+    - vendor: loguid
+      type: string
+      description: unique identifier of the log record
+      ecs: event.id
+      status: mapped
+    - vendor: action
+      type: string
+      description: what the gateway did - accept, drop, reject, encrypt, prevent, detect
+      ecs: event.action
+      status: mapped
+      notes: >
+        the blade decides the vocabulary. Firewall records read accept and
+        drop; threat-prevention records read prevent and detect, where detect
+        means it was allowed through and only logged. Treating detect as a
+        block is the most consequential misreading of this field.
+    - vendor: src
+      type: ip
+      description: source address of the connection
+      ecs: source.ip
+      status: partial
+      notes: >-
+        shares source.ip with client_ip, which the web blades use instead; a
+        record carries one or the other, and the pipeline must not let an
+        absent client_ip overwrite a populated src
+    - vendor: client_ip
+      type: ip
+      description: client address, on records from the web-facing blades
+      ecs: source.ip
+      status: partial
+      notes: same single-slot contention as src
+    - vendor: dst
+      type: ip
+      description: destination address of the connection
+      ecs: destination.ip
+      status: mapped
+    - vendor: xlatesrc
+      type: ip
+      description: translated source address after NAT
+      ecs: source.nat.ip
+      status: mapped
+      notes: >-
+        present only where NAT applied; its absence means no translation, not
+        that the field was dropped
+    - vendor: xlatedst
+      type: ip
+      description: translated destination address after NAT
+      ecs: destination.nat.ip
+      status: mapped
+    - vendor: proto
+      type: integer
+      description: IANA protocol number
+      ecs: network.iana_number
+      status: partial
+      transform: cast to string, and decode to network.transport
+      notes: >-
+        ECS types iana_number as keyword, so the integer must be cast; almost
+        every query wants network.transport instead, so populate both
+    - vendor: service
+      type: integer
+      description: destination port
+      ecs: destination.port
+      status: mapped
+      notes: >-
+        named service rather than port, which is a Check Point convention that
+        surprises everyone reading the raw log for the first time
+    - vendor: s_port
+      type: integer
+      description: source port
+      ecs: source.port
+      status: mapped
+    - vendor: service_name
+      type: string
+      description: name of the destination service, e.g. https, domain-udp
+      ecs: network.protocol
+      status: partial
+      notes: >-
+        the closest ECS home; it is the gateway's name for the port rather
+        than an observed application protocol, so it can say https for
+        anything on 443
+    - vendor: service_id
+      type: string
+      description: application the Application Control blade identified
+      ecs: network.application
+      status: partial
+      notes: >-
+        shares network.application with app_name; this is the identified
+        application rather than the port's nominal service, which is the
+        distinction that makes application control worth having
+    - vendor: app_name
+      type: string
+      description: application name from the Application Control blade
+      ecs: network.application
+      status: partial
+      notes: same single-slot contention as service_id
+    - vendor: app_risk
+      type: integer
+      description: risk rating Check Point assigns the application
+      ecs: event.risk_score
+      status: partial
+      notes: >-
+        a vendor-assigned application risk, not a score for this event;
+        constant for a given application, so alerting on it alerts on
+        application use rather than on anything that happened
+    - vendor: rule_name
+      type: string
+      description: name of the firewall rule that matched
+      ecs: rule.name
+      status: partial
+      notes: >
+        one of five vendor fields competing for rule.name - the others are
+        malware_rule_name, app_rule_name, dlp_rule_name and objectname, each
+        from its own blade. A record carries one. Applying the renames without
+        guarding on presence lets an empty later field blank a populated
+        earlier one.
+    - vendor: malware_rule_name
+      type: string
+      description: name of the threat-prevention rule that matched
+      ecs: rule.name
+      status: partial
+      notes: same five-way contention as rule_name
+    - vendor: app_rule_name
+      type: string
+      description: name of the application-control rule that matched
+      ecs: rule.name
+      status: partial
+      notes: same five-way contention as rule_name
+    - vendor: dlp_rule_name
+      type: string
+      description: name of the DLP rule that matched
+      ecs: rule.name
+      status: partial
+      notes: same five-way contention as rule_name
+    - vendor: rule_uid
+      type: string
+      description: unique identifier of the matched rule
+      ecs: rule.uuid
+      status: partial
+      notes: >-
+        the stable identity of a rule across renames, and the field a
+        detection should key on rather than the name; shares rule.uuid with
+        dlp_rule_uid
+    - vendor: policy
+      type: string
+      description: name of the policy package installed on the gateway
+      ecs: rule.ruleset
+      status: partial
+      notes: >-
+        shares rule.ruleset with smartdefence_profile, which the IPS blade
+        uses; together they answer which body of rules was in force
+    - vendor: layer_name
+      type: string
+      description: the policy layer the matching rule lives in
+      ecs: network.name
+      status: partial
+      notes: >
+        Elastic's integration maps this to network.name, which is an odd home
+        - a policy layer is not a network. Recorded as the integration behaves
+        so a reader is not surprised by what lands there, but a hand-built
+        pipeline should prefer a named custom and leave network.name alone.
+    - vendor: ifdir
+      type: string
+      description: direction of the traffic relative to the gateway
+      ecs: network.direction
+      status: partial
+      transform: map inbound and outbound to the ECS vocabulary
+    - vendor: ifname
+      type: string
+      description: the interface the traffic used
+      ecs: observer.ingress.interface.name
+      status: partial
+      transform: route by ifdir - ingress on inbound, egress on outbound
+      notes: >
+        one field naming whichever interface is relevant, and the direction
+        field is what says which. Writing it to both ingress and egress, as
+        the shipped integration effectively does, makes every record claim it
+        entered and left by the same interface.
+    - vendor: inzone
+      type: string
+      description: security zone the traffic entered from
+      ecs: observer.ingress.zone
+      status: mapped
+    - vendor: outzone
+      type: string
+      description: security zone the traffic left by
+      ecs: observer.egress.zone
+      status: mapped
+    - vendor: bytes
+      type: integer
+      description: bytes transferred in the connection
+      ecs: network.bytes
+      status: mapped
+      notes: >-
+        the total for the connection; Check Point does not split client and
+        server bytes on this field, so client.bytes and server.bytes stay
+        empty and a ratio-based exfiltration rule cannot be written from this
+        feed alone
+    - vendor: packets
+      type: integer
+      description: packets transferred in the connection
+      ecs: network.packets
+      status: mapped
+    - vendor: duration
+      type: integer
+      description: duration of the connection in seconds
+      ecs: event.duration
+      status: partial
+      transform: multiply by 1000000000 - ECS event.duration is nanoseconds
+    - vendor: origin
+      type: ip
+      description: address of the gateway that produced the record
+      ecs: observer.ip
+      status: mapped
+    - vendor: originsicname
+      type: string
+      description: 'the gateway''s Secure Internal Communication distinguished name'
+      ecs: null
+      status: partial
+      custom: checkpoint.origin_sic_name
+      notes: >-
+        the gateway's cryptographic identity in the management estate and the
+        most reliable way to tell two gateways apart; observer.name would
+        flatten it to a display string
+    - vendor: product
+      type: string
+      description: the blade that produced the record
+      ecs: observer.product
+      status: partial
+      notes: >
+        the closest thing to a blade discriminator this feed has, and worth
+        asserting on rather than inferring from field presence where it is
+        populated - but it is not present on every record, which is why field
+        presence remains the fallback.
+    - vendor: user
+      type: string
+      description: authenticated user associated with the connection
+      ecs: source.user.name
+      status: partial
+      notes: >-
+        populated only where identity awareness is configured and the session
+        was identified; absence is the normal case on a gateway without it
+    - vendor: src_user_group
+      type: string
+      description: group the identified user belongs to
+      ecs: source.user.group.name
+      status: mapped
+    - vendor: src_machine_name
+      type: string
+      description: machine name from identity awareness
+      ecs: source.domain
+      status: partial
+      notes: >-
+        often DOMAIN\HOST; the domain half duplicates what identity awareness
+        already knows and the host half is what joins to endpoint feeds
+    - vendor: url
+      type: string
+      description: URL requested, from the URL filtering blade
+      ecs: url.original
+      status: partial
+      notes: >-
+        shares url.original with resource, which older blades use; also the
+        highest-sensitivity field on the feed and the first candidate for edge
+        redaction
+    - vendor: http_host
+      type: string
+      description: Host header of the request
+      ecs: url.domain
+      status: mapped
+    - vendor: method
+      type: string
+      description: HTTP request method
+      ecs: http.request.method
+      status: mapped
+    - vendor: user_agent
+      type: string
+      description: User-Agent header
+      ecs: user_agent.original
+      status: mapped
+    - vendor: matched_category
+      type: string
+      description: URL filtering category the request matched
+      ecs: rule.category
+      status: partial
+      notes: >-
+        shares rule.category with categories; ECS has no url.category, so the
+        categorisation applied by the filtering entity is the closest home
+    - vendor: file_name
+      type: string
+      description: name of the file seen by the threat or DLP blades
+      ecs: file.name
+      status: partial
+      notes: shares file.name with dlp_file_name
+    - vendor: file_md5
+      type: string
+      description: MD5 of the inspected file
+      ecs: file.hash.md5
+      status: mapped
+    - vendor: file_sha256
+      type: string
+      description: SHA-256 of the inspected file
+      ecs: file.hash.sha256
+      status: mapped
+    - vendor: protection_name
+      type: string
+      description: name of the IPS protection or malware signature that fired
+      ecs: rule.description
+      status: partial
+      notes: >-
+        the specific thing detected, as opposed to the rule that decided what
+        to do about it; on an IPS record this is the field an analyst reads
+        first
+    - vendor: industry_reference
+      type: string
+      description: CVE or other public reference for the protection
+      ecs: vulnerability.id
+      status: partial
+      notes: >-
+        present on IPS records where the protection maps to a published
+        vulnerability; comma-separated when several apply, so split to an
+        array
+    - vendor: severity
+      type: string
+      description: severity assigned by the threat-prevention blade
+      ecs: event.severity
+      status: partial
+      transform: map the vendor words to an integer scale
+      notes: >-
+        emitted as words rather than numbers, and the scale differs from the
+        firewall blade's - another consequence of one stream carrying many
+        blades
+    - vendor: confidence_level
+      type: string
+      description: how confident the blade is in the detection
+      ecs: null
+      status: unmapped
+      custom: checkpoint.confidence_level
+      notes: >-
+        the field that separates a high-confidence block from a heuristic one;
+        ECS has no confidence concept, and pairing it with severity is how a
+        triage queue gets ordered sensibly
+    - vendor: domain_name
+      type: string
+      description: queried name, on DNS-inspection records
+      ecs: dns.question.name
+      status: mapped
+    - vendor: dns_type
+      type: string
+      description: query type, on DNS-inspection records
+      ecs: dns.question.type
+      status: mapped
+    - vendor: message
+      type: string
+      description: free-text description of the record
+      ecs: message
+      status: partial
+      notes: >-
+        shares message with reason and subject, each from a different blade; a
+        record carries one, and the same presence-guarding applies
+    - vendor: reason
+      type: string
+      description: why the blade took the action it did
+      ecs: message
+      status: partial
+      notes: same three-way contention as message

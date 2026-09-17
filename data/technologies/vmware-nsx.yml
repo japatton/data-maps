@@ -1,0 +1,1206 @@
+id: vmware-nsx
+name: VMware NSX Distributed Firewall
+vendor: Broadcom
+versions: NSX-T 3.2, NSX 4.1, NSX 4.2
+draft: true
+references:
+- >-
+  https://techdocs.broadcom.com/us/en/vmware-cis/nsx/vmware-nsx/4-0/administration-guide/security/distributed-firewall/firewall-packet-logs.html
+- >-
+  https://techdocs.broadcom.com/us/en/vmware-cis/nsx/nsxt-dc/3-0/administration-guide/security/distributed-firewall/firewall-packet-logs.html
+- >-
+  https://knowledge.broadcom.com/external/article/309070/understanding-tcp-flags-in-the-nsx-dfw-p.html
+- >-
+  https://knowledge.broadcom.com/external/article/406629/configuring-distributed-firewall-packet.html
+- https://knowledge.broadcom.com/external/article?articleId=396587
+- >-
+  https://techdocs.broadcom.com/us/en/vmware-cis/nsx/vmware-nsx/4-2/administration-guide/operations-and-management/log-messages-and-error-codes.html
+- >-
+  https://techdocs.broadcom.com/us/en/vmware-cis/nsx/nsxt-dc/3-2/administration-guide/operations-and-management/log-messages-and-error-codes.html
+- https://packs.cribl.io/
+- https://www.elastic.co/docs/reference/integrations/vmware-intro
+datasets:
+- id: dfw-packet-log
+  name: Distributed firewall packet log
+  description: >
+    Per-rule packet decisions from the distributed firewall data plane. The
+    DFW runs in the hypervisor as a filter on each VM vNIC, so these records
+    are the only east-west evidence a SOC gets for traffic between VMs on the
+    same host or the same segment - it never reaches a physical firewall. Each
+    transport node writes them to /var/run/log/dfwpktlogs.log (rotation
+    governed by /etc/vmsyslog.conf.d/dfwpktlogs.conf) and forwards them on the
+    node's syslog stream under the dfwpktlogs ident, mixed in with the rest of
+    the ESXi syslog feed. Two record shapes share the grammar: "match" records
+    logged per packet when a rule has logging enabled, and "TERM" records
+    emitted at connection close carrying the session's packet and byte
+    counters. Logging is per-rule and off by default, and enabling it broadly
+    is a documented cause of host resource and stability problems, so the
+    realistic feed is a deliberately chosen subset of rules.
+  event_categories:
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Receives the ESXi transport-node syslog stream over TCP/TLS; the DFW
+        packet log is not separately addressable, so it arrives interleaved
+        with hostd/vmkernel/vobd lines and is discriminated by the dfwpktlogs
+        ident. The crossing matters more here than on most sources because
+        this is the highest-volume dataset in the map.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-vmware_nsx.dfw
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Receives the ESXi transport-node syslog stream over TCP/TLS; the DFW
+        packet log is not separately addressable, so it arrives interleaved
+        with hostd/vmkernel/vobd lines and is discriminated by the dfwpktlogs
+        ident.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-vmware_nsx.dfw
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: cribl-pack
+      artifact: Cribl Pack for VMware NSX Syslog (community, Packs Dispensary)
+      notes: >
+        There is no Elastic integration for NSX - the VMware family ships
+        vSphere and Carbon Black packages only, and the vSphere integration's
+        syslog pipeline stops at the RFC 3339 header, leaving the whole DFW
+        grammar in message. The community NSX syslog pack in the Cribl Packs
+        Dispensary is the nearest ready-made parser; treat its field naming
+        and ECS coverage as unverified and expect to extend it, because the
+        record is positional with a variable tail (TCP flags on match records,
+        close reason plus two counter pairs on TERM records) rather than a
+        fixed column count.
+    fields:
+    - vendor: timestamp
+      type: timestamp
+      description: ISO 8601 UTC time the transport node logged the packet decision
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: dfwpktlogs
+      type: string
+      description: syslog ident identifying the line as a distributed firewall packet log
+      ecs: process.name
+      status: mapped
+      notes: >
+        the only discriminator separating these records from the rest of the
+        ESXi syslog stream, since per-file forwarding is unsupported and the
+        node emits one merged feed; branch every extraction on it
+    - vendor: hostname
+      type: string
+      description: >-
+        syslog header hostname of the ESXi transport node whose data-plane
+        filter made the decision
+      ecs: observer.name
+      status: mapped
+      notes: >
+        the enforcement point, not a party to the flow - deliberately kept off
+        host.name so neither endpoint VM is confused with the hypervisor
+    - vendor: VIF ID
+      type: string
+      description: >-
+        last eight hexadecimal digits of the virtual interface (vNIC)
+        identifier whose filter the packet traversed, e.g. b6507827
+      ecs: observer.ingress.interface.id
+      status: partial
+      notes: >
+        identifies the VM vNIC the rule was enforced on - the closest thing
+        this dataset has to an asset key, and the field that makes east-west
+        traffic attributable to a workload. Truncated to eight digits by the
+        logger, so it is not globally unique and needs a lookup against the
+        NSX inventory to resolve to a VM; the ingress spelling is approximate
+        because a single ECS interface field cannot carry a filter that sees
+        both directions
+    - vendor: INET type
+      type: enum
+      description: address family of the packet, INET for IPv4 or INET6 for IPv6
+      ecs: network.type
+      status: partial
+      transform: >-
+        lowercase and translate INET to ipv4 and INET6 to ipv6; the vendor
+        spelling is not the ECS vocabulary
+    - vendor: reason
+      type: enum
+      description: >-
+        record shape - "match" for a per-packet rule match, "TERM" for a
+        connection-close summary
+      ecs: null
+      status: unmapped
+      custom: vmware.nsx.dfw.record_type
+      transform: >
+        this token decides the grammar of everything after it, so it must be
+        read before the rest of the line is parsed; TERM records should also
+        set event.type to end, while match records are single-packet
+        observations rather than session records
+      notes: >
+        no ECS field models "which shape of record is this"; keeping it
+        explicit is what stops per-packet lengths and session totals being
+        aggregated together
+    - vendor: action
+      type: enum
+      description: disposition the matched rule applied - PASS, DROP or REJECT
+      ecs: event.action
+      status: mapped
+      transform: >
+        copy the vendor verb to event.action lowercased and drive
+        event.outcome from it (PASS to success, DROP and REJECT to failure),
+        with event.type set to allowed or denied accordingly; there is no
+        separate outcome column. REJECT differs from DROP in that the data
+        plane answers the sender, which is worth preserving rather than
+        collapsing both into "blocked"
+      notes: >-
+        TERM records carry no action column at all - do not default the field
+        to PASS when it is absent
+    - vendor: rule set name
+      type: string
+      description: >-
+        name of the rule set (filter) the matching rule belongs to, e.g.
+        mainrs, or the operator-configured per-rule Log Label when one is set
+      ecs: rule.ruleset
+      status: partial
+      notes: >
+        NSX lets an operator attach a Log Label to a firewall rule that is
+        documented to appear in the firewall logs; it is emitted in this
+        positional slot rather than as an extra column, so a parser that
+        assumes the literal mainrs will mis-handle exactly the rules an
+        operator cared enough to label. Treat the token as free text and
+        confirm the labelled-rule spelling against a live feed before alerting
+        on it
+    - vendor: rule ID
+      type: integer
+      description: NSX-assigned numeric identifier of the firewall rule that matched, e.g. 1024
+      ecs: rule.id
+      status: mapped
+      notes: >
+        safe to use rule.id here because rule.name is not occupied by a
+        different object on this dataset - the packet log carries no rule
+        display name, so rule.id and rule.ruleset describe the same rule. The
+        number alone is unreadable to an analyst, so a lookup against the NSX
+        policy API is needed to populate rule.name with the actual rule and
+        section name
+    - vendor: packet direction
+      type: enum
+      description: direction of the packet through the vNIC filter, IN or OUT
+      ecs: network.direction
+      status: partial
+      transform: >
+        translate IN to ingress and OUT to egress; the direction is relative
+        to the VM's vNIC, not to the datacenter perimeter, so the ECS
+        inbound/outbound vocabulary must not be used - on east-west traffic
+        both endpoints are internal and inbound/outbound would be meaningless
+      notes: >
+        this token is also what resolves which side of the connection tuple
+        the TERM counters belong to; parsing it wrong inverts byte direction
+        on half the dataset
+    - vendor: packet size
+      type: integer
+      description: >-
+        length in bytes of the individual packet that matched the rule (match
+        records only)
+      ecs: null
+      status: unmapped
+      custom: vmware.nsx.dfw.packet_length
+      notes: >
+        deliberately not network.bytes: ECS models that as a session total,
+        and these are per-packet lengths emitted only for the packets a
+        logging-enabled rule happened to see. Summing them alongside the TERM
+        byte counters would double-count and, because logging is per-rule and
+        sampled in practice, would understate real volume anyway
+    - vendor: protocol
+      type: string
+      description: >-
+        transport protocol of the packet - TCP, UDP, ICMP, or the literal form
+        "PROTO <number>" for anything else
+      ecs: network.transport
+      status: partial
+      transform: >
+        lowercase the named protocols into the ECS vocabulary; the "PROTO
+        <number>" form carries a bare IP protocol number that belongs in
+        network.iana_number rather than being indexed as a transport name
+    - vendor: source IP/port
+      type: ip
+      description: >-
+        source address and port of the packet, emitted as a composite
+        "src/sport->dst/dport" token
+      ecs: source.ip
+      status: partial
+      transform: >
+        split the composite token on "->" and then on "/" to yield source.ip,
+        source.port, destination.ip and destination.port; ICMP records carry
+        type/code values in the port positions rather than real ports, so gate
+        the port extraction on the protocol
+    - vendor: destination IP/port
+      type: ip
+      description: >-
+        destination address and port of the packet, from the second half of
+        the composite token
+      ecs: destination.ip
+      status: mapped
+    - vendor: TCP flags
+      type: string
+      description: >-
+        TCP flags set on the logged packet - S (SYN), SA (SYN-ACK), A (ACK), P
+        (PUSH), U (URGENT), F (FIN), R (RESET), and combinations
+      ecs: null
+      status: unmapped
+      custom: vmware.nsx.dfw.tcp_flags
+      notes: >
+        ECS has no TCP flags field, and the flag string is what separates a
+        scan (bare S with no SA in reply) from an established session on a
+        feed that has no session state of its own. The vendor's own examples
+        also show combinations such as SEW that the documented letter table
+        does not expand, so validate the observed vocabulary against a live
+        feed before writing detections on it
+    - vendor: close reason
+      type: enum
+      description: how the connection ended on a TERM record - RST or FIN
+      ecs: event.reason
+      status: partial
+      notes: >
+        present only on TERM records and only for TCP; a reset close is a
+        materially different signal from a graceful close when triaging
+        east-west lateral movement, so it is worth keeping rather than folding
+        into the record type
+    - vendor: packet counts
+      type: string
+      description: in/out packet counters on a TERM record, emitted as a single "20/16" token
+      ecs: network.packets
+      status: partial
+      transform: >
+        split on "/" and sum for network.packets; only split into
+        source.packets and destination.packets after resolving the record's
+        IN/OUT direction against the connection tuple, because the counters
+        are relative to the vNIC while source and destination are relative to
+        the flow - copying them across positionally inverts the direction on
+        every record logged in the opposite orientation
+    - vendor: byte counts
+      type: string
+      description: in/out byte counters on a TERM record, emitted as a single "1718/76308" token
+      ecs: network.bytes
+      status: partial
+      transform: >
+        split on "/" and sum for network.bytes, with source.bytes and
+        destination.bytes populated only after the same IN/OUT-to-tuple
+        resolution as the packet counters. These are the only true session
+        totals on the dataset, so volumetric detections should key on TERM
+        records and never on the per-packet lengths
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Own the positional grammar low-side and branch on the match/TERM
+          token before anything else, because the two shapes disagree on
+          column count and a single grok will silently mis-slot the counters:
+          match records carry action, packet length and TCP flags, TERM
+          records carry a close reason and the in/out packet and byte pairs
+          but no action at all. Resolve the IN/OUT direction against the
+          connection tuple in the same pipeline so the TERM counters land on
+          the right side of source/destination instead of being inverted on
+          half the records, split the src/sport->dst/dport token, and run the
+          rule-id-to-rule-name lookup against a periodically refreshed NSX
+          policy API export here where the rule catalogue is small and
+          cacheable. Volume control also belongs low-side: this feed is
+          per-packet, so sample or aggregate the PASS records by (rule id,
+          5-tuple) and keep DROP/REJECT unsampled, and drop _raw first on this
+          dataset once the parser is proven.
+        elastic: >
+          Land the pre-shaped documents in logs-vmware_nsx.dfw and keep the
+          high side to enrichment rather than a second parse: an enrich policy
+          that joins rule.id to the DFW rule display name, section and policy
+          so analysts are not triaging bare integers, and index-template
+          keyword mappings for the custom-namespace VIF id, TCP flags and
+          packet-length fields. Assert that event.outcome and
+          network.direction are populated on every match record and that TERM
+          records are distinguishable from match records by an explicit field,
+          because the two carry different byte semantics and summing them
+          together double-counts session volume.
+        relay: >
+          Low-side instances cross the guard: keep this at low (envelope mode
+          B) - full ECS-shaped NDJSON, not the raw positional line: a content
+          filter cannot make field-aware decisions about a space-delimited
+          record whose column count changes with the record type, and the
+          operator-supplied rule log label is free text sitting in the middle
+          of it. Cap the label and the VIF token low-side, hold the JSON to
+          two levels of nesting with short ASCII keys and bounded string
+          lengths, and validate against a Schema Library schema with a
+          dead-letter route immediately before the guard destination, on
+          Persistent Queue backpressure rather than Block. Nothing CEF is
+          involved. The crossing is at-most-once, and because this dataset is
+          bursty by nature, reconcile low-side and high-side counts per
+          (dataset, hour) against the low-side sampling ratio rather than
+          assuming a gap means a drop.
+      direct:
+        parse_location: low
+        cribl: >
+          Own the positional grammar in Cribl and branch on the match/TERM
+          token before anything else, because the two shapes disagree on
+          column count and a single grok will silently mis-slot the counters:
+          match records carry action, packet length and TCP flags, TERM
+          records carry a close reason and the in/out packet and byte pairs
+          but no action at all. Resolve the IN/OUT direction against the
+          connection tuple in the same pipeline so the TERM counters land on
+          the right side of source/destination instead of being inverted on
+          half the records, split the src/sport->dst/dport token, and run the
+          rule-id-to-rule-name lookup against a periodically refreshed NSX
+          policy API export here where the rule catalogue is small and
+          cacheable. Volume control also belongs up front in the pipeline:
+          this feed is per-packet, so sample or aggregate the PASS records by
+          (rule id, 5-tuple) and keep DROP/REJECT unsampled, and drop _raw
+          first on this dataset once the parser is proven.
+        elastic: >
+          Land the pre-shaped documents in logs-vmware_nsx.dfw and keep the
+          high side to enrichment rather than a second parse: an enrich policy
+          that joins rule.id to the DFW rule display name, section and policy
+          so analysts are not triaging bare integers, and index-template
+          keyword mappings for the custom-namespace VIF id, TCP flags and
+          packet-length fields. Assert that event.outcome and
+          network.direction are populated on every match record and that TERM
+          records are distinguishable from match records by an explicit field,
+          because the two carry different byte semantics and summing them
+          together double-counts session volume.
+  - format: netflow
+    enable: >
+      Firewall IPFIX is configured in NSX Manager, not on the ESXi host. First
+      add a Firewall IPFIX Collector under Plan & Troubleshoot > IPFIX >
+      Firewall IPFIX Collectors > Add with the collector's IP address and UDP
+      port (default 4739). Then add a Firewall IPFIX Profile under Plan &
+      Troubleshoot > IPFIX > Firewall IPFIX Profiles > Add: select that
+      collector, set the Active Flow Export Timeout (minutes - how often an
+      ongoing flow re-exports an update record), an Observation Domain ID
+      (default 0), a Priority (the lower value wins where two profiles both
+      apply to a member), and an Applied To scope of NSGroups whose members'
+      distributed-firewall flows should be exported. Every configured host
+      transport node then sends IPFIX messages to the collector on UDP 4739,
+      compliant with RFC 7011/7012. Two behaviours matter for the map: denied
+      flows continue to be written to the dfwpktlogs syslog as well, so pick
+      IPFIX or the syslog as the authoritative deny record to avoid double
+      counting; and when vCenter is added as a compute manager, the VDS path
+      does not export TCP flags in the firewall IPFIX records.
+    references:
+    - >-
+      https://techdocs.broadcom.com/us/en/vmware-cis/nsx/vmware-nsx/4-2/administration-guide/network-monitoring/advanced-monitoring-tools/configure-ipfix/esxi-ipfix-templates/esxi-distributed-firewall-ipfix-templates.html
+    - >-
+      https://techdocs.broadcom.com/us/en/vmware-cis/nsx/vmware-nsx/4-1/administration-guide/network-monitoring/advanced-monitoring-tools/configure-ipfix/configure-firewall-ipfix-profiles.html
+    - >-
+      https://techdocs.broadcom.com/us/en/vmware-cis/nsx/vmware-nsx/4-2/administration-guide/network-monitoring/advanced-monitoring-tools/configure-ipfix.html
+    - >-
+      https://techdocs.broadcom.com/us/en/vmware-cis/nsx/nsxt-dc/3-2/administration-guide/network-monitoring/add-a-firewall-ipfix-profile.html
+    - >-
+      https://techdocs.broadcom.com/us/en/vmware-cis/aria/aria-operations-for-networks/6-14/vrealize-network-insight-ug-4-1-and-later-6-14/configuring-flows/enabling-ipfix-configuration/nsx-ipfix/enabling-vmware-nsx-t-ipfix.html
+    parsing:
+      mechanism: elastic-integration
+      artifact: Elastic NetFlow Records integration (netflow), data stream logs-netflow.log
+      notes: >
+        Firewall IPFIX is binary IPFIX over UDP 4739, so it needs an IPFIX/
+        NetFlow decoder rather than the syslog parser the dfwpktlogs feed uses
+        - there is no Elastic integration for NSX and the community NSX syslog
+        pack does not read IPFIX at all. An Elastic Agent netflow input
+        decodes the IANA-standard elements (sourceIPv4Address,
+        destinationIPv4Address, sourceTransportPort, destinationTransportPort,
+        protocolIdentifier, octetDeltaCount, packetDeltaCount,
+        flowStartSeconds, flowEndSeconds) into netflow.* automatically, but
+        every NSX enterprise-specific element - firewallEvent, flowDirection,
+        ruleId, sessionFlags, reportingRole, flowId, the alg* fields,
+        averageLatency, retransmissionCount and vifUuid/vifId - arrives as a
+        raw template field and needs a custom ingest pipeline to reach ECS.
+        Cribl has no native IPFIX decoder, so on a Cribl-first path a NetFlow
+        collector or the Elastic Agent netflow input must terminate the UDP
+        stream first; the export is also periodic (Active Flow Export
+        Timeout), so an ongoing flow emits multiple update records that must
+        be joined on flowId, not treated as separate flows.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          A CDS content filter cannot inspect opaque binary IPFIX, and the
+          template records travel on a separate cadence from the data records,
+          so decode Firewall IPFIX to structured records LOW-SIDE (an Elastic
+          Agent netflow input or a NetFlow collector in the low enclave)
+          before the crossing. Resolve the ruleId-to-rule-name lookup here
+          against a periodically refreshed NSX policy API export while the
+          manager is reachable, exactly as on the dfwpktlogs path, and resolve
+          the 16-byte vifUuid to a VM against the NSX inventory here too.
+          Volume control still belongs low-side but is cheaper than on the
+          per-packet syslog: IPFIX is already flow-aggregated, so sample the
+          firewallEvent=1/5 created/update records by (ruleId, 5-tuple) and
+          keep every firewallEvent=3 denied record unsampled. Choose IPFIX or
+          the syslog as the single authoritative DFW feed per host to avoid
+          double counting the same enforcement.
+        elastic: >
+          Run the netflow integration for the standard sockets and add an
+          @custom pipeline that maps the NSX enterprise elements:
+          firewallEvent to event.action/event.type/event.outcome (1 created ->
+          connection/ start success, 2 deleted -> connection/end, 3 denied ->
+          denied failure, 5 update -> connection/info), ruleId to rule.id with
+          an enrich policy that joins the DFW rule display name, section and
+          policy so analysts are not triaging bare integers, and
+          flowStartSeconds/flowEndSeconds to event.start/event.end so
+          event.duration is derivable. Add index-template keyword mappings for
+          the custom-namespace flowId, VIF UUID, sessionFlags, alg* and
+          latency/retransmission fields, and assert that octetDeltaCount /
+          packetDeltaCount are understood as per-report deltas joined on
+          flowId rather than session totals, so periodic update records are
+          not summed as if each were a distinct flow.
+        relay: >
+          Cross decoded NDJSON, never the raw IPFIX stream - the binary form
+          is both un-inspectable at the guard and template-dependent, so a
+          naive byte relay would strand data records whose template packet
+          never crossed. Once decoded the record is almost entirely
+          fixed-width typed values with no attacker-influenced free text -
+          there is no URL, DNS or username on this dataset and no operator Log
+          Label in the IPFIX form - so the content-filter surface is far
+          smaller than the syslog path: hold the JSON to two levels of nesting
+          with short ASCII keys and bounded string lengths (the only string
+          element is vifId), validate against a Schema Library schema with a
+          dead-letter route immediately before the guard on Persistent Queue
+          backpressure rather than Block, and because the export is bursty
+          reconcile low-side and high-side counts per (dataset, hour) against
+          the low-side sampling ratio, since the crossing is at-most-once.
+      direct:
+        parse_location: high
+        cribl: >
+          For a high-side NSX with no guard, terminate Firewall IPFIX at an
+          Elastic Agent netflow input directly; there is little reason to
+          interpose Cribl for binary IPFIX beyond routing. Pick IPFIX or the
+          dfwpktlogs syslog as the authoritative DFW feed per host and disable
+          the other, joining on the 5-tuple during a brief cutover overlap.
+        elastic: >
+          Run the netflow integration for the standard sockets and add an
+          @custom pipeline that maps the NSX enterprise elements:
+          firewallEvent to event.action/event.type/event.outcome (1 created ->
+          connection/start success, 2 deleted -> connection/end, 3 denied ->
+          denied failure, 5 update -> connection/info), ruleId to rule.id with
+          an enrich policy that joins the DFW rule display name, section and
+          policy so analysts are not triaging bare integers, and
+          flowStartSeconds/flowEndSeconds to event.start/event.end so
+          event.duration is derivable. Add index-template keyword mappings for
+          the custom-namespace flowId, VIF UUID, sessionFlags, alg* and
+          latency/retransmission fields, and assert that octetDeltaCount /
+          packetDeltaCount are understood as per-report deltas joined on
+          flowId rather than session totals, so periodic update records are
+          not summed as if each were a distinct flow. With no boundary, treat
+          IPFIX as the higher-throughput flow feed - the flowId join key,
+          byte/packet counters, TCP retransmission/latency and ALG correlation
+          it adds are the fields a SOC uses to profile east-west volume -
+          while accepting that it is the L3/L4 view only: if the operator Log
+          Label, the per-packet TCP flag string, or a true per-record session
+          total is required, IPFIX cannot replace the dfwpktlogs syslog, so
+          run it alongside rather than instead of the packet log.
+    fields:
+    - vendor: sourceIPv4Address
+      type: ip
+      description: IPFIX element - IPv4 source address in the IP packet header of the flow.
+      ecs: source.ip
+      status: mapped
+      notes: >-
+        sourceIPv6Address (16-byte) is the IPv6-flow equivalent and populates
+        the same target
+    - vendor: destinationIPv4Address
+      type: ip
+      description: IPFIX element - IPv4 destination address in the IP packet header of the flow.
+      ecs: destination.ip
+      status: mapped
+      notes: >-
+        destinationIPv6Address (16-byte) is the IPv6-flow equivalent and
+        populates the same target
+    - vendor: sourceTransportPort
+      type: port
+      description: IPFIX element - source port identifier in the transport header.
+      ecs: source.port
+      status: partial
+      notes: >-
+        on ICMP flows the port carries no real value; gate the port extraction
+        on protocolIdentifier and read icmpTypeIPv4/icmpCodeIPv4 instead
+    - vendor: destinationTransportPort
+      type: port
+      description: IPFIX element - destination port identifier in the transport header.
+      ecs: destination.port
+      status: partial
+      notes: same ICMP caveat as the source port
+    - vendor: protocolIdentifier
+      type: integer
+      description: IPFIX element - IP protocol number from the packet header.
+      ecs: network.iana_number
+      status: mapped
+      transform: >-
+        numeric protocol; derive network.transport (tcp/udp/icmp) by lookup
+        rather than leaving transport blank
+    - vendor: octetDeltaCount
+      type: long
+      description: >-
+        IPFIX element - number of octets in incoming packets for the flow
+        since the previous report.
+      ecs: network.bytes
+      status: partial
+      transform: >
+        a per-report delta, NOT a session total; an ongoing flow emits
+        multiple update records at the Active Flow Export Timeout cadence, so
+        accumulate by flowId to a flow total and never sum sibling update
+        records as if each were a distinct flow. The count is not split into
+        per-direction sent/received, so source.bytes and destination.bytes
+        stay empty for the IPFIX form.
+    - vendor: packetDeltaCount
+      type: long
+      description: >-
+        IPFIX element - number of incoming packets for the flow since the
+        previous report.
+      ecs: network.packets
+      status: partial
+      transform: >-
+        same per-report delta and flowId-accumulation handling as
+        octetDeltaCount; not split per direction
+    - vendor: flowStartSeconds
+      type: timestamp
+      description: IPFIX element - absolute timestamp of the first packet of the flow.
+      ecs: event.start
+      status: mapped
+    - vendor: flowEndSeconds
+      type: timestamp
+      description: IPFIX element - absolute timestamp of the last packet of the flow.
+      ecs: event.end
+      status: mapped
+      notes: >-
+        event.duration = flowEndSeconds minus flowStartSeconds; both endpoints
+        are present unlike the syslog match record
+    - vendor: icmpTypeIPv4
+      type: integer
+      description: >-
+        IPFIX element - type of the IPv4 ICMP message (icmpTypeIPv6 is the
+        IPv6 equivalent).
+      ecs: null
+      status: unmapped
+      custom: vmware.nsx.dfw.icmp_type
+      notes: >-
+        ECS has no standard ICMP type field; present only on ICMP flows where
+        the transport ports carry no meaning
+    - vendor: icmpCodeIPv4
+      type: integer
+      description: >-
+        IPFIX element - code of the IPv4 ICMP message (icmpCodeIPv6 is the
+        IPv6 equivalent).
+      ecs: null
+      status: unmapped
+      custom: vmware.nsx.dfw.icmp_code
+    - vendor: flowId
+      type: long
+      description: IPFIX enterprise element - flow identifier unique within an observation domain.
+      ecs: null
+      status: unmapped
+      custom: vmware.nsx.dfw.flow_id
+      notes: >
+        the join key that ties the create, periodic update, and delete/deny
+        records of one flow together, and the field that makes the delta
+        counters accumulable into a flow total; the dfwpktlogs syslog form has
+        no equivalent, so keep it as a keyword for correlation
+    - vendor: firewallEvent
+      type: integer
+      description: >-
+        IPFIX enterprise element - firewall flow event: 1 created, 2 deleted,
+        3 denied, 4 alert (unused), 5 update.
+      ecs: event.action
+      status: partial
+      transform: >
+        drive event.action, event.type and event.outcome from the code: 1
+        created -> event.type connection/start, outcome success; 2 deleted ->
+        connection/end; 3 denied -> a blocked action with event.type denied
+        and outcome failure; 5 update -> connection/info. This is the
+        structured replacement for the syslog action token, but note the IPFIX
+        form uses deny where the syslog distinguishes DROP from REJECT, so the
+        drop/reject nuance is lost on this feed.
+    - vendor: flowDirection
+      type: integer
+      description: 'IPFIX enterprise element - flow orientation: 0 unknown, 1 forward, 2 reverse.'
+      ecs: null
+      status: unmapped
+      custom: vmware.nsx.dfw.flow_direction
+      notes: >
+        orients the record relative to the flow initiator (forward) versus
+        responder (reverse), which is what attributes the counters to a side;
+        deliberately NOT mapped to network.direction, whose ingress/egress/
+        inbound/outbound vocabulary means something different from IPFIX
+        forward/reverse and would mislead on east-west traffic where both
+        endpoints are internal
+    - vendor: ruleId
+      type: integer
+      description: >-
+        IPFIX enterprise element - NSX distributed-firewall rule id that acted
+        on the flow.
+      ecs: rule.id
+      status: mapped
+      notes: >
+        the same rule identifier the syslog carries; the number alone is
+        unreadable to an analyst, so a lookup against the NSX policy API is
+        needed to populate rule.name with the rule and section name. The IPFIX
+        form carries no operator Log Label, so rule.ruleset is not populated
+        from this feed
+    - vendor: sessionFlags
+      type: integer
+      description: 'IPFIX enterprise element - connection state flag: 0 unknown, 0x1 established.'
+      ecs: null
+      status: unmapped
+      custom: vmware.nsx.dfw.session_flags
+      notes: >
+        the IPFIX form's only statefulness signal; distinguishes an
+        established session from an unestablished/half-open one on a feed
+        that, unlike the syslog match record, carries no TCP flag string
+    - vendor: reportingRole
+      type: integer
+      description: IPFIX enterprise element - role of the exporter reporting this half of the flow.
+      ecs: null
+      status: unmapped
+      custom: vmware.nsx.dfw.reporting_role
+      notes: >
+        indicates which observation point produced the record; needed to
+        deduplicate when both ends of an intra-host flow are enforced and both
+        report, so counts are not doubled
+    - vendor: algControlFlowId
+      type: long
+      description: >-
+        IPFIX enterprise element - flowId of the ALG control flow that spawned
+        this data flow.
+      ecs: null
+      status: unmapped
+      custom: vmware.nsx.dfw.alg_control_flow_id
+      notes: >-
+        joins an ALG data flow (e.g. an FTP data connection) back to its
+        control flow; empty on non-ALG flows
+    - vendor: algType
+      type: integer
+      description: >-
+        IPFIX enterprise element - Application Layer Gateway type: 0 none, 1
+        FTP, 2 Oracle, 3 SUNRPC, 4 DCERPC, 5 TFTP.
+      ecs: null
+      status: unmapped
+      custom: vmware.nsx.dfw.alg_type
+      notes: >-
+        a vendor ALG taxonomy; network.protocol is a candidate once resolved
+        to a name, but the raw enum is kept custom to avoid asserting an
+        unverified protocol label
+    - vendor: algFlowType
+      type: integer
+      description: >-
+        IPFIX enterprise element - ALG flow classification: 0 none, 1 control
+        flow, 2 data flow.
+      ecs: null
+      status: unmapped
+      custom: vmware.nsx.dfw.alg_flow_type
+    - vendor: averageLatency
+      type: integer
+      description: IPFIX enterprise element - average TCP latency of the flow, in microseconds.
+      ecs: null
+      status: unmapped
+      custom: vmware.nsx.dfw.average_latency_us
+      notes: >-
+        performance telemetry the dfwpktlogs syslog does not emit; keep the
+        microsecond unit explicit so it is not confused with a millisecond
+        value
+    - vendor: retransmissionCount
+      type: integer
+      description: IPFIX enterprise element - count of TCP retransmissions observed on the flow.
+      ecs: null
+      status: unmapped
+      custom: vmware.nsx.dfw.retransmission_count
+    - vendor: vifUuid
+      type: string
+      description: >-
+        IPFIX enterprise element - 16-byte UUID uniquely identifying the VIF
+        (vNIC) the flow traversed.
+      ecs: observer.ingress.interface.id
+      status: partial
+      notes: >
+        the full-fidelity VIF identifier - unlike the syslog form, which
+        truncates the VIF to eight hex digits, this is the whole UUID and is
+        globally resolvable to a VM against the NSX inventory without a
+        collision risk. The ingress spelling is approximate because a single
+        ECS interface field cannot carry a filter that sees both directions
+    - vendor: vifId
+      type: string
+      description: >-
+        IPFIX enterprise element - VIF id in UTF-8 string form (up to 48
+        chars), the string rendering of the same VIF as vifUuid.
+      ecs: null
+      status: unmapped
+      custom: vmware.nsx.dfw.vif_id
+      notes: >-
+        kept custom to avoid colliding with vifUuid on
+        observer.ingress.interface.id; parse whichever of the two the
+        collector surfaces and treat them as the same VIF
+- id: manager-audit
+  name: NSX Manager audit and system log
+  description: >
+    Appliance-side audit and system events from NSX Manager, emitted as RFC
+    5424 syslog on facility local6 (22) with an [nsx@6876 ...] structured-data
+    element. Audit records are identified by audit="true" in the structured
+    data and cover every API call - all API calls are audited by default and
+    auditing cannot be disabled - plus CLI commands, UI and API logins, and
+    the policy and manager write operations that change firewall rules. This
+    is the control-plane counterpart to the packet log: it is where a firewall
+    rule being weakened, a security policy being deleted, or an administrator
+    logging in is visible, none of which appear in the data-plane feed.
+  event_categories:
+  - configuration
+  - authentication
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Receives the NSX Manager cluster's remote syslog export (configured
+        per node profile in NSX Manager) over TCP/TLS, separate from the
+        transport-node feed. It is low-volume and individually significant, so
+        the crossing shapes the _raw policy but not the parse location.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-vmware_nsx.manager_audit
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Receives the NSX Manager cluster's remote syslog export (configured
+        per node profile in NSX Manager) over TCP/TLS, separate from the
+        transport-node feed. It is low-volume and individually significant.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-vmware_nsx.manager_audit
+  formats:
+  - format: syslog-kv
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom NSX Manager audit pipeline
+      notes: >
+        No Elastic integration parses NSX appliance logs. The community NSX
+        syslog pack can supply the RFC 5424 envelope and structured-data
+        parse, but the audit record's identity lives in a second key="value"
+        grammar inside the message body (UserName, ModuleName, Operation,
+        Operation status, New value) whose vocabulary is NSX-specific and
+        undocumented as a closed list, so the Operation-to-action mapping is
+        purpose-built work either way. The CLI records (subcomp="cli") use a
+        third grammar again - a bare CMD: line with an appended duration - so
+        the pipeline needs at least three branches off subcomp.
+    fields:
+    - vendor: PRI
+      type: integer
+      description: syslog priority value; NSX emits on facility local6 (numerical value 22)
+      ecs: log.syslog.facility.code
+      status: partial
+      transform: >-
+        divide the priority by 8 for the facility code and take the remainder
+        for the syslog severity; the constant local6 facility is also a cheap
+        low-side filter for NSX-originated traffic on a shared listener
+    - vendor: TIMESTAMP
+      type: timestamp
+      description: RFC 5424 UTC timestamp of the event
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: HOSTNAME
+      type: string
+      description: hostname of the NSX appliance that emitted the record, e.g. svc.nsxmanager
+      ecs: observer.name
+      status: mapped
+      notes: >-
+        the manager node reporting the event; in a three-node manager cluster
+        this is what separates records by node
+    - vendor: PROCID
+      type: integer
+      description: process id of the emitting NSX process
+      ecs: process.pid
+      status: mapped
+    - vendor: MSGID
+      type: string
+      description: >-
+        NSX message class in the RFC 5424 MSGID position, e.g. FABRIC, SYSTEM,
+        MONITORING, or "-" when absent
+      ecs: null
+      status: unmapped
+      custom: vmware.nsx.manager.msgid
+      notes: >-
+        a coarse subsystem label; useful as a filter but too broad to be
+        event.code, which the Operation value has a better claim on
+    - vendor: audit
+      type: boolean
+      description: >-
+        structured-data flag marking the record as a security-relevant audit
+        event, audit="true"
+      ecs: null
+      status: unmapped
+      custom: vmware.nsx.manager.audit
+      notes: >
+        the only reliable discriminator between audit records and ordinary
+        system logging on this feed, and the primary low-side filter; no ECS
+        field expresses "this record is an audit record", and event.category
+        is derived from the operation rather than from this flag
+    - vendor: comp
+      type: string
+      description: >-
+        NSX component that produced the message, e.g. nsx-manager,
+        nsx-controller, nsx-edge
+      ecs: null
+      status: unmapped
+      custom: vmware.nsx.manager.component
+    - vendor: subcomp
+      type: string
+      description: sub-component within the NSX component, e.g. manager, policy, http, cli
+      ecs: null
+      status: unmapped
+      custom: vmware.nsx.manager.subcomponent
+      notes: >
+        the parse branch key - http/manager/policy records carry the
+        key="value" audit body, cli records carry a CMD: line instead, and a
+        single grammar assumption over both loses the CLI record entirely
+    - vendor: level
+      type: enum
+      description: NSX severity label in the structured data - INFO, WARNING, ERROR, FATAL
+      ecs: log.level
+      status: partial
+      transform: >
+        copy the word to log.level and derive numeric ECS event.severity from
+        it; note the level is INFO on successful and failed administrative
+        operations alike, so it must not drive event.outcome or alert
+        thresholds
+    - vendor: username
+      type: string
+      description: NSX account that performed the operation, from the structured data
+      ecs: user.name
+      status: mapped
+      notes: >-
+        the audit body repeats the same account as UserName= - parse one, and
+        prefer the structured-data value because it is present on records
+        whose body grammar differs
+    - vendor: euser
+      type: string
+      description: external user asserted by an upstream caller via the X-NSX-EUSER header
+      ecs: null
+      status: unmapped
+      custom: vmware.nsx.manager.external_user
+      notes: >
+        the human an automation platform claims to be acting for. Not
+        user.effective.name, which models privileges actually assumed inside
+        the system - this value is caller-asserted and unverified by NSX, and
+        conflating the two would let an upstream integration write arbitrary
+        attribution into an authoritative ECS user field
+    - vendor: reqId
+      type: string
+      description: request id correlating every log line emitted by a single API call
+      ecs: null
+      status: unmapped
+      custom: vmware.nsx.manager.request_id
+      notes: >
+        stitches the multi-line record of one API call back together, which is
+        how a single configuration change is reconstructed. Kept custom rather
+        than mapped to trace.id - it is an appliance-local request id with no
+        distributed-trace propagation semantics
+    - vendor: entId
+      type: string
+      description: entity id of the API object the operation acted on
+      ecs: null
+      status: unmapped
+      custom: vmware.nsx.manager.entity_id
+      notes: >-
+        the object being changed; the join key back to the NSX policy API when
+        reconstructing what a firewall rule looked like before and after an
+        edit
+    - vendor: update
+      type: boolean
+      description: >-
+        structured-data flag, "true" for write operations (PUT/POST/DELETE)
+        and "false" for reads (GET)
+      ecs: null
+      status: unmapped
+      custom: vmware.nsx.manager.write
+      notes: >
+        the single most useful field on the dataset for volume control -
+        auditing cannot be disabled at the source, so read traffic dominates
+        and this flag is what lets the low side keep only the changes
+    - vendor: errorCode
+      type: string
+      description: >-
+        unique NSX error identifier present on emergency, alert, critical and
+        error severity records, e.g. MP4039
+      ecs: event.code
+      status: partial
+      notes: >
+        only populated on severity 0-3 records, so event.code is empty on the
+        ordinary audit records that make up most of the feed; the Operation
+        value is the practical event identity for audit records and belongs in
+        event.action rather than being copied here
+    - vendor: ModuleName
+      type: string
+      description: >-
+        functional area the audited operation belongs to, e.g. ACCESS_CONTROL,
+        TransportZone, Firewall
+      ecs: null
+      status: unmapped
+      custom: vmware.nsx.manager.module
+      notes: >-
+        the coarse grouping that lets firewall-policy changes be separated
+        from unrelated fabric administration without enumerating every
+        operation name
+    - vendor: Operation
+      type: string
+      description: >-
+        name of the audited operation, e.g. LOGIN, CreateTransportZone, or the
+        policy/manager API method invoked
+      ecs: event.action
+      status: mapped
+      notes: >
+        the event identity on this dataset. The vocabulary is not published as
+        a closed list and grows with each NSX release, so the mapping to
+        normalized categories has to be maintained as a lookup that fails
+        visibly on unknown values
+    - vendor: Operation status
+      type: enum
+      description: >-
+        result of the audited operation - success or failure on API records,
+        CMD_EXECUTED on CLI records
+      ecs: event.outcome
+      status: partial
+      transform: >
+        map success and failure onto the ECS vocabulary directly, but leave
+        CMD_EXECUTED as unknown - it records that a CLI command ran, not that
+        it succeeded, and folding it into success would report every failed
+        administrative command as a successful one
+    - vendor: New value
+      type: string
+      description: full API request payload recorded on policy and manager API write operations
+      ecs: null
+      status: unmapped
+      custom: vmware.nsx.manager.new_value
+      notes: >
+        the actual content of a configuration change, and the only way to see
+        what a firewall rule was changed to. Unbounded, and it carries
+        credentials and certificate material whenever the payload configures
+        them, so it needs masking and length capping before it leaves the
+        enclave and should be kept out of the default field set
+    - vendor: 'CMD:'
+      type: string
+      description: >-
+        full CLI command text on subcomp="cli" records, with the execution
+        duration appended
+      ecs: process.command_line
+      status: partial
+      notes: >
+        direct appliance CLI activity, the highest-value administrative
+        telemetry on this feed; free text with no length bound and capable of
+        carrying credentials typed on a command line, so it needs the same
+        masking as the API payload
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Parse the RFC 5424 structured data low-side, filter on audit="true"
+          plus update="true" to keep the GET-request audit noise out of
+          Elastic entirely (every API call is audited and it cannot be turned
+          off at the source, so this filter is the only volume control
+          available), and branch the body parse on subcomp because the
+          http/manager/policy records use a key="value" grammar and the cli
+          records use a CMD: line. Mask before anything leaves the enclave:
+          the "New value" field carries the full API request body on policy
+          and manager writes and will contain credentials and certificate
+          material in configuration payloads, so redact password/secret/key
+          nodes and cap its length. Keep _raw on this route - it is low-volume
+          and each record is individually significant.
+        elastic: >
+          Land in logs-vmware_nsx.manager_audit and spend the high side on the
+          taxonomy the vendor does not publish: maintain the Operation-to-
+          event.action and Operation-to-event.category mapping as an enrich
+          policy so a new operation after an NSX upgrade surfaces as unmapped
+          rather than silently unclassified, and derive event.outcome only
+          from the success/failure vocabulary while leaving the CLI
+          CMD_EXECUTED value unknown rather than folding it into success. Add
+          index-template keyword mappings for the custom-namespace comp,
+          subcomp, module, request id and entity id fields so
+          administrative-activity dashboards can aggregate on them, and
+          convert the level word to numeric event.severity through the same
+          lookup used elsewhere in the estate.
+        relay: >
+          Low-side instances cross the guard as full ECS-shaped NDJSON rather
+          than a thin envelope, precisely because this dataset needs
+          field-aware redaction: the "New value" payload is the least bounded
+          and highest-risk content on the technology, and it must be masked
+          before the boundary rather than inspected at it. Everything else on
+          the record is short and allow-listable, so the custom content filter
+          can stay simple if the JSON is held to two levels of nesting with
+          short ASCII keys and bounded string lengths. Nothing CEF is
+          involved; the crossing is at-most-once, so reconcile counts per
+          (dataset, hour) - on a feed this low-volume a missing hour is
+          obvious and worth alerting on.
+      direct:
+        parse_location: low
+        cribl: >
+          Parse the RFC 5424 structured data in Cribl, filter on audit="true"
+          plus update="true" to keep the GET-request audit noise out of
+          Elastic entirely (every API call is audited and it cannot be turned
+          off at the source, so this filter is the only volume control
+          available), and branch the body parse on subcomp because the
+          http/manager/policy records use a key="value" grammar and the cli
+          records use a CMD: line. With no boundary to mask for, the "New
+          value" field still carries the full API request body on policy and
+          manager writes and will contain credentials and certificate material
+          in configuration payloads, so redact password/secret/key nodes, cap
+          its length, and keep it out of the default field set given its size
+          and sensitivity. Keep _raw on this route - it is low-volume and each
+          record is individually significant.
+        elastic: >
+          Land in logs-vmware_nsx.manager_audit and spend the high side on the
+          taxonomy the vendor does not publish: maintain the Operation-to-
+          event.action and Operation-to-event.category mapping as an enrich
+          policy so a new operation after an NSX upgrade surfaces as unmapped
+          rather than silently unclassified, and derive event.outcome only
+          from the success/failure vocabulary while leaving the CLI
+          CMD_EXECUTED value unknown rather than folding it into success. Add
+          index-template keyword mappings for the custom-namespace comp,
+          subcomp, module, request id and entity id fields so
+          administrative-activity dashboards can aggregate on them, and
+          convert the level word to numeric event.severity through the same
+          lookup used elsewhere in the estate.
+  - format: api-pull
+    enable: >
+      The audit trail is reachable over the NSX Manager REST API (HTTPS)
+      without any extra product feature - all API calls are audited by default
+      and the records are retained on the manager (up to 100,000 audit logs).
+      Authenticate as an admin or Auditor-role account, either with HTTP basic
+      auth or with a session token obtained from POST /api/session/create
+      (carrying the returned cookie and X-XSRF-TOKEN on each call). POST
+      /api/v1/administration/audit-logs is executed against a manager node to
+      display the audit logs from all nodes in the management- plane cluster
+      (it triggers a fresh collection when the master audit log is stale); GET
+      /api/v1/node/logs/{log-name}/data returns the raw audit log file from an
+      individual node for byte-range/incremental reads. There is no documented
+      server-side "since last poll" cursor on these endpoints, so a poller
+      sets its own window from the record timestamps and must de-duplicate on
+      its own state. To make the pull authoritative, disable the manager
+      cluster's remote-syslog audit export (configured per node profile) so
+      the same records are not also pushed - otherwise every audit event is
+      ingested twice.
+    references:
+    - >-
+      https://developer.broadcom.com/xapis/nsx-t-data-center-rest-api/latest/system_administration_monitoring.html
+    - >-
+      https://techdocs.broadcom.com/us/en/vmware-cis/nsx/vmware-nsx/4-2/administration-guide/operations-and-management/log-messages-and-error-codes.html
+    - >-
+      https://knowledge.broadcom.com/external/article/379700/nsxt-api-configuration-and-logs.html
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom NSX audit-log API poller feeding the NSX Manager audit pipeline
+      notes: >
+        The API returns exactly the RFC 5424 audit records the syslog feed
+        carries, so once a collector has polled the endpoint and split out
+        each record the SAME custom NSX Manager audit pipeline handles it -
+        the RFC 5424 envelope and structured-data parse, the subcomp branch
+        between the key="value" http/manager/policy body and the CMD: cli
+        body, and the purpose-built Operation-to-action mapping - with no new
+        field grammar to build. The only additional work is transport
+        plumbing: a poller (Cribl Collector on a REST/scheduled source, or a
+        small script) that authenticates, pages the audit-logs response,
+        watermarks on the record timestamp plus reqId, and emits one event per
+        record; no Elastic integration and no Cribl pack ingests this
+        endpoint, so both the poller and the reparse are custom.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          The hard constraint is that a scheduled API poll cannot cross a
+          one-way guard: the high side cannot reach back through the Everfox
+          HSG to call the NSX Manager API, so the collector MUST run low-side,
+          in the edge worker group that can reach the manager cluster, and
+          PUSH its results across exactly as the syslog path does - the
+          crossing shape (Cribl HTTP Destination -> guard -> Cribl HTTP Source
+          carrying NDJSON) is unchanged, only the ingress differs. Watermark
+          on the last record's timestamp and reqId and persist that cursor,
+          because these endpoints expose no server-side "new since" filter and
+          a naive re-poll re-ingests the whole retained window; de-duplicate
+          against that cursor before the crossing. If both this pull and the
+          remote- syslog export are live for the same cluster, dedupe on reqId
+          + Operation + timestamp and pick one as authoritative, since the
+          guard crossing is at-most-once and double-ingest wastes the budget.
+          Do the same "New value" masking here as on the syslog path - the API
+          payload is byte-identical and carries the same credentials and
+          certificate material - and cap its length before anything leaves the
+          enclave.
+        elastic: >
+          Land in logs-vmware_nsx.manager_audit, the same data stream as the
+          syslog feed, and reuse its enrichment wholesale: the Operation-to-
+          event.action / event.category enrich policy, the message-id / level
+          severity conversion, and the keyword mappings for the custom-
+          namespace comp, subcomp, module, request-id and entity-id fields.
+          Stamp an ingestion-path marker so an analyst can tell a pulled
+          record from a pushed one during a cutover, and assert that the
+          poller's watermarking has not created gaps or duplicates by
+          reconciling record counts per (dataset, hour) against the manager's
+          own audit index.
+        relay: >
+          Cross full ECS-shaped NDJSON, not the raw API response, because this
+          dataset needs the identical field-aware redaction the syslog path
+          needs: the "New value" payload is the least bounded, highest-risk
+          content on the technology and must be masked before the boundary,
+          not inspected at it. Everything else on the record is short and
+          allow- listable, so the content filter stays simple if the JSON is
+          held to two levels of nesting with short ASCII keys and bounded
+          string lengths. Nothing CEF is involved; the crossing is
+          at-most-once, so reconcile counts per (dataset, hour) - on a feed
+          this low-volume a missing hour is obvious and worth alerting on -
+          and route validation failures to a low-side dead-letter queue rather
+          than dropping them at the guard.
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side NSX Manager with no guard, a Cribl Collector can
+          poll the audit-logs endpoint directly on a schedule and route the
+          records with no crossing to engineer around. Even here, prefer the
+          remote- syslog export as the steady feed and reserve the API pull
+          for backfill or for an environment where a syslog listener is
+          genuinely unavailable: the pull is a poll against an endpoint that
+          collects across the cluster and can be heavy, it has no native
+          incremental cursor, and it races the continuous push feed for
+          completeness. Whichever is chosen, run one path as authoritative per
+          cluster and watermark the poller so a missed or overlapping window
+          does not silently gap or duplicate the audit record.
+        elastic: >
+          Same logs-vmware_nsx.manager_audit landing and the same
+          enrich-policy taxonomy, severity conversion and custom-namespace
+          keyword mappings as the syslog feed - the content is identical, so
+          no separate pipeline is needed beyond the poller. Retain full "New
+          value" and CMD: values with no boundary to mask for, but keep them
+          out of the default field set given their size and sensitivity,
+          exactly as on the syslog-kv feed.
+    fields_omitted: >
+      The audit-logs endpoint returns exactly the RFC 5424 audit records the
+      syslog-kv entry already inventories - same envelope and structured data,
+      same key="value" http/manager/policy body and CMD: cli body - so this
+      entry adds only transport plumbing (authentication, paging, timestamp
+      plus reqId watermarking) and no field grammar of its own.
+    fields: []

@@ -1,0 +1,1611 @@
+id: printers-mfd
+name: Printers / Multi-Function Devices
+vendor: Multi-vendor (HP, Xerox, Ricoh, Canon; Microsoft Print Service)
+versions: >-
+  HP FutureSmart 5.8+, Windows Server 2019/2022 Print Service, PaperCut NG/MF
+  22.x+
+draft: true
+references:
+- >-
+  https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rprn/b4a22048-7837-460e-b1bd-8d34f4270f29
+- >-
+  https://support.microsoft.com/en-us/topic/event-id-307-does-not-show-the-printed-document-name-in-windows-8ef93ff2-b501-c630-507b-849743e49286
+- https://kaas.hpcloud.hp.com/pdf-public/pdf_12112147_en-US-1.pdf
+- https://h10032.www1.hp.com/ctg/Manual/c06181681.pdf
+- https://www.elastic.co/docs/reference/integrations/winlog
+- https://www.papercut.com/help/manuals/ng-mf/common/sys-logging/
+datasets:
+- id: windows-print-jobs
+  name: Windows Print Service operational log
+  description: >
+    The fleet-wide print audit wherever jobs route through Windows print
+    servers, and the only feed in this map that is vendor-independent — an HP,
+    Xerox, Ricoh, or Canon queue all produce the same record. Event 307
+    ("document printed") on the Microsoft-Windows-PrintService/Operational
+    channel carries the who, what, from-where, to-which-printer, size, and
+    page count of every completed job; the channel is DISABLED by default and
+    must be turned on per print server, and the document name is suppressed to
+    a constant unless the "Allow job name in event logs" policy is set. Events
+    800/805 on the same channel carry the spooling and rendering stages of the
+    same job and correlate to 307 by job id. Where jobs do NOT traverse a
+    Windows print server (direct IP printing, or a print-management layer in
+    front of the fleet), the equivalent fleet-wide audit is PaperCut NG/MF's
+    Job Log — same semantic record, different field names, and a separate
+    mapping exercise.
+  event_categories:
+  - file
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Print servers are domain-joined Windows hosts, so the feed is
+        collected exactly as the Windows event channels are; branch and
+        OT-adjacent print servers are the bulk of the low-side population.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-mfd.print_jobs
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Print servers are domain-joined Windows hosts, collected exactly as
+        the Windows event channels are and forwarded straight to the core
+        worker group.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-mfd.print_jobs
+  formats:
+  - format: windows-event
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom PrintService pipeline
+      notes: >
+        No Elastic integration or Cribl pack parses this channel. Elastic's
+        Custom Windows Event Logs (winlog) integration will COLLECT
+        Microsoft-Windows-PrintService/Operational, but it ships the event
+        data as opaque winlog.event_data.Param1..Param8 with no semantic names
+        and no ECS mapping, so the positional Param decode is hand-built work
+        either way.
+    fields:
+    - vendor: EventID
+      type: integer
+      description: >-
+        numeric identifier of the PrintService event (307 document printed,
+        800/805 job spooling and rendering)
+      ecs: event.code
+      status: mapped
+    - vendor: Param1
+      type: integer
+      description: >-
+        print job identifier assigned by the spooler, used to link the 307
+        record to the 800/805 records for the same job
+      ecs: null
+      status: unmapped
+      custom: mfd.print.job_id
+      notes: >
+        no ECS field models a spooler job id; kept custom rather than
+        overloading event.id, which the ingest pipeline uses for the event's
+        own identity
+    - vendor: Param2
+      type: string
+      description: name of the printed document as supplied by the spooling application
+      ecs: file.name
+      status: partial
+      notes: >
+        this is a job title, not necessarily a filename ("Microsoft Word -
+        report.docx"), so file.name is an approximation; more importantly it
+        is rendered as the constant "Print Document" unless the "Allow job
+        name in event logs" policy is enabled on the print server, which is
+        the single largest audit gap in this dataset and must be verified per
+        server before the feed is treated as an exfiltration control
+    - vendor: Param3
+      type: string
+      description: account name of the user that owns the print job
+      ecs: user.name
+      status: mapped
+      transform: >-
+        split any DOMAIN\user prefix into user.domain plus a bare user.name
+        before indexing
+    - vendor: Param4
+      type: string
+      description: name of the client computer the job was submitted from
+      ecs: source.domain
+      status: partial
+      notes: >
+        NetBIOS machine name, usually rendered with a leading double backslash
+        that must be stripped; the record carries no client IP at all, so
+        source.ip is unavailable on this dataset and source.domain is the only
+        origin identifier
+    - vendor: Param5
+      type: string
+      description: name of the printer (spooler queue) the job was printed on
+      ecs: null
+      status: unmapped
+      custom: mfd.print.printer_name
+      notes: >
+        this is the shared queue name on the print server, not the physical
+        device; host.target.name was considered and rejected because the
+        printer here is a data destination rather than a host being
+        administered
+    - vendor: Param6
+      type: string
+      description: >-
+        spooler port the job was sent through (USB001, or an IP_x.x.x.x
+        standard TCP/IP port)
+      ecs: null
+      status: unmapped
+      custom: mfd.print.port_name
+      notes: >
+        on TCP/IP ports the port name embeds the device address and is the
+        only device-identifying value in the record; a low-side lookup should
+        resolve it to the physical device, site, and owner
+    - vendor: Param7
+      type: long
+      description: >-
+        size of the print job in bytes (the Size member of
+        RPC_BranchOfficeJobDataPrinted)
+      ecs: file.size
+      status: partial
+      notes: >
+        spool-file size, which tracks rendered output rather than source
+        document size; useful as a volume signal but should not be read as the
+        size of any file on disk. Param7 is bytes and Param8 is pages - the
+        two are commonly transposed in hand-rolled parsers
+    - vendor: Param8
+      type: integer
+      description: >-
+        number of pages the printed document contained (the TotalPages member
+        of RPC_BranchOfficeJobDataPrinted)
+      ecs: null
+      status: unmapped
+      custom: mfd.print.pages
+      notes: >
+        no ECS field models a page count; must be mapped as long in the index
+        template because the per-user page-volume anomaly is the primary
+        detection built on this dataset
+    - vendor: Status
+      type: integer
+      description: >-
+        implementation-specific error code for the last error during
+        processing of the print job
+      ecs: null
+      status: partial
+      custom: mfd.print.status_code
+      notes: >
+        32-bit code carried in the RPC_BranchOfficeJobDataPrinted structure
+        behind event 307 and populated on Branch Office Direct Printing
+        clients; needs a lookup to derive event.outcome, since a 307 is not by
+        itself proof the job completed cleanly
+    - vendor: Computer
+      type: string
+      description: hostname of the print server that recorded the event
+      ecs: host.name
+      status: mapped
+    - vendor: ProviderName
+      type: string
+      description: event provider that raised the event (Microsoft-Windows-PrintService)
+      ecs: event.provider
+      status: mapped
+    - vendor: TimeCreated.SystemTime
+      type: timestamp
+      description: UTC time the print server wrote the event
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: Message
+      type: string
+      description: >-
+        rendered human-readable event text with Param1..Param8 substituted
+        into the 307 template
+      ecs: message
+      status: mapped
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Decode the positional Param1..Param8 into named fields in the core
+          worker group — nothing downstream knows that Param7 is bytes and
+          Param8 is pages, and the two are trivially transposed. Do the
+          printer-queue enrichment here where it is cheapest: resolve Param5
+          (queue share name) and Param6 (port, typically IP_10.x.x.x) into
+          device IP, site, and device owner via a lookup, since the event
+          itself carries no address for the physical device. Emit ECS-shaped
+          JSON validated with C.Schema(...).validate before the Elastic
+          destination, dead-letter validation failures, and run the
+          destination on Persistent Queue backpressure rather than Block.
+        elastic: >
+          Own a custom logs-mfd.print_jobs ingest pipeline; there is no stock
+          integration to layer on. Derive event.outcome from the branch-office
+          Status code rather than assuming every 307 is a success, and add
+          explicitly typed custom-namespace index-template mappings for
+          mfd.print.job_id (keyword), mfd.print.pages (long),
+          mfd.print.printer_name and mfd.print.port_name (keyword), and
+          mfd.print.status_code (long) so page-count aggregations and
+          per-queue dashboards work without dynamic mapping. Alert-side, the
+          detection value is volume anomalies per (user.name,
+          mfd.print.pages), which needs mfd.print.pages typed numerically.
+        relay: >
+          Low-side print servers cross the guard: cross full ECS-shaped NDJSON
+          (envelope mode B) rather than rendered event XML — one line per
+          completed job, UTF-8, LF-terminated, compression disabled, nesting
+          depth two. The content-filter friction is file.name: user-chosen
+          document titles are unbounded free text, frequently non-ASCII, and
+          are exactly the field a content filter will object to, so cap and
+          flag them low-side rather than letting the guard truncate silently.
+          Drop _raw on this route early — the rendered 307 message text is
+          fully reconstructable from the parsed fields — and reconcile
+          low-side and high-side job counts per (printer, hour) to detect
+          silent drops, since the crossing is at-most-once with no return
+          channel.
+      direct:
+        parse_location: low
+        cribl: >
+          Decode the positional Param1..Param8 into named fields in the core
+          worker group — nothing downstream knows that Param7 is bytes and
+          Param8 is pages, and the two are trivially transposed. Do the
+          printer-queue enrichment here where it is cheapest: resolve Param5
+          (queue share name) and Param6 (port, typically IP_10.x.x.x) into
+          device IP, site, and device owner via a lookup, since the event
+          itself carries no address for the physical device. Emit ECS-shaped
+          JSON validated with C.Schema(...).validate before the Elastic
+          destination, dead-letter validation failures, and run the
+          destination on Persistent Queue backpressure rather than Block.
+        elastic: >
+          Own a custom logs-mfd.print_jobs ingest pipeline; there is no stock
+          integration to layer on. Derive event.outcome from the branch-office
+          Status code rather than assuming every 307 is a success, and add
+          explicitly typed custom-namespace index-template mappings for
+          mfd.print.job_id (keyword), mfd.print.pages (long),
+          mfd.print.printer_name and mfd.print.port_name (keyword), and
+          mfd.print.status_code (long) so page-count aggregations and
+          per-queue dashboards work without dynamic mapping. Alert-side, the
+          detection value is volume anomalies per (user.name,
+          mfd.print.pages), which needs mfd.print.pages typed numerically.
+- id: device-security-syslog
+  name: Device-native security event syslog
+  description: >
+    The MFD's own audit trail — administrative sign-in, configuration change,
+    and device-integrity events emitted straight off the device to a syslog
+    collector, covering everything that never touches a print server. This is
+    the vendor-variable feed: field names below are HP FutureSmart's enhanced
+    security event logging keys (firmware 5.8+, the best-documented grammar in
+    the class) and should be treated as PLACEHOLDERS for the fleet — Xerox,
+    Ricoh, and Canon emit the same semantics under different keys and a
+    different message envelope, so the custom namespace is deliberately
+    vendor-neutral mfd.* rather than hp.*, and each vendor's grammar needs its
+    own confirmed key list before its devices are onboarded. HP's shape is
+    "<priority> <device type>: <event summary>; <key=value pairs>", where the
+    summary is free text before the semicolon and only a subset of keys
+    appears on any given message.
+  event_categories:
+  - configuration
+  - authentication
+  route:
+    guarded:
+    - hop: cribl
+      location: edge Cribl worker group, on-prem enclave
+      notes: >
+        Devices send UDP/TCP syslog to a collector on the local segment; the
+        device syslog facility defaults to LPR and the per-device rate cap
+        (Syslog Maximum Messages) should be raised to 1000/min or the device
+        silently discards its own audit records. MFDs on OT and restricted
+        segments make up most of the low-side population.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-mfd.device_syslog
+    direct:
+    - hop: cribl
+      location: edge Cribl worker group, on-prem enclave
+      notes: >
+        Devices send UDP/TCP syslog to a collector on the local segment; the
+        device syslog facility defaults to LPR and the per-device rate cap
+        (Syslog Maximum Messages) should be raised to 1000/min or the device
+        silently discards its own audit records.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-mfd.device_syslog
+  formats:
+  - format: syslog-kv
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom multi-vendor MFD syslog pipeline
+      notes: >
+        No Elastic integration and no Cribl pack covers printer-native syslog.
+        HP publishes SIEM integration guides for Splunk and ArcSight but ships
+        no Elastic content, so the pipeline is hand-built and must be
+        per-vendor: one grammar cannot parse HP, Xerox, Ricoh, and Canon
+        messages.
+    fields:
+    - vendor: <priority value>
+      type: integer
+      description: >-
+        RFC 5424 syslog priority in the message header, computed as facility x
+        8 + severity
+      ecs: log.syslog.priority
+      status: mapped
+      transform: >
+        decompose into log.syslog.facility.code and log.syslog.severity.code;
+        the device facility defaults to LPR and is administrator-selectable,
+        so facility cannot be used to identify printer traffic
+    - vendor: <device type>
+      type: enum
+      description: type of device that generated the message (printer or scanner)
+      ecs: observer.type
+      status: partial
+      notes: >
+        the vendor's two-value device class, coarser than ECS's observer.type
+        vocabulary of security-device roles; carried because it is the only
+        self-identification in the message body. Set observer.vendor and
+        observer.product from the parser branch, not from the message
+    - vendor: <event summary>
+      type: string
+      description: >-
+        free-text summary of the event, everything between the device type and
+        the first semicolon
+      ecs: event.action
+      status: partial
+      notes: >
+        e.g. "Device Administrator Password modified", "EWS Sign In
+        Authentication", "Potential intrusion. Memory corruption detected." —
+        an unbounded English sentence, not an enum, and the only discriminator
+        between event classes; needs a lookup table to a stable action value
+        and will drift across firmware revisions
+    - vendor: time
+      type: timestamp
+      description: date and time of the event as recorded by the device
+      ecs: '@timestamp'
+      status: partial
+      notes: >
+        format is "YYYY-MMM-DD HH:MM AM/PM (UTC+HH:MM)" — 12-hour clock,
+        three-letter month, minute resolution only, offset in parentheses. Not
+        parseable by a standard date processor and one minute of granularity;
+        where the device clock is untrusted the syslog receipt time is the
+        safer @timestamp with this value kept for drift checks
+    - vendor: user
+      type: string
+      description: the authenticated entity associated with the event
+      ecs: user.name
+      status: partial
+      transform: >
+        realm-prefixed as REALM\user, where the realm may be a Windows domain,
+        the literal LOCAL, or an IP address; split into user.domain plus a
+        bare user.name. Unauthenticated actions omit the key entirely rather
+        than emitting an empty value
+    - vendor: source_IP
+      type: ip
+      description: IP address of the client computer associated with the event
+      ecs: source.ip
+      status: partial
+      notes: >
+        overloaded across message families — it is the client address on
+        sign-in and configuration events but the device's OWN address on
+        intrusion-detection and system-resource messages, so the parser must
+        branch on the event summary before assigning source.ip rather than
+        host.ip
+    - vendor: hostname
+      type: string
+      description: hostname of the client computer associated with the event
+      ecs: source.domain
+      status: partial
+      notes: >
+        FQDN or short name of the submitting client; paired with source_IP on
+        network-originated events and absent on control-panel events
+    - vendor: outcome
+      type: enum
+      description: result of the audited action (success, failure, canceled, partial_success)
+      ecs: event.outcome
+      status: mapped
+      transform: >
+        ECS event.outcome admits only success/failure/unknown; map success to
+        success, failure to failure, and both canceled and partial_success to
+        unknown while preserving the raw value in a custom field so "cancelled
+        by user" stays distinguishable from "device rejected"
+    - vendor: sign-in_method
+      type: enum
+      description: >-
+        sign-in method used for the authentication event (local_device,
+        windows, ldap, smartcard, or another authentication agent)
+      ecs: null
+      status: unmapped
+      custom: mfd.auth.sign_in_method
+      notes: >
+        the smartcard value is the one that matters for a CAC/PIV environment
+        — a windows or local_device sign-in on a device policy-configured for
+        smartcard is a direct detection. Note the hyphen in the vendor key
+        name, which trips naive kv extractors
+    - vendor: interface
+      type: enum
+      description: network interface the event was associated with (Wired, AP, STA)
+      ecs: null
+      status: unmapped
+      custom: mfd.device.interface
+      notes: >
+        radio/wired interface of the device, present only on SNMP and
+        REST-originated messages; distinct from the documentation's
+        "Interface(s)" column, which describes the administrative channel
+        (EWS, Control Panel, SNMP, OXPd) and is NOT emitted as a key
+    - vendor: item
+      type: string
+      description: the specific setting that was modified on a configuration-change event
+      ecs: null
+      status: unmapped
+      custom: mfd.config.setting
+      notes: >
+        enumerated per message family (maximum_login_attempts,
+        default_lockout_time, counter_reset_time, minimum_password_length,
+        printer_role, ...); the value space is per-event and cannot be treated
+        as one global enum
+    - vendor: value
+      type: string
+      description: new value of the modified setting
+      ecs: null
+      status: unmapped
+      custom: mfd.config.new_value
+      notes: >
+        arbitrary configuration payload — can be a small integer or a
+        multi-kilobyte certificate; must be length-capped and mapped with
+        ignore_above rather than left to dynamic mapping
+    - vendor: old_value
+      type: string
+      description: previous value of the modified setting, before the change
+      ecs: null
+      status: unmapped
+      custom: mfd.config.old_value
+      notes: >
+        the before/after pair is what makes this dataset useful for change
+        detection; same unbounded-length caveat as value
+    - vendor: account
+      type: enum
+      description: >-
+        which device account the policy change applied to
+        (local_administrator, remote_configuration, SNMPv3)
+      ecs: null
+      status: unmapped
+      custom: mfd.config.account
+      notes: >
+        a built-in device account role, not a user principal, so it is
+        deliberately not mapped to user.target.name
+    - vendor: policy_name
+      type: string
+      description: name of the security or access-control policy the event refers to
+      ecs: null
+      status: unmapped
+      custom: mfd.config.policy_name
+      notes: >
+        rule.name was considered and rejected — this names an
+        administrator-defined device policy, not a detection signature
+    - vendor: permission_set
+      type: string
+      description: name of the permission set granted, modified, or copied
+      ecs: null
+      status: unmapped
+      custom: mfd.config.permission_set
+    - vendor: reason_for_failure
+      type: enum
+      description: >-
+        cause of a failed operation, e.g. NTP_Timeout, NTP_TimeFormat,
+        NTP_InternalFailure, NTP_UnknownFailure
+      ecs: event.reason
+      status: mapped
+      notes: >
+        vendor-specific token rather than prose; carried verbatim into
+        event.reason since ECS puts no vocabulary on that field
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Build one parser branch per vendor keyed on the syslog header and
+          device-type token, and normalize all of them onto the same mfd.*
+          field set at the edge — the whole point of a multi-vendor class map
+          is that the high side sees one schema. Two conversions belong here
+          because they are unambiguous only near the source: parse HP's
+          12-hour "2025-Feb-09 11:54 AM (UTC-07:00)" timestamp into RFC3339,
+          and split the realm-prefixed user value into user.domain plus
+          user.name while recognising that the prefix may be a domain, the
+          literal LOCAL, or a bare IP. Resolve device IP to site and device
+          owner from a lookup here, gate the destination with
+          C.Schema(...).validate plus a dead-letter route, and use Persistent
+          Queue backpressure — never Block, because the device's own
+          1000-msg/min cap means dropped backpressure is unrecoverable.
+        elastic: >
+          Own a custom logs-mfd.device_syslog ingest pipeline. Two
+          normalizations must land here: turn the free-text event summary into
+          a stable event.action enum through an enrich policy (the summary is
+          the only thing distinguishing a password change from a firmware
+          rollback), and invert the syslog severity — HP follows RFC 5424
+          where 0 is most severe, the opposite direction from ECS
+          event.severity, so a straight copy produces backwards alert
+          ordering. Add typed custom-namespace mappings for
+          mfd.config.setting, mfd.config.account, mfd.config.policy_name,
+          mfd.config.permission_set, mfd.auth.sign_in_method, and
+          mfd.device.interface as keyword, and keep mfd.config.old_value and
+          mfd.config.new_value as keyword with ignore_above so a pasted
+          certificate in a config value cannot blow up the mapping.
+        relay: >
+          Low-side printer VLANs cross the guard: cross full ECS-shaped NDJSON
+          built low-side (envelope mode B) rather than the raw HP text grammar
+          — the guard should never see four vendor message grammars when it
+          can see one JSON schema. The friction to settle with the guard owner
+          is mfd.config.old_value / mfd.config.new_value: these carry
+          arbitrary configuration payloads including certificate and key
+          material at kilobyte scale, so cap, redact, and flag them before the
+          crossing rather than relying on a custom NDJSON content filter to
+          reason about them. Nothing CEF-shaped crosses on this route; the
+          device emits key=value syslog natively. Keep _raw across the guard
+          until each vendor branch of the hand-built parser is proven, since a
+          misparsed device grammar cannot be re-fetched from the far side.
+      direct:
+        parse_location: low
+        cribl: >
+          Build one parser branch per vendor keyed on the syslog header and
+          device-type token, and normalize all of them onto the same mfd.*
+          field set at the edge — the whole point of a multi-vendor class map
+          is that the high side sees one schema. Two conversions belong here
+          because they are unambiguous only near the source: parse HP's
+          12-hour "2025-Feb-09 11:54 AM (UTC-07:00)" timestamp into RFC3339,
+          and split the realm-prefixed user value into user.domain plus
+          user.name while recognising that the prefix may be a domain, the
+          literal LOCAL, or a bare IP. Resolve device IP to site and device
+          owner from a lookup here, gate the destination with
+          C.Schema(...).validate plus a dead-letter route, and use Persistent
+          Queue backpressure — never Block, because the device's own
+          1000-msg/min cap means dropped backpressure is unrecoverable.
+        elastic: >
+          Own a custom logs-mfd.device_syslog ingest pipeline. Two
+          normalizations must land here: turn the free-text event summary into
+          a stable event.action enum through an enrich policy (the summary is
+          the only thing distinguishing a password change from a firmware
+          rollback), and invert the syslog severity — HP follows RFC 5424
+          where 0 is most severe, the opposite direction from ECS
+          event.severity, so a straight copy produces backwards alert
+          ordering. Add typed custom-namespace mappings for
+          mfd.config.setting, mfd.config.account, mfd.config.policy_name,
+          mfd.config.permission_set, mfd.auth.sign_in_method, and
+          mfd.device.interface as keyword, and keep mfd.config.old_value and
+          mfd.config.new_value as keyword with ignore_above so a pasted
+          certificate in a config value cannot blow up the mapping.
+  - format: syslog-cef
+    enable: >
+      In the Embedded Web Server, go to Properties > Security > Logs > SIEM,
+      enable the SIEM feature, and add up to three SIEM destinations (host,
+      UDP/TCP port, protocol). Under Event Policies set the Event Range to the
+      logging severity cutoff you want (default 4 - Warning; messages at that
+      level and more severe are sent). The device transmits each audit event
+      as it occurs using the RFC 5424 syslog protocol with a CEF-formatted
+      MSG; Xerox devices use Log Audit facility code 13, so the header PRI is
+      facility 13 x 8 + severity. This is distinct from the on-device Audit
+      Log download and can run alongside it. Security Audit Logging must be
+      enabled (Properties > Security > Logs > Audit Log) for the events to be
+      generated at all.
+    references:
+    - >-
+      https://download.support.xerox.com/pub/docs/ALB80XX/userdocs/any-os/en_GB/AltaLink_VersaLink_series_siem_en-US.pdf
+    - >-
+      https://securitydocs.business.xerox.com/wp-content/uploads/2020/11/AltaLink_Series_SIEM_reference_guide_en-us.pdf
+    - https://www.support.xerox.com/en-us/article/KB0133329
+    - https://www.support.xerox.com/en-us/article/KB0332727
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom multi-vendor MFD syslog pipeline (Xerox CEF branch)
+      notes: >
+        No Elastic integration and no Cribl pack covers printer-native audit
+        data, so this is a branch of the same hand-built multi-vendor pipeline
+        the HP feed uses. The advantage over the HP key=value grammar is that
+        a CEF unpack (Cribl's CEF/key-value extraction, or an Elastic grok/kv
+        on the CEF extension) yields typed fields with a stable event
+        identity: the numeric Device Event Class ID (Audit Log ID) plus the
+        fixed Name replace HP's free-text summary as the event discriminator,
+        so no summary-to-action lookup that drifts across firmware is needed -
+        the catalogue is numbered. The remaining work is renaming the Xerox
+        CEF keys onto the shared mfd.* schema and inverting the RFC 5424
+        severity into ECS's scale, the same normalization the HP branch needs.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Unpack the CEF extension and normalize onto the same mfd.* field set
+          the HP branch emits, so the high side sees one schema across
+          vendors. Key the branch on the CEF Device Vendor/Device Product
+          header rather than the syslog header, set
+          observer.vendor/observer.product from that header, and map the
+          numeric Audit Log ID to event.code with the Name carried to
+          event.action - no free-text summary parsing is required here, which
+          is the whole reason to prefer the CEF form where a device supports
+          it. Invert the syslog severity into ECS event.severity at the edge
+          (facility 13 tags the printer traffic, but is administrator-
+          selectable so do not rely on it for identification), resolve
+          deviceExternalId (serial) and src to site/owner from a lookup, gate
+          the destination with C.Schema(...).validate plus a dead-letter
+          route, and run Persistent Queue backpressure - never Block, since
+          the device's own per-device syslog rate cap makes dropped
+          backpressure unrecoverable.
+        elastic: >
+          Own the shared custom logs-mfd.device_syslog ingest pipeline so the
+          Xerox CEF and HP key=value forms land in one data stream on one
+          schema. Because the Xerox event is numbered, drive event.action from
+          a (vendor, event.code) enrich table rather than the fragile
+          free-text lookup the HP form needs, and assert event.outcome is
+          populated for every outcome token (fold the Xerox Completion Status
+          values that are neither clean success nor failure to unknown while
+          keeping the raw value). Add typed custom-namespace mappings for
+          mfd.accounting.user_id and mfd.accounting.account_id as keyword, and
+          keep any config old/new value payloads as keyword with ignore_above
+          so a pasted certificate in a CEF msg cannot blow up the mapping.
+        relay: >
+          Low-side printer VLANs cross the guard as full ECS-shaped NDJSON
+          built low-side (envelope mode B), not the raw CEF text - the guard
+          should see one JSON schema, not a second vendor grammar alongside
+          HP's. Even though CEF is structured, unpack and re-shape it before
+          the crossing so the custom NDJSON content filter never has to reason
+          about CEF escaping. The friction to settle with the guard owner is
+          the CEF msg/request keys and any config-value payloads: these carry
+          arbitrary text including certificate material, so cap, redact and
+          flag them low-side. Keep _raw across the guard until the Xerox
+          branch is proven, since a misparsed device grammar cannot be
+          re-fetched from the far side.
+      direct:
+        parse_location: high
+        cribl: >
+          For a high-side device with no guard, forward the CEF syslog
+          straight to the core worker group; because CEF is self-describing,
+          the pipeline is a CEF unpack plus a rename onto mfd.*, not a
+          hand-built grammar, so it can run high-side without a low-side
+          envelope step. Still branch on the CEF header to set
+          observer.vendor/observer.product and still invert the severity,
+          since those are correctness issues independent of the boundary.
+        elastic: >
+          Own the shared custom logs-mfd.device_syslog ingest pipeline so the
+          Xerox CEF and HP key=value forms land in one data stream on one
+          schema, driving event.action from a (vendor, event.code) enrich
+          table rather than a free-text lookup. With no boundary, retain the
+          full CEF msg and config-value text; the decoded Xerox record is the
+          same mfd.* document as the HP form, so both share one set of
+          detections without discriminating the source vendor except through
+          observer.vendor.
+    fields:
+    - vendor: PRI
+      type: integer
+      description: >-
+        RFC 5424 syslog priority in the message header; Xerox devices use Log
+        Audit facility code 13, so PRI = 13 x 8 + severity
+      ecs: log.syslog.priority
+      status: mapped
+      transform: >
+        decompose into log.syslog.facility.code and log.syslog.severity.code;
+        facility is administrator-influenced and cannot be used to identify
+        printer traffic
+    - vendor: TIMESTAMP
+      type: timestamp
+      description: >-
+        RFC 5424 event time in the syslog header, yyyy-mm-ddThh:mm:ss+-ZONE -
+        already RFC3339, unlike the HP form's 12-hour minute-resolution string
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: HOSTNAME
+      type: string
+      description: hostname of the device as carried in the RFC 5424 syslog header
+      ecs: observer.hostname
+      status: mapped
+    - vendor: Device Vendor
+      type: string
+      description: CEF header field 1, the device manufacturer, constant "Xerox"
+      ecs: observer.vendor
+      status: mapped
+      notes: >-
+        set the parser branch from this header field rather than from the
+        syslog header, and pair it with Device Product to select the CEF key
+        rename table
+    - vendor: Device Product
+      type: string
+      description: CEF header field 2, the device model name, e.g. Altalink C8135
+      ecs: observer.product
+      status: mapped
+    - vendor: Device Version
+      type: string
+      description: >-
+        CEF header field 3, the device software (firmware) version, e.g.
+        111.009.009.23300
+      ecs: observer.version
+      status: mapped
+    - vendor: Device Event Class ID
+      type: integer
+      description: >-
+        CEF header field 4, the numeric Xerox Audit Log ID identifying the
+        event definition (e.g. 11 Audit Log Enabled, 31 User Login, 42 Network
+        Authentication Configuration, 89 Device User Account Management)
+      ecs: event.code
+      status: mapped
+      notes: >
+        the stable catalogue identifier and the key advantage of this form -
+        it replaces HP's drifting free-text summary as the event
+        discriminator, so event.action can be assigned from a (vendor,
+        event.code) table
+    - vendor: Name
+      type: string
+      description: >-
+        CEF header field 5, the fixed human-readable description of the event
+        (e.g. "Network Authentication Configuration")
+      ecs: event.action
+      status: mapped
+      notes: >-
+        a controlled description tied one-to-one to the Audit Log ID, not free
+        text, so it is a reliable event.action source unlike the HP event
+        summary
+    - vendor: Severity
+      type: integer
+      description: CEF header field 6, the syslog severity 0-7 assigned to the event
+      ecs: log.syslog.severity.code
+      status: partial
+      notes: >
+        RFC 5424 scale where 0 is most severe - the inverse of the direction
+        ECS event.severity consumers expect - so a straight copy to
+        event.severity inverts alert ordering; invert on the way to
+        event.severity and keep the raw code here
+    - vendor: dvchost
+      type: string
+      description: CEF extension deviceHostName - the configured device name
+      ecs: observer.name
+      status: mapped
+    - vendor: deviceExternalId
+      type: string
+      description: CEF extension - the device serial number
+      ecs: observer.serial_number
+      status: mapped
+    - vendor: suser
+      type: string
+      description: >-
+        CEF extension sourceUserName - the user logged in to the device when
+        the event occurred; email addresses are also mapped into this field
+      ecs: user.name
+      status: partial
+      transform: >
+        may be a realm-prefixed principal, the literal for a local admin, or
+        an email address; split any realm prefix into user.domain plus a bare
+        user.name and recognise the email-address case rather than treating it
+        as a domain\user
+    - vendor: duser
+      type: string
+      description: >-
+        CEF extension destinationUserName - the user associated with the event
+        destination or target (e.g. the account acted on in a user-account
+        management event)
+      ecs: destination.user.name
+      status: partial
+      notes: >-
+        present only on events that have a distinct target principal; absent
+        on most config events
+    - vendor: spriv
+      type: string
+      description: >-
+        CEF extension sourceUserPrivileges - the privilege or role assigned to
+        the user during the event
+      ecs: user.roles
+      status: mapped
+      notes: >-
+        ECS user.roles is an array; carry the single Xerox role token as a
+        one-element array
+    - vendor: src
+      type: ip
+      description: CEF extension sourceAddress - a source or session IPv4/IPv6 address
+      ecs: source.address
+      status: partial
+      transform: >-
+        copy to source.ip only when the value parses as an address; leave
+        console/internal tokens in source.address
+    - vendor: dst
+      type: ip
+      description: >-
+        CEF extension destinationAddress - a destination IPv4 address, IPv6
+        address, or host name
+      ecs: destination.address
+      status: partial
+      transform: copy to destination.ip only when the value parses as an address
+    - vendor: request
+      type: string
+      description: >-
+        CEF extension requestUrl - the URL accessed during the event (e.g. an
+        EWS configuration endpoint)
+      ecs: url.original
+      status: partial
+      notes: >-
+        present only on web-originated configuration events; unbounded free
+        text, so cap before the boundary
+    - vendor: sproc
+      type: string
+      description: CEF extension sourceProcessName - the name of the event source process
+      ecs: process.name
+      status: mapped
+    - vendor: outcome
+      type: enum
+      description: CEF extension eventOutcome - the result of the event
+      ecs: event.outcome
+      status: mapped
+      transform: >
+        ECS event.outcome admits only success/failure/unknown; map success to
+        success and failure to failure, and fold Completion Status tokens that
+        are neither (e.g. cancelled) to unknown while preserving the raw value
+        in a custom field
+    - vendor: reason
+      type: string
+      description: CEF extension Reason - identifies the reason the event was generated
+      ecs: event.reason
+      status: mapped
+      notes: vendor token carried verbatim; ECS puts no vocabulary on event.reason
+    - vendor: msg
+      type: string
+      description: CEF extension message - additional free-text information about the event
+      ecs: message
+      status: partial
+      notes: >
+        terse supplemental detail rather than a rendered event line (can be a
+        small integer or a short phrase); can carry config payload text, so
+        length-cap it low-side and map with ignore_above
+    - vendor: xrxaccUID1
+      type: string
+      description: >-
+        Xerox custom CEF key - the Accounting User ID name used on the device
+        when Network Accounting is enabled
+      ecs: null
+      status: unmapped
+      custom: mfd.accounting.user_id
+      notes: >-
+        a Standard/Network Accounting identifier distinct from the sign-in
+        principal in suser; kept custom because it is an accounting code, not
+        a directory user
+    - vendor: xrxaccAID1
+      type: string
+      description: >-
+        Xerox custom CEF key - the Accounting Account ID name used on the
+        device when Network Accounting is enabled
+      ecs: null
+      status: unmapped
+      custom: mfd.accounting.account_id
+  - format: csv-file
+    enable: >
+      Enable the Audit Log first: in the Embedded Web Server, Properties >
+      Security > Logs > Audit Log, enable it (Authentication must be
+      configured for the User Name to be recorded). To retrieve, click Export
+      Audit Log / Download Log, save the compressed .zip, and extract
+      auditfile.txt - a tab-delimited text file opened in a spreadsheet tool.
+      This is a manual or scheduled pull (Xerox also supports scheduled SFTP
+      export of the same file), not a push; a collector fetches and parses the
+      file rather than receiving syslog. It is an offline counterpart to the
+      SIEM/CEF feed and can be run alongside it.
+    references:
+    - >-
+      https://www.xerox.com/technical_product_documentation/Atlantis_SAG/en_EN/Xerox/Xerox/interpretingauditlog.html
+    - https://www.support.xerox.com/en-us/article/KB0118711
+    - https://www.support.xerox.com/en-us/article/KB0014572
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Xerox audit-file collector pipeline
+      notes: >
+        A Cribl File/S3 collector (or Elastic filestream custom input) picks
+        up the extracted auditfile.txt on a fetch schedule and a hand-built
+        pipeline splits the tab-delimited columns. The catch versus the CEF
+        stream is that columns 6-10 are positional detail slots whose meaning
+        depends on the Event ID (Index/Date/Time/Event ID/Event Description
+        are fixed, but a User Name, Job Name, Computer Name, Printer/Folder
+        name, Completion Status, Image Overwrite Status, or Accounting ID
+        appears in the trailing columns per event), so the parser must key
+        column semantics off column 4. Being a file pull it inherits a
+        collection lag and a gap mode - the log is a fixed-size ring on the
+        device, so records are lost if the fetch interval lets the ring wrap.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Run the file collector low-side against the device (or its SFTP
+          export target) and shape to the same mfd.* schema as the CEF and HP
+          forms before the crossing, so the audit-file and syslog transports
+          of the same event catalogue converge on one document. Resolve the
+          column-6-to-10 detail slots by Event ID (column 4) into named fields
+          rather than shipping positional columns downstream, combine the Date
+          and Time columns into an RFC3339 @timestamp low-side, and watermark
+          on the Index so a re-fetched file does not re-ship records already
+          seen. Schedule the fetch tighter than the device audit ring wraps,
+          and run Persistent Queue backpressure on the destination.
+        elastic: >
+          Share the custom logs-mfd.device_syslog ingest pipeline and its
+          (vendor, event.code) enrich table so the audit-file form resolves
+          the same event.action/event.code as the CEF form; detect the
+          transport by the presence of the Index column, which the syslog
+          forms do not carry. Map mfd.accounting.user_id,
+          mfd.accounting.account_id and mfd.job.destination as keyword, and
+          derive event.outcome from the Completion Status column rather than
+          assuming every recorded event succeeded.
+        relay: >
+          Low-side devices cross the guard as full ECS-shaped NDJSON built
+          low-side (envelope mode B), one decoded record per line, never the
+          raw tab-delimited file - the positional detail columns are exactly
+          the kind of ambiguous free text a custom NDJSON filter should not
+          have to reason about, so resolve and cap them before the boundary.
+          The friction is the same Job Name / destination / config detail free
+          text as the syslog forms; cap and flag it low-side. Because this is
+          an at-most-once file pull with no return channel, reconcile the
+          low-side fetched-record count against the high-side ingested count
+          per (device, hour) to detect silent drops from a wrapped audit ring.
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side device with no guard, run the collector against the
+          device from the core worker group and parse there; parse near the
+          collection point regardless, because the Event-ID-dependent column
+          decode and the Date/Time-to-@timestamp merge are cheapest done once
+          at fetch time. Keep the Index watermark so a restart does not
+          re-ship the file.
+        elastic: >
+          Share the custom logs-mfd.device_syslog ingest pipeline, its
+          (vendor, event.code) enrich table, and the same custom-namespace
+          mappings with the CEF and HP forms so all three transports resolve
+          one schema. With no boundary the audit-file form's only real
+          tradeoff versus the CEF stream is latency (a scheduled pull versus
+          push) against not needing a syslog listener, so use it where a
+          device cannot reach a SIEM destination but can be fetched from.
+    fields:
+    - vendor: Index
+      type: integer
+      description: column 1 - a unique value that identifies the event within the log
+      ecs: event.sequence
+      status: partial
+      notes: >-
+        a per-log ring index, not a cluster-wide counter, so it disambiguates
+        and orders records within one device's log and is the natural fetch
+        watermark; it has no equivalent in the CEF/syslog forms
+    - vendor: Date + Time
+      type: timestamp
+      description: >-
+        columns 2 and 3 - event date in mm/dd/yy and time in hh:mm:ss as
+        recorded by the device
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        concatenate the two columns and parse to RFC3339; the year is
+        two-digit and there is no timezone in the file, so apply the device's
+        configured zone, and where the device clock is untrusted prefer the
+        fetch/receipt time with this value kept for drift checks
+    - vendor: Event ID
+      type: integer
+      description: >-
+        column 4 - the numeric event type, corresponding to the same Audit Log
+        ID catalogue as the CEF Device Event Class ID
+      ecs: event.code
+      status: mapped
+    - vendor: Event Description
+      type: string
+      description: column 5 - the abbreviated fixed description of the event type
+      ecs: event.action
+      status: mapped
+    - vendor: User Name
+      type: string
+      description: >-
+        identity detail (columns 6-10) - the user name associated with the
+        event; recorded only when Authentication is configured
+      ecs: user.name
+      status: partial
+      transform: >-
+        split any realm prefix into user.domain plus user.name; absent when
+        Authentication is not configured, which is a coverage gap to verify
+        per device
+    - vendor: Completion Status
+      type: enum
+      description: detail column - the status/outcome of the event
+      ecs: event.outcome
+      status: partial
+      transform: >-
+        fold statuses that are neither clean success nor failure to unknown
+        while retaining the raw token
+    - vendor: Computer Name
+      type: string
+      description: >-
+        detail column - the client computer name associated with a
+        network-submitted event
+      ecs: source.domain
+      status: partial
+      notes: >-
+        NetBIOS/short or FQDN client name; the file carries no client IP, so
+        source.domain is the only network origin identifier, as on the HP
+        print-jobs form
+    - vendor: Job Name
+      type: string
+      description: detail column - the job name associated with a job event
+      ecs: null
+      status: unmapped
+      custom: mfd.job.name
+      notes: >-
+        a job title, present on job events and empty on device-generated
+        events; kept custom rather than overloaded onto file.name
+    - vendor: Printer/Folder/Destination Name
+      type: string
+      description: >-
+        detail column - the printer name, folder name, or destination
+        associated with the event
+      ecs: null
+      status: unmapped
+      custom: mfd.job.destination
+      notes: >-
+        shares the scan-send dataset's destination namespace; a UNC share or
+        folder name rather than a resolved directory on a monitored host
+    - vendor: Image Overwrite Status
+      type: enum
+      description: detail column - the status of Immediate Image Overwrite completed on each job
+      ecs: null
+      status: unmapped
+      custom: mfd.job.image_overwrite_status
+      notes: the device data-remnant control state per job; no ECS field models it
+    - vendor: Accounting User ID
+      type: string
+      description: >-
+        detail column - the Accounting User ID, displayed when Network
+        Accounting is enabled
+      ecs: null
+      status: unmapped
+      custom: mfd.accounting.user_id
+    - vendor: Accounting Account ID
+      type: string
+      description: >-
+        detail column - the Accounting Account ID, displayed when Network
+        Accounting is enabled
+      ecs: null
+      status: unmapped
+      custom: mfd.accounting.account_id
+- id: scan-send-jobs
+  name: Scan-to-destination and job completion events
+  description: >
+    The exfiltration channel for the class — an MFD can walk paper onto the
+    network as e-mail, a network folder write, a SharePoint upload, an HTTP
+    POST, a USB drive, or a fax archive, and none of that traffic passes a
+    print server. HP's job-completion messages record that a send happened, by
+    whom, from where, and with what result, and they are the best-documented
+    example in the class. They are also genuinely THIN: the vendor records the
+    destination CHANNEL but not the destination VALUE — no recipient e-mail
+    address, no UNC path, no SharePoint site, no attachment filename, and no
+    byte count on the scan-to-* messages. Treat the coverage below as the
+    realistic ceiling for device-native scan auditing; recipient-level
+    attribution requires the mail gateway, the file server audit log, or a
+    print-management layer, and other vendors are thinner still.
+  event_categories:
+  - file
+  route:
+    guarded:
+    - hop: cribl
+      location: edge Cribl worker group, on-prem enclave
+      notes: >
+        Same device syslog stream as the security event dataset, split by the
+        "job completion" event summary.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-mfd.scan_jobs
+    direct:
+    - hop: cribl
+      location: edge Cribl worker group, on-prem enclave
+      notes: >
+        Same device syslog stream as the security event dataset, split by the
+        "job completion" event summary.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-mfd.scan_jobs
+  formats:
+  - format: syslog-kv
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom MFD job-completion pipeline
+      notes: >
+        Split off the device syslog pipeline rather than parsed separately —
+        same grammar, different event families. No Elastic integration or
+        Cribl pack exists. Where the fleet sits behind a print-management
+        layer (PaperCut NG/MF), that product's Job Log carries copy and scan
+        records with richer destination detail and is a better primary source
+        for this dataset than device syslog.
+    fields:
+    - vendor: <event summary>
+      type: string
+      description: >-
+        free-text summary naming the job class and destination channel,
+        everything before the first semicolon
+      ecs: event.action
+      status: partial
+      notes: >
+        the load-bearing field of this dataset — "E-mail job completion",
+        "Save to Network Folder job completion", "Save to SharePoint job
+        completion", "Save to HTTP job completion", "Save to Device Memory job
+        completion", "Retrieve from Device Memory job completion", "Fax
+        Archive job completion", "Print job completion", "Copy job
+        completion". Needs a lookup to a stable action enum; the string is
+        firmware-versioned English prose
+    - vendor: time
+      type: timestamp
+      description: date and time the job completed, as recorded by the device
+      ecs: '@timestamp'
+      status: partial
+      notes: >-
+        same 12-hour, minute-resolution, parenthesised-offset format as the
+        security event dataset
+    - vendor: job_name
+      type: string
+      description: name of the job as submitted
+      ecs: file.name
+      status: partial
+      notes: >
+        present on Print job completion messages only; the scan-to-* messages
+        carry NO job name, filename, or document title at all, so there is
+        nothing to attach a data-loss rule to on the outbound side. Emitted as
+        an empty string on device-generated jobs such as the network security
+        report
+    - vendor: job_type
+      type: enum
+      description: >-
+        class of the job being stored, retrieved, or archived (print, copy,
+        fax, sent_fax, reveived_fax)
+      ecs: null
+      status: unmapped
+      custom: mfd.job.type
+      notes: >
+        the vendor documents the received-fax value as "reveived_fax" — a
+        spelling error in the emitted token, not the documentation, so the
+        parser must accept both spellings across firmware revisions
+    - vendor: destination_type
+      type: enum
+      description: destination channel of a fax archive job (e-mail, network_folder, ftp_server)
+      ecs: null
+      status: unmapped
+      custom: mfd.job.destination_type
+      notes: >
+        the only message family that names its destination channel in a key
+        rather than only in the event summary; a normalized
+        destination-channel field should be synthesized for all the other
+        families from the summary string
+    - vendor: destination
+      type: string
+      description: shared folder path a device data backup was exported to
+      ecs: null
+      status: unmapped
+      custom: mfd.job.destination
+      notes: >
+        the ONE message in the vendor's catalogue that emits an actual
+        destination value, and it is the config-backup export rather than a
+        user scan; file.directory was considered but the value is a UNC share,
+        not a resolved directory on a monitored host
+    - vendor: drive_name
+      type: string
+      description: name of the removable drive a job was saved to
+      ecs: null
+      status: unmapped
+      custom: mfd.job.drive_name
+      notes: >
+        scan-to-USB is the highest-risk destination in the class and this is
+        the entire field-level evidence for it — no filename, no size, no file
+        count
+    - vendor: user
+      type: string
+      description: the authenticated entity that submitted or released the job
+      ecs: user.name
+      status: partial
+      transform: >
+        realm-prefixed as REALM\user; split into user.domain plus user.name.
+        Jobs released through the OXPd solution interface are logged as the
+        literal "Guest" rather than the actual operator, which breaks
+        attribution on exactly the walk-up path most worth auditing
+    - vendor: source_IP
+      type: ip
+      description: IP address of the client computer that submitted the job
+      ecs: source.ip
+      status: partial
+      notes: >
+        present on network-submitted jobs (EWS, IPP, LPD, P9100, WS Print,
+        FTP, OXPd) and absent on control-panel walk-up jobs; device-generated
+        reports emit the literal 0.0.0.0, which must be dropped rather than
+        indexed as a real source
+    - vendor: hostname
+      type: string
+      description: hostname of the client computer that submitted the job
+      ecs: source.domain
+      status: partial
+    - vendor: outcome
+      type: enum
+      description: result of the job (success, canceled, partial_success, failure)
+      ecs: event.outcome
+      status: mapped
+      transform: >
+        fold canceled and partial_success to unknown for event.outcome while
+        retaining the raw token; partial_success on an e-mail or SharePoint
+        job means the data reached at least one but not all recipients, which
+        is materially different from a clean failure and must stay
+        distinguishable
+    - vendor: Syslog severity
+      type: integer
+      description: RFC 5424 severity level assigned to the job-completion message
+      ecs: event.severity
+      status: partial
+      notes: >
+        the vendor scale runs 0 (Emergency) to 7 (Debug), so LOWER is more
+        severe — the inverse of the convention ECS event.severity consumers
+        expect. A direct copy inverts alert ordering. Note also that HP
+        assigns Informational to successful sends and Warning to
+        cancellations, so severity does not track security interest on this
+        dataset at all
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Classify the destination channel at the edge: the event summary
+          string ("E-mail job completion", "Save to Network Folder job
+          completion", "Save to SharePoint job completion", "Save to HTTP job
+          completion", "Fax Archive job completion") is the ONLY thing that
+          distinguishes an internal copy from an outbound send, so turn it
+          into a stable mfd.job.destination_channel value low-side before
+          anything downstream tries to alert on it. Enrich device IP to site,
+          floor, and device owner here, and mark the records that carry no
+          destination value at all so the gap is queryable rather than
+          invisible. Persistent Queue backpressure on the destination, and
+          keep this route's volume in perspective — scan events are orders of
+          magnitude rarer than print events and are the wrong place to
+          optimise.
+        elastic: >
+          Own a custom logs-mfd.scan_jobs ingest pipeline that derives
+          event.outcome (folding canceled and partial_success into unknown
+          while keeping the raw value), normalizes the vendor's misspelled
+          job_type token reveived_fax alongside received_fax, and inverts the
+          RFC 5424 severity into ECS's event.severity scale rather than
+          copying it. Map mfd.job.type, mfd.job.destination_type,
+          mfd.job.destination, and mfd.job.drive_name as keyword in the
+          custom-namespace index template. The detection worth building is
+          volume and after-hours anomalies per (user.name, device, destination
+          channel) — recipient-level rules are not possible on this feed and
+          should be built against the mail gateway instead, which the
+          dashboard should state explicitly so analysts do not read absence of
+          evidence as evidence.
+        relay: >
+          Low-side printer VLANs cross the guard: cross full ECS-shaped NDJSON
+          built low-side (envelope mode B) with one line per completed job.
+          The content-filter friction is small on this dataset precisely
+          because it is thin — the only unbounded free-text values are
+          file.name on print-job messages and mfd.job.destination on backup
+          exports, both of which should be capped and flagged low-side so the
+          custom NDJSON filter can stay simple. Nothing CEF-shaped crosses.
+          Volume is low enough that _raw should be carried indefinitely here:
+          these are the highest-forensic-value records in the map and the
+          cheapest to keep whole.
+      direct:
+        parse_location: low
+        cribl: >
+          Classify the destination channel at the edge: the event summary
+          string ("E-mail job completion", "Save to Network Folder job
+          completion", "Save to SharePoint job completion", "Save to HTTP job
+          completion", "Fax Archive job completion") is the ONLY thing that
+          distinguishes an internal copy from an outbound send, so turn it
+          into a stable mfd.job.destination_channel value up front before
+          anything downstream tries to alert on it. Enrich device IP to site,
+          floor, and device owner here, and mark the records that carry no
+          destination value at all so the gap is queryable rather than
+          invisible. Persistent Queue backpressure on the destination, and
+          keep this route's volume in perspective — scan events are orders of
+          magnitude rarer than print events and are the wrong place to
+          optimise.
+        elastic: >
+          Own a custom logs-mfd.scan_jobs ingest pipeline that derives
+          event.outcome (folding canceled and partial_success into unknown
+          while keeping the raw value), normalizes the vendor's misspelled
+          job_type token reveived_fax alongside received_fax, and inverts the
+          RFC 5424 severity into ECS's event.severity scale rather than
+          copying it. Map mfd.job.type, mfd.job.destination_type,
+          mfd.job.destination, and mfd.job.drive_name as keyword in the
+          custom-namespace index template. The detection worth building is
+          volume and after-hours anomalies per (user.name, device, destination
+          channel) — recipient-level rules are not possible on this feed and
+          should be built against the mail gateway instead, which the
+          dashboard should state explicitly so analysts do not read absence of
+          evidence as evidence.
+  - format: syslog-cef
+    enable: >
+      Same enablement as the device-security CEF entry - Properties > Security
+      > Logs > SIEM with the Audit Log enabled - no separate configuration
+      splits the job events out; they arrive on the same SIEM syslog stream
+      and are separated downstream by the numeric Audit Log ID that names the
+      job class. Set the Event Range severity cutoff aware that Xerox tags
+      successful job completions at Informational and cancellations higher, so
+      a strict cutoff can silently drop the successful-send records that
+      matter most.
+    references:
+    - >-
+      https://download.support.xerox.com/pub/docs/ALB80XX/userdocs/any-os/en_GB/AltaLink_VersaLink_series_siem_en-US.pdf
+    - >-
+      https://securitydocs.business.xerox.com/wp-content/uploads/2020/11/AltaLink_Series_SIEM_reference_guide_en-us.pdf
+    - https://www.support.xerox.com/en-us/article/KB0133329
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom MFD job-completion pipeline (Xerox CEF branch)
+      notes: >
+        Split off the device syslog pipeline by the Audit Log ID range the
+        same way the HP form is split by its "job completion" event summary -
+        same grammar, different event families. No Elastic integration or
+        Cribl pack exists. The advantage over the HP form is that the
+        destination channel is an enumerated event ID rather than a
+        firmware-versioned English string, so mfd.job.destination_channel can
+        be assigned from a (vendor, event.code) table with no summary lookup
+        that drifts. Where the fleet sits behind a print-management layer,
+        that product's job log is still a richer destination-detail source
+        than any device-native form, Xerox included.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Classify the destination channel at the edge from the numeric Audit
+          Log ID into a stable mfd.job.destination_channel value, exactly as
+          the HP branch derives it from the event summary, so the high side
+          sees one enum across vendors. Carry the Xerox job event ID to
+          event.code and the Name to event.action, unpack the CEF extension
+          for suser, xrxjob1 (job name), fname, fileType and the accounting
+          IDs, and enrich device serial/src to site, floor and owner here.
+          Mark records that carry no destination value so the gap is queryable
+          rather than invisible, invert the syslog severity into
+          event.severity, and use Persistent Queue backpressure. Scan/job
+          events are orders of magnitude rarer than print events, so this is
+          the wrong route to optimise for volume.
+        elastic: >
+          Own the shared custom logs-mfd.scan_jobs ingest pipeline that
+          derives event.outcome (folding cancelled/partial to unknown while
+          keeping the raw token) and inverts the RFC 5424 severity into
+          event.severity rather than copying it. Map mfd.job.name,
+          mfd.job.file_type, mfd.job.source_service,
+          mfd.job.image_overwrite_status, mfd.accounting.user_id and
+          mfd.accounting.account_id as keyword. As on the HP form, the
+          buildable detection is volume and after-hours anomalies per
+          (user.name, device, destination channel); recipient-level rules are
+          not possible on this device-native feed and belong against the mail
+          gateway, which the dashboard should state so absence of evidence is
+          not read as evidence.
+        relay: >
+          Low-side printer VLANs cross the guard as full ECS-shaped NDJSON
+          built low-side (envelope mode B), one line per completed job, never
+          raw CEF. The content-filter friction is small because the feed is
+          thin: the only unbounded free-text values are fname/xrxjob1 (job and
+          file names) and any destination text, which should be capped and
+          flagged low-side so the custom NDJSON filter stays simple. Volume is
+          low enough that _raw can be carried indefinitely here - these are
+          the highest-forensic-value records in the map and the cheapest to
+          keep whole.
+      direct:
+        parse_location: high
+        cribl: >
+          For a high-side device with no guard, forward the CEF syslog to the
+          core worker group; the CEF unpack plus destination-channel
+          classification from the event ID runs high-side without a low-side
+          envelope step because the record is self-describing. Still branch on
+          the CEF header to set observer.vendor/observer.product and still
+          invert the severity.
+        elastic: >
+          Own the shared custom logs-mfd.scan_jobs ingest pipeline and drive
+          event.action and the destination channel from a (vendor, event.code)
+          table. With no boundary, retain the full job/file names; the decoded
+          Xerox job record shares the data stream and detections with the HP
+          form, distinguished only by observer.vendor.
+    fields:
+    - vendor: PRI
+      type: integer
+      description: >-
+        RFC 5424 syslog priority; Xerox devices use Log Audit facility code
+        13, so PRI = 13 x 8 + severity
+      ecs: log.syslog.priority
+      status: mapped
+      transform: decompose into log.syslog.facility.code and log.syslog.severity.code
+    - vendor: TIMESTAMP
+      type: timestamp
+      description: RFC 5424 job-completion time in the syslog header, already RFC3339
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: HOSTNAME
+      type: string
+      description: hostname of the device in the RFC 5424 syslog header
+      ecs: observer.hostname
+      status: mapped
+    - vendor: Device Vendor
+      type: string
+      description: >-
+        CEF header - device manufacturer, constant Xerox; set the parser
+        branch from this
+      ecs: observer.vendor
+      status: mapped
+    - vendor: Device Product
+      type: string
+      description: CEF header - device model name
+      ecs: observer.product
+      status: mapped
+    - vendor: Device Version
+      type: string
+      description: CEF header - device firmware version
+      ecs: observer.version
+      status: mapped
+    - vendor: Device Event Class ID
+      type: integer
+      description: >-
+        CEF header - the numeric Audit Log ID naming the job class and
+        destination channel (5 Print, 6 Network Scan, 7 Server Fax, 8 Internet
+        Fax, 9 Email, 12 Copy, 13 Embedded Fax, 14 LAN Fax, 20 Scan to
+        Mailbox, 24 Scan to Home, 74 Scan to USB, 78/79 Remote Scan)
+      ecs: event.code
+      status: mapped
+      notes: >-
+        the stable destination-channel discriminator - an enumerated ID here
+        rather than the HP form's free-text summary, so
+        mfd.job.destination_channel is a table lookup with no firmware drift
+    - vendor: Name
+      type: string
+      description: >-
+        CEF header - the fixed description of the job event (e.g. "Network
+        scan job", "Email job")
+      ecs: event.action
+      status: mapped
+    - vendor: Severity
+      type: integer
+      description: CEF header - syslog severity 0-7 assigned to the job message
+      ecs: log.syslog.severity.code
+      status: partial
+      notes: >
+        RFC 5424 scale where 0 is most severe, the inverse of ECS
+        event.severity; a direct copy inverts alert ordering. Xerox assigns
+        Informational to successful sends, so severity does not track security
+        interest on this dataset - invert on the way to event.severity and do
+        not gate collection on it
+    - vendor: suser
+      type: string
+      description: >-
+        CEF extension sourceUserName - the user that submitted or released the
+        job; email addresses are also mapped here
+      ecs: user.name
+      status: partial
+      transform: >-
+        split any realm prefix into user.domain plus user.name and recognise
+        the email-address case
+    - vendor: duser
+      type: string
+      description: >-
+        CEF extension destinationUserName - the user associated with the job
+        destination or target
+      ecs: destination.user.name
+      status: partial
+      notes: >-
+        present on send jobs that carry a target principal; still not a full
+        recipient list, so it does not close the recipient-attribution gap
+    - vendor: src
+      type: ip
+      description: >-
+        CEF extension sourceAddress - the source/session address of a
+        network-submitted job
+      ecs: source.address
+      status: partial
+      transform: >-
+        copy to source.ip only when it parses as an address; absent on
+        control-panel walk-up jobs
+    - vendor: dst
+      type: ip
+      description: >-
+        CEF extension destinationAddress - a destination IPv4/IPv6 address or
+        host name for server-fax/network destinations
+      ecs: destination.address
+      status: partial
+      transform: copy to destination.ip only when it parses as an address
+    - vendor: fname
+      type: string
+      description: CEF extension filename - the file name of the file used in the job
+      ecs: file.name
+      status: partial
+      notes: >-
+        present where the job carries a filename; the scan-to-* families are
+        thin on this, as on the HP form
+    - vendor: xrxjob1
+      type: string
+      description: Xerox custom CEF key - the Job Name used on the device
+      ecs: null
+      status: unmapped
+      custom: mfd.job.name
+      notes: >-
+        the job title; kept custom rather than overloaded onto file.name,
+        which fname already occupies
+    - vendor: fileType
+      type: enum
+      description: CEF extension fileType - the file type(s) used in the job
+      ecs: null
+      status: unmapped
+      custom: mfd.job.file_type
+      notes: >-
+        document format (e.g. PDF/TIFF), not ECS file.type's file/dir/symlink
+        vocabulary, so it is kept custom rather than mismapped to file.type
+    - vendor: sourceServiceName
+      type: string
+      description: >-
+        CEF extension - the service responsible for generating the event (e.g.
+        "Print From URL")
+      ecs: null
+      status: unmapped
+      custom: mfd.job.source_service
+      notes: >-
+        the submission channel/service that produced the job, a Xerox enum
+        rather than a running-service identity, so it is kept custom rather
+        than mapped to service.name
+    - vendor: act
+      type: string
+      description: >-
+        CEF extension deviceAction - the action taken after job completion,
+        carrying the Immediate Image Overwrite status (e.g. "IIO Not
+        Applicable")
+      ecs: null
+      status: unmapped
+      custom: mfd.job.image_overwrite_status
+      notes: >-
+        overloaded CEF act key - here it is the per-job data-remnant overwrite
+        state, not the event action (event.action comes from Name), so it is
+        kept in the job namespace
+    - vendor: outcome
+      type: enum
+      description: CEF extension eventOutcome - the result of the job
+      ecs: event.outcome
+      status: mapped
+      transform: >
+        fold cancelled and partial-success to unknown for event.outcome while
+        retaining the raw token; a partial success on an email/network job
+        means the data reached some but not all destinations and must stay
+        distinguishable from a clean failure
+    - vendor: msg
+      type: string
+      description: >-
+        CEF extension message - additional information about the job, e.g. an
+        image/page count
+      ecs: message
+      status: partial
+      notes: terse supplemental value rather than a rendered line; length-cap low-side
+    - vendor: xrxaccUID1
+      type: string
+      description: >-
+        Xerox custom CEF key - the Accounting User ID name, present when
+        Network Accounting is enabled
+      ecs: null
+      status: unmapped
+      custom: mfd.accounting.user_id
+    - vendor: xrxaccAID1
+      type: string
+      description: >-
+        Xerox custom CEF key - the Accounting Account ID name, present when
+        Network Accounting is enabled
+      ecs: null
+      status: unmapped
+      custom: mfd.accounting.account_id

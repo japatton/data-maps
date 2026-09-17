@@ -1,0 +1,438 @@
+id: jamf-protect
+name: Jamf Protect (macOS)
+vendor: Jamf
+versions: Jamf Protect 5.x agent, streaming to a collector or to S3
+draft: true
+references:
+- https://github.com/elastic/integrations/tree/main/packages/jamf_protect
+- >-
+  https://learn.jamf.com/en-US/bundle/jamf-protect-documentation/page/Data_Forwarding.html
+- https://www.elastic.co/docs/reference/integrations/jamf_protect
+datasets:
+- id: alerts
+  name: Analytic alert
+  description: |
+    Jamf Protect's detections on macOS endpoints. Filed at edge priority deliberately: it is only worth collecting if there is a Mac fleet, and the catalogue has no other macOS entry at all. Windows has its own technology, Linux has two, mobile is covered by the UEM entry, and macOS appears today only as a platform other products happen to support - Defender for Endpoint runs there, but its macOS behaviour is not separately mapped.
+    An alert is not a single event. Jamf Protect evaluates named analytics it calls facts against a stream of Endpoint Security events, and a match carries both the triggering event and a related graph of the files, processes, users and groups involved. That graph is the reason this feed is worth more than a detection name and a hostname.
+  event_categories:
+  - malware
+  - process
+  - file
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Jamf Protect streams to a collector endpoint or lands objects in S3.
+        Alert volume is low; the nested related graph makes each record large,
+        so this feed is small by count and not by bytes. There is no syslog or
+        CEF option, which removes the usual format choice and with it the
+        usual fidelity argument.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes. Full process argument vectors travel in the
+        related graph and can carry file paths from user home directories,
+        which is the content a filter will object to.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-jamf_protect.alerts
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Jamf Protect streams to a collector endpoint or lands objects in S3.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-jamf_protect.alerts
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: elastic/integrations jamf_protect, data stream alerts
+      notes: |
+        Deeply nested and array-heavy - the raw alert carries around 144 distinct key paths. The integration flattens almost all of it into ECS, which is why very little survives under a vendor namespace; the field rows below name the raw paths so a hand-built pipeline can find them.
+        The arrays are the difficulty. input.match.facts, input.match.context and every input.related.* member are lists, and a record can carry several facts that matched at once. Anything that reads only the first element silently drops the rest, and it is the multi-fact alerts - several analytics firing on one event - that are the interesting ones.
+    fields:
+    - vendor: input.match.event.timestamp
+      type: timestamp
+      description: when the triggering event occurred on the endpoint
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: input.match.uuid
+      type: string
+      description: unique identifier of the match
+      ecs: event.id
+      status: mapped
+    - vendor: input.match.severity
+      type: integer
+      description: severity of the match
+      ecs: event.severity
+      status: mapped
+      notes: >-
+        the match's severity, which is the highest of the facts that fired
+        rather than a value in its own right
+    - vendor: input.match.facts[].name
+      type: string
+      description: name of the analytic that matched
+      ecs: rule.name
+      status: partial
+      notes: >
+        an array. Several analytics can match one event, and rule.name is
+        singular in ECS, so a pipeline has to choose - the shipped integration
+        takes the first. Where more than one fired, the others are lost unless
+        they are kept in a custom array, and that combination is usually the
+        strongest signal on the record.
+    - vendor: input.match.facts[].human
+      type: string
+      description: human-readable description of the analytic
+      ecs: rule.description
+      status: partial
+      notes: same array caveat as the name
+    - vendor: input.match.facts[].uuid
+      type: string
+      description: identifier of the analytic
+      ecs: rule.id
+      status: partial
+      notes: >-
+        the stable identity of the analytic across renames, and what a
+        detection should key on rather than the name
+    - vendor: input.match.facts[].version
+      type: string
+      description: version of the analytic that matched
+      ecs: rule.version
+      status: partial
+      notes: >-
+        analytics are updated by Jamf, so an alert rate that changes without a
+        policy change is explained here and nowhere else
+    - vendor: input.match.facts[].severity
+      type: integer
+      description: severity of the individual analytic
+      ecs: null
+      status: partial
+      custom: jamf_protect.facts
+      notes: >-
+        per-fact rather than per-match; keeping the whole facts array under
+        one custom is what preserves the multi-analytic case the singular ECS
+        rule fields cannot express
+    - vendor: input.match.facts[].tags
+      type: string
+      description: tags on the analytic
+      ecs: tags
+      status: partial
+      notes: >-
+        where Jamf carries ATT&CK references when an analytic has them; not
+        parsed into threat.technique.id by the integration, so a pipeline that
+        wants ATT&CK coverage has to extract it here
+    - vendor: input.match.context[].name
+      type: string
+      description: name of a context value captured with the match
+      ecs: null
+      status: partial
+      custom: jamf_protect.context
+      notes: >-
+        name and value pairs describing why the analytic fired; the closest
+        thing to evidence the alert carries outside the related graph
+    - vendor: input.match.event.type
+      type: string
+      description: the Endpoint Security event type that triggered the match
+      ecs: event.action
+      status: mapped
+    - vendor: input.match.event.eventID
+      type: integer
+      description: numeric Endpoint Security event type
+      ecs: event.code
+      status: partial
+      transform: cast to string
+    - vendor: input.match.event.path
+      type: string
+      description: path of the file or process involved in the event
+      ecs: file.path
+      status: partial
+      notes: >-
+        a file path on file events and an executable path on process events;
+        the event type is what says which, and mapping it to file.path
+        unconditionally puts executables in a file field
+    - vendor: input.match.event.pid
+      type: integer
+      description: process id involved in the event
+      ecs: process.pid
+      status: mapped
+    - vendor: input.match.event.uid
+      type: integer
+      description: user id the event ran as
+      ecs: user.id
+      status: partial
+      transform: cast to string
+      notes: >-
+        a numeric macOS uid, not a name; 0 is root and 501 upward are the
+        local accounts, and joining to a directory needs the related users
+        array
+    - vendor: input.match.event.gid
+      type: integer
+      description: group id the event ran as
+      ecs: group.id
+      status: partial
+      transform: cast to string
+    - vendor: input.match.event.iNode
+      type: integer
+      description: inode of the file involved
+      ecs: file.inode
+      status: partial
+      transform: cast to string
+      notes: >-
+        the identity that survives a rename, which is what links a file alert
+        to the file it was about after the attacker moved it
+    - vendor: input.match.event.prevFile
+      type: string
+      description: previous path, on a rename event
+      ecs: null
+      status: partial
+      custom: jamf_protect.previous_path
+      notes: >-
+        with the current path this is the rename in full; ECS has no
+        before-and-after path shape
+    - vendor: input.host.hostname
+      type: string
+      description: hostname of the Mac
+      ecs: host.hostname
+      status: mapped
+    - vendor: input.host.provisioningUDID
+      type: string
+      description: 'the Mac''s provisioning UDID'
+      ecs: host.id
+      status: mapped
+      notes: >-
+        the stable device identity and the join key to Jamf Pro's inventory,
+        which is where everything else about the machine lives
+    - vendor: input.host.serial
+      type: string
+      description: hardware serial number
+      ecs: device.serial_number
+      status: mapped
+      notes: >-
+        the asset-management identity, and the one a property record uses; it
+        differs from the UDID and both are needed to reconcile the two systems
+    - vendor: input.host.ips
+      type: ip
+      description: addresses on the Mac
+      ecs: host.ip
+      status: mapped
+      notes: an array, including loopback and virtual interfaces
+    - vendor: input.host.os
+      type: string
+      description: macOS version
+      ecs: host.os.full
+      status: mapped
+    - vendor: input.host.protectVersion
+      type: string
+      description: version of the Jamf Protect agent
+      ecs: observer.version
+      status: mapped
+      notes: >-
+        an agent behind the fleet cannot run newer analytics, so a stale
+        version here explains an endpoint that never alerts
+    - vendor: input.related.files[]
+      type: array
+      description: files involved in the match, with path, inode, uid and mode
+      ecs: null
+      status: partial
+      custom: jamf_protect.related.files
+      notes: >
+        the evidence graph, and the reason an alert here is worth more than a
+        detection name. ECS has one file object per document, so a match
+        touching several files cannot be expressed in ECS at all - the array
+        has to be kept whole and the primary file promoted alongside it.
+    - vendor: input.related.processes[]
+      type: array
+      description: processes involved, with pid, path, arguments and signing
+      ecs: null
+      status: partial
+      custom: jamf_protect.related.processes
+      notes: >-
+        carries the process ancestry for the match; the same one-object limit
+        as files applies, and this is where full argument vectors live
+    - vendor: input.related.users[]
+      type: array
+      description: users involved in the match
+      ecs: null
+      status: partial
+      custom: jamf_protect.related.users
+      notes: >-
+        resolves the numeric uids on the event to names, which is the only
+        place that mapping appears
+    - vendor: input.related.binaries[]
+      type: array
+      description: binaries involved, with hashes and code-signing detail
+      ecs: null
+      status: partial
+      custom: jamf_protect.related.binaries
+      notes: >-
+        the hashes the integration lifts into related.hash; unsigned or
+        ad-hoc-signed binaries are the field to look at first on a macOS alert
+    - vendor: caid
+      type: string
+      description: the Jamf Protect tenant identifier
+      ecs: null
+      status: unmapped
+      custom: jamf_protect.caid
+- id: telemetry
+  name: Endpoint Security telemetry
+  description: |
+    The unfiltered macOS Endpoint Security event stream the agent observes - process execution, file events and their code-signing state - as opposed to the analytics that fire on it. The corroborating evidence a hunt pivots into, and the only view of macOS process activity the catalogue has.
+    Its defining property is volume: this is every exec on every Mac. Enabling it broadly is a bandwidth and storage decision before it is a detection one.
+  event_categories:
+  - process
+  - file
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Streamed from the agent. Highest-volume macOS feed by a wide margin
+        and the first candidate for edge filtering by process path.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes. Full argument vectors cross as free text.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-jamf_protect.telemetry
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Streamed from the agent.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-jamf_protect.telemetry
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: elastic/integrations jamf_protect, data stream telemetry
+      notes: >
+        Almost everything on this stream is promoted to ECS - one vendor field
+        survives - so the mapping work is small and the operational decisions
+        are all about volume. Note there is a separate telemetry_legacy data
+        stream for older agents with a different shape; confirm which one the
+        fleet produces before building against either.
+    fields:
+    - vendor: event.type
+      type: string
+      description: the Endpoint Security event, e.g. exec
+      ecs: event.action
+      status: mapped
+    - vendor: event.code
+      type: integer
+      description: numeric Endpoint Security event type
+      ecs: event.code
+      status: partial
+      transform: cast to string
+      notes: >-
+        the ES framework's own event numbering; stable across macOS releases
+        and the right thing to filter on at the edge, because it does not
+        depend on Jamf's naming
+    - vendor: process.executable
+      type: string
+      description: path of the executed binary
+      ecs: process.executable
+      status: mapped
+    - vendor: process.args
+      type: array
+      description: full argument vector
+      ecs: process.args
+      status: mapped
+      notes: >-
+        macOS passes environment entries in the same vector - the sample
+        record carries PATH and XPC_SERVICE_NAME among the arguments - so this
+        is not a clean command line and joining it into one string produces
+        something that was never executed
+    - vendor: process.code_signature.signing_id
+      type: string
+      description: 'the binary''s code-signing identifier'
+      ecs: process.code_signature.signing_id
+      status: mapped
+      notes: >-
+        the macOS equivalent of a publisher check and the most useful single
+        field for allow-listing; com.apple.* is Apple-signed
+    - vendor: process.code_signature.flags
+      type: string
+      description: code-signing flags
+      ecs: process.code_signature.flags
+      status: partial
+      notes: >-
+        a bitfield delivered as a decimal string; the platform-binary and
+        hardened-runtime bits are the ones worth decoding, and nothing decodes
+        them upstream
+    - vendor: process.endpoint_security_client
+      type: boolean
+      description: whether the process is itself an Endpoint Security client
+      ecs: null
+      status: partial
+      custom: jamf_protect.telemetry.endpoint_security_client
+      notes: >-
+        another security product's agent; useful for excluding known scanners
+        from noise, and equally useful for noticing an unrecognised process
+        holding that entitlement
+    - vendor: event_allowed_by_esclient
+      type: boolean
+      description: whether the Endpoint Security client permitted the operation
+      ecs: event.outcome
+      status: partial
+      transform: true to success, false to failure
+      notes: >
+        the one field that survives under the vendor namespace, and the only
+        statement of whether anything was actually blocked. Telemetry is
+        otherwise observational - a record here does not mean the operation
+        was prevented, and reading it as enforcement is the mistake this
+        stream invites.
+    - vendor: user.effective.id
+      type: string
+      description: effective user id of the process
+      ecs: user.effective.id
+      status: mapped
+      notes: >-
+        effective rather than real, so a setuid binary reports the identity it
+        escalated to - which is the one that matters and also the one that
+        hides the invoking user
+    - vendor: host.id
+      type: string
+      description: 'the Mac''s hardware identifier'
+      ecs: host.id
+      status: mapped
+    - vendor: device.serial_number
+      type: string
+      description: hardware serial number
+      ecs: device.serial_number
+      status: mapped
+    - vendor: host.os.full
+      type: string
+      description: macOS version and build
+      ecs: host.os.full
+      status: mapped
+    - vendor: observer.version
+      type: string
+      description: version of the Jamf Protect agent
+      ecs: observer.version
+      status: mapped

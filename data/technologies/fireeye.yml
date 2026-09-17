@@ -1,0 +1,3302 @@
+id: fireeye
+name: >-
+  FireEye NX / EX / FX / AX / CM (Trellix Network, Email, File & Malware
+  Analysis Security with Central Management)
+vendor: Trellix (formerly FireEye)
+versions: >-
+  NX/EX/FX/AX/CM 8.x, 9.x (FireEye); Network / Email / File Security, Malware
+  Analysis and Central Management 10.x, 11.x (Trellix)
+draft: true
+references:
+- https://docs.trellix.com/
+- https://docs.sekoia.com/integration/categories/network_security/trellix_nx/
+- https://www.elastic.co/docs/reference/integrations/fireeye
+- >-
+  https://github.com/elastic/integrations/tree/main/packages/fireeye/data_stream/nx
+- https://docs.rapid7.com/insightidr/fireeye-nx/
+- >-
+  https://docs.trellix.com/bundle/fe-email-server-landing/page/UUID-ca2a7502-d2aa-2294-6577-2592319a5837.html
+datasets:
+- id: nx-alert
+  name: NX network security alert (JSON extended)
+  description: >
+    fenotify alerts raised by the NX (Network Security) appliance, forwarded
+    centrally through the CM's rsyslog notification channel as one JSON object
+    per alert. alert.name carries the alert type (malware-object,
+    malware-callback, domain-match, infection-match, web-infection, ips-event,
+    riskware variants) and decides which explanation branches are populated;
+    extended verbosity additionally ships the full MVX detonation trace under
+    alert.explanation.os-changes.
+  event_categories:
+  - malware
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Receives JSON over TCP syslog from the CM's consolidated rsyslog
+        notification profile (Format = JSON, verbosity extended, Delivery =
+        per event, All events); the CM forwards notifications for every
+        managed appliance, so the appliance alert datasets share one wire feed
+        split by the envelope product token. Crosses the Everfox HSG under an
+        allow-list on the logs-fireeye.nx_alert destination data stream. The
+        free-text cnc-service channel strings and the extended os-changes
+        detonation trace need stripping or hard caps before the boundary.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-fireeye.nx_alert
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Receives JSON over TCP syslog from the CM's consolidated rsyslog
+        notification profile (Format = JSON, verbosity extended, Delivery =
+        per event, All events); the CM forwards notifications for every
+        managed appliance, so the appliance alert datasets share one wire feed
+        split by the envelope product token.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-fireeye.nx_alert
+  formats:
+  - format: json
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom FireEye JSON alert pipeline
+      notes: >
+        No vendor Cribl pack exists for FireEye/Trellix, and the Elastic
+        FireEye integration only ships an `nx` data stream that parses the
+        network-metadata feed (see the nx-metadata dataset), not the alert
+        notification feed. So this is a hand-built Cribl pipeline: strip the
+        syslog envelope, Extract JSON, split by the envelope product token
+        (the appliance alert datasets share the CM's single wire feed), then
+        flatten the nested alert object into ECS. The JSON keys are stable
+        descriptive paths, but explanation.malware-detected.malware arrives as
+        a single object on some software trains and an array on others, and
+        the pipeline must normalize that shape before mapping.
+    fields:
+    - vendor: appliance
+      type: string
+      description: >-
+        hostname identifying the appliance that raised the alert (notification
+        envelope, outside the alert object)
+      ecs: observer.hostname
+      status: partial
+      notes: >-
+        CM-forwarded feed — confirm in-tool that this names the originating NX
+        sensor rather than the forwarding CM; observer.hostname must identify
+        the sensor
+    - vendor: appliance-id
+      type: string
+      description: appliance identifier from the notification envelope
+      ecs: observer.serial_number
+      status: partial
+      notes: >-
+        confirm in-tool that this value matches the hardware serial convention
+        the asset inventory uses before joining on it
+    - vendor: product
+      type: string
+      description: product token in the notification envelope, e.g. "Web MPS" / "Network Security"
+      ecs: observer.product
+      status: mapped
+    - vendor: version
+      type: string
+      description: appliance software version emitting the notification
+      ecs: observer.version
+      status: mapped
+    - vendor: msg
+      type: string
+      description: notification type carried by the envelope, outside the alert object
+      ecs: event.kind
+      status: partial
+      transform: >-
+        set event.kind to `alert`; the raw token is the discriminator the
+        pipeline splits the CM's single wire feed on, not a value worth
+        carrying further
+      notes: >-
+        confirm in-tool that every record of the alert notification feed
+        carries the same token here
+    - vendor: alert.id
+      type: long
+      description: >-
+        appliance-assigned alert number, also embedded in the leading
+        "fenotify-<n>.alert" syslog tag
+      ecs: event.id
+      status: mapped
+    - vendor: alert.class
+      type: string
+      description: detection family the alert belongs to
+      ecs: rule.category
+      status: partial
+      notes: >-
+        vendor vocabulary; ECS event.category is a closed set the FireEye
+        classes do not map onto one for one, so the raw class rides on
+        rule.category and event.category is derived from it in the pipeline
+    - vendor: alert.root-infection
+      type: integer
+      description: identifier of the root infection this alert is correlated to
+      ecs: null
+      status: unmapped
+      custom: fireeye.nx.root_infection
+      notes: >-
+        correlation key with no ECS home - a candidate custom field, and the
+        one that lets a CSOC analyst group every alert of a single infection
+    - vendor: alert.uuid
+      type: string
+      description: universally unique alert identifier, stable across appliance renumbering
+      ecs: null
+      status: unmapped
+      custom: fireeye.nx.alert_uuid
+      notes: the durable cross-appliance join key; alert.id is only unique per appliance
+    - vendor: alert.product
+      type: string
+      description: detecting product named inside the alert object
+      ecs: event.provider
+      status: partial
+      notes: >-
+        the envelope's own product key carries observer.product; this is the
+        engine that raised the alert, so it belongs on the event rather than
+        the observer - confirm the two can differ on a CM-forwarded feed
+    - vendor: alert.version
+      type: string
+      description: software version reported inside the alert object
+      ecs: null
+      status: unmapped
+      custom: fireeye.nx.alert_version
+      notes: >-
+        observer.version already carries the appliance version from the
+        envelope; this is the alerting engine's own version and has no
+        separate ECS home - candidate for a custom field
+    - vendor: alert.sensor
+      type: string
+      description: sensor that produced the alert
+      ecs: observer.name
+      status: partial
+      notes: >-
+        same CM caveat as appliance - confirm this names the originating NX
+        sensor and not the forwarding CM
+    - vendor: alert.name
+      type: enum
+      description: >-
+        alert-type name — malware-object, malware-callback, domain-match,
+        infection-match, web-infection, ips-event, riskware variants
+      ecs: event.action
+      status: mapped
+    - vendor: alert.severity
+      type: enum
+      description: severity token — minr, majr, crit (casing varies by software train)
+      ecs: event.severity
+      status: partial
+      transform: >
+        three-token vendor scale, not a number; translate through a
+        case-insensitive lookup onto the platform-wide numeric severity
+        convention rather than copying the token through
+    - vendor: alert.occurred
+      type: timestamp
+      description: when the appliance registered the alert
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        "yyyy-MM-dd HH:mm:ss Z"-style with an explicit offset on JSON trains;
+        parse the offset rather than assuming local time, since the appliance
+        clock and the syslog envelope routinely disagree
+    - vendor: alert.attack-time
+      type: string (timestamp)
+      description: >-
+        time the attack itself was observed, which precedes the time the alert
+        was raised
+      ecs: event.start
+      status: partial
+      notes: >-
+        alert.occurred carries @timestamp; keeping the attack time on
+        event.start stops a detonation delay reading as the event time -
+        confirm the two differ in the deployed feed
+    - vendor: alert.action
+      type: enum
+      description: action the appliance took — notified or blocked
+      ecs: event.type
+      status: partial
+      transform: >
+        vendor values are translated to the ECS event.type vocabulary (allowed
+        / denied); note that "notified" means the NX was in detection-only
+        mode and the object still reached the endpoint, which is the
+        distinction the CSOC actually alerts on
+    - vendor: alert.ack
+      type: string
+      description: whether the alert has been acknowledged in the console
+      ecs: null
+      status: unmapped
+      custom: fireeye.nx.ack
+      notes: >-
+        console workflow state rather than event data; no ECS field expresses
+        it and it changes after the record is written
+    - vendor: alert.src.ip
+      type: ip
+      description: IP address of the victim/internal endpoint in the detected session
+      ecs: source.ip
+      status: mapped
+    - vendor: alert.src.port
+      type: port
+      description: source TCP/UDP port of the detected session
+      ecs: source.port
+      status: mapped
+    - vendor: alert.src.mac
+      type: string
+      description: MAC address of the victim endpoint as seen by the sensor
+      ecs: source.mac
+      status: mapped
+    - vendor: alert.src.host
+      type: string
+      description: hostname of the victim endpoint, when the sensor can resolve it
+      ecs: source.domain
+      status: mapped
+      notes: >-
+        frequently absent — resolution depends on what the sensor observes; do
+        not build detections that assume presence
+    - vendor: alert.src.vlan
+      type: integer
+      description: VLAN identifier the detected session was observed on
+      ecs: network.vlan.id
+      status: mapped
+    - vendor: alert.dst.ip
+      type: ip
+      description: IP address of the external/malicious peer in the detected session
+      ecs: destination.ip
+      status: mapped
+    - vendor: alert.dst.port
+      type: port
+      description: destination TCP/UDP port of the detected session
+      ecs: destination.port
+      status: mapped
+    - vendor: alert.dst.mac
+      type: string
+      description: MAC address of the next hop toward the malicious peer
+      ecs: destination.mac
+      status: mapped
+    - vendor: alert.explanation.protocol
+      type: enum
+      description: transport protocol of the detected session (tcp, udp, icmp)
+      ecs: network.transport
+      status: mapped
+    - vendor: alert.explanation.malware-detected.malware.name
+      type: string
+      description: detection/signature name, e.g. Trojan.Gen.MFC or FireEye.Malware.Binary
+      ecs: rule.name
+      status: mapped
+      notes: >-
+        malware arrives as a single object on some trains and an array on
+        others — normalize to an array before mapping, and take the first
+        element as the headline detection
+    - vendor: alert.explanation.malware-detected.malware.sid
+      type: long
+      description: numeric signature identifier for the detection that fired
+      ecs: rule.id
+      status: mapped
+    - vendor: alert.explanation.malware-detected.malware.md5sum
+      type: string
+      description: MD5 hash of the detonated object
+      ecs: file.hash.md5
+      status: mapped
+    - vendor: alert.explanation.malware-detected.malware.sha256
+      type: string
+      description: SHA-256 hash of the detonated object
+      ecs: file.hash.sha256
+      status: mapped
+    - vendor: alert.explanation.malware-detected.malware.url
+      type: string
+      description: >-
+        full URL the object was retrieved from, on web-infection and
+        malware-object alerts
+      ecs: url.original
+      status: mapped
+      notes: >
+        this is download provenance for the detonated object, not the URL of
+        the event itself. ECS 9.4 has beta file.origin_url; adopt when GA —
+        until then url.original carries it and analysts must know it describes
+        where the malware object came from
+    - vendor: alert.explanation.malware-detected.malware.original
+      type: string
+      description: original name of the object as it was transferred
+      ecs: file.name
+      status: mapped
+    - vendor: alert.explanation.malware-detected.malware.type
+      type: string
+      description: malware family type the detection assigned
+      ecs: null
+      status: unmapped
+      custom: fireeye.nx.malware_type
+      notes: >-
+        threat.software.type is the nearest ECS target but is defined against
+        the ATT&CK software list, which this vocabulary is not - verify the
+        emitted values before binding it
+    - vendor: alert.explanation.malware-detected.malware.malicious
+      type: string
+      description: verdict flag for the analysed object
+      ecs: null
+      status: unmapped
+      custom: fireeye.nx.malware_malicious
+      notes: >-
+        ECS carries no malicious boolean - the verdict is expressed through
+        event.category and event.type, which the pipeline derives; kept here
+        so the raw verdict is not lost
+    - vendor: alert.explanation.malware-detected.malware.submitted-at
+      type: string (timestamp)
+      description: time the object was submitted for analysis
+      ecs: event.created
+      status: partial
+      notes: >-
+        the pipeline's own ingest time also competes for event.created -
+        confirm which the CSOC wants before binding
+    - vendor: alert.explanation.malware-detected.malware.executed-at
+      type: string (timestamp)
+      description: time the object was executed during analysis
+      ecs: null
+      status: unmapped
+      custom: fireeye.nx.malware_executed_at
+      notes: >-
+        event.start already carries alert.attack-time; the detonation timeline
+        needs custom fields rather than competing for the same ECS target
+    - vendor: alert.explanation.malware-detected.malware.profile
+      type: string
+      description: analysis profile the object was detonated against
+      ecs: null
+      status: unmapped
+      custom: fireeye.nx.malware_profile
+      notes: >-
+        names the guest image, so it describes the analysis rather than the
+        event - candidate custom field
+    - vendor: alert.explanation.malware-detected.malware.http-header
+      type: string
+      description: HTTP headers captured with the transferred object
+      ecs: null
+      status: unmapped
+      custom: fireeye.nx.malware_http_header
+      notes: >-
+        ECS decomposes HTTP into http.request.* rather than carrying a raw
+        header blob; splitting it is pipeline work, so the raw value stays
+        unmapped until the CSOC asks for specific headers
+    - vendor: alert.explanation.cnc-services.cnc-service.address
+      type: string
+      description: command-and-control endpoint contacted on callback alerts
+      ecs: null
+      status: unmapped
+      custom: fireeye.nx.cnc.host
+      notes: >
+        value may be either a hostname or a bare IP, so it cannot be split
+        into destination.domain / destination.ip without a type test, and it
+        is not always the same as alert.dst.ip
+    - vendor: alert.explanation.cnc-services.cnc-service.channel
+      type: string
+      description: raw callback protocol payload — HTTP request line and headers
+      ecs: null
+      status: unmapped
+      custom: fireeye.nx.cnc.channel
+      notes: >-
+        high value for hunting, high risk for guard content inspection — the
+        field most likely to be truncated or stripped at a boundary
+    - vendor: alert.explanation.cnc-services.cnc-service.port
+      type: port
+      description: port of the command-and-control service contacted
+      ecs: null
+      status: unmapped
+      custom: fireeye.nx.cnc.port
+      notes: >-
+        kept alongside the cnc host rather than mapped to destination.port,
+        which belongs to the detected session and can differ
+    - vendor: alert.explanation.os-changes
+      type: object
+      description: >-
+        full MVX detonation trace — process, file, registry and network
+        changes observed in the sandbox (extended verbosity only)
+      ecs: null
+      status: unmapped
+      custom: fireeye.nx.os_changes
+      notes: >
+        can run to hundreds of kilobytes per alert and describes the MVX
+        sandbox image, not the victim endpoint — never let any of it reach
+        host.os.*, and strip it from the guarded route low-side; retain it
+        only on the direct high-side path if the index budget allows
+    - vendor: alert.mitre-mapping.code[].id
+      type: string
+      description: ATT&CK technique identifier the detection maps to
+      ecs: threat.technique.id
+      status: partial
+      transform: >-
+        an id of the form Txxxx.nnn is a sub-technique: put the full value on
+        threat.technique.subtechnique.id and the parent Txxxx on
+        threat.technique.id; a bare Txxxx populates threat.technique.id alone.
+        Set threat.framework to `MITRE ATT&CK` alongside
+      notes: >-
+        the feed carries both forms - verify against the deployed feed which
+        appear, because a sub-technique left on threat.technique.id breaks the
+        ATT&CK navigator views the CSOC builds from it
+    - vendor: alert.mitre-mapping.code[].name
+      type: string
+      description: ATT&CK technique name for the mapped code
+      ecs: threat.technique.name
+      status: partial
+      transform: >-
+        where the id is a sub-technique this name is the sub-technique's: put
+        it on threat.technique.subtechnique.name and carry the parent
+        technique name on threat.technique.name
+    - vendor: alert.mitre-mapping.code[].tactic
+      type: string
+      description: ATT&CK tactics the mapped technique serves
+      ecs: threat.tactic.name
+      status: partial
+      transform: >-
+        an array - one technique can serve several tactics, and
+        threat.tactic.name is array-capable, so it is carried through without
+        flattening
+      notes: >-
+        confirm whether the deployed feed also emits the tactic ids;
+        threat.tactic.id would be the better key for dashboards if so
+    - vendor: alert.alert-url
+      type: string
+      description: >-
+        deep link back to the alert on the NX/CM web UI
+        (event_stream/events_for_bot?ev_id=...), the analyst pivot for full
+        artifact detail
+      ecs: event.reference
+      status: mapped
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Flatten the nested alert object here and emit full ECS-shaped JSON:
+          normalize malware-detected.malware to an array before mapping, and
+          type-test the cnc-service address before deciding whether it is a
+          hostname or an IP. Do the three normalizations low-side: the
+          severity token scale (minr / majr / crit — casing varies by train)
+          through a lookup onto the platform-wide numeric convention, the
+          notified/blocked action through a lookup to event.type while
+          retaining the raw value (notified means detection-only and the
+          object still reached the endpoint), and the occurred timestamp parse
+          honoring its explicit UTC offset, since the appliance clock and
+          syslog envelope routinely disagree. Strip
+          alert.explanation.os-changes from the guarded route before the
+          crossing — the extended detonation trace can push a single record to
+          hundreds of kilobytes and it is sandbox telemetry, not victim
+          telemetry — and cap the cnc-service channel free text. Then validate
+          against a Schema Library schema (C.Schema(...).validate) with a
+          dead-letter route immediately before the guard destination and
+          Persistent Queue backpressure rather than Block; keep _raw across
+          the crossing once os-changes is stripped, since malware alerts are
+          the forensic class and this hand-built parser is unproven.
+        elastic: >
+          No integration covers this feed, so stand up a custom ingest
+          pipeline and index template for logs-fireeye.nx_alert that accepts
+          the pre-shaped documents instead of re-parsing them, with
+          custom-namespace keyword mappings for fireeye.nx.cnc.host,
+          fireeye.nx.cnc.channel and fireeye.nx.alert_uuid. Assert in the
+          template that event.severity arrives as the normalized numeric value
+          and that nothing from the os-changes detonation trace ever reaches
+          host.os.*, because it describes the MVX sandbox image rather than
+          the victim endpoint. Populate file.hash.sha256 alongside the MD5 so
+          alerts join the same threat-intel enrichment as the metadata feed.
+        relay: >
+          Full ECS-shaped JSON crosses the guard: the appliance emits JSON
+          over syslog and the low-side worker reshapes it, so what reaches the
+          boundary is the flattened document, never the raw five-level
+          notification nesting — hold the crossing document to two levels with
+          short ASCII keys. The two content-inspection flashpoints are the
+          cnc-service channel (raw callback HTTP request lines and headers)
+          and the extended os-changes detonation trace; strip os-changes
+          low-side and bound channel and url.original to declared lengths so
+          the content filter stays deterministic. Treat the crossing as
+          at-most-once with no return channel and detect silent drops by
+          reconciling low-side and high-side counts per (dataset, hour) rather
+          than expecting acknowledgements.
+      direct:
+        parse_location: low
+        cribl: >
+          Flatten the nested alert object at the edge worker and emit full
+          ECS-shaped JSON: normalize malware-detected.malware to an array
+          before mapping, and type-test the cnc-service address before
+          deciding whether it is a hostname or an IP. Do the three
+          normalizations at parse time: the severity token scale (minr / majr
+          / crit — casing varies by train) through a lookup onto the
+          platform-wide numeric convention, the notified/blocked action
+          through a lookup to event.type while retaining the raw value
+          (notified means detection-only and the object still reached the
+          endpoint), and the occurred timestamp parse honoring its explicit
+          UTC offset, since the appliance clock and syslog envelope routinely
+          disagree. With no guard on this path, retain the full cnc-service
+          channel free text and keep alert.explanation.os-changes where the
+          index budget allows — the extended detonation trace runs to hundreds
+          of kilobytes but is the forensic value of the feed; it is sandbox
+          telemetry, so still never let any of it reach host.os.*. Keep _raw,
+          since malware alerts are the forensic class and this hand-built
+          parser is unproven.
+        elastic: >
+          No integration covers this feed, so stand up a custom ingest
+          pipeline and index template for logs-fireeye.nx_alert that accepts
+          the pre-shaped documents instead of re-parsing them, with
+          custom-namespace keyword mappings for fireeye.nx.cnc.host,
+          fireeye.nx.cnc.channel and fireeye.nx.alert_uuid. Assert in the
+          template that event.severity arrives as the normalized numeric value
+          and that nothing from the os-changes detonation trace ever reaches
+          host.os.*, because it describes the MVX sandbox image rather than
+          the victim endpoint. Populate file.hash.sha256 alongside the MD5 so
+          alerts join the same threat-intel enrichment as the metadata feed.
+  - format: syslog-cef
+    enable: >
+      On the emitting NX (or centrally on the CM notification profile that
+      forwards for it) go to Settings > Notifications and check rsyslog to
+      enable a syslog notification. Enter the collector IP and a port above
+      1024 (the vendor guidance is to avoid 514), select the transport
+      (UDP/TCP) under Protocol, and set the Format drop-down to CEF; set
+      Delivery to Per Event and Notifications to All Events so every alert
+      type (malware-object, malware-callback, domain-match, infection-match,
+      web-infection, ips-event) is emitted. The equivalent CLI on the
+      appliance is `fenotify rsyslog trap-sink <sink> prefer message format
+      cef` with `fenotify rsyslog alert <type> enable` per alert type. CEF is
+      a single-format selection on the notification channel, so it replaces
+      the JSON verbosity on that channel rather than adding to it.
+    references:
+    - https://docs.rapid7.com/insightidr/fireeye-nx/
+    - >-
+      https://docs.fortinet.com/document/fortisiem/7.1.1/external-systems-configuration-guide/308860/fireeye-malware-protection-system-mps
+    - https://www.ibm.com/docs/en/dsm?topic=configuration-fireeye
+    - >-
+      https://docs.cloud.google.com/chronicle/docs/ingestion/default-parsers/fireeye-alert
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom FireEye CEF alert pipeline (CEF unpack + ECS map)
+      notes: >
+        The Elastic FireEye integration only parses the nx JSON metadata feed,
+        so it does not cover the CEF alert line; Cribl's CEF function (or an
+        ingest-pipeline CEF processor) unpacks the header and extension pairs,
+        then a custom stage maps the cs/cn slots to ECS. Unlike the JSON path
+        there is no nested object to flatten and no malware array to normalize
+        - CEF is already flat - but the cs slots are positional, so the
+        cs*Label pairs (cs1Label=sname, cs5Label=cncHost, cs6Label=ccChannel)
+        must be honoured rather than assumed, because slot assignment can
+        drift across software trains. Preserve CEF backslash-escaping of '='
+        '|' and newline inside values through the unpack.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Unpack the CEF line low-side and map the extensions to ECS: src/
+          spt/smac to source.*, dst/dpt/dmac to destination.*, proto to
+          network.transport, cn1(vlan) to network.vlan.id, cs1(sname) to
+          rule.name, request to url.original and cs4(link) to event.reference,
+          externalId to event.id and dvchost/dvc to
+          observer.hostname/observer.ip. Read severity from the CEF header
+          severity field, which the appliance already renders as a 0-10 number
+          rather than the minr/majr/crit token the JSON carries, so map it
+          through a numeric-scale lookup onto the platform severity convention
+          instead of the token lookup the JSON path uses. Keep cs5(cncHost),
+          cn3(cncPort) and cs6(ccChannel) in the fireeye.nx.cnc namespace and
+          type-test cncHost before deciding host vs IP. CEF is a single line
+          with no os-changes trace, so no stripping stage is needed, but still
+          cap cs6/ccChannel and request to declared lengths before the
+          crossing.
+        elastic: >
+          No integration covers the CEF alert line, so stand up a custom
+          ingest pipeline and index template for logs-fireeye.nx_alert that
+          accepts the pre-shaped documents, with custom-namespace keyword
+          mappings for fireeye.nx.cnc.host, fireeye.nx.cnc.channel and
+          fireeye.nx.cnc.port. Record at the template level that the CEF form
+          carries only file.hash.md5 (no sha256) and no host.os.* detonation
+          detail, so threat-intel enrichment keys on the MD5 alone on this
+          transport. Assert event.severity arrives as the normalized numeric
+          value.
+        relay: >
+          A single bounded CEF line is a friendlier crossing than the JSON
+          tree: there is no kilobyte os-changes trace and no five-level
+          nesting, so the record is naturally short. The two free-text
+          flashpoints remain the cs6/ccChannel callback payload and the
+          request URL - length-cap and unicode-normalize both low-side - and
+          the CEF escaping of '=' '|' and embedded newlines must survive the
+          content filter intact or the high-side unpack desyncs. Treat the
+          crossing as at-most-once with Persistent Queue (never Block) and per
+          (dataset, hour) count reconciliation as the only drop detector.
+      direct:
+        parse_location: low
+        cribl: >
+          High-side NX with no guard: unpack the CEF line and map the
+          extensions to ECS — src/spt/smac to source.*, dst/dpt/dmac to
+          destination.*, proto to network.transport, cn1(vlan) to
+          network.vlan.id, cs1(sname) to rule.name, request to url.original
+          and cs4(link) to event.reference, externalId to event.id and
+          dvchost/dvc to observer.hostname/observer.ip — normalizing the
+          numeric CEF header severity through the numeric-scale lookup and
+          keeping cs5(cncHost)/cn3(cncPort)/cs6(ccChannel) in the
+          fireeye.nx.cnc namespace with a host-vs-IP type test on cncHost.
+          Retain the full ccChannel and request values. Pick CEF or the JSON
+          verbosity as the single authoritative alert feed per appliance
+          notification channel, since the Format selector is one choice per
+          channel and running both double-counts alerts.
+        elastic: >
+          Custom ingest pipeline and index template for logs-fireeye.nx_alert
+          with keyword mappings for fireeye.nx.cnc.host,
+          fireeye.nx.cnc.channel and fireeye.nx.cnc.port. With no boundary the
+          fidelity ceiling of CEF is the reason to prefer JSON where the
+          detonation trace and sha256 matter: CEF here is the lightweight
+          option for a SIEM that only consumes the flat alert headline, not
+          the forensic MVX detail.
+    fields:
+    - vendor: rt
+      type: timestamp
+      description: FireEye CEF extension - receipt/event time of the alert.
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        CEF rt is either epoch milliseconds or a "MMM dd yyyy HH:mm:ss" string
+        depending on train; parse both forms, and prefer it over the syslog
+        envelope time since appliance and envelope clocks routinely disagree.
+    - vendor: src
+      type: ip
+      description: FireEye CEF extension - victim/internal endpoint IP of the detected session.
+      ecs: source.ip
+      status: mapped
+    - vendor: spt
+      type: port
+      description: FireEye CEF extension - source port of the detected session.
+      ecs: source.port
+      status: mapped
+    - vendor: smac
+      type: string
+      description: FireEye CEF extension - MAC address of the victim endpoint.
+      ecs: source.mac
+      status: mapped
+    - vendor: dst
+      type: ip
+      description: FireEye CEF extension - external/malicious peer IP of the detected session.
+      ecs: destination.ip
+      status: mapped
+    - vendor: dpt
+      type: port
+      description: FireEye CEF extension - destination port of the detected session.
+      ecs: destination.port
+      status: mapped
+    - vendor: dmac
+      type: string
+      description: FireEye CEF extension - MAC address of the next hop toward the peer.
+      ecs: destination.mac
+      status: mapped
+    - vendor: proto
+      type: string
+      description: FireEye CEF extension - transport protocol of the session (tcp/udp).
+      ecs: network.transport
+      status: mapped
+    - vendor: cn1
+      type: integer
+      description: FireEye CEF extension (cn1Label=vlan) - VLAN id the session was observed on.
+      ecs: network.vlan.id
+      status: mapped
+      notes: >-
+        honour the cn1Label pairing rather than assuming the cn slot, as slot
+        assignment varies by train
+    - vendor: cs1
+      type: string
+      description: >-
+        FireEye CEF extension (cs1Label=sname) - detection/signature name,
+        e.g. Trojan.Gen.MFC.
+      ecs: rule.name
+      status: mapped
+    - vendor: request
+      type: string
+      description: >-
+        FireEye CEF extension - full URL the object was retrieved from
+        (web-infection / malware-object).
+      ecs: url.original
+      status: partial
+      notes: >-
+        download provenance of the detonated object, not the URL of the event
+        itself; populated only on web/download alerts
+    - vendor: cs4
+      type: string
+      description: >-
+        FireEye CEF extension (cs4Label=link) - console deep link back to the
+        alert on the NX/CM UI.
+      ecs: event.reference
+      status: mapped
+    - vendor: fileHash
+      type: string
+      description: FireEye CEF extension - hash of the detonated object.
+      ecs: file.hash.md5
+      status: partial
+      notes: >
+        the single-line CEF form carries one fileHash, typically the MD5; the
+        sha256 the JSON verbosity also emits is not expressible here, so
+        threat-intel joins on this transport key on the MD5 alone.
+    - vendor: cs5
+      type: string
+      description: >-
+        FireEye CEF extension (cs5Label=cncHost) - command-and-control
+        endpoint on callback alerts.
+      ecs: null
+      status: unmapped
+      custom: fireeye.nx.cnc.host
+      notes: >-
+        may be a hostname or a bare IP, so it needs a type test before any
+        split into destination.domain/destination.ip, and is not always
+        alert.dst
+    - vendor: cs6
+      type: string
+      description: >-
+        FireEye CEF extension (cs6Label=ccChannel) - raw callback protocol
+        payload (HTTP request line and headers).
+      ecs: null
+      status: unmapped
+      custom: fireeye.nx.cnc.channel
+      notes: >-
+        high hunting value, high guard-inspection risk - the field most likely
+        to be truncated or stripped at a boundary
+    - vendor: cn3
+      type: port
+      description: FireEye CEF extension (cn3Label=cncPort) - port of the C&C service contacted.
+      ecs: null
+      status: unmapped
+      custom: fireeye.nx.cnc.port
+      notes: >-
+        kept alongside the cnc host rather than mapped to destination.port,
+        which belongs to the detected session and can differ
+    - vendor: externalId
+      type: long
+      description: >-
+        FireEye CEF extension - appliance-assigned alert number, matching the
+        fenotify-<n>.alert tag.
+      ecs: event.id
+      status: mapped
+    - vendor: act
+      type: string
+      description: FireEye CEF extension - action the appliance took (notified / blocked).
+      ecs: event.type
+      status: partial
+      transform: >
+        map to the ECS event.type vocabulary (allowed/denied) while retaining
+        the raw value; "notified" means detection-only and the object still
+        reached the endpoint, the distinction the CSOC alerts on.
+    - vendor: dvchost
+      type: string
+      description: FireEye CEF extension - hostname of the appliance that raised the alert.
+      ecs: observer.hostname
+      status: partial
+      notes: >-
+        on a CM-forwarded feed confirm in-tool that this names the originating
+        NX sensor rather than the forwarding CM
+    - vendor: dvc
+      type: ip
+      description: FireEye CEF extension - management IP of the emitting appliance.
+      ecs: observer.ip
+      status: mapped
+    - vendor: CEF header severity
+      type: integer
+      description: CEF header field 8 - alert severity rendered as a 0-10 number.
+      ecs: event.severity
+      status: partial
+      transform: >
+        the CEF header already renders severity as a number rather than the
+        minr/majr/crit token the JSON carries, so normalize it through a
+        numeric-scale lookup onto the platform severity convention.
+    - vendor: CEF header name
+      type: string
+      description: CEF header field 6 - human alert name (the alert type, e.g. malware-callback).
+      ecs: event.action
+      status: mapped
+  - format: syslog-leef
+    enable: >
+      Configured on the same Settings > Notifications > rsyslog panel (or the
+      CM notification profile) as CEF, but with the Format drop-down set to
+      LEEF; Delivery Per Event and Notifications All Events as before. The
+      appliance emits LEEF:1.0|FireEye|<product>|<version>|<eventType>|
+      followed by tab/caret-delimited key=value pairs. LEEF and CEF are
+      mutually exclusive Format selections on a given channel.
+    references:
+    - https://www.ibm.com/docs/en/dsm?topic=configuration-fireeye
+    - https://www.securitynik.com/2014/08/qradar-extracting-fields-from-fireeye.html
+    - https://docs.rapid7.com/insightidr/fireeye-nx/
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom FireEye LEEF alert pipeline (LEEF unpack + ECS map)
+      notes: >
+        Neither the Elastic FireEye integration nor a Cribl pack ingests LEEF,
+        so the pipeline splits the five-field LEEF header, then parses the
+        delimited key=value body (the delimiter is declared in the header, tab
+        by default) and maps the named keys to ECS. Because LEEF names the
+        fields explicitly (sname, cncHost, cncPort, cncChannel), the mapping
+        avoids the cs-slot ambiguity of CEF, but the payload is the same
+        single-line subset - no os-changes trace, one fileHash.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Split the LEEF header and body low-side and map the named keys:
+          src/srcPort/srcMAC to source.*, dst/dstPort/dstMAC to destination.*,
+          proto to network.transport, vlan to network.vlan.id, sname to
+          rule.name, request to url.original, link to event.reference,
+          externalId to event.id, dvchost/dvc to
+          observer.hostname/observer.ip. Keep cncHost/cncPort/cncChannel in
+          the fireeye.nx.cnc namespace with the same host-vs-IP type test as
+          the JSON path. Parse devTime against its devTimeFormat rather than
+          the envelope time, and normalize the severity value through the
+          numeric-scale lookup. Cap cncChannel and request before the guard.
+        elastic: >
+          Custom ingest pipeline and index template for logs-fireeye.nx_alert
+          as with CEF, with the same fireeye.nx.cnc.* keyword mappings.
+          Because LEEF names its fields, the pipeline is more robust across
+          trains than the CEF slot mapping; assert the same MD5-only hash and
+          numeric event.severity constraints.
+        relay: >
+          A single named-key LEEF line crosses even more legibly than CEF -
+          the keys are self-describing, so a content filter can allow-list by
+          key name. The free-text flashpoints are still cncChannel and
+          request; length-cap and unicode-normalize them low-side, and
+          preserve the declared LEEF delimiter so the high-side split stays
+          aligned. At-most-once, Persistent Queue, per (dataset, hour)
+          reconciliation.
+      direct:
+        parse_location: low
+        cribl: >
+          High-side NX with no guard: split the LEEF header and body and map
+          the named keys — src/srcPort/srcMAC to source.*, dst/dstPort/dstMAC
+          to destination.*, proto to network.transport, vlan to
+          network.vlan.id, sname to rule.name, request to url.original, link
+          to event.reference, externalId to event.id, dvchost/dvc to
+          observer.hostname/observer.ip — keeping cncHost/cncPort/ cncChannel
+          in the fireeye.nx.cnc namespace with a host-vs-IP type test on
+          cncHost, parsing devTime against its devTimeFormat and normalizing
+          severity through the numeric-scale lookup. Retain full cncChannel
+          and request values. Choose LEEF or JSON as the single authoritative
+          feed per notification channel to avoid double counts.
+        elastic: >
+          Custom ingest pipeline and index template for logs-fireeye.nx_alert
+          with the fireeye.nx.cnc.* keyword mappings; LEEF is the option where
+          a downstream that prefers named-key syslog over nested JSON consumes
+          the flat alert headline without the forensic MVX detail.
+    fields:
+    - vendor: devTime
+      type: timestamp
+      description: FireEye LEEF key - device event time; format declared by the devTimeFormat key.
+      ecs: '@timestamp'
+      status: partial
+      transform: >-
+        parse against the accompanying devTimeFormat rather than assuming a
+        fixed pattern or the envelope time
+    - vendor: src
+      type: ip
+      description: FireEye LEEF key - victim/internal endpoint IP.
+      ecs: source.ip
+      status: mapped
+    - vendor: srcPort
+      type: port
+      description: FireEye LEEF key - source port of the session.
+      ecs: source.port
+      status: mapped
+    - vendor: srcMAC
+      type: string
+      description: FireEye LEEF key - MAC address of the victim endpoint.
+      ecs: source.mac
+      status: mapped
+    - vendor: dst
+      type: ip
+      description: FireEye LEEF key - external/malicious peer IP.
+      ecs: destination.ip
+      status: mapped
+    - vendor: dstPort
+      type: port
+      description: FireEye LEEF key - destination port of the session.
+      ecs: destination.port
+      status: mapped
+    - vendor: dstMAC
+      type: string
+      description: FireEye LEEF key - MAC address of the next hop toward the peer.
+      ecs: destination.mac
+      status: mapped
+    - vendor: proto
+      type: string
+      description: FireEye LEEF key - transport protocol (tcp/udp).
+      ecs: network.transport
+      status: mapped
+    - vendor: vlan
+      type: integer
+      description: FireEye LEEF key - VLAN id the session was observed on.
+      ecs: network.vlan.id
+      status: mapped
+    - vendor: sname
+      type: string
+      description: FireEye LEEF key - detection/signature name.
+      ecs: rule.name
+      status: mapped
+    - vendor: request
+      type: string
+      description: FireEye LEEF key - URL the object was retrieved from.
+      ecs: url.original
+      status: partial
+      notes: >-
+        download provenance of the detonated object; populated only on
+        web/download alerts
+    - vendor: link
+      type: string
+      description: FireEye LEEF key - console deep link back to the alert.
+      ecs: event.reference
+      status: mapped
+    - vendor: fileHash
+      type: string
+      description: FireEye LEEF key - hash of the detonated object.
+      ecs: file.hash.md5
+      status: partial
+      notes: >-
+        single-line LEEF carries one hash (MD5); sha256 is not expressible on
+        this transport
+    - vendor: cncHost
+      type: string
+      description: FireEye LEEF key - command-and-control endpoint on callback alerts.
+      ecs: null
+      status: unmapped
+      custom: fireeye.nx.cnc.host
+      notes: may be a hostname or a bare IP - type-test before any host/IP split
+    - vendor: cncPort
+      type: port
+      description: FireEye LEEF key - port of the C&C service contacted.
+      ecs: null
+      status: unmapped
+      custom: fireeye.nx.cnc.port
+    - vendor: cncChannel
+      type: string
+      description: >-
+        FireEye LEEF key - raw callback protocol payload (HTTP request line
+        and headers).
+      ecs: null
+      status: unmapped
+      custom: fireeye.nx.cnc.channel
+      notes: >-
+        the guard-inspection flashpoint on this feed, most likely to be
+        truncated at a boundary
+    - vendor: externalId
+      type: long
+      description: FireEye LEEF key - appliance-assigned alert number.
+      ecs: event.id
+      status: mapped
+    - vendor: dvchost
+      type: string
+      description: FireEye LEEF key - hostname of the emitting appliance.
+      ecs: observer.hostname
+      status: partial
+      notes: on a CM-forwarded feed confirm it names the originating NX, not the CM
+    - vendor: dvc
+      type: ip
+      description: FireEye LEEF key - management IP of the emitting appliance.
+      ecs: observer.ip
+      status: mapped
+- id: ex-alert
+  name: EX email security alert (JSON extended)
+  description: >
+    fenotify alerts from the EX (Email Security - Server) appliance, forwarded
+    centrally through the CM with product token eMPS / Email MPS in the
+    notification envelope, one JSON object per alert. Emitted when an
+    attachment or embedded URL detonates malicious in the MVX engine, carrying
+    the envelope sender/recipient and subject under alert.src / alert.dst /
+    alert.smtp-message alongside the detection.
+  event_categories:
+  - malware
+  - file
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Arrives on the CM's consolidated notification feed (Format = JSON,
+        verbosity extended, Delivery = per event); the envelope product token
+        (eMPS / Email MPS) is the routing discriminator. Crosses the Everfox
+        HSG; email subjects and attachment filenames are user-controlled free
+        text and are the first thing a content-inspection policy will reject
+        or truncate.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-fireeye.ex_alert
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Arrives on the CM's consolidated notification feed (Format = JSON,
+        verbosity extended, Delivery = per event); the envelope product token
+        (eMPS / Email MPS) is the routing discriminator.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-fireeye.ex_alert
+  formats:
+  - format: json
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom FireEye JSON alert pipeline (shared envelope stage, EX-specific flatten)
+      notes: >
+        Shares the syslog-envelope strip and Extract JSON stage with nx-alert
+        but needs its own flatten: the email-specific src.smtp-mail-from /
+        dst.smtp-to / smtp-message keys never appear on the NX, and the
+        detection detail lives under the same explanation.malware-detected
+        branch with attachment semantics (original = filename) instead of
+        network-object semantics.
+    fields:
+    - vendor: appliance
+      type: string
+      description: hostname identifying the appliance that raised the alert (notification envelope)
+      ecs: observer.hostname
+      status: partial
+      notes: >-
+        CM-forwarded feed — confirm in-tool that this names the originating EX
+        rather than the forwarding CM; observer.hostname must identify the
+        sensor
+    - vendor: product
+      type: string
+      description: product token in the notification envelope, e.g. "Email MPS" / eMPS
+      ecs: observer.product
+      status: mapped
+    - vendor: version
+      type: string
+      description: appliance software version emitting the notification
+      ecs: observer.version
+      status: mapped
+    - vendor: msg
+      type: string
+      description: notification type carried by the envelope, outside the alert object
+      ecs: event.kind
+      status: partial
+      transform: >-
+        set event.kind to `alert`; the raw token is the discriminator the
+        pipeline splits the CM's single wire feed on, not a value worth
+        carrying further
+      notes: >-
+        confirm in-tool that every record of the alert notification feed
+        carries the same token here. carried on the alert envelope the
+        appliance feeds share, so it is expected here too; the wording above
+        is verified against an NX record and inferred for this product -
+        confirm on its own feed
+    - vendor: alert.id
+      type: long
+      description: appliance-assigned alert number, matching the fenotify-<n>.alert syslog tag
+      ecs: event.id
+      status: mapped
+    - vendor: alert.class
+      type: string
+      description: detection family the alert belongs to
+      ecs: rule.category
+      status: partial
+      notes: >-
+        vendor vocabulary; ECS event.category is a closed set the FireEye
+        classes do not map onto one for one, so the raw class rides on
+        rule.category and event.category is derived from it in the pipeline.
+        carried on the alert envelope the appliance feeds share, so it is
+        expected here too; the wording above is verified against an NX record
+        and inferred for this product - confirm on its own feed
+    - vendor: alert.root-infection
+      type: integer
+      description: identifier of the root infection this alert is correlated to
+      ecs: null
+      status: unmapped
+      custom: fireeye.ex.root_infection
+      notes: >-
+        correlation key with no ECS home - a candidate custom field, and the
+        one that lets a CSOC analyst group every alert of a single infection.
+        carried on the alert envelope the appliance feeds share, so it is
+        expected here too; the wording above is verified against an NX record
+        and inferred for this product - confirm on its own feed
+    - vendor: alert.uuid
+      type: string
+      description: universally unique alert identifier, stable across appliance renumbering
+      ecs: null
+      status: unmapped
+      custom: fireeye.ex.alert_uuid
+      notes: the durable cross-appliance join key; alert.id is only unique per appliance
+    - vendor: alert.product
+      type: string
+      description: detecting product named inside the alert object
+      ecs: event.provider
+      status: partial
+      notes: >-
+        the envelope's own product key carries observer.product; this is the
+        engine that raised the alert, so it belongs on the event rather than
+        the observer - confirm the two can differ on a CM-forwarded feed.
+        carried on the alert envelope the appliance feeds share, so it is
+        expected here too; the wording above is verified against an NX record
+        and inferred for this product - confirm on its own feed
+    - vendor: alert.version
+      type: string
+      description: software version reported inside the alert object
+      ecs: null
+      status: unmapped
+      custom: fireeye.ex.alert_version
+      notes: >-
+        observer.version already carries the appliance version from the
+        envelope; this is the alerting engine's own version and has no
+        separate ECS home - candidate for a custom field. carried on the alert
+        envelope the appliance feeds share, so it is expected here too; the
+        wording above is verified against an NX record and inferred for this
+        product - confirm on its own feed
+    - vendor: alert.sensor
+      type: string
+      description: sensor that produced the alert
+      ecs: observer.name
+      status: partial
+      notes: >-
+        same CM caveat as appliance - confirm this names the originating NX
+        sensor and not the forwarding CM. carried on the alert envelope the
+        appliance feeds share, so it is expected here too; the wording above
+        is verified against an NX record and inferred for this product -
+        confirm on its own feed
+    - vendor: alert.name
+      type: enum
+      description: alert-type name, e.g. malware-object (and phish-object on newer trains)
+      ecs: event.action
+      status: mapped
+    - vendor: alert.severity
+      type: enum
+      description: severity token — minr, majr, crit (casing varies by software train)
+      ecs: event.severity
+      status: partial
+      transform: >-
+        same three-token vendor scale as the NX; normalize through the same
+        case-insensitive lookup
+    - vendor: alert.occurred
+      type: timestamp
+      description: when the alert was raised
+      ecs: '@timestamp'
+      status: partial
+      transform: same explicit-offset timestamp parse as the NX alert dataset
+    - vendor: alert.attack-time
+      type: string (timestamp)
+      description: >-
+        time the attack itself was observed, which precedes the time the alert
+        was raised
+      ecs: event.start
+      status: partial
+      notes: >-
+        alert.occurred carries @timestamp; keeping the attack time on
+        event.start stops a detonation delay reading as the event time -
+        confirm the two differ in the deployed feed. carried on the alert
+        envelope the appliance feeds share, so it is expected here too; the
+        wording above is verified against an NX record and inferred for this
+        product - confirm on its own feed
+    - vendor: alert.action
+      type: enum
+      description: disposition applied to the message
+      ecs: event.type
+      status: partial
+      transform: >
+        vendor values mapped to allowed / denied; quarantined is operationally
+        distinct from blocked (the message is recoverable by an admin) and
+        that nuance is lost in ECS, so the raw value is retained — confirm the
+        deployed value set in-tool
+    - vendor: alert.src.smtp-mail-from
+      type: string
+      description: envelope sender address of the offending message
+      ecs: email.from.address
+      status: partial
+      notes: >
+        trivially spoofed and not necessarily the header From, so alerting on
+        it needs to be paired with the gateway's own auth results rather than
+        trusted alone
+    - vendor: alert.dst.smtp-to
+      type: string
+      description: envelope recipient address the alert was raised for
+      ecs: email.to.address
+      status: partial
+      notes: >-
+        single recipient per alert record — a message fanned out to N
+        recipients produces N alerts, so recipient counts must be derived by
+        grouping on the per-message correlator, not by counting events
+    - vendor: alert.smtp-message.subject
+      type: string
+      description: subject line of the offending message
+      ecs: email.subject
+      status: mapped
+      notes: >
+        user-controlled free text (unicode, RFC 2047 encoded words) — the
+        guard-crossing flashpoint on this feed
+    - vendor: alert.smtp-message.id
+      type: string
+      description: appliance handle for the message payload
+      ecs: email.message_id
+      status: partial
+      notes: >
+        behaves as the per-message correlator across the N-recipient fan-out;
+        confirm in-tool that the key is present on the deployed train and
+        whether it carries the RFC 5322 Message-ID or an appliance-internal
+        handle before joining against mail-gateway logs
+    - vendor: alert.explanation.malware-detected.malware.name
+      type: string
+      description: detection/signature name for the malicious attachment or URL
+      ecs: rule.name
+      status: mapped
+      notes: >-
+        same object-or-array shape variance as the NX — normalize to an array
+        before mapping
+    - vendor: alert.explanation.malware-detected.malware.sid
+      type: long
+      description: numeric signature identifier for the detection that fired
+      ecs: rule.id
+      status: mapped
+    - vendor: alert.explanation.malware-detected.malware.original
+      type: string
+      description: filename of the malicious attachment
+      ecs: email.attachments.file.name
+      status: mapped
+    - vendor: alert.explanation.malware-detected.malware.md5sum
+      type: string
+      description: MD5 hash of the detonated attachment
+      ecs: email.attachments.file.hash.md5
+      status: mapped
+    - vendor: alert.explanation.malware-detected.malware.sha256
+      type: string
+      description: SHA-256 hash of the detonated attachment
+      ecs: email.attachments.file.hash.sha256
+      status: mapped
+    - vendor: alert.explanation.malware-detected.malware.type
+      type: string
+      description: vendor file-type token for the attachment, e.g. "exe" or "pdf"
+      ecs: email.attachments.file.mime_type
+      status: partial
+      notes: >-
+        free text rather than a strict IANA media type, so it needs a lookup
+        before it satisfies email.attachments.file.mime_type consumers
+    - vendor: alert.explanation.malware-detected.malware.url
+      type: string
+      description: malicious URL extracted from the message body
+      ecs: url.original
+      status: partial
+      notes: populated only for URL-detonation alerts, empty for attachment-only alerts
+    - vendor: alert.explanation.os-changes
+      type: object
+      description: full MVX detonation trace for the attachment (extended verbosity only)
+      ecs: null
+      status: unmapped
+      custom: fireeye.ex.os_changes
+      notes: >-
+        same handling as the NX — sandbox telemetry, never host.os.*, strip
+        from the guarded route low-side
+    - vendor: alert.alert-url
+      type: string
+      description: deep link back to the alert detail on the EX/CM web UI
+      ecs: event.reference
+      status: mapped
+    - vendor: alert.ack
+      type: string
+      description: whether the alert has been acknowledged in the console
+      ecs: null
+      status: unmapped
+      custom: fireeye.ex.ack
+      notes: >-
+        console workflow state rather than event data; no ECS field expresses
+        it and it changes after the record is written. carried on the alert
+        envelope the appliance feeds share, so it is expected here too; the
+        wording above is verified against an NX record and inferred for this
+        product - confirm on its own feed
+    - vendor: alert.mitre-mapping.code[].id
+      type: string
+      description: ATT&CK technique identifier the detection maps to
+      ecs: threat.technique.id
+      status: partial
+      transform: >-
+        an id of the form Txxxx.nnn is a sub-technique: put the full value on
+        threat.technique.subtechnique.id and the parent Txxxx on
+        threat.technique.id; a bare Txxxx populates threat.technique.id alone.
+        Set threat.framework to `MITRE ATT&CK` alongside
+      notes: >-
+        the feed carries both forms - verify against the deployed feed which
+        appear, because a sub-technique left on threat.technique.id breaks the
+        ATT&CK navigator views the CSOC builds from it. carried on the alert
+        envelope the appliance feeds share, so it is expected here too; the
+        wording above is verified against an NX record and inferred for this
+        product - confirm on its own feed
+    - vendor: alert.mitre-mapping.code[].name
+      type: string
+      description: ATT&CK technique name for the mapped code
+      ecs: threat.technique.name
+      status: partial
+      transform: >-
+        where the id is a sub-technique this name is the sub-technique's: put
+        it on threat.technique.subtechnique.name and carry the parent
+        technique name on threat.technique.name
+      notes: >-
+        carried on the alert envelope the appliance feeds share, so it is
+        expected here too; the wording above is verified against an NX record
+        and inferred for this product - confirm on its own feed
+    - vendor: alert.mitre-mapping.code[].tactic
+      type: string
+      description: ATT&CK tactics the mapped technique serves
+      ecs: threat.tactic.name
+      status: partial
+      transform: >-
+        an array - one technique can serve several tactics, and
+        threat.tactic.name is array-capable, so it is carried through without
+        flattening
+      notes: >-
+        confirm whether the deployed feed also emits the tactic ids;
+        threat.tactic.id would be the better key for dashboards if so. carried
+        on the alert envelope the appliance feeds share, so it is expected
+        here too; the wording above is verified against an NX record and
+        inferred for this product - confirm on its own feed
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Reuse the nx-alert envelope and Extract JSON stages but give the EX
+          its own flatten — normalize malware-detected.malware to an array
+          exactly as on the NX, then map the attachment fields (original,
+          md5sum, sha256, type) into the email.attachments namespace. Apply
+          the same severity token lookup and the action lookup while retaining
+          the raw value (quarantined is admin-recoverable, blocked is not —
+          confirm the deployed action value set in-tool), and the same
+          occurred timestamp parse. Normalize subjects and attachment
+          filenames to UTF-8, strip control characters and enforce declared
+          length caps before the guard destination, and translate the
+          free-text malware.type token through a lookup before it is allowed
+          to satisfy email.attachments.file.mime_type consumers. Strip
+          os-changes from the guarded route as on the NX, then
+          Schema-Library-validate with a dead-letter route and Persistent
+          Queue backpressure ahead of the guard destination; keep _raw once
+          os-changes is stripped, since alert records are small without it and
+          the flatten is hand-built.
+        elastic: >
+          The FireEye package ships only an nx data stream, so
+          logs-fireeye.ex_alert needs its own custom ingest pipeline and index
+          template, with custom-namespace keyword mappings for
+          fireeye.ex.alert_uuid and fireeye.ex.os_changes handling. Map the
+          email.attachments.* objects as nested so per-attachment filename and
+          hash queries resolve, and treat email.message_id as the appliance
+          payload handle rather than the RFC 5322 header until a join against
+          the mail gateway is actually confirmed. Record at the template level
+          that recipient counts are derived by grouping on that per-message
+          correlator, because a message fanned out to N recipients produces N
+          alert documents.
+        relay: >
+          Full ECS-shaped JSON crosses, flattened from the notification
+          nesting on the low side. The friction here is user-controlled free
+          text: subjects and attachment filenames carry unicode and RFC 2047
+          encoded words, so normalize to UTF-8, strip control characters and
+          enforce declared length caps on subject, filename and url.original
+          before the guard destination so content inspection stays
+          deterministic; strip the os-changes detonation trace before the
+          boundary as on the NX feed. Treat the crossing as at-most-once with
+          Persistent Queue (never Block) on the guard destination and per
+          (dataset, hour) count reconciliation as the only drop detector.
+      direct:
+        parse_location: low
+        cribl: >
+          Reuse the nx-alert envelope and Extract JSON stages but give the EX
+          its own flatten — normalize malware-detected.malware to an array
+          exactly as on the NX, then map the attachment fields (original,
+          md5sum, sha256, type) into the email.attachments namespace. Apply
+          the same severity token lookup and the action lookup while retaining
+          the raw value (quarantined is admin-recoverable, blocked is not —
+          confirm the deployed action value set in-tool), and the same
+          occurred timestamp parse. Normalize subjects and attachment
+          filenames to UTF-8 and translate the free-text malware.type token
+          through a lookup before it is allowed to satisfy
+          email.attachments.file.mime_type consumers. With no guard on this
+          path, retain os-changes where the index budget allows — it is
+          sandbox telemetry, so still never let any of it reach host.os.*.
+          Keep _raw, since the flatten is hand-built.
+        elastic: >
+          The FireEye package ships only an nx data stream, so
+          logs-fireeye.ex_alert needs its own custom ingest pipeline and index
+          template, with custom-namespace keyword mappings for
+          fireeye.ex.alert_uuid and fireeye.ex.os_changes handling. Map the
+          email.attachments.* objects as nested so per-attachment filename and
+          hash queries resolve, and treat email.message_id as the appliance
+          payload handle rather than the RFC 5322 header until a join against
+          the mail gateway is actually confirmed. Record at the template level
+          that recipient counts are derived by grouping on that per-message
+          correlator, because a message fanned out to N recipients produces N
+          alert documents.
+  - format: syslog-cef
+    enable: >
+      On the EX (or the CM notification profile carrying the eMPS product
+      token) set Settings > Notifications > rsyslog Format to CEF, Delivery
+      Per Event, Notifications All Events; enable the email alert types
+      (malware-object, and phish-object on newer trains) so attachment and URL
+      detonations are emitted. The CLI equivalent is `fenotify rsyslog
+      trap-sink <sink> prefer message format cef` with `fenotify rsyslog alert
+      malware-object enable`. CEF is one Format selection per channel,
+      mutually exclusive with the JSON verbosity.
+    references:
+    - https://docs.logrhythm.com/devices/docs/syslog-fireeye-ex
+    - >-
+      https://docs.cloud.google.com/chronicle/docs/ingestion/default-parsers/fireeye-emps
+    - https://www.ibm.com/docs/en/dsm?topic=configuration-fireeye
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom FireEye EX CEF alert pipeline (CEF unpack + email ECS map)
+      notes: >
+        Reuses the CEF-unpack stage of the NX pipeline but maps the email
+        extensions: suser/duser to the email address namespace, msg to
+        email.subject, fname/fileHash to the email.attachments namespace. The
+        single-line CEF form carries one attachment hash and no nested
+        per-attachment array, so a multi-attachment message renders its
+        headline attachment only; and as in the JSON form a message fanned out
+        to N recipients produces N alert lines that must be correlated on the
+        appliance message handle, which CEF does not always carry.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Unpack the CEF line low-side and map suser to email.from.address,
+          duser to email.to.address, msg to email.subject, fname to
+          email.attachments.file.name and fileHash to
+          email.attachments.file.hash.md5, cs1(sname) to rule.name, request to
+          url.original and cs4(link) to event.reference, externalId to
+          event.id, dvchost to observer.hostname. Normalize the subject and
+          filename to UTF-8, strip control characters and enforce declared
+          length caps before the guard, and read severity from the numeric CEF
+          header field through the numeric-scale lookup. Map act to event.type
+          while retaining the raw value (quarantined is admin-recoverable,
+          blocked is not).
+        elastic: >
+          Custom ingest pipeline and index template for logs-fireeye.ex_alert
+          with email.attachments.* mapped as nested so per-attachment filename
+          and hash queries resolve; note at the template level that the CEF
+          line carries a single attachment hash (MD5) and no sha256 or
+          os-changes, and that recipient counts derive from grouping on the
+          appliance message handle, not from counting lines.
+        relay: >
+          User-controlled free text is the friction here: the msg subject and
+          fname filename carry unicode and RFC 2047 encoded words, so
+          normalize to UTF-8, strip control characters and cap subject,
+          filename and the request URL length low-side before the crossing.
+          The bounded single CEF line is otherwise a clean crossing with no
+          os-changes trace. At-most-once, Persistent Queue, per (dataset,
+          hour) reconciliation.
+      direct:
+        parse_location: low
+        cribl: >
+          High-side EX with no guard: unpack the CEF line and map suser to
+          email.from.address, duser to email.to.address, msg to email.subject,
+          fname to email.attachments.file.name and fileHash to
+          email.attachments.file.hash.md5, cs1(sname) to rule.name, request to
+          url.original and cs4(link) to event.reference, externalId to
+          event.id, dvchost to observer.hostname; read severity from the
+          numeric CEF header field through the numeric-scale lookup and map
+          act to event.type while retaining the raw value (quarantined is
+          admin-recoverable, blocked is not). Retain full subject and filename
+          values. Choose CEF or JSON as the single authoritative feed per
+          notification channel.
+        elastic: >
+          Custom ingest pipeline and index template for logs-fireeye.ex_alert
+          with email.attachments.* mapped as nested so per-attachment filename
+          and hash queries resolve, and recipient counts derived by grouping
+          on the appliance message handle rather than counting lines; CEF is
+          the lighter option where the SIEM consumes the flat email alert
+          headline and does not need the MVX detonation detail the JSON
+          verbosity carries.
+    fields:
+    - vendor: suser
+      type: string
+      description: FireEye EX CEF extension - envelope sender address of the offending message.
+      ecs: email.from.address
+      status: partial
+      notes: >-
+        trivially spoofed and not necessarily the header From; pair with the
+        gateway's own auth results before trusting
+    - vendor: duser
+      type: string
+      description: FireEye EX CEF extension - envelope recipient the alert was raised for.
+      ecs: email.to.address
+      status: partial
+      notes: >-
+        one recipient per alert line; a fan-out to N recipients produces N
+        lines, so recipient counts derive from the message handle, not a line
+        count
+    - vendor: msg
+      type: string
+      description: FireEye EX CEF extension - subject line of the offending message.
+      ecs: email.subject
+      status: mapped
+      notes: >-
+        user-controlled free text (unicode, RFC 2047 encoded words) - the
+        guard-crossing flashpoint on this feed
+    - vendor: fname
+      type: string
+      description: FireEye EX CEF extension - filename of the malicious attachment.
+      ecs: email.attachments.file.name
+      status: mapped
+    - vendor: fileHash
+      type: string
+      description: FireEye EX CEF extension - hash of the malicious attachment.
+      ecs: email.attachments.file.hash.md5
+      status: partial
+      notes: >-
+        the single-line CEF carries one attachment hash (MD5) and no
+        per-attachment array, so a multi-attachment message shows its headline
+        attachment only
+    - vendor: cs1
+      type: string
+      description: >-
+        FireEye EX CEF extension (cs1Label=sname) - detection/signature name
+        for the attachment or URL.
+      ecs: rule.name
+      status: mapped
+    - vendor: request
+      type: string
+      description: >-
+        FireEye EX CEF extension - malicious URL extracted from the message
+        body, on URL-detonation alerts.
+      ecs: url.original
+      status: partial
+      notes: populated only for URL-detonation alerts, empty for attachment-only alerts
+    - vendor: cs4
+      type: string
+      description: >-
+        FireEye EX CEF extension (cs4Label=link) - console deep link back to
+        the alert on the EX/CM UI.
+      ecs: event.reference
+      status: mapped
+    - vendor: act
+      type: string
+      description: FireEye EX CEF extension - disposition applied to the message.
+      ecs: event.type
+      status: partial
+      transform: >
+        map to allowed/denied while retaining the raw value; quarantined is
+        operationally distinct from blocked (recoverable by an admin) and that
+        nuance is lost in ECS.
+    - vendor: externalId
+      type: long
+      description: FireEye EX CEF extension - appliance-assigned alert number.
+      ecs: event.id
+      status: mapped
+    - vendor: dvchost
+      type: string
+      description: FireEye EX CEF extension - hostname of the emitting EX appliance.
+      ecs: observer.hostname
+      status: partial
+      notes: on a CM-forwarded feed confirm it names the originating EX, not the CM
+    - vendor: CEF header severity
+      type: integer
+      description: CEF header field 8 - alert severity as a 0-10 number.
+      ecs: event.severity
+      status: partial
+      transform: >-
+        numeric CEF severity, normalized through the numeric-scale lookup
+        rather than the minr/majr/crit token lookup
+    - vendor: CEF header name
+      type: string
+      description: CEF header field 6 - alert name (alert type, e.g. malware-object).
+      ecs: event.action
+      status: mapped
+  - format: syslog-leef
+    enable: >
+      Same Settings > Notifications > rsyslog panel with the Format set to
+      LEEF; enable the email alert types as for CEF. LEEF and CEF are mutually
+      exclusive Format selections on the channel.
+    references:
+    - https://www.ibm.com/docs/en/dsm?topic=configuration-fireeye
+    - https://docs.logrhythm.com/devices/docs/syslog-fireeye-ex
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom FireEye EX LEEF alert pipeline (LEEF unpack + email ECS map)
+      notes: >
+        Splits the LEEF header and delimited body and maps the email named
+        keys to ECS. As with CEF the line carries one attachment hash and no
+        nested per-attachment array, and one recipient per line correlated on
+        the message handle.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Map the LEEF email keys low-side - sender to email.from.address,
+          recipient to email.to.address, subject to email.subject, attachment
+          filename to email.attachments.file.name and its hash to
+          email.attachments.file.hash.md5, sname to rule.name - and apply the
+          same UTF-8 normalization, control-character stripping and length
+          caps on subject and filename before the crossing. Parse devTime
+          against devTimeFormat and normalize severity through the
+          numeric-scale lookup.
+        elastic: >
+          Custom pipeline and index template for logs-fireeye.ex_alert as with
+          CEF, email.attachments.* nested; the named-key LEEF mapping is more
+          robust across trains than the CEF slots.
+        relay: >
+          Same subject/filename free-text friction as CEF; cap and normalize
+          low-side, preserve the LEEF delimiter across the crossing, and run
+          at-most-once with Persistent Queue and per (dataset, hour)
+          reconciliation.
+      direct:
+        parse_location: low
+        cribl: >
+          High-side EX with no guard: split the LEEF header and body and map
+          the email named keys — sender to email.from.address, recipient to
+          email.to.address, subject to email.subject, attachment filename to
+          email.attachments.file.name and its hash to
+          email.attachments.file.hash.md5, sname to rule.name — parsing
+          devTime against devTimeFormat and normalizing severity through the
+          numeric-scale lookup. Retain full subject and filename values.
+          Choose LEEF or JSON as the single authoritative channel feed.
+        elastic: >
+          Custom ingest pipeline and index template for logs-fireeye.ex_alert
+          with email.attachments.* nested; LEEF is the option for a named-key
+          syslog consumer that does not need the MVX detail.
+    fields:
+    - vendor: devTime
+      type: timestamp
+      description: FireEye EX LEEF key - device event time; format in devTimeFormat.
+      ecs: '@timestamp'
+      status: partial
+      transform: parse against the accompanying devTimeFormat rather than the envelope time
+    - vendor: src
+      type: ip
+      description: >-
+        FireEye EX LEEF key - connecting/source IP recorded for the message,
+        where present.
+      ecs: source.ip
+      status: partial
+      notes: >-
+        confirm in-tool which EX trains populate a source address on the email
+        alert line
+    - vendor: suser
+      type: string
+      description: FireEye EX LEEF key - envelope sender address.
+      ecs: email.from.address
+      status: partial
+      notes: trivially spoofed; pair with gateway auth results before trusting
+    - vendor: duser
+      type: string
+      description: FireEye EX LEEF key - envelope recipient address.
+      ecs: email.to.address
+      status: partial
+      notes: one recipient per line; derive recipient counts from the message handle
+    - vendor: msg
+      type: string
+      description: FireEye EX LEEF key - subject line of the offending message.
+      ecs: email.subject
+      status: mapped
+      notes: user-controlled free text - the guard-crossing flashpoint on this feed
+    - vendor: fname
+      type: string
+      description: FireEye EX LEEF key - filename of the malicious attachment.
+      ecs: email.attachments.file.name
+      status: mapped
+    - vendor: fileHash
+      type: string
+      description: FireEye EX LEEF key - hash of the malicious attachment.
+      ecs: email.attachments.file.hash.md5
+      status: partial
+      notes: one attachment hash (MD5) on the single line; no per-attachment array
+    - vendor: sname
+      type: string
+      description: FireEye EX LEEF key - detection/signature name.
+      ecs: rule.name
+      status: mapped
+    - vendor: request
+      type: string
+      description: >-
+        FireEye EX LEEF key - malicious URL extracted from the message body,
+        on URL-detonation alerts.
+      ecs: url.original
+      status: partial
+      notes: populated only for URL-detonation alerts
+    - vendor: externalId
+      type: long
+      description: FireEye EX LEEF key - appliance-assigned alert number.
+      ecs: event.id
+      status: mapped
+    - vendor: dvchost
+      type: string
+      description: FireEye EX LEEF key - hostname of the emitting EX appliance.
+      ecs: observer.hostname
+      status: partial
+      notes: on a CM-forwarded feed confirm it names the originating EX, not the CM
+- id: fx-alert
+  name: FX file security alert (JSON extended)
+  description: >
+    fenotify alerts from the FX (File Content Security) appliance, forwarded
+    centrally through the CM with product token File MPS in the notification
+    envelope, one JSON object per alert. Raised when a file discovered on a
+    monitored CIFS/NFS share detonates malicious in the MVX engine; the alert
+    carries the file's path on the scanned share alongside its hashes and the
+    detection detail.
+  event_categories:
+  - malware
+  - file
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Arrives on the CM's consolidated notification feed (Format = JSON,
+        verbosity extended, Delivery = per event); the envelope product token
+        (File MPS) is the routing discriminator. Crosses the Everfox HSG;
+        share paths and filenames are user-controlled free text and the first
+        thing a content-inspection policy will reject or truncate.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-fireeye.fx_alert
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Arrives on the CM's consolidated notification feed (Format = JSON,
+        verbosity extended, Delivery = per event); the envelope product token
+        (File MPS) is the routing discriminator.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-fireeye.fx_alert
+  formats:
+  - format: json
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom FireEye JSON alert pipeline (shared envelope stage, FX-specific flatten)
+      notes: >
+        Shares the syslog-envelope strip and Extract JSON stage with the other
+        appliance alert feeds but needs its own flatten: the detection detail
+        lives under the same explanation.malware-detected branch, with
+        malware.original carrying the file's full path on the scanned share
+        rather than a bare filename.
+    fields:
+    - vendor: appliance
+      type: string
+      description: hostname identifying the appliance that raised the alert (notification envelope)
+      ecs: observer.hostname
+      status: partial
+      notes: >-
+        CM-forwarded feed — confirm in-tool that this names the originating FX
+        rather than the forwarding CM; observer.hostname must identify the
+        sensor
+    - vendor: product
+      type: string
+      description: product token in the notification envelope, e.g. "File MPS"
+      ecs: observer.product
+      status: mapped
+    - vendor: version
+      type: string
+      description: appliance software version emitting the notification
+      ecs: observer.version
+      status: mapped
+    - vendor: msg
+      type: string
+      description: notification type carried by the envelope, outside the alert object
+      ecs: event.kind
+      status: partial
+      transform: >-
+        set event.kind to `alert`; the raw token is the discriminator the
+        pipeline splits the CM's single wire feed on, not a value worth
+        carrying further
+      notes: >-
+        confirm in-tool that every record of the alert notification feed
+        carries the same token here. carried on the alert envelope the
+        appliance feeds share, so it is expected here too; the wording above
+        is verified against an NX record and inferred for this product -
+        confirm on its own feed
+    - vendor: alert.id
+      type: long
+      description: appliance-assigned alert number, matching the fenotify-<n>.alert syslog tag
+      ecs: event.id
+      status: mapped
+    - vendor: alert.class
+      type: string
+      description: detection family the alert belongs to
+      ecs: rule.category
+      status: partial
+      notes: >-
+        vendor vocabulary; ECS event.category is a closed set the FireEye
+        classes do not map onto one for one, so the raw class rides on
+        rule.category and event.category is derived from it in the pipeline.
+        carried on the alert envelope the appliance feeds share, so it is
+        expected here too; the wording above is verified against an NX record
+        and inferred for this product - confirm on its own feed
+    - vendor: alert.root-infection
+      type: integer
+      description: identifier of the root infection this alert is correlated to
+      ecs: null
+      status: unmapped
+      custom: fireeye.fx.root_infection
+      notes: >-
+        correlation key with no ECS home - a candidate custom field, and the
+        one that lets a CSOC analyst group every alert of a single infection.
+        carried on the alert envelope the appliance feeds share, so it is
+        expected here too; the wording above is verified against an NX record
+        and inferred for this product - confirm on its own feed
+    - vendor: alert.uuid
+      type: string
+      description: universally unique alert identifier, stable across appliance renumbering
+      ecs: null
+      status: unmapped
+      custom: fireeye.fx.alert_uuid
+      notes: the durable cross-appliance join key; alert.id is only unique per appliance
+    - vendor: alert.product
+      type: string
+      description: detecting product named inside the alert object
+      ecs: event.provider
+      status: partial
+      notes: >-
+        the envelope's own product key carries observer.product; this is the
+        engine that raised the alert, so it belongs on the event rather than
+        the observer - confirm the two can differ on a CM-forwarded feed.
+        carried on the alert envelope the appliance feeds share, so it is
+        expected here too; the wording above is verified against an NX record
+        and inferred for this product - confirm on its own feed
+    - vendor: alert.version
+      type: string
+      description: software version reported inside the alert object
+      ecs: null
+      status: unmapped
+      custom: fireeye.fx.alert_version
+      notes: >-
+        observer.version already carries the appliance version from the
+        envelope; this is the alerting engine's own version and has no
+        separate ECS home - candidate for a custom field. carried on the alert
+        envelope the appliance feeds share, so it is expected here too; the
+        wording above is verified against an NX record and inferred for this
+        product - confirm on its own feed
+    - vendor: alert.sensor
+      type: string
+      description: sensor that produced the alert
+      ecs: observer.name
+      status: partial
+      notes: >-
+        same CM caveat as appliance - confirm this names the originating NX
+        sensor and not the forwarding CM. carried on the alert envelope the
+        appliance feeds share, so it is expected here too; the wording above
+        is verified against an NX record and inferred for this product -
+        confirm on its own feed
+    - vendor: alert.name
+      type: enum
+      description: alert-type name, e.g. malware-object
+      ecs: event.action
+      status: mapped
+    - vendor: alert.severity
+      type: enum
+      description: severity token — minr, majr, crit (casing varies by software train)
+      ecs: event.severity
+      status: partial
+      transform: >-
+        same three-token vendor scale as the other appliance feeds; normalize
+        through the same case-insensitive lookup
+    - vendor: alert.occurred
+      type: timestamp
+      description: when the alert was raised
+      ecs: '@timestamp'
+      status: partial
+      transform: same explicit-offset timestamp parse as the other appliance alert feeds
+    - vendor: alert.attack-time
+      type: string (timestamp)
+      description: >-
+        time the attack itself was observed, which precedes the time the alert
+        was raised
+      ecs: event.start
+      status: partial
+      notes: >-
+        alert.occurred carries @timestamp; keeping the attack time on
+        event.start stops a detonation delay reading as the event time -
+        confirm the two differ in the deployed feed. carried on the alert
+        envelope the appliance feeds share, so it is expected here too; the
+        wording above is verified against an NX record and inferred for this
+        product - confirm on its own feed
+    - vendor: alert.action
+      type: enum
+      description: disposition applied to the file found on the share
+      ecs: event.type
+      status: partial
+      transform: >
+        vendor values mapped to allowed / denied; quarantine moves the file
+        off the share into appliance quarantine, a materially different
+        outcome than detection-only, so the raw value is retained — confirm
+        the deployed value set in-tool
+    - vendor: alert.explanation.malware-detected.malware.name
+      type: string
+      description: detection/signature name for the malicious file
+      ecs: rule.name
+      status: mapped
+      notes: >-
+        same object-or-array shape variance as the other appliance feeds —
+        normalize to an array before mapping
+    - vendor: alert.explanation.malware-detected.malware.sid
+      type: long
+      description: numeric signature identifier for the detection that fired
+      ecs: rule.id
+      status: mapped
+    - vendor: alert.explanation.malware-detected.malware.original
+      type: string
+      description: full path of the malicious file on the scanned share
+      ecs: file.path
+      status: partial
+      notes: >-
+        carries the share-rooted path (UNC-style for CIFS shares); derive
+        file.name low-side from the final path segment
+    - vendor: alert.explanation.malware-detected.malware.md5sum
+      type: string
+      description: MD5 hash of the detonated file
+      ecs: file.hash.md5
+      status: mapped
+    - vendor: alert.explanation.malware-detected.malware.sha256
+      type: string
+      description: SHA-256 hash of the detonated file
+      ecs: file.hash.sha256
+      status: mapped
+    - vendor: alert.explanation.malware-detected.malware.type
+      type: string
+      description: vendor file-type token, e.g. "exe" or "pdf"
+      ecs: file.mime_type
+      status: partial
+      notes: >-
+        free text rather than a strict IANA media type, so it needs a lookup
+        before it satisfies file.mime_type consumers
+    - vendor: alert.explanation.os-changes
+      type: object
+      description: full MVX detonation trace for the file (extended verbosity only)
+      ecs: null
+      status: unmapped
+      custom: fireeye.fx.os_changes
+      notes: sandbox telemetry, never host.os.*; strip from the guarded route low-side
+    - vendor: alert.alert-url
+      type: string
+      description: deep link back to the alert detail on the FX/CM web UI
+      ecs: event.reference
+      status: mapped
+    - vendor: alert.ack
+      type: string
+      description: whether the alert has been acknowledged in the console
+      ecs: null
+      status: unmapped
+      custom: fireeye.fx.ack
+      notes: >-
+        console workflow state rather than event data; no ECS field expresses
+        it and it changes after the record is written. carried on the alert
+        envelope the appliance feeds share, so it is expected here too; the
+        wording above is verified against an NX record and inferred for this
+        product - confirm on its own feed
+    - vendor: alert.mitre-mapping.code[].id
+      type: string
+      description: ATT&CK technique identifier the detection maps to
+      ecs: threat.technique.id
+      status: partial
+      transform: >-
+        an id of the form Txxxx.nnn is a sub-technique: put the full value on
+        threat.technique.subtechnique.id and the parent Txxxx on
+        threat.technique.id; a bare Txxxx populates threat.technique.id alone.
+        Set threat.framework to `MITRE ATT&CK` alongside
+      notes: >-
+        the feed carries both forms - verify against the deployed feed which
+        appear, because a sub-technique left on threat.technique.id breaks the
+        ATT&CK navigator views the CSOC builds from it. carried on the alert
+        envelope the appliance feeds share, so it is expected here too; the
+        wording above is verified against an NX record and inferred for this
+        product - confirm on its own feed
+    - vendor: alert.mitre-mapping.code[].name
+      type: string
+      description: ATT&CK technique name for the mapped code
+      ecs: threat.technique.name
+      status: partial
+      transform: >-
+        where the id is a sub-technique this name is the sub-technique's: put
+        it on threat.technique.subtechnique.name and carry the parent
+        technique name on threat.technique.name
+      notes: >-
+        carried on the alert envelope the appliance feeds share, so it is
+        expected here too; the wording above is verified against an NX record
+        and inferred for this product - confirm on its own feed
+    - vendor: alert.mitre-mapping.code[].tactic
+      type: string
+      description: ATT&CK tactics the mapped technique serves
+      ecs: threat.tactic.name
+      status: partial
+      transform: >-
+        an array - one technique can serve several tactics, and
+        threat.tactic.name is array-capable, so it is carried through without
+        flattening
+      notes: >-
+        confirm whether the deployed feed also emits the tactic ids;
+        threat.tactic.id would be the better key for dashboards if so. carried
+        on the alert envelope the appliance feeds share, so it is expected
+        here too; the wording above is verified against an NX record and
+        inferred for this product - confirm on its own feed
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Reuse the shared envelope and Extract JSON stages with an
+          FX-specific flatten — normalize malware-detected.malware to an array
+          as on the other feeds, split malware.original into file.path plus a
+          derived file.name from the final path segment, and apply the same
+          severity token lookup, action lookup with the raw value retained
+          (quarantine moves the file off the share into appliance quarantine —
+          confirm the deployed action value set in-tool), and explicit-offset
+          occurred parse. Normalize share paths and filenames to UTF-8, strip
+          control characters and enforce declared length caps before the guard
+          destination, strip os-changes from the guarded route, then
+          Schema-Library-validate with a dead-letter route and Persistent
+          Queue backpressure ahead of the guard destination; keep _raw once
+          os-changes is stripped.
+        elastic: >
+          No integration covers this feed, so stand up a custom ingest
+          pipeline and index template for logs-fireeye.fx_alert that accepts
+          the pre-shaped documents, with a custom-namespace keyword mapping
+          for fireeye.fx.alert_uuid. Populate file.hash.sha256 alongside the
+          MD5 so detections join threat-intel enrichment, and assert in the
+          template that event.severity arrives as the normalized numeric value
+          and that file.path is always populated — the share location is the
+          pivot a responder needs first.
+        relay: >
+          Full ECS-shaped JSON crosses, flattened low-side. The friction is
+          user-controlled free text in share paths and filenames (unicode,
+          long UNC paths), so normalize, strip control characters and enforce
+          declared length caps on file.path, file.name and the detection name
+          before the guard destination; strip the os-changes detonation trace
+          before the boundary. Treat the crossing as at-most-once with
+          Persistent Queue (never Block) on the guard destination and per
+          (dataset, hour) count reconciliation as the only drop detector.
+      direct:
+        parse_location: low
+        cribl: >
+          Reuse the shared envelope and Extract JSON stages with an
+          FX-specific flatten — normalize malware-detected.malware to an array
+          as on the other feeds, split malware.original into file.path plus a
+          derived file.name from the final path segment, and apply the same
+          severity token lookup, action lookup with the raw value retained
+          (quarantine moves the file off the share into appliance quarantine —
+          confirm the deployed action value set in-tool), and explicit-offset
+          occurred parse. Normalize share paths and filenames to UTF-8. With
+          no guard on this path, retain os-changes where the index budget
+          allows — it is sandbox telemetry, so still never let any of it reach
+          host.os.*. Keep _raw, since the flatten is hand-built.
+        elastic: >
+          No integration covers this feed, so stand up a custom ingest
+          pipeline and index template for logs-fireeye.fx_alert that accepts
+          the pre-shaped documents, with a custom-namespace keyword mapping
+          for fireeye.fx.alert_uuid. Populate file.hash.sha256 alongside the
+          MD5 so detections join threat-intel enrichment, and assert in the
+          template that event.severity arrives as the normalized numeric value
+          and that file.path is always populated — the share location is the
+          pivot a responder needs first.
+  - format: syslog-cef
+    enable: >
+      On the FX (or the CM notification profile carrying the File MPS product
+      token) set Settings > Notifications > rsyslog Format to CEF, Delivery
+      Per Event, Notifications All Events, and enable the malware-object alert
+      type so share detections are emitted. CLI equivalent `fenotify rsyslog
+      trap-sink <sink> prefer message format cef`. CEF is one Format selection
+      per channel, mutually exclusive with the JSON verbosity.
+    references:
+    - >-
+      https://docs.fortinet.com/document/fortisiem/7.1.1/external-systems-configuration-guide/308860/fireeye-malware-protection-system-mps
+    - https://www.ibm.com/docs/en/dsm?topic=configuration-fireeye
+    - https://www.securitynik.com/2014/08/qradar-extracting-fields-from-fireeye.html
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom FireEye FX CEF alert pipeline (CEF unpack + file ECS map)
+      notes: >
+        Reuses the CEF-unpack stage and maps the file extensions: filePath
+        (the share-rooted, often UNC path) to file.path with file.name derived
+        from the final segment, fileHash to file.hash.md5, cs1/sname to
+        rule.name. The single CEF line carries one hash and no nested
+        detonation trace, so it is the flat detection headline, not the MVX
+        detail.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Unpack the CEF line low-side, split filePath into file.path plus a
+          derived file.name from the final path segment, map fileHash to
+          file.hash.md5, cs1(sname) to rule.name, externalId to event.id,
+          dvchost to observer.hostname. Normalize the share path and filename
+          to UTF-8, strip control characters and enforce declared length caps
+          on file.path/file.name before the guard (long UNC paths are the
+          friction here), map act to event.type retaining the raw value
+          (quarantine moves the file off the share), and read severity from
+          the numeric CEF header field.
+        elastic: >
+          Custom ingest pipeline and index template for logs-fireeye.fx_alert
+          accepting the pre-shaped documents; assert file.path is always
+          populated (the share location is the responder's first pivot) and
+          note the CEF form carries MD5 only, no sha256 or os-changes.
+        relay: >
+          The friction is user-controlled free text in the share path and
+          filename (unicode, long UNC), so normalize and length-cap file.path,
+          file.name and the detection name low-side before the crossing; the
+          single CEF line is otherwise bounded with no trace to strip.
+          At-most-once, Persistent Queue, per (dataset, hour) reconciliation.
+      direct:
+        parse_location: low
+        cribl: >
+          High-side FX with no guard: unpack the CEF line, split filePath into
+          file.path plus a derived file.name from the final path segment, map
+          fileHash to file.hash.md5, cs1(sname) to rule.name, externalId to
+          event.id, dvchost to observer.hostname, map act to event.type
+          retaining the raw value (quarantine moves the file off the share),
+          and read severity from the numeric CEF header field. Retain full
+          path and filename values. Choose CEF or JSON as the single
+          authoritative channel feed.
+        elastic: >
+          Custom ingest pipeline and index template for logs-fireeye.fx_alert
+          with file.path always populated (the share location is the
+          responder's first pivot); CEF is the lighter option where the flat
+          share-detection headline suffices without the MVX detonation detail.
+    fields:
+    - vendor: filePath
+      type: string
+      description: FireEye FX CEF extension - full path of the malicious file on the scanned share.
+      ecs: file.path
+      status: partial
+      notes: >-
+        share-rooted (UNC-style for CIFS shares); derive file.name low-side
+        from the final path segment
+    - vendor: fname
+      type: string
+      description: >-
+        FireEye FX CEF extension - filename of the malicious file, where the
+        line carries a bare name rather than the full path.
+      ecs: file.name
+      status: partial
+      notes: >-
+        present on trains that emit fname separately from filePath; where only
+        filePath is present, derive file.name from its final segment instead
+    - vendor: fileHash
+      type: string
+      description: FireEye FX CEF extension - hash of the detonated file.
+      ecs: file.hash.md5
+      status: partial
+      notes: >-
+        the single CEF line carries one hash (MD5); sha256 is not expressible
+        on this transport
+    - vendor: cs1
+      type: string
+      description: >-
+        FireEye FX CEF extension (cs1Label=sname) - detection/signature name
+        for the file.
+      ecs: rule.name
+      status: mapped
+    - vendor: act
+      type: string
+      description: FireEye FX CEF extension - disposition applied to the file on the share.
+      ecs: event.type
+      status: partial
+      transform: >-
+        map to allowed/denied while retaining the raw value; quarantine moves
+        the file into appliance quarantine, materially different from
+        detection-only
+    - vendor: externalId
+      type: long
+      description: FireEye FX CEF extension - appliance-assigned alert number.
+      ecs: event.id
+      status: mapped
+    - vendor: dvchost
+      type: string
+      description: FireEye FX CEF extension - hostname of the emitting FX appliance.
+      ecs: observer.hostname
+      status: partial
+      notes: on a CM-forwarded feed confirm it names the originating FX, not the CM
+    - vendor: cs4
+      type: string
+      description: FireEye FX CEF extension (cs4Label=link) - console deep link back to the alert.
+      ecs: event.reference
+      status: mapped
+    - vendor: CEF header severity
+      type: integer
+      description: CEF header field 8 - alert severity as a 0-10 number.
+      ecs: event.severity
+      status: partial
+      transform: numeric CEF severity, normalized through the numeric-scale lookup
+    - vendor: CEF header name
+      type: string
+      description: CEF header field 6 - alert name (alert type, e.g. malware-object).
+      ecs: event.action
+      status: mapped
+  - format: syslog-leef
+    enable: >
+      Same Settings > Notifications > rsyslog panel with the Format set to
+      LEEF and the malware-object alert type enabled. LEEF and CEF are
+      mutually exclusive Format selections on the channel.
+    references:
+    - https://www.ibm.com/docs/en/dsm?topic=configuration-fireeye
+    - https://www.securitynik.com/2014/08/qradar-extracting-fields-from-fireeye.html
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom FireEye FX LEEF alert pipeline (LEEF unpack + file ECS map)
+      notes: >
+        Splits the LEEF header and delimited body and maps the file named
+        keys; filePath carries the share-rooted path with file.name derived
+        from the final segment, and the line carries one fileHash and no
+        detonation trace.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Map the LEEF file keys low-side - filePath to file.path with a
+          derived file.name, fileHash to file.hash.md5, sname to rule.name -
+          and apply the same UTF-8 normalization and length caps on the share
+          path and filename before the crossing. Parse devTime against
+          devTimeFormat and normalize severity through the numeric-scale
+          lookup.
+        elastic: >
+          Custom pipeline and index template for logs-fireeye.fx_alert as with
+          CEF; the named-key LEEF mapping is more robust across trains than
+          the CEF slots, and the same file.path-always-populated and MD5-only
+          assertions apply.
+        relay: >
+          Same share-path/filename free-text friction; normalize and cap
+          low-side, preserve the LEEF delimiter across the crossing, and run
+          at-most-once with Persistent Queue and per (dataset, hour)
+          reconciliation.
+      direct:
+        parse_location: low
+        cribl: >
+          High-side FX with no guard: split the LEEF header and body and map
+          the file named keys — filePath to file.path with a derived
+          file.name, fileHash to file.hash.md5, sname to rule.name — parsing
+          devTime against devTimeFormat and normalizing severity through the
+          numeric-scale lookup. Retain full path and filename values. Choose
+          LEEF or JSON as the single authoritative channel feed.
+        elastic: >
+          Custom ingest pipeline and index template for logs-fireeye.fx_alert
+          with file.path always populated; the named-key LEEF mapping is more
+          robust across trains than the CEF slots, and LEEF is the named-key
+          option without the MVX detail.
+    fields:
+    - vendor: devTime
+      type: timestamp
+      description: FireEye FX LEEF key - device event time; format in devTimeFormat.
+      ecs: '@timestamp'
+      status: partial
+      transform: parse against the accompanying devTimeFormat rather than the envelope time
+    - vendor: filePath
+      type: string
+      description: FireEye FX LEEF key - full path of the malicious file on the scanned share.
+      ecs: file.path
+      status: partial
+      notes: share-rooted UNC-style path; derive file.name low-side from the final segment
+    - vendor: fileHash
+      type: string
+      description: FireEye FX LEEF key - hash of the detonated file.
+      ecs: file.hash.md5
+      status: partial
+      notes: one hash (MD5) on the single line; sha256 not expressible
+    - vendor: sname
+      type: string
+      description: FireEye FX LEEF key - detection/signature name for the file.
+      ecs: rule.name
+      status: mapped
+    - vendor: externalId
+      type: long
+      description: FireEye FX LEEF key - appliance-assigned alert number.
+      ecs: event.id
+      status: mapped
+    - vendor: link
+      type: string
+      description: FireEye FX LEEF key - console deep link back to the alert.
+      ecs: event.reference
+      status: mapped
+    - vendor: dvchost
+      type: string
+      description: FireEye FX LEEF key - hostname of the emitting FX appliance.
+      ecs: observer.hostname
+      status: partial
+      notes: on a CM-forwarded feed confirm it names the originating FX, not the CM
+- id: ax-alert
+  name: AX malware analysis alert (JSON extended)
+  description: >
+    fenotify alerts from the AX (Malware Analysis) appliance, forwarded
+    centrally through the CM with product token Malware Analysis in the
+    notification envelope — the on-demand detonation sandbox. Alerts fire when
+    an analyst-submitted file or URL detonates malicious. Volume is
+    analyst-driven and small; at extended verbosity the notification carries
+    the full MVX detonation trace, which is this appliance's principal output.
+  event_categories:
+  - malware
+  - file
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Arrives on the CM's consolidated notification feed (Format = JSON,
+        verbosity extended, Delivery = per event); the envelope product token
+        (Malware Analysis) is the routing discriminator. Crosses the Everfox
+        HSG.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-fireeye.ax_alert
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Arrives on the CM's consolidated notification feed (Format = JSON,
+        verbosity extended, Delivery = per event); the envelope product token
+        (Malware Analysis) is the routing discriminator.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-fireeye.ax_alert
+  formats:
+  - format: json
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom FireEye JSON alert pipeline (shared envelope stage, AX-specific flatten)
+      notes: >
+        Shares the syslog-envelope strip and Extract JSON stage with the other
+        appliance alert feeds. AX verdicts can come from dynamic analysis
+        alone, so the signature name and id under explanation.malware-detected
+        are not always present — the flatten must tolerate their absence.
+    fields:
+    - vendor: appliance
+      type: string
+      description: hostname identifying the appliance that raised the alert (notification envelope)
+      ecs: observer.hostname
+      status: partial
+      notes: >-
+        CM-forwarded feed — confirm in-tool that this names the originating AX
+        rather than the forwarding CM; observer.hostname must identify the
+        sensor
+    - vendor: product
+      type: string
+      description: product token in the notification envelope, e.g. "Malware Analysis"
+      ecs: observer.product
+      status: mapped
+    - vendor: version
+      type: string
+      description: appliance software version emitting the notification
+      ecs: observer.version
+      status: mapped
+    - vendor: msg
+      type: string
+      description: notification type carried by the envelope, outside the alert object
+      ecs: event.kind
+      status: partial
+      transform: >-
+        set event.kind to `alert`; the raw token is the discriminator the
+        pipeline splits the CM's single wire feed on, not a value worth
+        carrying further
+      notes: >-
+        confirm in-tool that every record of the alert notification feed
+        carries the same token here. carried on the alert envelope the
+        appliance feeds share, so it is expected here too; the wording above
+        is verified against an NX record and inferred for this product -
+        confirm on its own feed
+    - vendor: alert.id
+      type: long
+      description: appliance-assigned alert number, matching the fenotify-<n>.alert syslog tag
+      ecs: event.id
+      status: mapped
+    - vendor: alert.class
+      type: string
+      description: detection family the alert belongs to
+      ecs: rule.category
+      status: partial
+      notes: >-
+        vendor vocabulary; ECS event.category is a closed set the FireEye
+        classes do not map onto one for one, so the raw class rides on
+        rule.category and event.category is derived from it in the pipeline.
+        carried on the alert envelope the appliance feeds share, so it is
+        expected here too; the wording above is verified against an NX record
+        and inferred for this product - confirm on its own feed
+    - vendor: alert.root-infection
+      type: integer
+      description: identifier of the root infection this alert is correlated to
+      ecs: null
+      status: unmapped
+      custom: fireeye.ax.root_infection
+      notes: >-
+        correlation key with no ECS home - a candidate custom field, and the
+        one that lets a CSOC analyst group every alert of a single infection.
+        carried on the alert envelope the appliance feeds share, so it is
+        expected here too; the wording above is verified against an NX record
+        and inferred for this product - confirm on its own feed
+    - vendor: alert.uuid
+      type: string
+      description: universally unique alert identifier, stable across appliance renumbering
+      ecs: null
+      status: unmapped
+      custom: fireeye.ax.alert_uuid
+      notes: the durable cross-appliance join key; alert.id is only unique per appliance
+    - vendor: alert.product
+      type: string
+      description: detecting product named inside the alert object
+      ecs: event.provider
+      status: partial
+      notes: >-
+        the envelope's own product key carries observer.product; this is the
+        engine that raised the alert, so it belongs on the event rather than
+        the observer - confirm the two can differ on a CM-forwarded feed.
+        carried on the alert envelope the appliance feeds share, so it is
+        expected here too; the wording above is verified against an NX record
+        and inferred for this product - confirm on its own feed
+    - vendor: alert.version
+      type: string
+      description: software version reported inside the alert object
+      ecs: null
+      status: unmapped
+      custom: fireeye.ax.alert_version
+      notes: >-
+        observer.version already carries the appliance version from the
+        envelope; this is the alerting engine's own version and has no
+        separate ECS home - candidate for a custom field. carried on the alert
+        envelope the appliance feeds share, so it is expected here too; the
+        wording above is verified against an NX record and inferred for this
+        product - confirm on its own feed
+    - vendor: alert.sensor
+      type: string
+      description: sensor that produced the alert
+      ecs: observer.name
+      status: partial
+      notes: >-
+        same CM caveat as appliance - confirm this names the originating NX
+        sensor and not the forwarding CM. carried on the alert envelope the
+        appliance feeds share, so it is expected here too; the wording above
+        is verified against an NX record and inferred for this product -
+        confirm on its own feed
+    - vendor: alert.name
+      type: enum
+      description: alert-type name for the analysis verdict, e.g. malware-object
+      ecs: event.action
+      status: mapped
+    - vendor: alert.severity
+      type: enum
+      description: severity token — minr, majr, crit (casing varies by software train)
+      ecs: event.severity
+      status: partial
+      transform: >-
+        same three-token vendor scale as the other appliance feeds; normalize
+        through the same case-insensitive lookup
+    - vendor: alert.occurred
+      type: timestamp
+      description: when the analysis verdict was raised
+      ecs: '@timestamp'
+      status: partial
+      transform: same explicit-offset timestamp parse as the other appliance alert feeds
+    - vendor: alert.attack-time
+      type: string (timestamp)
+      description: >-
+        time the attack itself was observed, which precedes the time the alert
+        was raised
+      ecs: event.start
+      status: partial
+      notes: >-
+        alert.occurred carries @timestamp; keeping the attack time on
+        event.start stops a detonation delay reading as the event time -
+        confirm the two differ in the deployed feed. carried on the alert
+        envelope the appliance feeds share, so it is expected here too; the
+        wording above is verified against an NX record and inferred for this
+        product - confirm on its own feed
+    - vendor: alert.explanation.malware-detected.malware.name
+      type: string
+      description: detection/signature name, when a signature contributed to the verdict
+      ecs: rule.name
+      status: partial
+      notes: >-
+        absent when the verdict comes from dynamic analysis alone — the
+        flatten and any detections must tolerate a missing value
+    - vendor: alert.explanation.malware-detected.malware.sid
+      type: long
+      description: numeric signature identifier, when a signature contributed to the verdict
+      ecs: rule.id
+      status: partial
+      notes: same presence caveat as the signature name
+    - vendor: alert.explanation.malware-detected.malware.original
+      type: string
+      description: filename of the submitted object
+      ecs: file.name
+      status: mapped
+    - vendor: alert.explanation.malware-detected.malware.md5sum
+      type: string
+      description: MD5 hash of the submitted object
+      ecs: file.hash.md5
+      status: mapped
+    - vendor: alert.explanation.malware-detected.malware.sha256
+      type: string
+      description: SHA-256 hash of the submitted object
+      ecs: file.hash.sha256
+      status: mapped
+    - vendor: alert.explanation.malware-detected.malware.url
+      type: string
+      description: submitted URL, on URL-detonation analyses
+      ecs: url.original
+      status: partial
+      notes: populated only for URL submissions, empty for file submissions
+    - vendor: alert.explanation.os-changes
+      type: object
+      description: full MVX detonation trace — the analysis result itself (extended verbosity only)
+      ecs: null
+      status: unmapped
+      custom: fireeye.ax.os_changes
+      notes: >
+        this appliance's principal output, but sandbox telemetry nonetheless —
+        never host.os.*, and strip it from the guarded route low-side;
+        analysts reach the full trace through the event.reference deep link on
+        the appliance
+    - vendor: alert.alert-url
+      type: string
+      description: >-
+        deep link back to the analysis detail on the AX web UI, the analyst
+        pivot to the full detonation trace
+      ecs: event.reference
+      status: mapped
+    - vendor: alert.ack
+      type: string
+      description: whether the alert has been acknowledged in the console
+      ecs: null
+      status: unmapped
+      custom: fireeye.ax.ack
+      notes: >-
+        console workflow state rather than event data; no ECS field expresses
+        it and it changes after the record is written. carried on the alert
+        envelope the appliance feeds share, so it is expected here too; the
+        wording above is verified against an NX record and inferred for this
+        product - confirm on its own feed
+    - vendor: alert.mitre-mapping.code[].id
+      type: string
+      description: ATT&CK technique identifier the detection maps to
+      ecs: threat.technique.id
+      status: partial
+      transform: >-
+        an id of the form Txxxx.nnn is a sub-technique: put the full value on
+        threat.technique.subtechnique.id and the parent Txxxx on
+        threat.technique.id; a bare Txxxx populates threat.technique.id alone.
+        Set threat.framework to `MITRE ATT&CK` alongside
+      notes: >-
+        the feed carries both forms - verify against the deployed feed which
+        appear, because a sub-technique left on threat.technique.id breaks the
+        ATT&CK navigator views the CSOC builds from it. carried on the alert
+        envelope the appliance feeds share, so it is expected here too; the
+        wording above is verified against an NX record and inferred for this
+        product - confirm on its own feed
+    - vendor: alert.mitre-mapping.code[].name
+      type: string
+      description: ATT&CK technique name for the mapped code
+      ecs: threat.technique.name
+      status: partial
+      transform: >-
+        where the id is a sub-technique this name is the sub-technique's: put
+        it on threat.technique.subtechnique.name and carry the parent
+        technique name on threat.technique.name
+      notes: >-
+        carried on the alert envelope the appliance feeds share, so it is
+        expected here too; the wording above is verified against an NX record
+        and inferred for this product - confirm on its own feed
+    - vendor: alert.mitre-mapping.code[].tactic
+      type: string
+      description: ATT&CK tactics the mapped technique serves
+      ecs: threat.tactic.name
+      status: partial
+      transform: >-
+        an array - one technique can serve several tactics, and
+        threat.tactic.name is array-capable, so it is carried through without
+        flattening
+      notes: >-
+        confirm whether the deployed feed also emits the tactic ids;
+        threat.tactic.id would be the better key for dashboards if so. carried
+        on the alert envelope the appliance feeds share, so it is expected
+        here too; the wording above is verified against an NX record and
+        inferred for this product - confirm on its own feed
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Reuse the shared envelope and Extract JSON stages with an
+          AX-specific flatten, applying the same severity token lookup and
+          explicit-offset occurred parse as the other feeds and tolerating
+          absent signature name/id on dynamic-analysis verdicts. Cap the
+          submitted filename's length, strip os-changes from the guarded route
+          ahead of the crossing — analysts retrieve the full trace through the
+          alert-url pivot on the appliance — then Schema-Library-validate with
+          a dead-letter route and Persistent Queue backpressure ahead of the
+          guard destination. Keep _raw: the feed is small and analyst-driven,
+          so the retention cost is negligible and the forensic value high.
+        elastic: >
+          No integration covers this feed, so stand up a custom ingest
+          pipeline and index template for logs-fireeye.ax_alert that accepts
+          the pre-shaped documents, with a custom-namespace keyword mapping
+          for fireeye.ax.alert_uuid. Assert in the template that
+          event.reference is always populated — the deep link back to the
+          analysis on the appliance is how analysts reach the full detonation
+          detail that does not cross the guard.
+        relay: >
+          Full ECS-shaped JSON crosses, flattened low-side. This is the
+          smallest feed in the family, so transfer budget is not the concern;
+          the flashpoints are the submitted filename (user-controlled free
+          text) and the os-changes detonation trace, so cap the former and
+          strip the latter before the boundary. Treat the crossing as
+          at-most-once with Persistent Queue (never Block) on the guard
+          destination and per (dataset, hour) count reconciliation as the only
+          drop detector.
+      direct:
+        parse_location: low
+        cribl: >
+          Reuse the shared envelope and Extract JSON stages with an
+          AX-specific flatten, applying the same severity token lookup and
+          explicit-offset occurred parse as the other feeds and tolerating
+          absent signature name/id on dynamic-analysis verdicts. With no guard
+          on this path, retain os-changes — this appliance's principal output
+          — where the index budget allows; it is sandbox telemetry, so still
+          never let any of it reach host.os.*. Keep _raw: the feed is small
+          and analyst-driven, so the retention cost is negligible and the
+          forensic value high.
+        elastic: >
+          No integration covers this feed, so stand up a custom ingest
+          pipeline and index template for logs-fireeye.ax_alert that accepts
+          the pre-shaped documents, with a custom-namespace keyword mapping
+          for fireeye.ax.alert_uuid. Assert in the template that
+          event.reference is always populated — the deep link back to the
+          analysis on the appliance is the analyst pivot to the full
+          detonation detail whenever the trace itself is not indexed.
+  - format: syslog-cef
+    enable: >
+      On the AX (or the CM notification profile carrying the Malware Analysis
+      product token) set Settings > Notifications > rsyslog Format to CEF,
+      Delivery Per Event, Notifications All Events. CLI equivalent `fenotify
+      rsyslog trap-sink <sink> prefer message format cef`. CEF is one Format
+      selection per channel, mutually exclusive with the JSON verbosity.
+    references:
+    - https://www.ibm.com/docs/en/dsm?topic=configuration-fireeye
+    - >-
+      https://docs.fortinet.com/document/fortisiem/7.1.1/external-systems-configuration-guide/308860/fireeye-malware-protection-system-mps
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom FireEye AX CEF alert pipeline (CEF unpack + verdict ECS map)
+      notes: >
+        Reuses the CEF-unpack stage and maps fname to file.name, fileHash to
+        file.hash.md5, cs1/sname to rule.name and cs4/link to event.reference.
+        The flatten must tolerate an absent sname, since AX verdicts can come
+        from dynamic analysis alone. The MVX detonation trace that is this
+        appliance's principal output is not expressible on the CEF line, so
+        the analyst pivot to the full trace is the cs4/link deep link.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Unpack the CEF line low-side, map fname to file.name, fileHash to
+          file.hash.md5, cs1(sname) to rule.name tolerating its absence on
+          dynamic-analysis verdicts, cs4(link) to event.reference, externalId
+          to event.id, dvchost to observer.hostname, and read severity from
+          the numeric CEF header field. Cap the submitted filename length
+          before the crossing. The os-changes trace is not on the line, so
+          there is nothing to strip - but flag that the CEF form of this feed
+          is the verdict headline only and that the full analysis lives behind
+          the event.reference link on the appliance.
+        elastic: >
+          Custom ingest pipeline and index template for logs-fireeye.ax_alert;
+          assert event.reference is always populated, because on the CEF
+          transport it is the only route to the detonation detail the line
+          omits.
+        relay: >
+          The smallest feed in the family and the CEF line is bounded, so
+          transfer budget is not the concern; cap the submitted filename
+          (user-controlled free text) low-side before the crossing. The full
+          trace never crosses on this transport by construction. At-most-once,
+          Persistent Queue, per (dataset, hour) reconciliation.
+      direct:
+        parse_location: low
+        cribl: >
+          High-side AX with no guard: unpack the CEF line, map fname to
+          file.name, fileHash to file.hash.md5, cs1(sname) to rule.name
+          tolerating its absence on dynamic-analysis verdicts, cs4(link) to
+          event.reference, externalId to event.id, dvchost to
+          observer.hostname, and read severity from the numeric CEF header
+          field. Where the detonation trace itself is wanted, prefer the JSON
+          verbosity — the CEF line cannot carry os-changes — so run CEF here
+          only for a consumer that needs the flat verdict headline.
+        elastic: >
+          Custom ingest pipeline and index template for logs-fireeye.ax_alert
+          with event.reference as the mandatory pivot to the analysis the CEF
+          line does not carry.
+    fields:
+    - vendor: fname
+      type: string
+      description: FireEye AX CEF extension - filename of the submitted object.
+      ecs: file.name
+      status: mapped
+    - vendor: fileHash
+      type: string
+      description: FireEye AX CEF extension - hash of the submitted object.
+      ecs: file.hash.md5
+      status: partial
+      notes: >-
+        the single CEF line carries one hash (MD5); sha256 is not expressible
+        on this transport
+    - vendor: cs1
+      type: string
+      description: >-
+        FireEye AX CEF extension (cs1Label=sname) - detection/signature name,
+        when a signature contributed to the verdict.
+      ecs: rule.name
+      status: partial
+      notes: >-
+        absent when the verdict comes from dynamic analysis alone - the
+        flatten and any detections must tolerate a missing value
+    - vendor: request
+      type: string
+      description: FireEye AX CEF extension - submitted URL, on URL-detonation analyses.
+      ecs: url.original
+      status: partial
+      notes: populated only for URL submissions, empty for file submissions
+    - vendor: cs4
+      type: string
+      description: >-
+        FireEye AX CEF extension (cs4Label=link) - console deep link to the
+        full analysis, the analyst pivot to the detonation trace the line
+        omits.
+      ecs: event.reference
+      status: mapped
+    - vendor: externalId
+      type: long
+      description: FireEye AX CEF extension - appliance-assigned alert number.
+      ecs: event.id
+      status: mapped
+    - vendor: dvchost
+      type: string
+      description: FireEye AX CEF extension - hostname of the emitting AX appliance.
+      ecs: observer.hostname
+      status: partial
+      notes: on a CM-forwarded feed confirm it names the originating AX, not the CM
+    - vendor: CEF header severity
+      type: integer
+      description: CEF header field 8 - verdict severity as a 0-10 number.
+      ecs: event.severity
+      status: partial
+      transform: numeric CEF severity, normalized through the numeric-scale lookup
+    - vendor: CEF header name
+      type: string
+      description: CEF header field 6 - alert name (analysis verdict type, e.g. malware-object).
+      ecs: event.action
+      status: mapped
+  - format: syslog-leef
+    enable: >
+      Same Settings > Notifications > rsyslog panel with the Format set to
+      LEEF. LEEF and CEF are mutually exclusive Format selections on the
+      channel.
+    references:
+    - https://www.ibm.com/docs/en/dsm?topic=configuration-fireeye
+    - https://www.securitynik.com/2014/08/qradar-extracting-fields-from-fireeye.html
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom FireEye AX LEEF alert pipeline (LEEF unpack + verdict ECS map)
+      notes: >
+        Splits the LEEF header and delimited body and maps the verdict named
+        keys, tolerating an absent sname on dynamic-analysis verdicts. As with
+        CEF the detonation trace is not on the line; the link key is the pivot
+        to the full analysis.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Map the LEEF verdict keys low-side - fname to file.name, fileHash to
+          file.hash.md5, sname to rule.name (tolerating absence), link to
+          event.reference - cap the submitted filename before the crossing,
+          parse devTime against devTimeFormat, and normalize severity through
+          the numeric-scale lookup.
+        elastic: >
+          Custom pipeline and index template for logs-fireeye.ax_alert as with
+          CEF; event.reference is the mandatory pivot to the analysis the line
+          omits.
+        relay: >
+          Smallest feed, bounded line; cap the submitted filename low-side.
+          The trace never crosses by construction. Preserve the LEEF
+          delimiter, run at-most-once with Persistent Queue and per (dataset,
+          hour) reconciliation.
+      direct:
+        parse_location: low
+        cribl: >
+          High-side AX with no guard: split the LEEF header and body and map
+          the verdict named keys — fname to file.name, fileHash to
+          file.hash.md5, sname to rule.name (tolerating absence), link to
+          event.reference — parsing devTime against devTimeFormat and
+          normalizing severity through the numeric-scale lookup. Prefer JSON
+          where the detonation trace is wanted, since LEEF cannot carry it.
+        elastic: >
+          Custom ingest pipeline and index template for logs-fireeye.ax_alert
+          with event.reference the pivot to the full analysis the line omits.
+    fields:
+    - vendor: devTime
+      type: timestamp
+      description: FireEye AX LEEF key - device event time; format in devTimeFormat.
+      ecs: '@timestamp'
+      status: partial
+      transform: parse against the accompanying devTimeFormat rather than the envelope time
+    - vendor: fname
+      type: string
+      description: FireEye AX LEEF key - filename of the submitted object.
+      ecs: file.name
+      status: mapped
+    - vendor: fileHash
+      type: string
+      description: FireEye AX LEEF key - hash of the submitted object.
+      ecs: file.hash.md5
+      status: partial
+      notes: one hash (MD5) on the single line; sha256 not expressible
+    - vendor: sname
+      type: string
+      description: >-
+        FireEye AX LEEF key - detection/signature name, when a signature
+        contributed to the verdict.
+      ecs: rule.name
+      status: partial
+      notes: >-
+        absent on dynamic-analysis-only verdicts - detections must tolerate a
+        missing value
+    - vendor: request
+      type: string
+      description: FireEye AX LEEF key - submitted URL, on URL-detonation analyses.
+      ecs: url.original
+      status: partial
+      notes: populated only for URL submissions
+    - vendor: link
+      type: string
+      description: >-
+        FireEye AX LEEF key - console deep link to the full analysis, the
+        analyst pivot to the detonation trace the line omits.
+      ecs: event.reference
+      status: mapped
+    - vendor: externalId
+      type: long
+      description: FireEye AX LEEF key - appliance-assigned alert number.
+      ecs: event.id
+      status: mapped
+    - vendor: dvchost
+      type: string
+      description: FireEye AX LEEF key - hostname of the emitting AX appliance.
+      ecs: observer.hostname
+      status: partial
+      notes: on a CM-forwarded feed confirm it names the originating AX, not the CM
+- id: cm-audit
+  name: CM console audit (syslog)
+  description: >
+    The Central Management appliance's own console audit — admin logins,
+    configuration changes, user management, and appliance-management actions
+    on the CM itself. A distinct feed from the alert notifications the CM
+    forwards for the managed appliances: audit events leave through the
+    appliance's remote audit-logging syslog setting as line-oriented syslog.
+    The wire format is the top verify-in-tool item for this dataset — confirm
+    what the audit lines actually look like before pinning extraction
+    patterns.
+  event_categories:
+  - authentication
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Receives syslog directly from the CM's remote audit-logging setting.
+        Crosses the Everfox HSG; a small feed with one free-text detail field.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-fireeye.cm_audit
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Receives syslog directly from the CM's remote audit-logging setting. A
+        small feed with one free-text detail field.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-fireeye.cm_audit
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom CM audit pipeline (line-oriented extraction)
+      notes: >
+        Not fenotify and not JSON — the audit trail is line-oriented syslog,
+        so this is a regex/token extraction pipeline rather than a reuse of
+        the shared JSON alert stages. Build the extraction patterns from
+        captured lines of the deployed system, not from documentation.
+    fields:
+    - vendor: syslog timestamp
+      type: timestamp
+      description: envelope timestamp of the audit line
+      ecs: '@timestamp'
+      status: partial
+      transform: >-
+        parse with an explicit UTC assumption, since the appliance clock and
+        syslog envelope can disagree
+    - vendor: syslog hostname
+      type: string
+      description: hostname of the CM appliance emitting the audit line
+      ecs: observer.hostname
+      status: mapped
+    - vendor: user token
+      type: string
+      description: administrator who performed the action
+      ecs: user.name
+      status: partial
+      notes: >-
+        extraction pattern depends on the deployed line format — confirm
+        against captured lines in-tool
+    - vendor: client address token
+      type: ip
+      description: console client address the action came from
+      ecs: source.ip
+      status: partial
+      notes: confirm presence and position in the deployed line format
+    - vendor: action token
+      type: string
+      description: >-
+        audit action — login, logout, configuration change, user management,
+        appliance management
+      ecs: event.action
+      status: partial
+      transform: normalize the vendor verbs into a bounded event.action set during extraction
+    - vendor: outcome token
+      type: string
+      description: result of the action, where the line carries one
+      ecs: event.outcome
+      status: partial
+      notes: >-
+        translate to the ECS success/failure vocabulary; confirm which line
+        types carry an outcome in-tool
+    - vendor: message remainder
+      type: string
+      description: free-text detail of the audit action
+      ecs: null
+      status: unmapped
+      custom: fireeye.cm.audit_detail
+      notes: >-
+        the only unbounded field on this feed — cap to a declared length ahead
+        of the guard
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Extract the actor, source address, action, and outcome from the
+          audit lines low-side and emit ECS-shaped JSON. Normalize the action
+          verbs into a distinct event.action set (login, logout,
+          config-change, user-management, appliance-management) rather than
+          one generic audit value, and populate event.outcome so failed
+          console logins are queryable — this appliance manages the entire
+          sensor fleet, so its admin plane is CSOC-relevant. Cap the free-text
+          detail to a declared length, then Schema-Library-validate with a
+          dead-letter route and Persistent Queue backpressure ahead of the
+          guard destination.
+        elastic: >
+          Custom ingest pipeline and index template for logs-fireeye.cm_audit,
+          with a custom-namespace keyword mapping for fireeye.cm.audit_detail.
+          Assert that user.name and event.action are populated on every
+          document — an audit record without actor or action is noise.
+        relay: >
+          Small, low-volume feed; the only unbounded field is the audit detail
+          message, so cap it low-side before the guard destination. Standard
+          crossing discipline applies: at-most-once, Persistent Queue (never
+          Block), and per (dataset, hour) count reconciliation as the only
+          drop detector.
+      direct:
+        parse_location: low
+        cribl: >
+          Extract the actor, source address, action, and outcome from the
+          audit lines at the edge worker and emit ECS-shaped JSON. Normalize
+          the action verbs into a distinct event.action set (login, logout,
+          config-change, user-management, appliance-management) rather than
+          one generic audit value, and populate event.outcome so failed
+          console logins are queryable — this appliance manages the entire
+          sensor fleet, so its admin plane is CSOC-relevant.
+        elastic: >
+          Custom ingest pipeline and index template for logs-fireeye.cm_audit,
+          with a custom-namespace keyword mapping for fireeye.cm.audit_detail.
+          Assert that user.name and event.action are populated on every
+          document — an audit record without actor or action is noise.
+- id: nx-metadata
+  name: NX extended network metadata (JSON)
+  description: >
+    The NX "extended"/network-metadata feed — a Suricata-EVE-shaped JSON
+    record per flow with nested http, dns, tls, fileinfo, and flow objects.
+    Not an alert feed: it is the connection-level telemetry the CSOC uses to
+    pivot from an NX alert, and it is the feed the Elastic FireEye integration
+    actually parses.
+  event_categories:
+  - network
+  - dns
+  - web
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        JSON over TCP/UDP syslog (or file drop) from the NX metadata exporter.
+        Volume here is orders of magnitude above the alert feeds, so on this
+        guarded path this dataset is the one that will hit the transfer budget
+        first — expect sampling or a field-level allow-list across the Everfox
+        HSG rather than a straight pass-through.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-fireeye.nx
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        JSON over TCP/UDP syslog (or file drop) from the NX metadata exporter.
+        Volume here is orders of magnitude above the alert feeds, so this
+        dataset drives the ingest and index budget and is the first candidate
+        for sampling by flow identifier.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-fireeye.nx
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: FireEye integration, nx data stream
+      notes: >
+        The stock integration pipeline unwraps the outer JSON envelope,
+        re-parses the nested `rawmsg` string as JSON, then renames the
+        rawmsg.* keys into ECS. Only the `nx` data stream exists in the
+        package — there is no EX/eMPS data stream and no alert-notification
+        handling, so this integration cannot be reused for the two alert
+        datasets above.
+    fields:
+    - vendor: rawmsg.src_ip
+      type: ip
+      description: source IP address of the observed flow
+      ecs: source.ip
+      status: mapped
+    - vendor: rawmsg.src_port
+      type: port
+      description: source port of the observed flow
+      ecs: source.port
+      status: mapped
+    - vendor: rawmsg.dest_ip
+      type: ip
+      description: destination IP address of the observed flow
+      ecs: destination.ip
+      status: mapped
+    - vendor: rawmsg.dest_port
+      type: port
+      description: destination port of the observed flow
+      ecs: destination.port
+      status: mapped
+    - vendor: rawmsg.proto
+      type: enum
+      description: transport protocol of the flow (TCP, UDP, ICMP)
+      ecs: network.transport
+      status: mapped
+    - vendor: rawmsg.app_proto
+      type: string
+      description: application protocol the sensor identified on the flow (http, dns, tls, ...)
+      ecs: network.protocol
+      status: mapped
+    - vendor: rawmsg.event_type
+      type: enum
+      description: which nested record this line carries — flow, http, dns, tls, fileinfo, or alert
+      ecs: event.type
+      status: partial
+      transform: >
+        vendor values are copied straight into event.type by the stock
+        pipeline even though most of them are not in the ECS event.type
+        vocabulary; a corrective mapping to connection/protocol/info is needed
+        before category filters behave
+    - vendor: rawmsg.flow.bytes_toserver
+      type: long
+      description: bytes sent from the client to the server over the flow
+      ecs: source.bytes
+      status: mapped
+    - vendor: rawmsg.flow.bytes_toclient
+      type: long
+      description: bytes returned from the server to the client over the flow
+      ecs: destination.bytes
+      status: mapped
+    - vendor: rawmsg.http.hostname
+      type: string
+      description: HTTP Host header of the request
+      ecs: url.domain
+      status: mapped
+    - vendor: rawmsg.http.url
+      type: string
+      description: request path portion of the URL
+      ecs: url.path
+      status: mapped
+    - vendor: rawmsg.http.http_method
+      type: string
+      description: HTTP request method
+      ecs: http.request.method
+      status: mapped
+    - vendor: rawmsg.http.http_user_agent
+      type: string
+      description: raw User-Agent header string
+      ecs: user_agent.original
+      status: mapped
+    - vendor: rawmsg.dns.rrname
+      type: string
+      description: queried DNS name
+      ecs: dns.question.name
+      status: mapped
+    - vendor: rawmsg.dns.rrtype
+      type: string
+      description: DNS resource record type queried (A, AAAA, TXT, ...)
+      ecs: dns.question.type
+      status: mapped
+    - vendor: rawmsg.tls.sni
+      type: string
+      description: TLS Server Name Indication offered by the client
+      ecs: tls.client.server_name
+      status: mapped
+    - vendor: rawmsg.tls.ja3.hash
+      type: string
+      description: JA3 fingerprint hash of the client TLS handshake
+      ecs: tls.client.ja3
+      status: mapped
+    - vendor: rawmsg.fileinfo.md5
+      type: string
+      description: MD5 hash of a file carved out of the flow
+      ecs: file.hash.md5
+      status: partial
+      notes: >-
+        the stock integration parks this at fireeye.nx.fileinfo.md5 and does
+        NOT promote it to file.hash.md5; an ingest-pipeline override is
+        required for it to join threat-intel enrichment
+    - vendor: rawmsg.flow_id
+      type: long
+      description: sensor-local flow identifier
+      ecs: null
+      status: unmapped
+      custom: fireeye.nx.flow_id
+      notes: >-
+        the join key between the flow, http, dns, tls, and fileinfo records
+        that describe one connection
+    - vendor: json.meta_cbname
+      type: string
+      description: hostname of the emitting NX appliance
+      ecs: null
+      status: unmapped
+      custom: fireeye.nx.hostname
+      notes: >-
+        the stock pipeline keeps it here rather than setting
+        observer.hostname, so appliance-level dashboards need the custom field
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Ship the thin envelope — {_dataId, @timestamp, host, _raw} with the
+          EVE-shaped JSON line intact in _raw and _dataId set to the FireEye
+          nx integration route key — rather than parsing here, since a good
+          integration already exists and the outer envelope keys stay
+          identical across every route. This feed runs orders of magnitude
+          above the alert datasets and will exhaust the transfer budget first,
+          so do the volume control low-side and sample by flow identifier
+          rather than by record, so the http, dns, tls and fileinfo siblings
+          of a sampled connection travel together and the analyst pivot stays
+          usable. Validate the envelope against a Schema Library schema with a
+          dead-letter route, use Persistent Queue backpressure on the guard
+          destination, and dead-letter oversize records instead of letting
+          them be cut in flight.
+        elastic: >
+          Let the stock FireEye integration nx data stream do the parse, then
+          layer a logs-fireeye.nx@custom pipeline for the three fixes this map
+          documents: promote the carved-file MD5 out of
+          fireeye.nx.fileinfo.md5 into file.hash.md5 so it reaches
+          threat-intel enrichment, replace the vendor event_type values the
+          stock pipeline copies verbatim into event.type with the ECS
+          vocabulary (connection/protocol/info) so category filters behave,
+          and set observer.hostname from the appliance name the stock pipeline
+          parks in a custom field. Add a custom-namespace keyword mapping for
+          fireeye.nx.flow_id, the join key that ties a connection's flow,
+          http, dns, tls and fileinfo records together.
+        relay: >
+          A thin envelope crosses with the unparsed JSON in _raw, which makes
+          truncation unrecoverable high-side — unlike a cut CEF line, a cut
+          JSON object yields nothing — so enforce a hard maximum record size
+          low-side and dead-letter anything over it rather than letting the
+          content filter trim it. The unbounded, user-controlled values all
+          live inside _raw (request URLs, User-Agent strings, queried names,
+          TLS SNI) and can carry unicode and kilobyte lengths, so the size and
+          character policy has to be applied to the raw line itself before the
+          crossing. Volume makes this the first route to hit the transfer
+          budget: sample ahead of the guard destination, never Block, and
+          reconcile low- and high-side counts per (dataset, hour) since the
+          crossing is at-most-once and unacknowledged.
+      direct:
+        parse_location: hybrid
+        cribl: >
+          Ship the thin envelope — {_dataId, @timestamp, host, _raw} with the
+          EVE-shaped JSON line intact in _raw and _dataId set to the FireEye
+          nx integration route key — rather than parsing here, since a good
+          integration already exists and the outer envelope keys stay
+          identical across every route. This feed runs orders of magnitude
+          above the alert datasets and drives the ingest and index budget, so
+          do the volume control at the edge worker and sample by flow
+          identifier rather than by record, so the http, dns, tls and fileinfo
+          siblings of a sampled connection travel together and the analyst
+          pivot stays usable.
+        elastic: >
+          Let the stock FireEye integration nx data stream do the parse, then
+          layer a logs-fireeye.nx@custom pipeline for the three fixes this map
+          documents: promote the carved-file MD5 out of
+          fireeye.nx.fileinfo.md5 into file.hash.md5 so it reaches
+          threat-intel enrichment, replace the vendor event_type values the
+          stock pipeline copies verbatim into event.type with the ECS
+          vocabulary (connection/protocol/info) so category filters behave,
+          and set observer.hostname from the appliance name the stock pipeline
+          parks in a custom field. Add a custom-namespace keyword mapping for
+          fireeye.nx.flow_id, the join key that ties a connection's flow,
+          http, dns, tls and fileinfo records together.

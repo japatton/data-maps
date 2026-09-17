@@ -1,0 +1,643 @@
+id: tenable-sc
+name: Tenable Security Center (ACAS console)
+vendor: Tenable
+versions: >-
+  Tenable Security Center 6.x, formerly Tenable.sc and before that
+  SecurityCenter; the ACAS console that aggregates Nessus scanner results
+draft: true
+references:
+- https://github.com/elastic/integrations/tree/main/packages/tenable_sc
+- https://docs.tenable.com/security-center/api/index.htm
+- https://www.elastic.co/docs/reference/integrations/tenable_sc
+datasets:
+- id: vulnerability
+  name: Vulnerability finding
+  description: |
+    One record per vulnerability instance - a plugin firing on a host, on a port. This is the console's aggregated view rather than raw scanner output, which is the distinction that matters: the catalogue already covers the Nessus scanner, and this is where those results are deduplicated, aged, risk-accepted and reported against. ACAS is the scanner and the console together, and a migration that carries only the scanner loses every accept-risk and recast-risk decision the security staff have made.
+    Findings are state, not events. A record describes a condition that is true until a later scan says otherwise, so it does not age out the way a log line does and last_seen, not @timestamp, is what says whether it is still real.
+  event_categories:
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Pulled from the Security Center REST API rather than pushed. The
+        collector holds an API key, which means the credential lives on the
+        low side and the poll interval - not the appliance - decides
+        freshness. Security Center can also email or file-export a report, but
+        a report is a rendering with a schedule and a template between the
+        finding and the reader, and it cannot be re-queried.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes. Plugin output text is long, free-form and
+        occasionally quotes file contents from the scanned host, which makes
+        it the field a content filter is most likely to object to.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-tenable_sc.vulnerability
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Pulled from the Security Center REST API on a schedule.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-tenable_sc.vulnerability
+  formats:
+  - format: api-pull
+    parsing:
+      mechanism: elastic-integration
+      artifact: elastic/integrations tenable_sc, data stream vulnerability
+      notes: |
+        The integration parses the API response and namespaces almost everything under tenable_sc.vulnerability.*. It promotes only five fields to ECS - cve, description, dnsName, operatingSystem and severity.name - and sets event.category to threat and vulnerability with observer.vendor Tenable.
+        That thinness is the reason this map is worth writing. Sixty-odd fields arrive correctly parsed and vendor-namespaced, and the ones a detection or a report actually needs - the host address, the CVSS scores, the STIG severity, the first and last seen dates - are not in ECS unless a pipeline puts them there. The rows below say where each should go; anything marked mapped here is a target the integration does not currently populate on its own.
+    fields:
+    - vendor: cve
+      type: string
+      description: CVE identifier or identifiers for the vulnerability
+      ecs: vulnerability.id
+      status: partial
+      notes: >
+        a plugin can cite several CVEs and the API returns them
+        comma-separated in one string, so the pipeline must split to an array.
+        Many plugins - compliance checks and local configuration audits
+        especially - cite none at all, and a report that joins on CVE silently
+        loses exactly the STIG findings this console exists to track.
+    - vendor: pluginID
+      type: integer
+      description: numeric id of the Nessus plugin that fired
+      ecs: vulnerability.enumeration
+      status: partial
+      transform: cast to string
+      notes: >-
+        the real identity of a finding here, and the only identifier that
+        exists on every record including the ones with no CVE; joins to the
+        Nessus scanner feed
+    - vendor: pluginName
+      type: string
+      description: display name of the plugin
+      ecs: vulnerability.category
+      status: partial
+      notes: >-
+        the human-readable statement of what was found; not
+        vulnerability.description, which the longer description field holds
+    - vendor: description
+      type: string
+      description: full description of the vulnerability
+      ecs: vulnerability.description
+      status: mapped
+    - vendor: synopsis
+      type: string
+      description: one-line summary of the vulnerability
+      ecs: message
+      status: partial
+      notes: >-
+        the closest thing to a headline the record has; kept because a console
+        view without it is unreadable
+    - vendor: solution
+      type: string
+      description: the remediation the plugin recommends
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.vulnerability.solution
+      notes: >-
+        the field that turns a finding into a ticket; ECS has no remediation
+        concept at all
+    - vendor: severity
+      type: object
+      description: severity of the finding, as an object carrying id, name and description
+      ecs: vulnerability.severity
+      status: partial
+      transform: take severity.name
+      notes: >
+        Tenable's own scale - Info, Low, Medium, High, Critical - and not the
+        CVSS score, which is separate. The two disagree: Security Center's
+        severity reflects the recast and accepted-risk decisions made locally,
+        and the CVSS score does not, which is the whole point of having both.
+    - vendor: stigSeverity
+      type: string
+      description: DISA STIG severity category of the finding
+      ecs: null
+      status: partial
+      custom: tenable_sc.vulnerability.stig_severity
+      notes: >
+        CAT I, II or III. Deliberately withheld from vulnerability.severity,
+        which carries Tenable's own scale - they are different classifications
+        and a CAT I is not a Critical. In an RMF estate this is often the
+        field that drives the remediation deadline, so it is worth a named
+        custom rather than being flattened into the vendor severity.
+    - vendor: baseScore
+      type: string
+      description: CVSSv2 base score
+      ecs: vulnerability.score.base
+      status: partial
+      transform: cast to float
+      notes: >-
+        shares vulnerability.score.base with the v3 and v4 base scores and
+        only one can hold it; the pipeline must pick the highest CVSS version
+        present and set vulnerability.score.version to match, or the score
+        means nothing
+    - vendor: cvssV3BaseScore
+      type: float
+      description: CVSSv3 base score
+      ecs: vulnerability.score.base
+      status: partial
+      notes: same single-slot contention as baseScore
+    - vendor: cvssV4BaseScore
+      type: float
+      description: CVSSv4 base score
+      ecs: vulnerability.score.base
+      status: partial
+      notes: >-
+        preferred when present, being the newest; set
+        vulnerability.score.version to 4.0 alongside it
+    - vendor: temporalScore
+      type: string
+      description: CVSSv2 temporal score
+      ecs: vulnerability.score.temporal
+      status: partial
+      transform: cast to float
+    - vendor: cvssV3TemporalScore
+      type: float
+      description: CVSSv3 temporal score
+      ecs: vulnerability.score.temporal
+      status: partial
+    - vendor: cvssVector
+      type: string
+      description: CVSSv2 vector string
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.vulnerability.cvss_vector
+    - vendor: cvssV3Vector
+      type: string
+      description: CVSSv3 vector string
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.vulnerability.cvss_v3_vector
+    - vendor: cvssV4Vector
+      type: string
+      description: CVSSv4 vector string
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.vulnerability.cvss_v4_vector
+    - vendor: vprScore
+      type: float
+      description: Tenable Vulnerability Priority Rating
+      ecs: null
+      status: partial
+      custom: tenable_sc.vulnerability.vpr_score
+      notes: >-
+        Tenable's own threat-informed priority, which is what most remediation
+        queues are actually sorted by; withheld from vulnerability.score.base
+        because it is not a CVSS score and mixing the two scales in one field
+        makes both unusable
+    - vendor: epssScore
+      type: float
+      description: Exploit Prediction Scoring System probability
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.vulnerability.epss_score
+    - vendor: exploitAvailable
+      type: boolean
+      description: whether a public exploit exists
+      ecs: null
+      status: partial
+      custom: tenable_sc.vulnerability.exploit.is_available
+      notes: >-
+        the single most useful triage field on the record and it has no ECS
+        home; worth promoting into a named custom rather than leaving it in
+        the vendor namespace by default
+    - vendor: exploitEase
+      type: string
+      description: how easily the vulnerability can be exploited
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.vulnerability.exploit.ease
+    - vendor: exploitFrameworks
+      type: string
+      description: exploit frameworks that carry a module for it
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.vulnerability.exploit.frameworks
+      notes: names Metasploit, Core Impact and Canvas where a module exists
+    - vendor: ip
+      type: ip
+      description: address of the asset the finding was found on
+      ecs: host.ip
+      status: mapped
+      notes: >-
+        not source.ip or destination.ip - nothing here describes a flow, and
+        the asset is the subject of the record
+    - vendor: dnsName
+      type: string
+      description: DNS name of the asset
+      ecs: host.hostname
+      status: mapped
+    - vendor: netbiosName
+      type: string
+      description: NetBIOS name of the asset
+      ecs: host.name
+      status: partial
+      notes: >-
+        often DOMAIN\HOST rather than a bare name; split before use or the
+        host join against every other feed fails
+    - vendor: macAddress
+      type: string
+      description: MAC address of the asset
+      ecs: host.mac
+      status: partial
+      transform: normalize to upper-case hyphen-separated, per ECS
+      notes: >-
+        ECS specifies the separator and case; Tenable does not guarantee
+        either, and an unnormalized MAC will not join
+    - vendor: operatingSystem
+      type: string
+      description: operating system detected on the asset
+      ecs: host.os.full
+      status: mapped
+    - vendor: osCPE
+      type: string
+      description: CPE string for the detected operating system
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.vulnerability.os_cpe
+    - vendor: port
+      type: integer
+      description: port the finding was observed on
+      ecs: null
+      status: partial
+      custom: tenable_sc.vulnerability.port
+      notes: >
+        withheld from destination.port and source.port alike. The finding is a
+        property of a listening service on the asset, not of a connection, and
+        putting it in a flow field makes every vulnerability record look like
+        network traffic to any query that does not know better.
+    - vendor: protocol
+      type: string
+      description: transport protocol of the affected service
+      ecs: network.transport
+      status: partial
+      transform: lowercase
+      notes: ECS specifies lowercase; Tenable emits mixed case
+    - vendor: firstSeen
+      type: timestamp
+      description: when a scan first identified the finding
+      ecs: event.start
+      status: partial
+      transform: epoch_seconds to ISO-8601 UTC
+    - vendor: lastSeen
+      type: timestamp
+      description: when a scan most recently identified the finding
+      ecs: '@timestamp'
+      status: partial
+      transform: epoch_seconds to ISO-8601 UTC
+      notes: >
+        this and not the collection time is the timestamp of record. A finding
+        is a state that persists between scans, so indexing on collection time
+        makes every finding look like it was discovered today and destroys any
+        ageing report. The gap between firstSeen and lastSeen is how long the
+        condition has been true.
+    - vendor: vulnPubDate
+      type: timestamp
+      description: when the vulnerability was publicly disclosed
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.vulnerability.vuln_pub_date
+    - vendor: patchPubDate
+      type: timestamp
+      description: when a patch was published
+      ecs: null
+      status: partial
+      custom: tenable_sc.vulnerability.patch_pub_date
+      notes: >-
+        with firstSeen this gives time-to-patch-availability, which is the
+        metric that distinguishes an unpatchable finding from an unpatched one
+    - vendor: hasBeenMitigated
+      type: string
+      description: whether the finding has been mitigated
+      ecs: null
+      status: partial
+      custom: tenable_sc.vulnerability.has_been_mitigated
+      transform: 'compare against the strings ''0'' and ''1'', then cast to boolean'
+      notes: >
+        the API returns the character '0' or '1', not a JSON boolean, so a
+        truthiness test in a pipeline treats '0' as true and marks every
+        unmitigated finding mitigated. A mitigated finding is still returned
+        by the API, so a query that does not filter on this reports resolved
+        findings as open.
+    - vendor: acceptRisk
+      type: string
+      description: whether a risk-acceptance rule applies to the finding
+      ecs: null
+      status: partial
+      custom: tenable_sc.vulnerability.accept_risk
+      notes: >
+        the local decision that this finding will not be fixed, and one of the
+        two reasons the console view differs from raw scanner output. Carrying
+        it is the difference between a migration that preserves the security
+        staff's judgements and one that reopens every accepted risk on
+        cutover.
+    - vendor: acceptRiskRuleComment
+      type: string
+      description: justification recorded with the risk acceptance
+      ecs: null
+      status: partial
+      custom: tenable_sc.vulnerability.accept_risk_comment
+      notes: the audit trail for the acceptance; free text, and often the only record of why
+    - vendor: recastRisk
+      type: string
+      description: whether a severity-recast rule applies to the finding
+      ecs: null
+      status: partial
+      custom: tenable_sc.vulnerability.recast_risk
+      notes: >-
+        the other local decision - this finding is real but not as severe here
+        as the plugin claims - and the reason severity and the CVSS score
+        disagree
+    - vendor: recastRiskRuleComment
+      type: string
+      description: justification recorded with the recast
+      ecs: null
+      status: partial
+      custom: tenable_sc.vulnerability.recast_risk_comment
+    - vendor: repository
+      type: object
+      description: the Security Center repository the finding lives in
+      ecs: null
+      status: partial
+      custom: tenable_sc.vulnerability.repository
+      notes: >-
+        repositories are how Security Center separates enclaves or
+        organisations, so this is usually the tenancy boundary and belongs on
+        every record
+    - vendor: pluginText
+      type: string
+      description: 'the plugin''s output for this specific finding'
+      ecs: null
+      status: partial
+      custom: tenable_sc.vulnerability.plugin_text
+      notes: >
+        the evidence - what the scanner actually saw. Long, free-form, and for
+        local checks it can quote file contents or configuration from the
+        scanned host, so it is both the most useful field for triage and the
+        first candidate for redaction or omission at a guard.
+    - vendor: riskFactor
+      type: string
+      description: 'the plugin''s own risk rating'
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.vulnerability.risk_factor
+    - vendor: seeAlso
+      type: string
+      description: reference URLs for the vulnerability
+      ecs: vulnerability.reference
+      status: partial
+      transform: split on newline to an array
+    - vendor: xref
+      type: string
+      description: cross-references to other vulnerability databases
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.vulnerability.xref
+    - vendor: bid
+      type: string
+      description: Bugtraq identifier
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.vulnerability.bid
+    - vendor: cpe
+      type: string
+      description: CPE of the affected product
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.vulnerability.cpe
+    - vendor: family
+      type: object
+      description: the plugin family, as an object with id, name and type
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.vulnerability.family
+    - vendor: uuid
+      type: string
+      description: unique identifier of the asset record
+      ecs: host.id
+      status: partial
+      notes: >-
+        the asset's identity in Security Center, which is what the asset
+        dataset joins on
+    - vendor: seolDate
+      type: timestamp
+      description: date the affected software reaches end of life
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.vulnerability.seol_date
+- id: asset
+  name: Asset summary
+  description: >
+    One record per scanned asset with its rolled-up finding counts by
+    severity. Not a finding stream and not a substitute for one - it is the
+    inventory view, and it answers what was scanned and when, which is the
+    question a coverage report asks and the vulnerability dataset cannot
+    answer. An asset absent here was not scanned; an asset with a stale
+    lastAuthRun was scanned without credentials and its results are shallower
+    than they look.
+  event_categories:
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Pulled from the Security Center REST API. Low volume - one record per
+        asset per poll - and no free-text fields.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes. Structurally simple and a good candidate for a
+        tight allow-listed filter policy.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-tenable_sc.asset
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Pulled from the Security Center REST API on a schedule.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-tenable_sc.asset
+  formats:
+  - format: api-pull
+    parsing:
+      mechanism: elastic-integration
+      artifact: elastic/integrations tenable_sc, data stream asset
+      notes: >
+        The integration promotes a single field to ECS on this stream -
+        dnsName to host.hostname - and namespaces the rest. The severity
+        counters are the point of the record and none of them reaches ECS,
+        which has no concept of a rolled-up finding count.
+    fields:
+    - vendor: ip
+      type: ip
+      description: address of the asset
+      ecs: host.ip
+      status: mapped
+    - vendor: dnsName
+      type: string
+      description: DNS name of the asset
+      ecs: host.hostname
+      status: mapped
+    - vendor: netbiosName
+      type: string
+      description: NetBIOS name of the asset
+      ecs: host.name
+      status: partial
+      transform: split DOMAIN\HOST and keep the host portion
+    - vendor: macAddress
+      type: string
+      description: MAC address of the asset
+      ecs: host.mac
+      status: partial
+      transform: normalize to upper-case hyphen-separated, per ECS
+    - vendor: uuid
+      type: string
+      description: 'Security Center''s identifier for the asset'
+      ecs: host.id
+      status: mapped
+      notes: the join key to the vulnerability dataset
+    - vendor: biosGUID
+      type: string
+      description: BIOS GUID reported by the host
+      ecs: null
+      status: partial
+      custom: tenable_sc.asset.bios_guid
+      notes: >-
+        survives a rebuild and an address change, which makes it a better
+        asset identity than the address for anything longitudinal
+    - vendor: tpmID
+      type: string
+      description: TPM identifier reported by the host
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.asset.tpm_id
+    - vendor: mcafeeGUID
+      type: string
+      description: agent GUID from a McAfee or Trellix endpoint agent
+      ecs: null
+      status: partial
+      custom: tenable_sc.asset.mcafee_guid
+      notes: >-
+        the join key to the ePO estate, which is the one field here that
+        correlates the scanning stack with the endpoint stack
+    - vendor: timestamp
+      type: timestamp
+      description: when the asset record was last updated
+      ecs: '@timestamp'
+      status: partial
+      transform: epoch_seconds to ISO-8601 UTC
+    - vendor: lastAuthRun
+      type: timestamp
+      description: when the asset was last scanned with credentials
+      ecs: null
+      status: partial
+      custom: tenable_sc.asset.last_auth_run
+      notes: >
+        the coverage field that matters. An uncredentialed scan sees what a
+        remote attacker sees and misses most local configuration findings, so
+        an asset whose lastAuthRun is far behind lastUnauthRun has results
+        that understate its exposure - and nothing in the finding records
+        themselves says so.
+    - vendor: lastUnauthRun
+      type: timestamp
+      description: when the asset was last scanned without credentials
+      ecs: null
+      status: partial
+      custom: tenable_sc.asset.last_unauth_run
+    - vendor: severityCritical
+      type: integer
+      description: count of critical findings on the asset
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.asset.severity.critical
+    - vendor: severityHigh
+      type: integer
+      description: count of high findings on the asset
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.asset.severity.high
+    - vendor: severityMedium
+      type: integer
+      description: count of medium findings on the asset
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.asset.severity.medium
+    - vendor: severityLow
+      type: integer
+      description: count of low findings on the asset
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.asset.severity.low
+    - vendor: severityInfo
+      type: integer
+      description: count of informational findings on the asset
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.asset.severity.info
+    - vendor: total
+      type: integer
+      description: total findings on the asset
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.asset.severity.total
+    - vendor: score
+      type: integer
+      description: 'Security Center''s computed risk score for the asset'
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.asset.score
+    - vendor: policyName
+      type: string
+      description: scan policy last applied to the asset
+      ecs: null
+      status: partial
+      custom: tenable_sc.asset.policy_name
+      notes: >-
+        which policy ran is what decides which plugins were even eligible to
+        fire, so a coverage question is unanswerable without it
+    - vendor: pluginSet
+      type: string
+      description: plugin feed version used for the last scan
+      ecs: null
+      status: partial
+      custom: tenable_sc.asset.plugin_set
+      notes: >-
+        a stale plugin set cannot detect a recent vulnerability at all; this
+        is the field that distinguishes "not vulnerable" from "not looked for"
+    - vendor: repository
+      type: object
+      description: the Security Center repository the asset lives in
+      ecs: null
+      status: partial
+      custom: tenable_sc.asset.repository

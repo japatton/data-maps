@@ -1,0 +1,1191 @@
+id: netflow
+name: NetFlow/IPFIX
+vendor: Multiple
+versions: NetFlow v5, NetFlow v9 (RFC 3954), IPFIX / v10 (RFC 7011)
+draft: true
+references:
+- https://www.elastic.co/docs/reference/integrations/netflow
+- >-
+  https://www.elastic.co/guide/en/beats/filebeat/current/filebeat-input-netflow.html
+- >-
+  https://www.elastic.co/guide/en/beats/filebeat/current/exported-fields-netflow.html
+- https://www.iana.org/assignments/ipfix/ipfix.xhtml
+- https://docs.cribl.io/stream/sources-netflow/
+- https://www.rfc-editor.org/rfc/rfc7011
+- https://www.ietf.org/rfc/rfc3954.txt
+datasets:
+- id: flow
+  name: Flow records
+  description: >
+    One record per observed traffic flow, exported over UDP by routers,
+    switches, and firewalls: the 5-tuple plus byte/packet counters, TCP
+    control bits, BGP AS numbers, and SNMP interface indices. The wire format
+    is binary, so the parser IS the collector - there is no text line to
+    re-parse downstream. NetFlow v5 is a fixed 48-byte record; v9 and IPFIX
+    are template-driven, meaning the field layout arrives in separate template
+    records that the collector must have cached before any data record can be
+    decoded. Vendor field names below are the IANA IPFIX Information Element
+    names; the Elastic netflow input renders them as snake_case under
+    netflow.* (for example sourceIPv4Address becomes
+    netflow.source_ipv4_address).
+  event_categories:
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Exporters send binary UDP (commonly port 2055/4739) to a collector.
+        Raw NetFlow cannot cross the guard at all - templates travel out of
+        band on their own UDP datagrams and a one-way, at-most-once,
+        protocol-breaking hop will strand data records that arrive without
+        their template - so the decode happens before the crossing and NDJSON
+        crosses instead.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-netflow.log
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Exporters send binary UDP (commonly port 2055/4739) to a collector.
+        Cribl runs in NetFlow pass-through mode, replicating the raw datagrams
+        (__netflowRaw) to a NetFlow destination in front of the Elastic Agent
+        that runs the decoder.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-netflow.log
+  formats:
+  - format: other
+    parsing:
+      mechanism: elastic-integration
+      artifact: NetFlow Records integration (filebeat netflow input)
+      notes: >
+        The Elastic netflow input is a genuine binary decoder, not a regex
+        pass: it handles v1/v5/v6/v7/v8/v9 and IPFIX, caches v9/IPFIX
+        templates (expiration_timeout), tracks sequence resets
+        (detect_sequence_reset), carries the full IANA IPFIX element registry,
+        and maps the well-known elements to ECS in Go before the ingest
+        pipeline runs. Cribl Stream also ships a NetFlow & IPFIX source
+        covering v5, v9, and IPFIX with cluster-wide template sync from the
+        Leader, but it names registered fields in Cisco-style camelCase
+        (srcAddr, dstAddr) rather than the IPFIX element names, and emits
+        unregistered enterprise elements as raw type-code/byte-buffer arrays -
+        so choosing Cribl as the collector means owning the field naming and
+        the enterprise-element decode by hand. Whichever collector is chosen,
+        only one may terminate the binary stream.
+    fields:
+    - vendor: sourceIPv4Address
+      type: ip
+      description: IPv4 source address of the flow (IE 8; sourceIPv6Address, IE 27, for v6 flows)
+      ecs: source.ip
+      status: mapped
+    - vendor: destinationIPv4Address
+      type: ip
+      description: >-
+        IPv4 destination address of the flow (IE 12; destinationIPv6Address,
+        IE 28, for v6 flows)
+      ecs: destination.ip
+      status: mapped
+    - vendor: sourceTransportPort
+      type: port
+      description: source port for TCP/UDP/SCTP flows (IE 7)
+      ecs: source.port
+      status: mapped
+    - vendor: destinationTransportPort
+      type: port
+      description: destination port for TCP/UDP/SCTP flows (IE 11)
+      ecs: destination.port
+      status: mapped
+    - vendor: protocolIdentifier
+      type: integer
+      description: >-
+        IANA IP protocol number of the flow, e.g. 6 for TCP, 17 for UDP, 1 for
+        ICMP (IE 4)
+      ecs: network.transport
+      status: partial
+      transform: >
+        the wire value is a numeric protocol number; the decoder resolves the
+        well-known ones to the lowercase ECS transport names (tcp, udp, icmp)
+        and also copies the number to network.iana_number. Protocol numbers
+        outside the decoder's enum leave network.transport unset while
+        network.iana_number is still populated, so alerting must not assume
+        network.transport exists.
+    - vendor: octetDeltaCount
+      type: long
+      description: number of octets in the packets of this flow since the previous report (IE 1)
+      ecs: source.bytes
+      status: partial
+      transform: >
+        unidirectional counter for the observed direction only. The decoder
+        assigns it to source.bytes and sums it with the reverse counter into
+        network.bytes; where the exporter emits octetTotalCount (IE 85) or
+        initiatorOctets (IE 231) instead, the same ECS target is used. If flow
+        sampling is enabled on the exporter, this value counts only sampled
+        packets and must be multiplied by the sampling interval from the
+        options records before it means anything.
+    - vendor: packetDeltaCount
+      type: long
+      description: number of packets in this flow since the previous report (IE 2)
+      ecs: source.packets
+      status: partial
+      transform: >
+        same shape as octetDeltaCount - unidirectional, summed with the
+        reverse counter into network.packets, and subject to the same
+        sampling-interval scaling
+    - vendor: reverseOctetDeltaCount
+      type: long
+      description: >-
+        octet count for the reverse direction of a bidirectional (biflow)
+        record, reverse PEN 29305
+      ecs: destination.bytes
+      status: partial
+      notes: >
+        only present when the exporter emits biflows; most router and switch
+        exporters emit two unidirectional records instead, in which case
+        destination.bytes and destination.packets are simply absent and any
+        dashboard that expects a symmetric byte pair will read zero
+    - vendor: tcpControlBits
+      type: integer
+      description: cumulative union of the TCP flags observed on the packets of this flow (IE 6)
+      ecs: null
+      status: unmapped
+      custom: netflow.tcp_flags
+      transform: >
+        the wire value is a bitmask; the integration's ingest pipeline runs a
+        Painless script that expands it into a keyword array of flag names
+        (FIN, SYN, RST, PSH, ACK, URG, ECE, CWR) under netflow.tcp_flags while
+        retaining the raw integer as netflow.tcp_control_bits
+      notes: >
+        ECS 9.4 has no field for TCP flags on a network event, so both the
+        bitmask and the expanded names stay in the netflow custom namespace;
+        scan and port-sweep detections that key on SYN-only flows depend on
+        this field being mapped as keyword
+    - vendor: ingressInterface
+      type: long
+      description: >-
+        SNMP ifIndex of the interface on which the packets of this flow were
+        received (IE 10)
+      ecs: observer.ingress.interface.id
+      status: mapped
+      transform: >
+        numeric ifIndex is stringified into the keyword ECS field; it is only
+        meaningful alongside the exporter identity, and an ifIndex-to-name
+        enrich table (built from the options records' interfaceName) is
+        required before observer.ingress.interface.name can be populated
+    - vendor: egressInterface
+      type: long
+      description: >-
+        SNMP ifIndex of the interface on which the packets of this flow were
+        forwarded (IE 14)
+      ecs: observer.egress.interface.id
+      status: mapped
+    - vendor: bgpSourceAsNumber
+      type: long
+      description: 'autonomous system number of the source, from the exporter''s BGP table (IE 16)'
+      ecs: source.as.number
+      status: mapped
+      notes: >
+        many exporters are configured for peer-AS rather than origin-AS, or
+        export 0 when the prefix is not in the BGP table, so this is not a
+        substitute for the integration's own GeoIP/ASN enrichment of source.ip
+    - vendor: bgpDestinationAsNumber
+      type: long
+      description: >-
+        autonomous system number of the destination, from the exporter's BGP
+        table (IE 17)
+      ecs: destination.as.number
+      status: mapped
+    - vendor: flowStartSysUpTime
+      type: long
+      description: >-
+        milliseconds since the exporter booted at which the first packet of
+        this flow was observed (IE 22)
+      ecs: event.start
+      status: partial
+      transform: >
+        this is a relative uptime delta, not a timestamp. It only becomes an
+        absolute event.start when added to the exporter boot time -
+        systemInitTimeMilliseconds (IE 160) from an options record, or the
+        sysUpTime and unix_secs pair in the v9 packet header - and an exporter
+        that reboots or has unsynchronised NTP will produce plausible but
+        wrong flow times. Exporters that emit flowStartMilliseconds (IE 152)
+        instead give an absolute date directly and need no reconstruction.
+    - vendor: flowEndSysUpTime
+      type: long
+      description: >-
+        milliseconds since the exporter booted at which the last packet of
+        this flow was observed (IE 21)
+      ecs: event.end
+      status: partial
+      transform: >
+        same reconstruction as flowStartSysUpTime; the end-minus-start
+        difference is what the decoder converts into nanosecond
+        event.duration, so a bad boot time corrupts the duration too
+    - vendor: flowDirection
+      type: enum
+      description: >-
+        direction of the flow observed at the observation point, 0 = ingress,
+        1 = egress (IE 61)
+      ecs: network.direction
+      status: partial
+      notes: >
+        the vendor vocabulary is ingress/egress relative to the interface,
+        which is not the ECS network.direction vocabulary (inbound, outbound,
+        internal, external, unknown). Elastic derives the ECS value from
+        source/destination locality against the configured internal_networks
+        instead, so this element should not be copied into network.direction
+        verbatim - keep it distinct or the two definitions will silently
+        disagree.
+    - vendor: ipClassOfService
+      type: integer
+      description: >-
+        value of the IPv4 ToS / IPv6 Traffic Class octet in the first packet
+        of the flow (IE 5)
+      ecs: null
+      status: unmapped
+      custom: netflow.ip_class_of_service
+      notes: >
+        carries the DSCP and ECN bits; ECS 9.4 models no QoS or DSCP concept,
+        so it stays custom. Useful for spotting traffic marked into the wrong
+        queue and for OT/voice segment baselining.
+    - vendor: flowEndReason
+      type: enum
+      description: >-
+        why the flow record was terminated - 1 idle timeout, 2 active timeout,
+        3 end of flow detected, 4 forced end, 5 lack of resources (IE 136)
+      ecs: null
+      status: unmapped
+      custom: netflow.flow_end_reason
+      notes: >
+        deliberately not event.outcome - a flow record describes observation,
+        not success or failure, and value 5 (lack of resources) is an exporter
+        health signal rather than a property of the traffic. Alert on a rise
+        in value 5 as evidence that the exporter is shedding flows.
+    - vendor: flowId
+      type: long
+      description: >-
+        exporter-assigned identifier for a flow, unique within the observation
+        domain (IE 148)
+      ecs: null
+      status: unmapped
+      custom: netflow.flow_id
+      notes: >
+        rarely exported by routers. Separately, the Elastic decoder always
+        synthesises its own top-level flow.id by hashing the 5-tuple - that
+        field is NOT in ECS 9.4 (there is no flow.* object), so it needs an
+        explicit index-template mapping and must not be confused with this
+        element.
+    - vendor: exporterIPv4Address
+      type: ip
+      description: IPv4 address of the exporting process (IE 130)
+      ecs: observer.ip
+      status: partial
+      notes: >
+        most router and firewall exporters never send IE 130; the collector
+        instead records the UDP source address of the datagram as
+        netflow.exporter.address in IP:port form and extracts the address
+        portion into observer.ip. That fallback breaks when the collector sits
+        behind a NAT or a container bridge, which is the single most common
+        cause of every flow appearing to come from one exporter. observer.name
+        is not populated at all - there is no hostname on the wire - so an
+        exporter-address-to-name lookup is required before per-device
+        dashboards work.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Do no field extraction here: put the NetFlow source in pass-through
+          mode so the raw datagrams are replicated to a NetFlow destination
+          untouched, and let the Elastic Agent decoder be the single parser -
+          splitting the decode between Cribl and the netflow input just
+          duplicates template state. Cribl's real work on this route is UDP
+          survivability and volume: run the source close to the exporters,
+          size the OS receive buffers, use Persistent Queue backpressure
+          (never Block) on the destination, and attach the exporter-to-site
+          and exporter-to-owner enrichment that is cheapest near the source.
+          Shape volume by sampling at the exporter rather than dropping
+          datagrams in Cribl, because a dropped template FlowSet costs every
+          data record behind it, not just itself.
+        elastic: >
+          The stock NetFlow Records integration ingest pipeline is the parser;
+          set internal_networks so source.locality, destination.locality, and
+          the derived network.direction are meaningful rather than unknown,
+          and layer a logs-netflow.log@custom pipeline for the four
+          normalizations this map records: reconstruct absolute event.start
+          and event.end by adding the flowStartSysUpTime/flowEndSysUpTime
+          millisecond deltas to the exporter boot time before trusting them,
+          multiply octet and packet counters by the sampling interval carried
+          on the options records (or flag the document as sampled so nobody
+          sums unscaled bytes), resolve protocolIdentifier through the IANA
+          protocol table for the values network.transport does not name, and
+          enrich the ingress/egress SNMP ifIndex into
+          observer.ingress.interface.name and observer.egress.interface.name.
+          Add custom-namespace index-template mappings for netflow.tcp_flags
+          (keyword array), netflow.flow_end_reason,
+          netflow.ip_class_of_service, and netflow.flow_id, and note that the
+          integration's own flow.id, flow.locality, and
+          source.locality/destination.locality are not ECS fields - they need
+          explicit mappings or they land on dynamic templates.
+        relay: >
+          Raw NetFlow must never be the thing that crosses the guard. The
+          protocol is UDP with out-of-band templates and no return channel, so
+          an at-most-once protocol break that loses one v9/IPFIX template
+          FlowSet silently renders every subsequent data record for that
+          template undecodable on the high side, with no way to request a
+          resend. For low-side instances the recommendation therefore inverts
+          to parse_location low: decode to full ECS-shaped NDJSON on the low
+          side and cross that instead - UTF-8, LF-terminated, compression
+          disabled, nesting depth at most two, short ASCII keys. Flow records
+          are the easiest content-filter case on the estate because every
+          field is numeric, an address, or a bounded enum with no free text,
+          so a custom NDJSON filter can stay simple if the key set is
+          allow-listed low-side. There is no _raw worth carrying here - the
+          binary datagram is not human-readable forensic evidence - and drop
+          detection must be low-side versus high-side record counts per
+          (exporter, hour), which for this technology should be reconciled
+          against the exporter's own exportedFlowRecordTotalCount counter on
+          the options records.
+      direct:
+        parse_location: high
+        cribl: >
+          Do no field extraction here: put the NetFlow source in pass-through
+          mode so the raw datagrams are replicated to a NetFlow destination
+          untouched, and let the Elastic Agent decoder be the single parser -
+          splitting the decode between Cribl and the netflow input just
+          duplicates template state. Cribl's real work on this route is UDP
+          survivability and volume: run the source close to the exporters,
+          size the OS receive buffers, use Persistent Queue backpressure
+          (never Block) on the destination, and attach the exporter-to-site
+          and exporter-to-owner enrichment that is cheapest near the source.
+          Shape volume by sampling at the exporter rather than dropping
+          datagrams in Cribl, because a dropped template FlowSet costs every
+          data record behind it, not just itself.
+        elastic: >
+          The stock NetFlow Records integration ingest pipeline is the parser;
+          set internal_networks so source.locality, destination.locality, and
+          the derived network.direction are meaningful rather than unknown,
+          and layer a logs-netflow.log@custom pipeline for the four
+          normalizations this map records: reconstruct absolute event.start
+          and event.end by adding the flowStartSysUpTime/flowEndSysUpTime
+          millisecond deltas to the exporter boot time before trusting them,
+          multiply octet and packet counters by the sampling interval carried
+          on the options records (or flag the document as sampled so nobody
+          sums unscaled bytes), resolve protocolIdentifier through the IANA
+          protocol table for the values network.transport does not name, and
+          enrich the ingress/egress SNMP ifIndex into
+          observer.ingress.interface.name and observer.egress.interface.name.
+          Add custom-namespace index-template mappings for netflow.tcp_flags
+          (keyword array), netflow.flow_end_reason,
+          netflow.ip_class_of_service, and netflow.flow_id, and note that the
+          integration's own flow.id, flow.locality, and
+          source.locality/destination.locality are not ECS fields - they need
+          explicit mappings or they land on dynamic templates.
+  - format: sflow
+    enable: >
+      sFlow is configured on the exporting switch or router, not on the
+      collector. On Arista EOS: set the packet sampling rate and the
+      collector, then enable globally - "sflow sample 16384", "sflow
+      destination <collector-ip> 6343", "sflow source-interface <mgmt>",
+      "sflow run" (per-interface "sflow enable" where the default is off). On
+      Cisco 8000 / IOS XR: define an sflow-map with the agent address, the
+      collector ("collector <ip> port 6343"), the sampling rate and the
+      counter polling-interval, then apply it under the interface. On
+      NVIDIA/Cumulus and most merchant-silicon switches the agent (host-sflow
+      / hsflowd) is given a sampling rate, a polling interval and one or more
+      collectors. The agent samples on average one packet in N, truncates each
+      to a header snap length (commonly 128 bytes), and sends the samples as
+      UDP to the collector - the IANA-registered sFlow port is 6343, distinct
+      from the 2055/4739 NetFlow/IPFIX listeners. Unlike v9/IPFIX there is no
+      template handshake and no options template: the sampling rate travels
+      inline in every flow sample and the datagram is self-describing by
+      data_format tag.
+    references:
+    - https://sflow.org/sflow_version_5.txt
+    - https://sflow.org/SFLOW-DATAGRAM5.txt
+    - https://github.com/sflow/sflowtool/blob/master/README
+    - >-
+      https://www.cisco.com/c/en/us/td/docs/iosxr/cisco8000/netflow/configuration/b-netflow-configuration-ios-xr-8000/monitor-traffic-using-sflow.html
+    - https://en.wikipedia.org/wiki/SFlow
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: sflowtool/host-sflow decode to JSON, then a Cribl JSON-to-ECS pipeline
+      notes: >
+        There is no stock decoder for this format on either side: the Elastic
+        netflow input decodes only NetFlow/IPFIX and rejects sFlow, and Cribl
+        Stream's NetFlow & IPFIX source does not read sFlow either, so the
+        binary sFlow datagram cannot be terminated by the same collector the
+        NetFlow feed uses. A dedicated sFlow collector must decode it first -
+        sflowtool (InMon) with "-J" emits one JSON object per datagram, and
+        host-sflow's hsflowd/mod modules can forward decoded records - after
+        which a Cribl JSON-to-ECS pipeline (or an elastic-ingest-pipeline over
+        the same JSON) maps the decoded tokens. The decisive semantic
+        difference to carry through that pipeline: an sFlow flow sample is ONE
+        sampled packet, not an aggregated flow, so there is no octet/packet
+        counter per flow - byte and packet volume must be ESTIMATED as sampled
+        size times sampling_rate, and network.bytes/network.packets are
+        statistical rather than measured. The collector reads srcIP, dstIP,
+        the ports and IP_protocol by parsing the raw sampled header out of the
+        datagram.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          sFlow shares the flow feed's UDP-survivability problem and adds a
+          collection gap: neither Cribl nor the Elastic Agent decodes it, so
+          the low-side worker group cannot simply pass sFlow through the way
+          it passes raw NetFlow to a decoder. Stand up an sFlow collector
+          (sflowtool -J, or hsflowd) next to the exporters, have it emit JSON
+          lines, and land those on a Cribl source; do the sampled-size times
+          sampling_rate scaling and the exporter-to-site/owner enrichment in
+          the low-side pipeline before the crossing, because the raw sampled
+          packet header is not something to carry across a content filter.
+          Size OS receive buffers and use Persistent Queue backpressure on the
+          downstream destination exactly as for NetFlow, and shape volume by
+          raising the sampling rate at the exporter rather than dropping
+          datagrams - a dropped sFlow datagram loses only its own samples (no
+          template dependency), but it also loses the inline sampling_rate
+          those samples needed to be scaled.
+        elastic: >
+          With no netflow input to lean on, model the decoded sFlow record
+          explicitly: srcIP/dstIP/ports/IP_protocol to the ECS source/
+          destination and network fields, inputPort/outputPort ifIndex to
+          observer.ingress/egress.interface.id (stringified, enriched to name
+          from SNMP or the counter samples), and the src_as/dst_as from an
+          extended_gateway record to source/destination.as.number when
+          present. Compute network.bytes and network.packets from packet_size
+          and the inline sampling_rate and FLAG the document as sampled so
+          nobody treats the estimate as a measured counter. Map the raw
+          sFlow-only signals - sflow.sampling_rate, sflow.sampled_packet_size,
+          sflow.tcp_flags (decompose the bitmask as on the NetFlow feed),
+          sflow.drops and sflow.sample_pool - in the custom namespace, and
+          resolve IP_protocol through the IANA table into network.transport
+          with the numeric value kept on network.iana_number.
+        relay: >
+          Raw sFlow must not be the thing that crosses the guard, and the
+          reason is sharper than for NetFlow: an sFlow flow sample carries a
+          truncated copy of a real captured packet header (the sampled_header
+          bytes), so shipping raw sFlow across would carry uninspected packet
+          content over the boundary. Decode low-side to ECS-shaped NDJSON -
+          UTF-8, LF-terminated, compression disabled, shallow nesting, short
+          ASCII keys - discard the raw sampled_header after the 5-tuple is
+          extracted, and cross only the resolved numeric/address/enum fields,
+          which are as easy a content-filter case as the NetFlow feed. Fold
+          the inline sampling_rate into the scaled counters before the
+          boundary so the high side never needs it. Treat as at-most-once and
+          reconcile low-side versus high-side sample counts per (agent, hour);
+          there is no exporter-side flow-record total to reconcile against as
+          there is on NetFlow, so the low/high count check is the only drop
+          detector.
+      direct:
+        parse_location: high
+        cribl: >
+          High-side instances have no guard, so the only question is where the
+          sFlow collector runs: it still cannot be the Elastic netflow input,
+          so either run sflowtool/hsflowd near the exporters and forward JSON
+          to the core worker group, or run it beside Elastic. Decode close to
+          the exporters regardless, because the raw datagram is UDP with no
+          retransmission and the sampled_header is bulky; forward the decoded,
+          scaled JSON rather than the binary. Keep the interface and AS
+          enrichment cheapest near the source.
+        elastic: >
+          With no netflow input to lean on, model the decoded sFlow record
+          explicitly: srcIP/dstIP/ports/IP_protocol to the ECS
+          source/destination and network fields, inputPort/outputPort ifIndex
+          to observer.ingress/egress.interface.id (stringified, enriched to
+          name from SNMP or the counter samples), and the src_as/dst_as from
+          an extended_gateway record to source/destination.as.number when
+          present. Estimate network.bytes and network.packets from packet_size
+          times sampling_rate and mark the document sampled so nobody treats
+          the estimate as a measured counter, resolve IP_protocol through the
+          IANA table into network.transport with the numeric value kept on
+          network.iana_number, and decompose sflow.tcp_flags. Keep the
+          sFlow-only fields in the custom namespace with index-template
+          mappings so the sampled-flow aggregations do not fall back to
+          dynamic mapping.
+    fields:
+    - vendor: srcIP
+      type: ip
+      description: source IP decoded from the sampled packet header (sampled_header / sampled_ipv4)
+      ecs: source.ip
+      status: mapped
+    - vendor: dstIP
+      type: ip
+      description: destination IP decoded from the sampled packet header
+      ecs: destination.ip
+      status: mapped
+    - vendor: tcp_src_port
+      type: integer
+      description: >-
+        source port from the sampled header; sflowtool emits tcp_src_port,
+        udp_src_port, or icmp_type per protocol
+      ecs: source.port
+      status: mapped
+    - vendor: tcp_dst_port
+      type: integer
+      description: >-
+        destination port from the sampled header; sflowtool emits
+        tcp_dst_port, udp_dst_port, or icmp_code per protocol
+      ecs: destination.port
+      status: mapped
+    - vendor: IP_protocol
+      type: integer
+      description: >-
+        IANA IP protocol number decoded from the sampled header, e.g. 6 TCP,
+        17 UDP, 1 ICMP
+      ecs: network.iana_number
+      status: partial
+      transform: >
+        the numeric value is copied to network.iana_number and resolved
+        through the IANA protocol table into the lowercase network.transport
+        names (tcp, udp, icmp); numbers outside the resolver's set leave
+        network.transport unset while network.iana_number is still populated,
+        so alerting must not assume network.transport exists
+    - vendor: sampling_rate
+      type: long
+      description: >-
+        inline packet sampling rate carried in every flow sample - 1 in N
+        packets is sampled (struct flow_sample sampling_rate)
+      ecs: null
+      status: unmapped
+      custom: sflow.sampling_rate
+      transform: >
+        this is the multiplier that makes sFlow volume meaningful - unlike
+        NetFlow it is not on a separate options record but inline in each
+        sample, so it is always available for scaling but must actually be
+        applied: estimated bytes = sampled_packet_size * sampling_rate and
+        estimated packets = sample_count * sampling_rate. ECS has no sampling
+        concept, so it stays custom
+      notes: >
+        a flow sample carries no measured octet/packet counter the way a
+        NetFlow record does, so any network.bytes/network.packets derived here
+        is a statistical estimate, not a count, and must be flagged as sampled
+        on the document
+    - vendor: packet_size
+      type: long
+      description: >-
+        frame_length of the sampled packet in bytes, before truncation to the
+        header snap length (sampled_header frame_length)
+      ecs: null
+      status: unmapped
+      custom: sflow.sampled_packet_size
+      notes: >
+        the size of the single sampled packet, NOT the flow's byte total;
+        multiplied by sampling_rate it becomes the byte-volume estimate.
+        Deliberately not source.bytes, whose ECS meaning is a measured
+        directional counter
+    - vendor: inputPort
+      type: long
+      description: >-
+        SNMP ifIndex of the ingress interface the sampled packet arrived on
+        (struct flow_sample input)
+      ecs: observer.ingress.interface.id
+      status: mapped
+      transform: >
+        numeric ifIndex stringified into the keyword ECS field; meaningful
+        only alongside the agent identity, and an ifIndex-to-name table (from
+        SNMP or from the counter samples' ifIndex) is required before
+        observer.ingress.interface.name can be populated. A special value
+        indicates the packet was dropped or destined to the agent itself
+    - vendor: outputPort
+      type: long
+      description: >-
+        SNMP ifIndex of the egress interface (struct flow_sample output);
+        special values encode multiple/dropped/unknown outputs
+      ecs: observer.egress.interface.id
+      status: mapped
+    - vendor: in_vlan
+      type: integer
+      description: ingress 802.1Q VLAN id from an extended_switch record (src_vlan)
+      ecs: network.vlan.id
+      status: partial
+      notes: >
+        only present when the agent emits the extended_switch structure; maps
+        the ingress VLAN to the single ECS network.vlan.id. The egress VLAN
+        (out_vlan / dst_vlan) has no second ECS slot and lands on
+        sflow.out_vlan
+    - vendor: out_vlan
+      type: integer
+      description: egress 802.1Q VLAN id from an extended_switch record (dst_vlan)
+      ecs: null
+      status: unmapped
+      custom: sflow.out_vlan
+      notes: >-
+        ECS models a single network.vlan.id, taken from the ingress VLAN, so
+        the egress VLAN stays custom
+    - vendor: tcp_flags
+      type: integer
+      description: TCP control-bit union decoded from the sampled TCP header
+      ecs: null
+      status: unmapped
+      custom: sflow.tcp_flags
+      transform: >
+        a bitmask; expand it into a keyword array of flag names (FIN, SYN,
+        RST, PSH, ACK, URG, ECE, CWR) under sflow.tcp_flags while keeping the
+        raw integer, exactly as the NetFlow feed handles tcpControlBits. ECS
+        9.4 has no TCP-flags field, so both stay custom
+      notes: >-
+        only meaningful when the sampled packet was TCP and its header was
+        captured within the snap length; scan/port-sweep detections that key
+        on SYN-only flows depend on this being mapped as keyword
+    - vendor: src_as
+      type: long
+      description: >-
+        source autonomous system number from an extended_gateway record
+        (extended_gateway src_as)
+      ecs: source.as.number
+      status: partial
+      notes: >
+        only present when the agent emits the extended_gateway structure and
+        has a BGP table; the same peer-AS vs origin-AS ambiguity as NetFlow
+        applies, so it is not a substitute for GeoIP/ASN enrichment of
+        source.ip
+    - vendor: dst_as
+      type: long
+      description: >-
+        destination autonomous system number, the last AS in the
+        extended_gateway dst_as_path
+      ecs: destination.as.number
+      status: partial
+      notes: >-
+        taken from the tail of dst_as_path in the extended_gateway record;
+        absent unless the agent emits extended_gateway
+    - vendor: header
+      type: string
+      description: >-
+        raw sampled packet header bytes, hex-encoded, up to the snap length
+        (sampled_header header, with header_protocol/frame_length/stripped)
+      ecs: null
+      status: unmapped
+      custom: sflow.raw_header
+      notes: >
+        the defining sFlow artifact - an actual truncated copy of the observed
+        packet, from which the collector parses the 5-tuple. It is real packet
+        content and must be discarded after decode rather than carried across
+        a guard; retain it only on high-side direct feeds if packet-header
+        forensics are wanted, mapped as keyword
+    - vendor: drops
+      type: long
+      description: >-
+        count of packets the agent could not sample because of a lack of
+        resources, since the last sample (struct flow_sample drops)
+      ecs: null
+      status: unmapped
+      custom: sflow.drops
+      notes: >-
+        an agent-health signal analogous to the NetFlow options
+        ignoredPacketTotalCount - a rising value means the switch is shedding
+        samples and coverage estimates are overstated
+    - vendor: sample_pool
+      type: long
+      description: >-
+        total number of packets that could have been sampled from this source,
+        a running pool counter (struct flow_sample sample_pool)
+      ecs: null
+      status: unmapped
+      custom: sflow.sample_pool
+      notes: >-
+        the denominator that lets a collector verify the effective sampling
+        rate against the configured one; deltas between consecutive samples
+        reveal the true realized rate
+- id: options
+  name: Options and sampler records
+  description: >
+    Options data records exported alongside the flow records on v9 and IPFIX.
+    They carry the metering configuration and exporter health that the flow
+    records themselves depend on but do not contain: the sampling algorithm
+    and interval needed to scale byte and packet counters, the
+    ifIndex-to-interface-name table needed to make observer.*.interface.id
+    readable, the exporter boot time needed to turn sysUpTime deltas into real
+    timestamps, and the exporter's own exported/ignored counters. Low volume,
+    high leverage - dropping this record type is what makes flow data quietly
+    wrong rather than obviously missing.
+  event_categories:
+  - network
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Arrives interleaved with the flow records on the same UDP listener and
+        is decoded by the same collector, so it shares the flow dataset's
+        route and lands in the same data stream, distinguished by the
+        decoder's netflow.type discriminator. These records are decoded before
+        the crossing with the flow records rather than crossing as raw
+        datagrams.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-netflow.log
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Arrives interleaved with the flow records on the same UDP listener and
+        is decoded by the same collector, so it shares the flow dataset's
+        route and lands in the same data stream, distinguished by the
+        decoder's netflow.type discriminator.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-netflow.log
+  formats:
+  - format: other
+    parsing:
+      mechanism: elastic-integration
+      artifact: NetFlow Records integration (filebeat netflow input)
+      notes: >
+        The filebeat netflow input explicitly reads options records as well as
+        flows, decoding them against the cached options templates and tagging
+        the result with netflow.type. They are not broken out into a separate
+        Elastic data stream, so isolating them for enrichment or
+        exporter-health monitoring means filtering on netflow.type or on the
+        presence of the option-only elements.
+    fields:
+    - vendor: samplingInterval
+      type: long
+      description: >-
+        packet interval at which the exporter samples, e.g. 1000 means one
+        packet in every 1000 is metered (IE 34)
+      ecs: null
+      status: unmapped
+      custom: netflow.sampling_interval
+      transform: >
+        this is the multiplier that makes flow counters real - octet and
+        packet counts on sampled exporters must be multiplied by it before
+        they are summed or compared. ECS has no sampling concept, so it stays
+        custom and the scaling has to be applied explicitly in an ingest
+        pipeline.
+      notes: >
+        newer exporters send samplerRandomInterval (IE 305) or the
+        selector-based elements instead; deployment must record which element
+        each platform emits, because assuming an unsampled 1:1 feed
+        understates traffic volume by the sampling rate
+    - vendor: samplingAlgorithm
+      type: enum
+      description: sampling method in use - 1 deterministic, 2 random n-out-of-N (IE 35)
+      ecs: null
+      status: unmapped
+      custom: netflow.sampling_algorithm
+      notes: >-
+        deterministic sampling biases periodic traffic; worth surfacing on any
+        dashboard that presents flow byte totals as absolute
+    - vendor: samplerName
+      type: string
+      description: human-readable name of the sampler configured on the exporter (IE 84)
+      ecs: null
+      status: unmapped
+      custom: netflow.sampler_name
+    - vendor: samplerRandomInterval
+      type: long
+      description: number of packets the exporter selects from within each sampling window (IE 305)
+      ecs: null
+      status: unmapped
+      custom: netflow.sampler_random_interval
+      notes: >-
+        paired with samplingInterval on random n-out-of-N samplers; both are
+        needed to compute the true scaling factor
+    - vendor: interfaceName
+      type: string
+      description: >-
+        short name of the interface identified by the record's ifIndex, e.g.
+        GigabitEthernet0/0/1 (IE 82)
+      ecs: null
+      status: unmapped
+      custom: netflow.interface_name
+      notes: >
+        deliberately NOT mapped to observer.ingress.interface.name here - on
+        an options record this is a row in a lookup table keyed by ifIndex,
+        not a property of an observed flow. It becomes the source of that ECS
+        field only after being turned into an enrich policy and applied to the
+        flow records.
+    - vendor: interfaceDescription
+      type: string
+      description: operator-configured description string for the interface (IE 83)
+      ecs: null
+      status: unmapped
+      custom: netflow.interface_description
+      notes: >-
+        unbounded operator free text - the only content-filter-relevant value
+        in this dataset, and often the only place a circuit or site name
+        appears
+    - vendor: observationDomainId
+      type: long
+      description: >-
+        identifier of the observation domain within the exporter that produced
+        the record (IE 149)
+      ecs: null
+      status: unmapped
+      custom: netflow.observation_domain_id
+      notes: >
+        template and options-record scope is (exporter address, observation
+        domain), so every enrich policy built from this dataset must be keyed
+        on the pair, not on the exporter alone - a chassis with several line
+        cards reuses ifIndex values across domains
+    - vendor: systemInitTimeMilliseconds
+      type: timestamp
+      description: >-
+        absolute time at which the exporting process was initialised, in
+        milliseconds since epoch (IE 160)
+      ecs: null
+      status: unmapped
+      custom: netflow.system_init_time_milliseconds
+      notes: >
+        the anchor that converts the flow dataset's flowStartSysUpTime and
+        flowEndSysUpTime deltas into absolute event.start and event.end. Kept
+        custom rather than mapped to any ECS date, because it describes the
+        exporter's boot, not the event; mapping it to event.created or
+        @timestamp would misdate every record.
+    - vendor: exportedFlowRecordTotalCount
+      type: long
+      description: running count of flow records the exporting process has sent (IE 42)
+      ecs: null
+      status: unmapped
+      custom: netflow.exported_flow_record_total_count
+      notes: >-
+        monotonic counter; the authoritative figure to reconcile received
+        record counts against, including across a guard hop
+    - vendor: ignoredPacketTotalCount
+      type: long
+      description: >-
+        running count of packets the metering process observed but did not
+        process (IE 164)
+      ecs: null
+      status: unmapped
+      custom: netflow.ignored_packet_total_count
+      notes: >
+        exporter-side loss, invisible to any collector-side count
+        reconciliation - a rising value means the router shed traffic before
+        it ever became a flow record, so flow-based coverage claims are
+        overstated
+    - vendor: applicationName
+      type: string
+      description: >-
+        name of the application associated with an application id, from the
+        exporter's NBAR2-style classification table (IE 96)
+      ecs: network.application
+      status: partial
+      notes: >
+        exported as an options-record table mapping applicationId (IE 95) to a
+        name; only after that table is applied to the flow records does
+        network.application carry a value, and the taxonomy is
+        platform-specific rather than a shared vocabulary across vendors
+    - vendor: exporterIPv4Address
+      type: ip
+      description: IPv4 address of the exporting process (IE 130)
+      ecs: observer.ip
+      status: partial
+      notes: >
+        as on the flow dataset, usually absent on the wire and substituted
+        from the datagram's UDP source address; it is the join key for every
+        enrich policy built from this dataset, so a NAT or container bridge
+        that collapses all exporters onto one address corrupts the interface
+        and sampler tables rather than merely mislabelling them
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Nothing to extract low-side, but protect this record type from the
+          volume controls applied to flows: any sampling, throttling, or
+          queue-drop rule that treats the NetFlow listener as one
+          undifferentiated stream will discard the options records first
+          because they are rare, and their loss silently degrades every flow
+          record behind them. Exempt them from drop rules, keep Persistent
+          Queue backpressure on the destination, and alert on an exporter that
+          has stopped sending options records at all - that is the earliest
+          warning that the sampling interval and interface table on the
+          Elastic side have gone stale.
+        elastic: >
+          Land them in logs-netflow.log with the flows and turn them into the
+          two enrich policies the flow dataset needs rather than leaving them
+          as inert documents: an (exporter, ifIndex) to
+          interfaceName/interfaceDescription policy that fills
+          observer.ingress.interface.name and observer.egress.interface.name,
+          and an (exporter, samplerId) to samplingInterval policy that the
+          logs-netflow.log@custom pipeline uses to scale the flow counters.
+          Map the exporter counters (exported_flow_record_total_count,
+          ignored_packet_total_count) as long in the netflow custom namespace
+          and build the ingest-completeness check on them, since a rising
+          ignored count is the exporter admitting it dropped flows before
+          export - a gap no low-side/high-side reconciliation can see.
+        relay: >
+          These records are the reason raw NetFlow cannot cross the guard:
+          they are infrequent, they are what the flow decode depends on, and a
+          one-way at-most-once hop offers no way to notice one was dropped or
+          ask for it again. Decode low-side and cross the resolved values
+          instead - fold the sampling interval and interface name into each
+          flow record before the boundary so the high side never needs a table
+          that may not have made it across, and send the exporter-health
+          counters as their own small NDJSON stream. Every field here is
+          numeric or a short bounded string, so the content filter's only real
+          exposure is interfaceDescription, which is operator-authored free
+          text and should be length-capped and stripped of non-ASCII before
+          the guard destination.
+      direct:
+        parse_location: high
+        cribl: >
+          No field extraction happens in Cribl, but protect this record type
+          from the volume controls applied to flows: any sampling, throttling,
+          or queue-drop rule that treats the NetFlow listener as one
+          undifferentiated stream will discard the options records first
+          because they are rare, and their loss silently degrades every flow
+          record behind them. Exempt them from drop rules, keep Persistent
+          Queue backpressure on the destination, and alert on an exporter that
+          has stopped sending options records at all - that is the earliest
+          warning that the sampling interval and interface table on the
+          Elastic side have gone stale.
+        elastic: >
+          Land them in logs-netflow.log with the flows and turn them into the
+          two enrich policies the flow dataset needs rather than leaving them
+          as inert documents: an (exporter, ifIndex) to
+          interfaceName/interfaceDescription policy that fills
+          observer.ingress.interface.name and observer.egress.interface.name,
+          and an (exporter, samplerId) to samplingInterval policy that the
+          logs-netflow.log@custom pipeline uses to scale the flow counters.
+          Map the exporter counters (exported_flow_record_total_count,
+          ignored_packet_total_count) as long in the netflow custom namespace
+          and build the ingest-completeness check on them, since a rising
+          ignored count is the exporter admitting it dropped flows before
+          export - a gap no collector-side reconciliation can see.
+  - format: sflow
+    enable: >
+      Counter samples are enabled by giving the sFlow agent a counter polling
+      interval alongside the flow sampling rate - Arista EOS "sflow
+      polling-interval <seconds>", Cisco IOS XR "counter polling-interval
+      <seconds>" in the sflow-map, host-sflow "polling = <seconds>" per
+      interface. At each interval the agent emits a counter sample for every
+      enabled interface, interleaved with the flow samples on the same UDP
+      6343 datagram stream and distinguished by the sFlow sample-type tag
+      (counter sample vs flow sample). The generic if_counters structure is
+      the default; some agents additionally emit ethernet, LAG or host counter
+      structures. There is no separate template or options record to cache -
+      each counter sample is self-describing by its data_format.
+    references:
+    - https://sflow.org/sflow_version_5.txt
+    - https://sflow.org/SFLOW-DATAGRAM5.txt
+    - https://github.com/sflow/sflowtool/blob/master/README
+    - https://sflow.org/sflow_lag.txt
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: sflowtool/host-sflow decode to JSON, then a Cribl JSON-to-ECS pipeline
+      notes: >
+        Decoded by the same non-stock path as the flow samples - sflowtool -J
+        or hsflowd emits the counter sample as its own JSON object, tagged
+        distinctly from a flow sample - since neither the Elastic netflow
+        input nor the Cribl NetFlow source reads sFlow at all. These records
+        are the interface-identity and exporter-health half of an sFlow feed:
+        they carry the ifIndex and the interface octet/packet/error counters,
+        which is what makes the flow samples' inputPort/outputPort readable
+        and what an interface-health baseline is built from. Two honest gaps
+        versus the NetFlow options dataset: the counter sample carries ifIndex
+        but NOT interfaceName/interfaceDescription (no interface name is on
+        the sFlow wire - it comes from SNMP against the agent), and the
+        sampling rate needed to scale flow volume is inline in the flow
+        samples rather than here, so this record does not supply it.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          As with the NetFlow options records, protect this record type from
+          any volume control applied to the sampled-flow stream: counter
+          samples are far rarer than flow samples, so a blanket throttle or
+          queue-drop on the sFlow listener discards them first, and their loss
+          blinds every interface-health baseline. Decode them low-side with
+          the flow samples, exempt them from drop rules, and alert on an agent
+          that has stopped sending counter samples - that is the earliest sign
+          the interface table and utilization view have gone stale. The one
+          content-filter-relevant enrichment (the SNMP-sourced interface name)
+          is added low-side, not carried from the wire.
+        elastic: >
+          Land the counter samples in the same data stream as the flow samples
+          and turn them into the enrich material the flow side needs: an
+          (agent, ifIndex) to interface-name policy - the name sourced from
+          SNMP, since sFlow does not carry it - that fills
+          observer.ingress/egress.interface.name on the flow documents, and an
+          (agent, ifIndex) interface-utilization baseline from ifInOctets/
+          ifOutOctets. Map the counters (sflow.if_in_octets, sflow.if_out_
+          octets, sflow.if_in_ucast_pkts, sflow.if_out_ucast_pkts,
+          sflow.if_in_ errors, sflow.if_out_errors, sflow.if_in_discards) as
+          long in the custom namespace, and
+          ifSpeed/ifType/ifStatus/ifDirection as their natural types, so the
+          interface dashboards aggregate without dynamic mapping.
+        relay: >
+          Every field in a counter sample is numeric or a bounded enum - there
+          is no operator free text on the wire (the interface name and
+          description that are the NetFlow options dataset's one free-text
+          exposure are simply absent from sFlow), so this is the easiest
+          content-filter case on the estate. Decode low-side and cross the
+          resolved counters and the ifIndex; fold the SNMP-sourced interface
+          name into the flow documents before the boundary rather than
+          crossing a separate name table. Treat as at-most-once; because sFlow
+          gives no exported-record total to reconcile against, drop detection
+          is low-side versus high-side counter-sample counts per (agent,
+          hour).
+      direct:
+        parse_location: high
+        cribl: >
+          High-side, no guard: decode counter samples with the flow samples in
+          the same sflowtool/hsflowd collector and forward the JSON. Keep the
+          SNMP interface-name lookup near the source so
+          observer.*.interface.name is populated before Elastic sees the flow
+          documents.
+        elastic: >
+          Land the counter samples in the same data stream as the flow samples
+          and turn them into the enrich material the flow side needs: an
+          (agent, ifIndex) to interface-name policy - the name sourced from
+          SNMP, since sFlow does not carry it - that fills
+          observer.ingress/egress.interface.name on the flow documents, and an
+          (agent, ifIndex) interface-utilization baseline from
+          ifInOctets/ifOutOctets. Map the counters (sflow.if_in_octets,
+          sflow.if_out_octets, sflow.if_in_ucast_pkts,
+          sflow.if_out_ucast_pkts, sflow.if_in_errors, sflow.if_out_errors,
+          sflow.if_in_discards) as long in the custom namespace, and
+          ifSpeed/ifType/ifStatus/ifDirection as their natural types, so the
+          interface dashboards aggregate without dynamic mapping. Drive an
+          interface-error/discard alert off
+          ifInErrors/ifOutErrors/ifInDiscards rather than leaving them inert.
+    fields:
+    - vendor: ifIndex
+      type: long
+      description: >-
+        SNMP ifIndex identifying the interface this counter sample describes
+        (if_counters ifIndex)
+      ecs: null
+      status: unmapped
+      custom: sflow.if_index
+      notes: >
+        on a counter sample this is a lookup-table key, not a property of an
+        observed flow, so it is deliberately not observer.*.interface.id here
+        - it becomes the join key of the enrich policy that fills the flow
+        documents' interface fields
+    - vendor: ifType
+      type: integer
+      description: IANA ifType of the interface, e.g. 6 ethernetCsmacd (if_counters ifType)
+      ecs: null
+      status: unmapped
+      custom: sflow.if_type
+    - vendor: ifSpeed
+      type: long
+      description: interface speed in bits per second (if_counters ifSpeed)
+      ecs: null
+      status: unmapped
+      custom: sflow.if_speed
+      notes: >-
+        the denominator for any interface-utilization percentage built from
+        the octet counters
+    - vendor: ifDirection
+      type: integer
+      description: >-
+        interface direction - 1 full-duplex, 2 half-duplex, 3 in, 4 out
+        (if_counters ifDirection)
+      ecs: null
+      status: unmapped
+      custom: sflow.if_direction
+    - vendor: ifStatus
+      type: integer
+      description: bit-encoded admin and operational status of the interface (if_counters ifStatus)
+      ecs: null
+      status: unmapped
+      custom: sflow.if_status
+      notes: >-
+        bit 0 is admin up/down, bit 1 is oper up/down; an interface flapping
+        oper-down is worth alerting on independently of the flow data
+    - vendor: ifInOctets
+      type: long
+      description: >-
+        total octets received on the interface, a running counter (if_counters
+        ifInOctets)
+      ecs: null
+      status: unmapped
+      custom: sflow.if_in_octets
+      notes: >-
+        a monotonic gauge; utilization is the delta between consecutive
+        counter samples over the polling interval, not the absolute value
+    - vendor: ifInUcastPkts
+      type: long
+      description: unicast packets received on the interface (if_counters ifInUcastPkts)
+      ecs: null
+      status: unmapped
+      custom: sflow.if_in_ucast_pkts
+    - vendor: ifInMulticastPkts
+      type: long
+      description: multicast packets received on the interface (if_counters ifInMulticastPkts)
+      ecs: null
+      status: unmapped
+      custom: sflow.if_in_multicast_pkts
+    - vendor: ifInBroadcastPkts
+      type: long
+      description: broadcast packets received on the interface (if_counters ifInBroadcastPkts)
+      ecs: null
+      status: unmapped
+      custom: sflow.if_in_broadcast_pkts
+    - vendor: ifInDiscards
+      type: long
+      description: >-
+        inbound packets discarded though no error was detected, e.g. buffer
+        exhaustion (if_counters ifInDiscards)
+      ecs: null
+      status: unmapped
+      custom: sflow.if_in_discards
+      notes: >-
+        a rising discard count is an interface-congestion signal invisible to
+        the flow samples, which only see what was successfully forwarded
+    - vendor: ifInErrors
+      type: long
+      description: inbound packets containing errors (if_counters ifInErrors)
+      ecs: null
+      status: unmapped
+      custom: sflow.if_in_errors
+    - vendor: ifOutOctets
+      type: long
+      description: total octets transmitted on the interface (if_counters ifOutOctets)
+      ecs: null
+      status: unmapped
+      custom: sflow.if_out_octets
+    - vendor: ifOutUcastPkts
+      type: long
+      description: unicast packets transmitted on the interface (if_counters ifOutUcastPkts)
+      ecs: null
+      status: unmapped
+      custom: sflow.if_out_ucast_pkts
+    - vendor: ifOutErrors
+      type: long
+      description: >-
+        outbound packets that could not be transmitted because of errors
+        (if_counters ifOutErrors)
+      ecs: null
+      status: unmapped
+      custom: sflow.if_out_errors
+    - vendor: ifPromiscuousMode
+      type: integer
+      description: >-
+        whether the interface is in promiscuous mode - 0 no, 1 yes
+        (if_counters ifPromiscuousMode)
+      ecs: null
+      status: unmapped
+      custom: sflow.if_promiscuous_mode

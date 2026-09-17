@@ -1,0 +1,818 @@
+id: xsoar-soar
+name: SOAR Platform (XSOAR/Phantom)
+vendor: Multiple
+versions: Cortex XSOAR 6.x, Cortex XSOAR 8.x (SaaS), Splunk SOAR (Phantom) 5.x/6.x
+draft: true
+references:
+- >-
+  https://docs-cortex.paloaltonetworks.com/r/Cortex-XSOAR/6.9/Cortex-XSOAR-Administrator-Guide/Send-the-Audit-Trail-to-an-External-Log-Service
+- https://github.com/demisto/demisto-py/blob/master/server_api_swagger.json
+- >-
+  https://github.com/demisto/content/blob/master/Packs/CommonScripts/Scripts/ExportAuditLogsToFile/ExportAuditLogsToFile.py
+- https://xsoar.pan.dev/docs/reference/scripts/forward-audit-logs-to-splunk-hec
+- >-
+  https://help.splunk.com/en/splunk-soar/soar-on-premises/rest-api-reference/8.4.0/audit-endpoints/rest-audit
+- >-
+  https://help.splunk.com/en/splunk-soar/soar-on-premises/rest-api-reference/6.4.0/run-action-endpoints/rest-run-action
+- https://docs.splunk.com/Documentation/SOAR/current/PlatformAPI/RESTRunAction
+datasets:
+- id: console-audit
+  name: SOAR console audit trail
+  description: >
+    Platform-administration audit records from the SOAR console itself: who
+    logged in, who created or changed a playbook, integration instance, asset,
+    user, role or API key, and what the value was before and after. Pulled
+    over the product API rather than syslog — Cortex XSOAR 6 exposes it at
+    /settings/audits (XSOAR 8 SaaS at /public_api/v1/audits/management_logs)
+    and Splunk SOAR at /rest/audit. This is the only record of privileged
+    change to the automation platform: an analyst who edits a containment
+    playbook or swaps an integration credential leaves a trace here and
+    nowhere else. Field names below use the XSOAR audit record as the primary
+    shape with the Splunk SOAR /rest/audit column names carried where they are
+    the only source of a concept.
+  event_categories:
+  - configuration
+  - iam
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Cribl REST Collector polls the SOAR management API on a schedule
+        (XSOAR /settings/audits or /public_api/v1/audits/management_logs,
+        Splunk SOAR /rest/audit) using a dedicated read-only API key; for the
+        SOAR console fronting the lower enclave that collector runs low-side
+        and the audit trail crosses the guard.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-soar.console_audit
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Cribl REST Collector polls the SOAR management API on a schedule
+        (XSOAR /settings/audits or /public_api/v1/audits/management_logs,
+        Splunk SOAR /rest/audit) using a dedicated read-only API key;
+        high-side instances run the collector alongside Elastic and ship
+        directly with no guard hop.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-soar.console_audit
+  formats:
+  - format: api-pull
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom SOAR console audit pipeline
+      notes: >
+        No Elastic integration and no Cribl pack exists for either vendor's
+        management audit API, so this is a hand-built pipeline that normalises
+        the two vendors' record shapes onto one schema.
+    fields:
+    - vendor: modified
+      type: timestamp
+      description: when the audited change was recorded by the SOAR server
+      ecs: '@timestamp'
+      status: mapped
+      notes: >
+        XSOAR 6 /settings/audits returns `modified` (RFC3339) and is also
+        queried on it (query "modified:>..."); XSOAR 8 SaaS uses
+        modification_time/timestamp epoch millis; Splunk SOAR /rest/audit
+        returns the TIME column
+      transform: XSOAR 8 and Splunk SOAR epoch-millis values need conversion to RFC3339
+    - vendor: user
+      type: string
+      description: username or API-key identity that performed the audited action
+      ecs: user.name
+      status: mapped
+      notes: Splunk SOAR /rest/audit calls the same concept USER
+    - vendor: USER ID
+      type: integer
+      description: numeric internal identifier of the acting user (Splunk SOAR)
+      ecs: user.id
+      status: mapped
+      notes: >
+        Splunk SOAR emits a numeric user id alongside the display name; XSOAR
+        has no separate id column, so user.id is null on XSOAR rows
+    - vendor: type
+      type: string
+      description: the audited action verb (create, update, delete, login, logout, ...)
+      ecs: event.action
+      status: mapped
+      notes: >
+        XSOAR Audit.type; the Splunk SOAR equivalent is carried in CHANGED
+        FIELD plus AUDIT SOURCE rather than a single verb column
+    - vendor: object
+      type: string
+      description: human-readable name or description of the object that changed
+      ecs: null
+      status: unmapped
+      custom: soar.audit.object_name
+      notes: >
+        e.g. the playbook, integration instance, asset or role name;
+        deliberately not mapped to rule.name — rule.name in this file would
+        collide with the playbook object in the action-execution dataset
+    - vendor: identifier
+      type: string
+      description: unique identifier of the object that changed
+      ecs: null
+      status: unmapped
+      custom: soar.audit.object_id
+      notes: Splunk SOAR /rest/audit equivalent is the OBJECT ID column
+    - vendor: OBJECT TYPE
+      type: string
+      description: class of object the audit row is about (user, role, playbook, container, asset)
+      ecs: null
+      status: unmapped
+      custom: soar.audit.object_type
+      notes: >
+        drives the event.category split (user/role rows are iam,
+        playbook/asset rows are configuration); XSOAR carries the same notion
+        inside the action blob rather than as its own column
+    - vendor: action
+      type: string
+      description: the change detail blob describing what was actually performed
+      ecs: message
+      status: partial
+      notes: >
+        XSOAR Audit.action is a free-form object (map of arbitrary keys), not
+        a scalar; it is the only place the substance of an XSOAR change is
+        recorded, so it has to be serialised to a bounded string for message
+        and the interesting keys lifted out separately
+      transform: serialise the object to a length-capped JSON string; flag truncation explicitly
+    - vendor: id
+      type: string
+      description: unique identifier of the audit record itself
+      ecs: event.id
+      status: mapped
+      notes: also the dedupe key for overlapping API polls
+    - vendor: version
+      type: integer
+      description: server-side object version counter on the audit record
+      ecs: null
+      status: unmapped
+      custom: soar.audit.record_version
+    - vendor: IP ADDRESS
+      type: ip
+      description: source address the acting user connected from (Splunk SOAR)
+      ecs: source.ip
+      status: mapped
+      notes: >
+        Splunk SOAR /rest/audit records the actor's client IP; the XSOAR audit
+        record does not carry one, so source.ip is null on XSOAR rows and
+        console-session attribution there depends on the login rows only
+    - vendor: CHANGED FIELD
+      type: string
+      description: name of the specific attribute that was modified (Splunk SOAR)
+      ecs: null
+      status: unmapped
+      custom: soar.audit.changed_field
+    - vendor: OLD VALUE
+      type: string
+      description: 'the attribute''s value before the change (Splunk SOAR)'
+      ecs: null
+      status: unmapped
+      custom: soar.audit.old_value
+      notes: >
+        unbounded free-text; a playbook or asset-configuration edit can
+        serialise kilobytes here, and integration-instance edits can carry
+        secret-shaped material — cap and mask before egress
+    - vendor: NEW VALUE
+      type: string
+      description: 'the attribute''s value after the change (Splunk SOAR)'
+      ecs: null
+      status: unmapped
+      custom: soar.audit.new_value
+      notes: same unbounded/secret-bearing caveat as OLD VALUE
+    - vendor: AUDIT SOURCE
+      type: enum
+      description: which subsystem produced the row (Audit, Action Run, Playbook Run)
+      ecs: null
+      status: unmapped
+      custom: soar.audit.record_source
+      notes: >
+        Splunk SOAR returns console audit rows and automation-execution rows
+        from the same endpoint and they can share an AUDIT ID; this column is
+        the router between this dataset and action-execution
+    - vendor: RELATED OBJECT TYPE
+      type: string
+      description: >-
+        class of a second object the change relates to, e.g. the role a user
+        was added to
+      ecs: null
+      status: unmapped
+      custom: soar.audit.related_object_type
+    - vendor: RELATED OBJECT ID
+      type: string
+      description: identifier of the related object
+      ecs: null
+      status: unmapped
+      custom: soar.audit.related_object_id
+    - vendor: NOTE
+      type: string
+      description: free-text note the platform or the operator attached to the audit row
+      ecs: event.reason
+      status: partial
+      notes: >
+        the only place a rejected or failed administrative action explains
+        itself; needs pattern extraction before it can drive event.outcome
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Normalise both vendors into one record shape at the collector:
+          lowercase and snake_case the Splunk SOAR column names (USER, USER
+          ID, OBJECT TYPE, CHANGED FIELD, OLD VALUE, NEW VALUE, RELATED OBJECT
+          TYPE), serialise the XSOAR action blob to a bounded string, and
+          route AUDIT SOURCE values of "Action Run" and "Playbook Run" into
+          the action-execution dataset so console changes and analyst
+          containment actions do not share an index pattern. Because these are
+          API-pull records with no transport metadata, stamp observer.vendor,
+          observer.product and service.name from the collector configuration,
+          and cap OLD VALUE / NEW VALUE (which can carry a whole serialised
+          playbook) with an explicit truncation flag rather than letting a
+          multi-kilobyte diff reach the destination. Run the collector on a
+          modified/TIME high-water cursor with an id-based dedupe window,
+          since a re-poll after a restart will otherwise replay the overlap.
+        elastic: >
+          Own a custom logs-soar.console_audit ingest pipeline: derive
+          event.kind and event.outcome (neither vendor emits an outcome on an
+          audit row — failed logons and rejected changes have to be inferred
+          from the action type and NOTE text), and set
+          event.category/event.type from the audit object type so user, role
+          and API-key changes land in the iam profile while playbook and
+          integration edits land in configuration. Add explicit index-template
+          mappings for the soar.audit.* custom namespace — object_id,
+          object_type, changed_field, record_source, related_object_type and
+          related_object_id as keyword, record_version as long, and
+          old_value/new_value as match_only_text with a keyword sub-field — so
+          credential-rotation and playbook-edit hunting does not depend on
+          dynamic mapping guessing types from the first document.
+        relay: >
+          Low-side instances cross the guard: ship full ECS-shaped NDJSON
+          (envelope mode B) — one audit record per line, UTF-8, LF-terminated,
+          compression disabled, nesting depth kept at or below 2 by flattening
+          the XSOAR action object low-side — because there is no integration
+          on the high side to finish the parse. The content-filter friction to
+          settle with the guard owner is OLD VALUE / NEW VALUE and the XSOAR
+          action blob: unbounded free-text that can carry embedded JSON,
+          non-ASCII, and occasionally secret material from an
+          integration-instance edit, so allowlist the outer keys and cap value
+          length before the crossing. This feed is API-pull JSON today, not
+          CEF, so nothing CEF-shaped crosses; with no return channel,
+          reconcile low-side and high-side counts per (dataset, hour) and
+          carry _raw for this dataset — it is low volume and high forensic
+          value.
+      direct:
+        parse_location: low
+        cribl: >
+          Normalise both vendors into one record shape at the collector:
+          lowercase and snake_case the Splunk SOAR column names (USER, USER
+          ID, OBJECT TYPE, CHANGED FIELD, OLD VALUE, NEW VALUE, RELATED OBJECT
+          TYPE), serialise the XSOAR action blob to a bounded string, and
+          route AUDIT SOURCE values of "Action Run" and "Playbook Run" into
+          the action-execution dataset so console changes and analyst
+          containment actions do not share an index pattern. Because these are
+          API-pull records with no transport metadata, stamp observer.vendor,
+          observer.product and service.name from the collector configuration,
+          and cap OLD VALUE / NEW VALUE (which can carry a whole serialised
+          playbook) with an explicit truncation flag rather than letting a
+          multi-kilobyte diff reach the destination. Run the collector on a
+          modified/TIME high-water cursor with an id-based dedupe window,
+          since a re-poll after a restart will otherwise replay the overlap.
+        elastic: >
+          Own a custom logs-soar.console_audit ingest pipeline: derive
+          event.kind and event.outcome (neither vendor emits an outcome on an
+          audit row — failed logons and rejected changes have to be inferred
+          from the action type and NOTE text), and set
+          event.category/event.type from the audit object type so user, role
+          and API-key changes land in the iam profile while playbook and
+          integration edits land in configuration. Add explicit index-template
+          mappings for the soar.audit.* custom namespace — object_id,
+          object_type, changed_field, record_source, related_object_type and
+          related_object_id as keyword, record_version as long, and
+          old_value/new_value as match_only_text with a keyword sub-field — so
+          credential-rotation and playbook-edit hunting does not depend on
+          dynamic mapping guessing types from the first document.
+  - format: syslog-cef
+    enable: >
+      Cortex XSOAR can push the same management/audit records it exposes on
+      the API out to an external log service as CEF wrapped in syslog, instead
+      of (or alongside) being polled. On Cortex XSOAR 6.x this is "Send the
+      Audit Trail to an External Log Service": add custom server
+      configurations (Settings -> About -> Troubleshooting -> Add Server
+      Configuration, the same Logs Server Configurations surface that tunes
+      the server log) that define the external syslog target for the audit
+      trail, then restart the server so the audit writer begins mirroring each
+      audit event to that target. On Cortex XSOAR 8.x on-prem the same
+      capability is delivered through the syslog-server manager: add a syslog
+      server (host, port, TCP/UDP/TLS) under Settings, then create a
+      notification-forwarding rule whose scope is "Management Audit Logs" so
+      management-audit events are forwarded to it. The wire format is a CEF
+      record over syslog whose header carries the audited object class as the
+      CEF Signature ID and the audited action as the CEF Name, e.g.
+      `CEF:0|Palo Alto Networks|Palo Alto Networks Cortex
+      XSOAR|<build>|incident|edit|3|suser=... startTime=...
+      cs1Label=identifier cs1=... cs2Label=details cs2=...`. This forward is a
+      compact summary of each audit event: it carries the actor, the object
+      type, the action, the object identifier and a short details string, and
+      does not carry the full before/after value pair or the related-object
+      linkage that the management API record exposes.
+    references:
+    - >-
+      https://docs-cortex.paloaltonetworks.com/r/Cortex-XSOAR/6.9/Cortex-XSOAR-Administrator-Guide/Send-the-Audit-Trail-to-an-External-Log-Service
+    - >-
+      https://docs-cortex.paloaltonetworks.com/r/Cortex-XSOAR/6.14/Cortex-XSOAR-Administrator-Guide/Send-the-Audit-Trail-to-an-External-Log-Service
+    - >-
+      https://docs-cortex.paloaltonetworks.com/r/Cortex-XSOAR/6.11/Cortex-XSOAR-Administrator-Guide/Logs-Server-Configurations
+    - >-
+      https://docs-cortex.paloaltonetworks.com/r/Cortex-XSOAR/8/Cortex-XSOAR-Administrator-Guide/Add-a-Syslog-Server
+    - >-
+      https://docs-cortex.paloaltonetworks.com/r/Cortex-XSOAR/8.12/Cortex-XSOAR-On-prem-Documentation/Manage-syslog-servers
+    - https://splunkbase.splunk.com/app/6326
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom SOAR console audit CEF pipeline (Cribl CEF parser function)
+      notes: >
+        No Elastic integration and no Cribl pack targets the XSOAR audit CEF
+        feed. CEF is self-describing, so a Cribl pipeline built on the CEF
+        parser function extracts the header (vendor, product, version,
+        signature id, name, severity) and the extension key/values (suser,
+        startTime, cs1/cs1Label, cs2/cs2Label) with no hand-written grok. The
+        work is semantic, not lexical: dereference the cs1Label/cs2Label
+        labels to real names before mapping, convert the microsecond startTime
+        to a milli/RFC3339 timestamp, and derive event.category from the
+        signature-id object class so user/role rows land in the iam profile
+        while playbook/integration rows land in configuration.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Because CEF is a single self-contained line, this format relays far
+          more cheaply than the api-pull JSON: run the CEF parser function
+          low-side only far enough to validate the header and dereference the
+          cs*Label pairs, then let the CEF line itself cross and finish the
+          field promotion high-side. Stamp observer.vendor/observer.product/
+          service.name from collector config as a backstop even though the CEF
+          header already carries vendor and product, and route on the CEF
+          Name/Signature-ID pair so login/logout rows and object-change rows
+          are separable. The cs2 "details" extension is a short bounded string
+          here (unlike the unbounded old/new values on the API record), so
+          length capping is a guard rather than a routine truncation, but
+          still cap it and flag any overflow.
+        elastic: >
+          Own a custom logs-soar.console_audit ingest pipeline that accepts
+          CEF-derived documents: set event.code from the CEF Signature ID (the
+          object class), event.action from the CEF Name, and event.severity
+          from the numeric CEF severity, then derive event.category/event.type
+          from the object class exactly as the api-pull pipeline does so both
+          feeds converge on one schema. Map the cs1 identifier into the
+          soar.audit.object_id keyword namespace, and keep event.outcome
+          inference (neither the CEF nor the API record emits an outcome)
+          driven off the action verb. Add index-template mappings for
+          soar.audit.object_id as keyword and the summary details string as
+          match_only_text so CEF and API documents share mappings.
+        relay: >
+          CEF-over-syslog is the format that actually crosses well: ship the
+          raw CEF line as UTF-8 text, one record per line, and reconstruct
+          fields high-side, because the whole record is a single flat ASCII
+          string with no nesting to flatten and no embedded JSON to allowlist.
+          The content-filter surface is small and bounded — suser, a numeric
+          identifier in cs1, and a short cs2 details summary — with none of
+          the unbounded old_value/new_value or serialised-playbook material
+          that makes the api-pull feed hard to police, so the guard's
+          syslog/CEF policy can stay simple. Treat the crossing as
+          at-most-once with no return channel and reconcile low-side vs
+          high-side counts per (object-class, hour); accept that this format
+          is lossier than the management API (no before/after values, no
+          related-object linkage), which is the tradeoff for a cheap,
+          easily-inspected crossing.
+      direct:
+        parse_location: hybrid
+        cribl: >
+          High-side instances receive the CEF syslog directly with no guard:
+          run the CEF parser function in one pipeline, dereference the
+          cs*Label pairs, normalise the microsecond startTime, and route on
+          the Name/Signature-ID pair. No masking or length-capping regime is
+          required beyond sane defaults since the record never crosses a
+          boundary, but still stamp observer/service identity from collector
+          config so every SOAR instance carries identical envelope metadata
+          regardless of transport.
+        elastic: >
+          Own a custom logs-soar.console_audit ingest pipeline that accepts
+          CEF-derived documents: set event.code from the CEF Signature ID (the
+          object class), event.action from the CEF Name, and event.severity
+          from the numeric CEF severity, then derive event.category/event.type
+          from the object class so user/role rows land in the iam profile
+          while playbook/integration rows land in configuration. Map the cs1
+          identifier into the soar.audit.object_id keyword namespace and drive
+          event.outcome inference off the action verb, since neither the CEF
+          nor the api-pull record emits an outcome. Keeping one pipeline
+          across both the CEF and api-pull feeds means credential-rotation and
+          playbook-edit hunting works identically regardless of which
+          transport a given SOAR instance uses.
+    fields:
+    - vendor: Device Vendor
+      type: string
+      description: CEF header field 4 — always "Palo Alto Networks" for the XSOAR audit forward
+      ecs: observer.vendor
+      status: mapped
+      notes: fixed literal in the CEF header; stamp from collector config as a backstop
+    - vendor: Device Product
+      type: string
+      description: CEF header field 5 — "Palo Alto Networks Cortex XSOAR"
+      ecs: observer.product
+      status: mapped
+    - vendor: Device Version
+      type: string
+      description: >-
+        CEF header field 6 — the XSOAR server build string, e.g.
+        6.2.0.1578666.61a7405830d5f0cc21023b4a1d41eabc513f40d3
+      ecs: observer.version
+      status: mapped
+    - vendor: Signature ID
+      type: string
+      description: >-
+        CEF header field 7 (deviceEventClassId) — the audited object class,
+        e.g. incident, playbook, user, role, integration
+      ecs: event.code
+      status: mapped
+      notes: >
+        this is the CEF slot that carries the object type; it drives the
+        event.category split (user/role -> iam, playbook/integration ->
+        configuration) and is the CEF counterpart of the api-pull OBJECT TYPE
+        column
+    - vendor: Name
+      type: string
+      description: >-
+        CEF header field 8 — the audited action verb, e.g. edit, delete,
+        create, login, logout
+      ecs: event.action
+      status: mapped
+    - vendor: Severity
+      type: integer
+      description: >-
+        CEF header field 9 — numeric CEF severity (0-10) the audit writer
+        assigns to the event
+      ecs: event.severity
+      status: mapped
+      notes: CEF 0-10 severity scale; carried straight into event.severity as a long
+    - vendor: suser
+      type: string
+      description: >-
+        CEF extension — the username or API-key identity that performed the
+        audited action
+      ecs: user.name
+      status: mapped
+      notes: CEF counterpart of the api-pull `user` field
+    - vendor: startTime
+      type: timestamp
+      description: >-
+        CEF extension — event time as a microsecond epoch (also emitted as
+        start/rt on some builds)
+      ecs: '@timestamp'
+      status: mapped
+      transform: microsecond epoch (16-digit) -> milliseconds/RFC3339 before indexing
+    - vendor: cs1
+      type: string
+      description: >-
+        CEF custom-string extension labelled by cs1Label=identifier — the
+        unique identifier of the changed object
+      ecs: null
+      status: unmapped
+      custom: soar.audit.object_id
+      notes: >
+        the label/value split means cs1Label carries the literal string
+        "identifier" and cs1 carries the value; dereference the label before
+        mapping. CEF counterpart of the api-pull `identifier` object id
+    - vendor: cs2
+      type: string
+      description: >
+        CEF custom-string extension labelled by cs2Label=details — a short
+        summary of the change (for example a "count: 9" style detail string)
+      ecs: message
+      status: partial
+      notes: >
+        cs2Label carries the literal "details"; the value is a bounded summary
+        string, not the full before/after value pair the management API
+        exposes, so it maps to message as a human-readable summary only
+      transform: dereference cs2Label, then carry the bounded details string into message
+- id: action-execution
+  name: Playbook and action execution history
+  description: >
+    The action-accountability record: which automation ran, against which
+    asset, with which arguments, on whose behalf, and whether it succeeded. In
+    Splunk SOAR this is the action_run record plus its per-asset app_run
+    children (/rest/action_run, /rest/app_run); in Cortex XSOAR it is the
+    war-room entry and playbook-task execution history (Entry.brand,
+    EntryTask, InvestigationPlaybookTask scriptArguments/state) reachable
+    through the Core REST API. These are the records that show an
+    analyst-initiated containment — block an IP on the firewall, quarantine a
+    host in the EDR, disable an account — attributed to a person rather than
+    to the SOAR's own service account, which is how the acted-on product logs
+    it. Field names below use the Splunk SOAR action_run/app_run shape as the
+    primary with the XSOAR equivalents noted.
+  event_categories:
+  - process
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Cribl REST Collector polls /rest/action_run and /rest/app_run (Splunk
+        SOAR) or the Core REST API entry/task history (XSOAR) with a read-only
+        API key. Where the SOAR reaches into the lower enclave to execute
+        containment, its execution history crosses with it.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-soar.action_run
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Cribl REST Collector polls /rest/action_run and /rest/app_run (Splunk
+        SOAR) or the Core REST API entry/task history (XSOAR) with a read-only
+        API key; high-side instances run the collector alongside Elastic and
+        ship directly with no guard hop.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-soar.action_run
+  formats:
+  - format: api-pull
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom SOAR action-execution pipeline
+      notes: >
+        No Elastic integration or Cribl pack covers SOAR execution history;
+        the pipeline joins action_run parents to their app_run children and
+        normalises XSOAR task entries onto the same schema.
+    fields:
+    - vendor: action
+      type: string
+      description: >-
+        name of the connector action that was executed, e.g. "block ip" or
+        "quarantine device"
+      ecs: event.action
+      status: mapped
+      notes: the XSOAR equivalent is the executed command/automation name on the task entry
+    - vendor: name
+      type: string
+      description: operator- or playbook-supplied label for this action run
+      ecs: null
+      status: unmapped
+      custom: soar.action.run_name
+      notes: XSOAR equivalent is EntryTask.taskName
+    - vendor: app_name
+      type: string
+      description: the connector app that carried the action out (Splunk SOAR app_run)
+      ecs: null
+      status: unmapped
+      custom: soar.action.app_name
+    - vendor: asset
+      type: string
+      description: >-
+        configured asset the action executed against — the connector instance
+        bound to a target product
+      ecs: null
+      status: unmapped
+      custom: soar.action.asset
+      notes: >
+        the SOAR asset is the tool used (a firewall or EDR console integration
+        configuration), not the endpoint being contained, so it is
+        deliberately not mapped to host.target.name; the contained host lives
+        inside parameter
+    - vendor: parameter
+      type: string
+      description: the arguments the action was invoked with, as a nested JSON object
+      ecs: null
+      status: partial
+      custom: soar.action.parameter
+      notes: >
+        the substance of the accountability record — which IP was blocked,
+        which host was quarantined, which account disabled; connector-defined
+        and unbounded, and frequently carries cleartext credentials. XSOAR
+        equivalent is InvestigationPlaybookTask.scriptArguments
+      transform: >-
+        flatten to depth 2, mask credential-shaped keys, and lift the target
+        host/address out for host.target.name or destination.ip
+    - vendor: container
+      type: integer
+      description: identifier of the container (incident/event) the action was run under
+      ecs: null
+      status: unmapped
+      custom: soar.action.container_id
+      notes: no ECS case/incident identifier exists, so the case join key stays custom
+    - vendor: playbook
+      type: string
+      description: name of the playbook that invoked the action, empty for manually run actions
+      ecs: null
+      status: unmapped
+      custom: soar.action.playbook_name
+      notes: >
+        not mapped to rule.name — this is an automation definition, not a
+        detection signature, and mapping it would put a playbook name where
+        alert triage expects a rule
+    - vendor: playbook_run
+      type: integer
+      description: identifier of the specific playbook execution that invoked the action
+      ecs: null
+      status: unmapped
+      custom: soar.action.playbook_run_id
+    - vendor: owner
+      type: string
+      description: user the action run is attributed to
+      ecs: user.name
+      status: mapped
+      notes: >
+        null when a playbook fired unattended; the presence or absence of an
+        owner is what separates an analyst-initiated containment from an
+        automated one. XSOAR equivalent is
+        InvestigationPlaybookTask.completedBy
+    - vendor: effective_user
+      type: integer
+      description: numeric identity the connector actually executed as (Splunk SOAR app_run detail)
+      ecs: user.effective.id
+      status: mapped
+      notes: >
+        differs from owner when an action is created by one identity and
+        executed on behalf of another (scheduled or delegated runs); the
+        sibling `creator` field on action_run records the requesting identity
+        and can be folded into user.effective.name
+    - vendor: status
+      type: enum
+      description: terminal or in-flight state of the run (success, failed, running, pending)
+      ecs: event.outcome
+      status: mapped
+      transform: success -> success, failed -> failure, running/pending/cancelled -> unknown
+    - vendor: message
+      type: string
+      description: result or error text the connector returned for the run
+      ecs: message
+      status: mapped
+    - vendor: start_time
+      type: timestamp
+      description: when the action began executing
+      ecs: event.start
+      status: mapped
+    - vendor: end_time
+      type: timestamp
+      description: when the action finished executing
+      ecs: event.end
+      status: mapped
+      notes: >-
+        end_time minus start_time yields event.duration, which neither vendor
+        emits directly
+    - vendor: id
+      type: integer
+      description: unique identifier of the action run record
+      ecs: event.id
+      status: mapped
+      transform: >-
+        numeric in both vendors' APIs; stringify for event.id and use with
+        status as the dedupe key
+    - vendor: exception_occurred
+      type: boolean
+      description: whether the connector raised an exception during the run (Splunk SOAR app_run)
+      ecs: null
+      status: partial
+      custom: soar.action.exception_occurred
+      notes: >
+        a parent action_run can report success while a child app_run raised an
+        exception, so this has to be folded into the derived event.outcome
+        rather than trusting status alone
+    - vendor: result_summary
+      type: string
+      description: connector-supplied summary of what the action affected, as a nested JSON object
+      ecs: null
+      status: unmapped
+      custom: soar.action.result_summary
+      notes: >
+        shape is defined per connector (total_objects,
+        total_objects_successful, and arbitrary per-app keys); needs
+        flattening and key allowlisting before indexing
+    - vendor: automation_broker
+      type: string
+      description: broker that proxied the connector execution into a remote network (Splunk SOAR)
+      ecs: null
+      status: unmapped
+      custom: soar.action.automation_broker
+      notes: >
+        identifies which network segment the containment was actually issued
+        from, which matters when one SOAR reaches into several enclaves
+    - vendor: brand
+      type: string
+      description: XSOAR integration brand that produced the execution entry
+      ecs: null
+      status: unmapped
+      custom: soar.action.integration_brand
+      notes: XSOAR Entry.brand; the nearest equivalent of app_name on the Splunk SOAR side
+    - vendor: investigationId
+      type: string
+      description: XSOAR investigation (incident) the execution entry belongs to
+      ecs: null
+      status: unmapped
+      custom: soar.action.investigation_id
+      notes: XSOAR Entry.investigationId; the counterpart of the Splunk SOAR container id
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Join each action_run parent to its app_run children in the low-side
+          pipeline so one event carries the analyst, the action name, the
+          asset it ran against and that asset's own result, rather than
+          shipping a parent and N orphan children that have to be correlated
+          at query time. These records mutate while the action is in flight
+          (status walks pending/running/success), so ship terminal states only
+          — key on id plus status and suppress the intermediate polls — and
+          mask credential-shaped values inside parameter before egress,
+          because connector arguments routinely carry API keys and passwords
+          in cleartext. Extract the target host or address out of parameter
+          with an action-name-keyed lookup near the source where the action
+          catalogue is known, and run the destination on Persistent Queue
+          backpressure.
+        elastic: >
+          Own a custom logs-soar.action_run ingest pipeline: derive
+          event.outcome from status combined with exception_occurred (a run
+          can report success at the parent while a child app_run raised an
+          exception), compute event.duration from start_time and end_time, and
+          promote the low-side-extracted containment target into
+          host.target.name or destination.ip so a blocked address is joinable
+          against the firewall's own log. Attribute unattended runs explicitly
+          — owner is null when a playbook fired without an analyst — by
+          falling back to the playbook name and flagging the event as
+          automated rather than leaving user.name empty. Add index-template
+          mappings for the soar.action.* namespace: run_name, app_name, asset,
+          playbook_name, automation_broker and integration_brand as keyword,
+          container_id/playbook_run_id/investigation_id as long, and parameter
+          and result_summary as flattened so arbitrary connector arguments
+          stay queryable without mapping explosion.
+        relay: >
+          Low-side instances cross the guard: ship full ECS-shaped NDJSON
+          (envelope mode B) with the parent/child join already done low-side —
+          an at-most-once crossing means a child app_run that is dropped can
+          never be rejoined on the high side. The content-filter friction is
+          parameter and result_summary: arbitrary nested connector-defined
+          JSON with unbounded string values, which must be flattened to depth
+          2, key- allowlisted and length-capped low-side so the guard's custom
+          NDJSON filter can stay simple. The feed is API-pull JSON rather than
+          CEF, so nothing CEF-shaped crosses; keep _raw for this dataset
+          despite the flattening, because a containment action is the
+          highest-forensic-value record the SOAR produces.
+      direct:
+        parse_location: low
+        cribl: >
+          Join each action_run parent to its app_run children in the collector
+          pipeline so one event carries the analyst, the action name, the
+          asset it ran against and that asset's own result, rather than
+          shipping a parent and N orphan children that have to be correlated
+          at query time. These records mutate while the action is in flight
+          (status walks pending/running/success), so ship terminal states only
+          — key on id plus status and suppress the intermediate polls — and
+          mask credential-shaped values inside parameter before egress,
+          because connector arguments routinely carry API keys and passwords
+          in cleartext. Extract the target host or address out of parameter
+          with an action-name-keyed lookup near the source where the action
+          catalogue is known, and run the destination on Persistent Queue
+          backpressure.
+        elastic: >
+          Own a custom logs-soar.action_run ingest pipeline: derive
+          event.outcome from status combined with exception_occurred (a run
+          can report success at the parent while a child app_run raised an
+          exception), compute event.duration from start_time and end_time, and
+          promote the collector-extracted containment target into
+          host.target.name or destination.ip so a blocked address is joinable
+          against the firewall's own log. Attribute unattended runs explicitly
+          — owner is null when a playbook fired without an analyst — by
+          falling back to the playbook name and flagging the event as
+          automated rather than leaving user.name empty. Add index-template
+          mappings for the soar.action.* namespace: run_name, app_name, asset,
+          playbook_name, automation_broker and integration_brand as keyword,
+          container_id/playbook_run_id/investigation_id as long, and parameter
+          and result_summary as flattened so arbitrary connector arguments
+          stay queryable without mapping explosion.

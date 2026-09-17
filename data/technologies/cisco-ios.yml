@@ -1,0 +1,1796 @@
+id: cisco-ios
+name: Cisco IOS / IOS-XE
+vendor: Cisco
+versions: IOS 15.x (M/T), IOS-XE 16.x, IOS-XE 17.x
+draft: true
+references:
+- >-
+  https://www.cisco.com/c/en/us/td/docs/switches/lan/catalyst3750/software/release/12-1_19_ea1/system/message/3750smg/overview.html
+- >-
+  https://sec.cloudapps.cisco.com/security/center/resources/identify_incidents_via_syslog
+- >-
+  https://sec.cloudapps.cisco.com/security/center/resources/access_control_list_logging.html
+- >-
+  https://www.cisco.com/c/en/us/td/docs/ios-xml/ios/sec_data_acl/configuration/xe-16-9/sec-data-acl-xe-16-9-book/sec-acl-syslog.html
+- >-
+  https://www.cisco.com/c/en/us/td/docs/ios-xml/ios/config-mgmt/configuration/15mt/config-mgmt-15-mt-book/cm-config-logger.html
+- https://www.cisco.com/c/en/us/support/docs/csa/cisco-sa-20180328-slogin.html
+- https://www.elastic.co/docs/reference/integrations/cisco_ios
+- >-
+  https://github.com/elastic/integrations/blob/main/packages/cisco_ios/data_stream/log/elasticsearch/ingest_pipeline/default.yml
+- >-
+  https://github.com/elastic/integrations/blob/main/packages/cisco_ios/data_stream/log/fields/fields.yml
+datasets:
+- id: acl-logging
+  name: ACL logging
+  description: >
+    Packets matched by an access-list entry carrying the `log` or `log-input`
+    keyword — the %SEC-6-IPACCESSLOG* family on classic IOS and the identical
+    %FMANFP-6-IPACCESSLOG* family emitted by the forwarding manager on IOS-XE.
+    Six template variants exist and they differ in token layout:
+    LOGP/ACCESSLOGP carry ports, LOGDP carries an ICMP type/code pair, LOGSP
+    an IGMP type, LOGNP a bare protocol number, LOGRP neither.
+    %SEC-6-IPACCESSLOGRL is a companion record reporting how many matches were
+    dropped by the logging rate limiter. This is the closest thing an IOS
+    device has to a firewall traffic log and is the highest-volume dataset
+    here by a wide margin.
+  event_categories:
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Receives RFC 3164 syslog over UDP/514 from the device `logging host`
+        configuration. The operator-defined access-list names (free text,
+        often revealing enclave topology) are the field a content-inspection
+        policy will constrain first. All four datasets in this file share one
+        syslog listener.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cisco_ios.log
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Receives RFC 3164 syslog over UDP/514 from the device `logging host`
+        configuration and forwards it to the Elastic core worker group with no
+        guard hop. All four datasets in this file share one syslog listener.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cisco_ios.log
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: elastic-integration
+      artifact: Cisco IOS integration (cisco_ios), data stream logs-cisco_ios.log
+      notes: >
+        The cisco_ios integration ships ONE ingest pipeline and ONE data
+        stream; all four datasets in this file land in logs-cisco_ios.log, so
+        the split here is logical (an event.code / cisco.ios.facility filter),
+        not a routing split. The pipeline first groks the syslog and IOS
+        headers, then branches on the extracted mnemonic with a per-variant
+        `dissect`. ACL logging on IOS is rate-limited and CPU-punted by
+        design, so Cribl-side sampling is rarely needed here — but the
+        `log-input` keyword doubles the message length and should be confirmed
+        before sizing.
+    fields:
+    - vendor: facility
+      type: string
+      description: >-
+        Subsystem that raised the message, the first token of the
+        %FACILITY-SEVERITY-MNEMONIC header
+      ecs: null
+      status: unmapped
+      custom: cisco.ios.facility
+      notes: >
+        SEC on classic IOS, FMANFP on IOS-XE forwarding-manager platforms,
+        IPV6/IPV6_ACL for the v6 equivalents. Deliberately NOT mapped to
+        log.syslog.facility.name — that ECS field means the RFC 3164 numeric
+        facility (local7 etc.), which is a different thing. The integration
+        also uses this value to derive observer.type=firewall for the ACL
+        facilities.
+    - vendor: severity
+      type: integer
+      description: Single digit 0-7 in the message header indicating message importance
+      ecs: event.severity
+      status: partial
+      notes: >
+        Cisco severity is INVERTED relative to ECS convention — 0 is emergency
+        and 7 is debug, so a naive "event.severity > 5" threshold selects the
+        least important events. The integration copies the digit verbatim into
+        event.severity and separately derives log.level
+        (emergencies/alert/critical/error/warning/notification/
+        informational/debug). Plan a lookup rather than trusting
+        event.severity for alert thresholds.
+    - vendor: mnemonic
+      type: string
+      description: Message code identifying the specific message template within the facility
+      ecs: event.code
+      status: mapped
+      transform: >
+        the third header token (IPACCESSLOGP, IPACCESSLOGDP, IPACCESSLOGNP,
+        IPACCESSLOGSP, IPACCESSLOGRP, IPACCESSLOGRL, ACCESSLOGP, ...). It is
+        the primary key for all downstream parsing — every field below only
+        exists for a specific subset of mnemonics. Note that event.code holds
+        the mnemonic ALONE, without the facility prefix, so a rule keyed on
+        event.code=IPACCESSLOGP matches both the SEC and FMANFP variants.
+    - vendor: access-list name
+      type: string
+      description: Name or number of the access list whose ACE matched the packet
+      ecs: rule.name
+      status: partial
+      notes: >
+        the token after `list` (or `access-list` on some IOS-XE builds). The
+        stock integration lands it at cisco.ios.access_list and never
+        populates ECS rule.name, so alert content keyed on rule.name needs a
+        copy step. IOS gives no stable identifier for the individual ACE that
+        matched — only the list — so rule.id has no source and two different
+        deny reasons inside one ACL are indistinguishable.
+    - vendor: '{permitted | denied}'
+      type: enum
+      description: Whether the matched access-list entry permitted or denied the packet
+      ecs: event.action
+      status: mapped
+      transform: >
+        `denied` becomes event.action=deny with event.type=[denied],
+        `permitted` becomes event.action=allow with event.type=[allowed]. IOS
+        emits no event.outcome token at all for this family, so event.outcome
+        stays null across the whole dataset — detections must key on
+        event.action, not outcome.
+    - vendor: protocol
+      type: enum
+      description: Named transport protocol of the logged packet
+      ecs: network.transport
+      status: partial
+      notes: >
+        printed lowercase (tcp/udp/icmp/igmp). For protocols IOS cannot name
+        it emits the IANA number instead via the IPACCESSLOGNP template, so
+        network.transport is null for GRE, ESP, OSPF and similar matches.
+    - vendor: protocol number
+      type: integer
+      description: IANA protocol number printed by the IPACCESSLOGNP/ACCESSLOGNP variant
+      ecs: network.iana_number
+      status: mapped
+      notes: >-
+        the numeric alternative to the named protocol above; the two are
+        mutually exclusive within one message
+    - vendor: source address
+      type: ip
+      description: Address the logged packet was sent from
+      ecs: source.ip
+      status: mapped
+      transform: >
+        the pipeline dissects to source.address then converts to source.ip; on
+        conversion failure it falls back to source.domain, which is how non-IP
+        tokens (an IOS-XE slot prefix leaking into the field on a malformed
+        line) silently end up outside source.ip.
+    - vendor: source port
+      type: port
+      description: Source port of the logged packet
+      ecs: source.port
+      status: partial
+      notes: >-
+        present only on the ...LOGP / ACCESSLOGP variants; the ICMP, IGMP,
+        numbered-protocol and RP variants carry no ports at all
+    - vendor: destination address
+      type: ip
+      description: Address the logged packet was sent to
+      ecs: destination.ip
+      status: mapped
+    - vendor: destination port
+      type: port
+      description: Destination port of the logged packet
+      ecs: destination.port
+      status: partial
+      notes: same variant-dependent presence as source port
+    - vendor: packet count
+      type: long
+      description: Number of packets that matched the ACE during the five-minute logging interval
+      ecs: source.packets
+      status: partial
+      transform: >
+        IOS aggregates matches over a logging interval and prints `, N
+        packet(s)`; the integration writes it to source.packets and copies it
+        to network.packets. Because one line can represent many packets, naive
+        event counting UNDERCOUNTS denies — any volumetric detection (scan,
+        sweep, brute force) must sum this field rather than count documents.
+    - vendor: ICMP type/code
+      type: integer
+      description: ICMP type and code pair printed by the IPACCESSLOGDP variant
+      ecs: null
+      status: unmapped
+      custom: icmp.type
+      notes: >
+        printed as `(type/code)`, e.g. `(3/4)`. ECS 9.4 still has no icmp.*
+        fieldset, so the integration defines top-level custom icmp.type and
+        icmp.code keyword fields; both are strings, not numbers.
+    - vendor: IGMP type
+      type: integer
+      description: IGMP message type printed by the IPACCESSLOGSP variant
+      ecs: null
+      status: unmapped
+      custom: igmp.type
+      notes: >-
+        same custom-namespace situation as ICMP; relevant mainly for
+        multicast-boundary ACLs
+    - vendor: rate-limited packet count
+      type: long
+      description: >-
+        Packets the ACL logging rate limiter discarded without logging
+        (%SEC-6-IPACCESSLOGRL)
+      ecs: null
+      status: unmapped
+      custom: cisco.ios.access_list_rate_limited
+      notes: >
+        the standalone message `access-list logging rate-limited or missed N
+        packets`. It carries no addresses and therefore no ECS mapping, but it
+        is the ONLY signal that the dataset above is incomplete — a spike here
+        means denies were silently dropped and any count-based detection is
+        under-reporting. Worth its own low-noise monitor.
+    - vendor: sequence number
+      type: long
+      description: >-
+        Per-device monotonic message counter emitted when `service
+        sequence-numbers` is configured
+      ecs: event.sequence
+      status: mapped
+      notes: >-
+        gaps in this sequence are the cleanest available detector for dropped
+        UDP syslog between the device and Cribl; it is absent unless the
+        command is configured
+    - vendor: hostname
+      type: string
+      description: Device name carried in the syslog header
+      ecs: log.syslog.hostname
+      status: partial
+      notes: >
+        many deployments send the header as an IP rather than a name, and the
+        pipeline treats an all-digit hostname as a sequence number instead.
+        observer.name is never populated by the integration, so device
+        identity for the CSOC has to come from the Cribl source metadata or a
+        CMDB enrichment keyed on this value.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Keep the core worker group a pass-through and lean on the device's
+          own ACL logging rate limiter instead of adding Cribl sampling, but
+          attach access-list-name to owning-site and device to owner lookups
+          low-side while the operator-chosen list names still resolve, and set
+          observer.name from the syslog input metadata because the integration
+          never populates it. This is the file's highest-volume,
+          lowest-forensic-value dataset, so it is the first place to drop _raw
+          once the per-variant dissects are proven; use Persistent Queue
+          backpressure on the Elastic destination, never Block.
+        elastic: >
+          Ship raw and let the stock cisco_ios pipeline parse, then add a
+          logs-cisco_ios.log@custom pipeline that derives event.severity from
+          the Cisco digit by lookup rather than keeping the verbatim inverted
+          copy, copies the parsed access-list name into rule.name, and leaves
+          event.outcome null while documenting event.action as the sole
+          allow/deny discriminator for this family. Add custom-namespace index
+          template mappings for icmp.type/icmp.code and igmp.type as keywords
+          and for the rate-limited counter as a long, and confirm
+          source.packets is a long so volumetric detections sum matches
+          instead of counting documents. Give the rate-limiter record its own
+          low-noise monitor: a spike there is the only evidence that deny
+          counts are under-reported.
+        relay: >
+          Low-side instances cross the guard: send the thin envelope
+          ({_dataId, @timestamp, host, _raw}) with hybrid parsing behind a
+          Persistent Queue and a low-side dead-letter route rather than Block.
+          The content-filter friction is the operator-defined access-list
+          names — free text that often encodes enclave topology — so bound
+          their length and constrain them to ASCII low-side, and reconcile
+          low-side against high-side counts per (dataset, hour), since the
+          crossing is at-most-once with no acknowledgement. Given the volume,
+          this is also the dataset to drop _raw from the crossing first.
+      direct:
+        parse_location: high
+        cribl: >
+          Keep the core worker group a pass-through and lean on the device's
+          own ACL logging rate limiter instead of adding Cribl sampling, but
+          attach the access-list-name-to-site and device-to-owner lookups at
+          the ingest worker group, and set observer.name from the syslog input
+          metadata because the integration never populates it. This is the
+          file's highest-volume, lowest-forensic-value dataset, so it is the
+          first place to drop _raw once the per-variant dissects are proven;
+          use Persistent Queue backpressure on the Elastic destination, never
+          Block.
+        elastic: >
+          Ship raw and let the stock cisco_ios pipeline parse, then add a
+          logs-cisco_ios.log@custom pipeline that derives event.severity from
+          the Cisco digit by lookup rather than keeping the verbatim inverted
+          copy, copies the parsed access-list name into rule.name, and leaves
+          event.outcome null while documenting event.action as the sole
+          allow/deny discriminator for this family. Add custom-namespace index
+          template mappings for icmp.type/icmp.code and igmp.type as keywords
+          and for the rate-limited counter as a long, and confirm
+          source.packets is a long so volumetric detections sum matches
+          instead of counting documents. Give the rate-limiter record its own
+          low-noise monitor: a spike there is the only evidence that deny
+          counts are under-reported.
+  - format: snmp-trap
+    enable: >
+      Raise the syslog-history level to include the informational ACL records
+      with `logging history informational` (level 6) - the default history
+      level of warnings would drop the entire %SEC-6-IPACCESSLOG* family - and
+      size the buffer with `logging history size <1-500>` so a burst is not
+      lost between trap sends. Enable the syslog trap with `snmp-server enable
+      traps syslog`, then add the manager as a trap host with the `syslog`
+      notification-type keyword: `snmp-server host <manager-ip> [version {2c
+      <community> | 3 <user>}] syslog`. On modern IOS-XE use SNMPv3 auth+priv
+      (a configured `snmp-server group` / `snmp-server user`) because the ACL
+      records disclose the operator-chosen access-list names and internal
+      addresses. Note this trap set is a distinct control from `logging trap`,
+      which governs the plain syslog destination; a device can run both, but
+      see the double-counting caveat in the direct recommendation.
+    references:
+    - >-
+      https://www.cisco.com/c/en/us/td/docs/ios-xml/ios/snmp/configuration/15-sy/snmp-15-sy-book/nm-snmp-cfg-snmp-support.html
+    - >-
+      https://www.cisco.com/c/en/us/td/docs/ios-xml/ios/snmp/command/nm-snmp-cr-book/nm-snmp-cr-s3.html
+    - https://web.mit.edu/outland/share/snmp/mibs/CISCO-SYSLOG-MIB.my
+    - https://github.com/cisco/cisco-mibs/blob/main/schema/CISCO-SYSLOG-MIB.schema
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom IOS SNMP-trap (CISCO-SYSLOG-MIB) reparse pipeline
+      notes: >
+        Neither the stock cisco_ios integration nor any Cribl pack ingests
+        SNMP traps: a trap receiver (snmptrapd or an equivalent SNMP source)
+        must terminate the PDU and expose the varbinds first. The pipeline
+        then copies clogHistMsgText into event.original and re-runs the SAME
+        per-variant dissect the syslog-raw feed uses (LOGP/LOGDP/LOGSP/LOGNP/
+        LOGRP/LOGRL), because the IOS message body grammar is unchanged - the
+        trap only re-transports it. The MIB metadata varbinds are a
+        convenience (facility, mnemonic and severity arrive already broken out
+        of the header) but they remove none of the body-parsing work, and the
+        254-byte truncation means a `log-input` record, whose input-interface
+        and MAC tokens roughly double the length, can arrive clipped and
+        unparsable past the cut.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Terminate the trap on a low-side SNMP receiver, decode the varbinds,
+          and map clogHistMsgText to event.original before the crossing - a
+          CDS cannot inspect an opaque SNMP PDU, and traps are unacknowledged
+          UDP, so decode and validate low-side. This is the highest-volume,
+          lowest-forensic-value dataset in the file, and a trap-per-record is
+          costly, so lean on the device's own ACL logging rate limiter rather
+          than adding Cribl sampling, attach the access-list-name-to-site and
+          device-to-owner lookups low-side while the operator-chosen names
+          still resolve, and set observer.name from the receiver metadata
+          because the trap carries no observer identity. Use a Persistent
+          Queue on the Elastic destination, never Block.
+        elastic: >
+          A custom logs-cisco_ios.log-compatible @custom pipeline that parses
+          clogHistMsgText with the existing per-variant patterns, then applies
+          the same derivations the syslog dataset needs: derive event.action
+          (allow/deny) and event.type from the permitted/denied token, leave
+          event.outcome null, copy the parsed access-list name into rule.name,
+          and sum source.packets for volumetric detections rather than
+          counting documents. Convert clogHistSeverity (the 1-8 MIB enum) by
+          subtracting one to recover the Cisco 0-7 digit for event.severity,
+          which is still INVERTED versus ECS, so reuse the severity lookup
+          built for the syslog feed instead of thresholding the raw value.
+          Keep the ICMP type/code and IGMP type in the custom icmp.*/igmp.*
+          keyword fields, and give the %SEC-6-IPACCESSLOGRL rate-limiter
+          record its own low-noise monitor - a spike there is the only signal
+          that trapped deny counts are under-reported.
+        relay: >
+          Cross decoded NDJSON, never the raw trap PDU. The content-inspection
+          friction is identical to the syslog feed - the operator-defined
+          access-list names are free text that often encodes enclave topology
+          - so bound their length and constrain them to ASCII low-side, and
+          add the varbind envelope to the fields the guard sees. Given the
+          volume, this is the dataset to drop event.original from the crossing
+          first once the per-variant reparse is proven. Persistent Queue plus
+          a low-side dead-letter route rather than Block, and reconcile
+          low-side against high-side counts per (dataset, hour) since the
+          crossing is at-most-once and the trap transport is itself lossy UDP.
+      direct:
+        parse_location: high
+        cribl: >
+          For a high-side device with no guard, terminate the trap on an SNMP
+          receiver and forward the decoded varbinds to the core worker group;
+          there is little advantage to the trap over plain syslog for the ACL
+          family, and the per-record PDU overhead is a real cost at this
+          volume, so adopt it only where SNMP is the existing collection path.
+          Do not run the syslog trap and `logging trap` as dual authoritative
+          feeds for the same ACL family on one device - pick one to avoid
+          double-counting denies.
+        elastic: >
+          A custom clogHistMsgText reparse pipeline that parses the message
+          with the existing per-variant patterns, derives event.action
+          (allow/deny) and event.type from the permitted/denied token, leaves
+          event.outcome null, copies the parsed access-list name into
+          rule.name, and sums source.packets for volumetric detections rather
+          than counting documents. Convert clogHistSeverity (the 1-8 MIB enum)
+          by subtracting one to recover the Cisco 0-7 digit for
+          event.severity, which is still INVERTED versus ECS, so reuse the
+          severity lookup built for the syslog feed instead of thresholding
+          the raw value, and keep the ICMP type/code and IGMP type in the
+          custom icmp.*/igmp.* keyword fields. With no boundary the only
+          tradeoff to accept is the 254-byte truncation on long `log-input`
+          records - alert on trailing-'*' (truncated) records so an analyst
+          can see when an ACL match arrived clipped, and treat the trap as
+          strictly inferior to syslog-raw for full-fidelity ACL forensics.
+    fields:
+    - vendor: clogHistMsgText
+      type: string
+      description: >-
+        CISCO-SYSLOG-MIB - full text of the ACL match message, truncated to
+        254 bytes with a trailing '*' if longer.
+      ecs: event.original
+      status: partial
+      notes: >
+        carries the whole %SEC-6-IPACCESSLOG* / %FMANFP-6-IPACCESSLOG*
+        sentence; every address, port, protocol, ICMP/IGMP token and the `, N
+        packet(s)` counter still has to be parsed out of it with the same
+        per-variant grammar as syslog-raw. The `log-input` keyword roughly
+        doubles the length and is the record most likely to be clipped by the
+        254-byte cap.
+    - vendor: clogHistMsgName
+      type: string
+      description: CISCO-SYSLOG-MIB - message name (the bare mnemonic), SIZE 1..30.
+      ecs: event.code
+      status: mapped
+      transform: >
+        IOS supplies the mnemonic ALONE here (IPACCESSLOGP, IPACCESSLOGDP,
+        IPACCESSLOGNP, IPACCESSLOGSP, IPACCESSLOGRP, IPACCESSLOGRL), which
+        matches the IOS event.code convention of mnemonic-without-facility
+        exactly, so a rule keyed on event.code=IPACCESSLOGP still matches both
+        the SEC and FMANFP variants. The facility that disambiguates them
+        arrives separately in clogHistFacility below.
+    - vendor: clogHistFacility
+      type: string
+      description: >-
+        CISCO-SYSLOG-MIB - name of the facility that generated the message
+        (e.g. 'SEC', 'FMANFP'), SIZE 1..20.
+      ecs: null
+      status: unmapped
+      custom: cisco.ios.facility
+      notes: >
+        SEC on classic IOS, FMANFP on the IOS-XE forwarding-manager platforms.
+        Deliberately NOT mapped to log.syslog.facility.name - that ECS field
+        means the RFC 3164 numeric facility (local7 etc.), which is a
+        different thing from the Cisco subsystem name - so it takes the same
+        custom namespace as the syslog dataset. The reparse pipeline also uses
+        it to derive observer.type=firewall.
+    - vendor: clogHistSeverity
+      type: integer
+      description: CISCO-SYSLOG-MIB - SyslogSeverity enum emergency(1)..debug(8).
+      ecs: event.severity
+      status: partial
+      transform: >
+        the MIB enum is 1-8 (emergency=1), offset by one from the raw Cisco
+        0-7 syslog digit; subtract one to recover the digit the syslog feed
+        carries in event.severity. That digit is still INVERTED relative to
+        ECS (0 is most severe), so drive log.level and any alert threshold
+        from the same lookup the syslog datasets use, not from the raw value.
+        ACL match records are all severity 6.
+    - vendor: clogHistTimestamp
+      type: integer
+      description: >-
+        CISCO-SYSLOG-MIB - value of sysUpTime (device-uptime ticks) when the
+        message was generated.
+      ecs: null
+      status: unmapped
+      custom: cisco.ios.snmp.sysuptime
+      notes: >
+        device-uptime ticks, NOT wall-clock time, so it cannot populate
+        @timestamp directly; @timestamp must come from the trap-receiver
+        arrival time (or be reconstructed from sysUpTime plus agent boot
+        time). Keep the raw ticks for clock-drift analysis - they are the trap
+        equivalent of the syslog `uptime` header caveat.
+    - vendor: clogHistIndex
+      type: integer
+      description: >-
+        CISCO-SYSLOG-MIB - monotonically increasing index of the message in
+        the syslog history table.
+      ecs: null
+      status: unmapped
+      custom: cisco.ios.snmp.history_index
+      notes: >
+        the syslog-history table row index, carried in the varbind OID
+        instance. Gaps or duplicates in it are the trap-transport analogue of
+        the syslog `service sequence-numbers` integrity check - the only way
+        to detect dropped traps, since they are unacknowledged UDP.
+- id: login-aaa
+  name: Login and AAA authentication
+  description: >
+    Management-plane authentication: %SEC_LOGIN-5-LOGIN_SUCCESS and
+    %SEC_LOGIN-4-LOGIN_FAILED (emitted only when `login on-success log` /
+    `login on-failure log` are configured), %SEC_LOGIN-1-QUIET_MODE_ON when
+    login-block thresholds trip, %SYS-6-LOGOUT on session teardown,
+    %SSH-5-SSH2_USERAUTH for the SSH transport result, %SYS-5-PRIV_AUTH_PASS
+    /_FAIL for enable-mode escalation, and the AAA/RADIUS/TACACS server-state
+    messages. This is the dataset a SOC watches for credential attacks against
+    network infrastructure.
+  event_categories:
+  - authentication
+  - iam
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same syslog listener as the ACL dataset; separated only by facility
+        and mnemonic. Administrator usernames and management-station source
+        addresses in this dataset are the most likely candidates for
+        guard-side redaction rules.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cisco_ios.log
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Same syslog listener as the ACL dataset; separated only by facility
+        and mnemonic.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cisco_ios.log
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: elastic-integration
+      artifact: Cisco IOS integration (cisco_ios), data stream logs-cisco_ios.log
+      notes: >
+        SIGNIFICANT GAP — the stock pipeline has a grok branch for
+        LOGIN_SUCCESS and a dissect for LOGOUT, but NO branch for
+        LOGIN_FAILED, QUIET_MODE_ON, SSH2_USERAUTH or the AAA family. Those
+        arrive with the header fields (event.code, event.severity, facility)
+        populated and the entire body sitting unparsed in `message`. Building
+        brute-force detection therefore requires either a Cribl pipeline in
+        front of the integration or a custom ingest pipeline appended to it;
+        this is the single most important parsing decision in this file.
+    fields:
+    - vendor: mnemonic
+      type: string
+      description: Message code identifying which authentication event occurred
+      ecs: event.code
+      status: mapped
+      transform: >
+        LOGIN_SUCCESS / LOGIN_FAILED / QUIET_MODE_ON / LOGOUT / SSH2_USERAUTH
+        / PRIV_AUTH_PASS / PRIV_AUTH_FAIL. Because the pipeline derives no
+        event.outcome for the unparsed members, this field is in practice the
+        ONLY reliable outcome discriminator — detections should test
+        event.code, not event.outcome.
+    - vendor: facility
+      type: string
+      description: Subsystem that raised the message
+      ecs: null
+      status: unmapped
+      custom: cisco.ios.facility
+      notes: >
+        SEC_LOGIN, SYS, SSH, AAA, RADIUS or TACACS depending on the message.
+        Note the trap for query authors — SEC_LOGIN (login enhancements) and
+        SEC (ACL logging) are different facilities that both begin "SEC", so a
+        prefix match will mix authentication with ACL denies.
+    - vendor: severity
+      type: integer
+      description: Single digit 0-7 in the message header indicating message importance
+      ecs: event.severity
+      status: partial
+      notes: >-
+        same inverted 0-7 scale and log.level derivation as the ACL dataset;
+        QUIET_MODE_ON is severity 1, LOGIN_FAILED is 4, LOGIN_SUCCESS is 5
+    - vendor: Login Success | Login failed
+      type: enum
+      description: Literal result phrase opening the SEC_LOGIN message body
+      ecs: event.outcome
+      status: partial
+      notes: >
+        the integration's LOGIN_SUCCESS grok captures this phrase into
+        cisco.ios.action rather than event.outcome, and no branch reads it at
+        all on failure. Deriving success/failure from event.code via a lookup
+        is more reliable than parsing this phrase, whose capitalisation
+        differs between the success and failure templates ("Success" vs
+        "failed").
+    - vendor: '[user: ]'
+      type: string
+      description: Account name presented on the login attempt
+      ecs: source.user.name
+      status: partial
+      notes: >
+        bracketed token in the SEC_LOGIN body. Populated on failure too (IOS
+        does not mask it the way ASA does), which makes password spraying
+        detectable here — but only if the LOGIN_FAILED parsing gap above is
+        closed. related.user and user.name are not populated by the stock
+        pipeline and need a copy step for cross-source identity pivots.
+    - vendor: '[Source: ]'
+      type: ip
+      description: Address the management session originated from
+      ecs: source.ip
+      status: partial
+      notes: >
+        console and auxiliary-port logins report the literal 0.0.0.0, which
+        converts cleanly to an IP but is meaningless as a network indicator;
+        suppress or special-case it before feeding source.ip into any geo or
+        threat-intel enrichment.
+    - vendor: '[localport: ]'
+      type: port
+      description: Device-side TCP port the session arrived on
+      ecs: destination.port
+      status: mapped
+      notes: >-
+        22 for SSH, 23 for telnet; the cleanest available signal that telnet
+        is still enabled somewhere in the estate
+    - vendor: '[Reason: ]'
+      type: enum
+      description: Documented reason the login attempt was rejected
+      ecs: event.reason
+      status: partial
+      notes: >
+        LOGIN_FAILED and QUIET_MODE_ON only ("Login Authentication Failed",
+        "Invalid login", "AAA Authentication fails", ...). No stock pipeline
+        branch extracts it, so today it exists only inside `message`; it is
+        the field that distinguishes a bad password from an unreachable AAA
+        server and is worth extracting first.
+    - vendor: '[ACL: ]'
+      type: string
+      description: Name of the auto-generated quiet-mode ACL applied when login blocking engages
+      ecs: null
+      status: unmapped
+      custom: cisco.ios.access_list
+      notes: >
+        appears on %SEC_LOGIN-1-QUIET_MODE_ON, usually the built-in
+        sl_def_acl. Its presence means the device has stopped accepting
+        management logins entirely — a high-value, very low-volume alert.
+    - vendor: at <time> <tz> <day> <mon> <dd> <yyyy>
+      type: timestamp
+      description: >-
+        Trailing wall-clock stamp the SEC_LOGIN body carries in the device's
+        local timezone
+      ecs: '@timestamp'
+      status: partial
+      notes: >
+        a SECOND timestamp inside the body, distinct from the syslog and
+        `service timestamps` headers the pipeline actually uses for
+        @timestamp. It is frequently in device-local time while the header is
+        UTC; treat it as a clock-drift check, not a mapping source.
+    - vendor: session type
+      type: enum
+      description: Line class of the session being torn down
+      ecs: null
+      status: unmapped
+      custom: cisco.ios.session.type
+      notes: >-
+        from the %SYS-6-LOGOUT dissect — tty, vty, con; there is no ECS field
+        for terminal-line class
+    - vendor: session number
+      type: integer
+      description: Line number of the session being torn down
+      ecs: null
+      status: unmapped
+      custom: cisco.ios.session.number
+      notes: >
+        the only join key between a LOGIN_SUCCESS and its matching LOGOUT, and
+        therefore what an analyst needs to bound an administrator's session.
+        IOS reuses line numbers aggressively, so the join is only safe within
+        a short time window on one device.
+    - vendor: action
+      type: string
+      description: >-
+        Verb describing what the session did, captured from the LOGIN_SUCCESS
+        and LOGOUT bodies
+      ecs: event.action
+      status: partial
+      notes: >
+        the integration writes "Login"/"exited" into cisco.ios.action, not ECS
+        event.action, and the vocabulary is per-template free text rather than
+        a normalized verb set — normalize to logged-in/logged-out from
+        event.code instead.
+    - vendor: privilege level
+      type: integer
+      description: EXEC privilege level reached on an enable-mode escalation
+      ecs: null
+      status: unmapped
+      custom: cisco.ios.privilege_level
+      notes: >
+        from %SYS-5-PRIV_AUTH_PASS/_FAIL. ECS has no privilege-level concept,
+        and unlike ASA's 502103 the IOS message reports only the new level,
+        not the old one — so "escalated to 15" is detectable but the delta is
+        not.
+    - vendor: SSH crypto cipher
+      type: string
+      description: Negotiated cipher and HMAC reported by %SSH-5-SSH2_USERAUTH
+      ecs: null
+      status: unmapped
+      custom: cisco.ios.ssh.cipher
+      notes: >
+        quoted cipher and hmac names in the SSH2_USERAUTH body. Unparsed by
+        the stock pipeline, but the only in-band evidence of weak crypto
+        (3des-cbc, hmac-sha1) still being negotiated on management sessions —
+        useful for a compliance query, not for alerting.
+    - vendor: AAA server address
+      type: ip
+      description: Address of the RADIUS or TACACS+ server named in an AAA state-change message
+      ecs: server.address
+      status: partial
+      notes: >
+        from %RADIUS-4-RADIUS_DEAD / %TACACS-3-SERVERUNREACHABLE and friends.
+        Nothing in the stock pipeline extracts it. server.address is the
+        truest ECS fit (it is the AAA back end, not the thing the admin
+        connected to), but it is a keyword field so it will not support
+        IP-range queries without a matching server.ip copy. These messages
+        matter because AAA going dead silently fails logins over to local
+        accounts.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Keep the listener a pass-through and keep _raw — credential-attack
+          evidence is forensically load-bearing — but set observer.name from
+          the source metadata and tag or suppress the literal 0.0.0.0 that
+          console and auxiliary logins report before it can reach geo or
+          threat-intel enrichment. Use Persistent Queue backpressure on the
+          Elastic destination and add no low-side field extraction, since
+          keeping the whole IOS message grammar in one place on the high side
+          beats splitting it across the boundary.
+        elastic: >
+          Close the parsing gap with a logs-cisco_ios.log@custom pipeline
+          appended to the stock integration, adding branches for LOGIN_FAILED,
+          QUIET_MODE_ON, SSH2_USERAUTH, PRIV_AUTH_PASS/_FAIL and the
+          RADIUS/TACACS server-state messages that extract the account, source
+          address, local port and rejection reason now surviving only inside
+          message. Derive event.outcome from event.code by lookup instead of
+          parsing the result phrase, normalize the free-text action verb into
+          ECS event.action, populate user.name and related.user for
+          cross-source identity pivots, and reuse the severity lookup built
+          for the ACL dataset. Add custom-namespace mappings for the session
+          type/number join keys, privilege level and negotiated SSH cipher,
+          and copy the AAA server address into server.ip alongside the keyword
+          server.address so range queries work.
+        relay: >
+          On the low-side crossing this is the dataset that flips to full
+          ECS-shaped JSON built low-side (parse_location: low) rather than the
+          thin envelope, because administrator usernames and
+          management-station addresses are the flagged redaction targets and
+          the guard cannot make field-aware decisions against an opaque _raw.
+          Build that JSON shallow (nesting no deeper than two), ASCII-keyed
+          and length-bounded, validate it with C.Schema(...).validate
+          immediately before the guard destination with a dead-letter route
+          for failures, and reconcile counts per hour across the boundary.
+      direct:
+        parse_location: high
+        cribl: >
+          Keep the listener a pass-through and keep _raw — credential-attack
+          evidence is forensically load-bearing — but set observer.name from
+          the source metadata and tag or suppress the literal 0.0.0.0 that
+          console and auxiliary logins report before it can reach geo or
+          threat-intel enrichment. Use Persistent Queue backpressure on the
+          Elastic destination and add no low-side field extraction, since
+          keeping the whole IOS message grammar in one place beats splitting
+          it across two systems.
+        elastic: >
+          Close the parsing gap with a logs-cisco_ios.log@custom pipeline
+          appended to the stock integration, adding branches for LOGIN_FAILED,
+          QUIET_MODE_ON, SSH2_USERAUTH, PRIV_AUTH_PASS/_FAIL and the
+          RADIUS/TACACS server-state messages that extract the account, source
+          address, local port and rejection reason now surviving only inside
+          message. Derive event.outcome from event.code by lookup instead of
+          parsing the result phrase, normalize the free-text action verb into
+          ECS event.action, populate user.name and related.user for
+          cross-source identity pivots, and reuse the severity lookup built
+          for the ACL dataset. Add custom-namespace mappings for the session
+          type/number join keys, privilege level and negotiated SSH cipher,
+          and copy the AAA server address into server.ip alongside the keyword
+          server.address so range queries work.
+  - format: snmp-trap
+    enable: >
+      Set `logging history informational` (level 6) so LOGOUT (severity 6) and
+      everything more severe enters the history table - a lower level would
+      silently drop the LOGOUT teardown records - and size it with `logging
+      history size <1-500>`. Note that the LOGIN_FAILED and on-success records
+      only exist at all when `login on-failure log` / `login on-success log`
+      are configured on the device, independent of the trap. Enable the trap
+      with `snmp-server enable traps syslog` and add the host with
+      `snmp-server host <manager-ip> version 3 <user> syslog`; strongly prefer
+      SNMPv3 auth+priv here because the trapped records carry administrator
+      usernames, management-station source addresses and rejection reasons in
+      clear text inside clogHistMsgText.
+    references:
+    - >-
+      https://www.cisco.com/c/en/us/td/docs/ios-xml/ios/snmp/configuration/15-sy/snmp-15-sy-book/nm-snmp-cfg-snmp-support.html
+    - >-
+      https://www.cisco.com/c/en/us/td/docs/ios-xml/ios/snmp/command/nm-snmp-cr-book/nm-snmp-cr-s3.html
+    - https://web.mit.edu/outland/share/snmp/mibs/CISCO-SYSLOG-MIB.my
+    - https://github.com/cisco/cisco-mibs/blob/main/schema/CISCO-SYSLOG-MIB.schema
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom IOS SNMP-trap (CISCO-SYSLOG-MIB) reparse pipeline
+      notes: >
+        A trap receiver terminates the PDU; the pipeline copies
+        clogHistMsgText to event.original and must re-run the body parsing,
+        which for this family is largely NET-NEW work rather than reuse - the
+        stock cisco_ios pipeline groks LOGIN_SUCCESS and dissects LOGOUT but
+        has NO branch for LOGIN_FAILED, QUIET_MODE_ON, SSH2_USERAUTH,
+        PRIV_AUTH_PASS/_FAIL or the AAA/RADIUS/TACACS state messages, so those
+        arrive with only the varbind metadata resolved and the whole body
+        sitting in event.original. Whether the reparse runs in the Cribl
+        pipeline or a custom ingest pipeline, the branches for those unparsed
+        mnemonics are the single most important parsing work for this dataset,
+        exactly as on the syslog feed.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          This dataset flips to full ECS-shaped JSON built low-side rather
+          than a thin envelope, because the trap PDU is opaque to the guard
+          and the flagged redaction targets - administrator usernames and
+          management-station source addresses - are field-aware decisions the
+          guard cannot make against binary varbinds. Terminate the trap on a
+          low-side receiver, decode the varbinds, reparse clogHistMsgText into
+          the account, source address, local port and rejection reason, mask
+          or tag usernames per the redaction policy, and suppress the literal
+          0.0.0.0 that console and auxiliary logins report before it can reach
+          geo or threat-intel enrichment. Set observer.name from the receiver
+          metadata. Keep _raw / event.original - credential-attack evidence is
+          forensically load-bearing.
+        elastic: >
+          Close the same parsing gap the syslog feed has with a
+          logs-cisco_ios.log@custom pipeline adding LOGIN_FAILED,
+          QUIET_MODE_ON, SSH2_USERAUTH, PRIV_AUTH_PASS/_FAIL and RADIUS/TACACS
+          branches over the reparsed text. Derive event.outcome from
+          event.code (clogHistMsgName) by lookup rather than parsing the
+          result phrase, populate user.name and related.user for cross-source
+          identity pivots, apply the clogHistSeverity minus-one conversion to
+          event.severity and reuse the inverted-severity lookup, and copy the
+          AAA server address into server.ip alongside the keyword
+          server.address so range queries work. Add custom-namespace mappings
+          for the session type/number join keys, privilege level and
+          negotiated SSH cipher.
+        relay: >
+          Build the low-side JSON shallow (nesting no deeper than two),
+          ASCII-keyed and length-bounded, validate it with
+          C.Schema(...).validate immediately before the guard destination with
+          a dead-letter route for failures, and reconcile counts per hour
+          across the boundary. Length-cap the SSH2_USERAUTH cipher string and
+          the AAA reason phrase specifically - they are the records most
+          likely to hit the trap's 254-byte clogHistMsgText truncation - and
+          alert on trailing-'*' records so a clipped credential record is
+          visible as a collection gap.
+      direct:
+        parse_location: high
+        cribl: >
+          For a high-side device, terminate the trap on an SNMP receiver and
+          forward the decoded varbinds; keeping the whole IOS message grammar
+          in one reparse pipeline beats splitting it, so add no low-side field
+          extraction beyond the varbind decode. Do not run the syslog trap and
+          `logging trap` as dual authoritative feeds for one device, or every
+          login event double-counts.
+        elastic: >
+          A logs-cisco_ios.log@custom pipeline adding LOGIN_FAILED,
+          QUIET_MODE_ON, SSH2_USERAUTH, PRIV_AUTH_PASS/_FAIL and RADIUS/TACACS
+          branches over the reparsed text. Derive event.outcome from
+          event.code (clogHistMsgName) by lookup rather than parsing the
+          result phrase, populate user.name and related.user for cross-source
+          identity pivots, apply the clogHistSeverity minus-one conversion to
+          event.severity and reuse the inverted-severity lookup, copy the AAA
+          server address into server.ip alongside the keyword server.address
+          so range queries work, and add custom-namespace mappings for the
+          session type/number join keys, privilege level and negotiated SSH
+          cipher. Retain full usernames; accept that the 254-byte truncation
+          is unavoidable in this transport and alert on trailing-'*' records
+          so an analyst knows a long SSH2_USERAUTH cipher line or AAA reason
+          was clipped.
+    fields:
+    - vendor: clogHistMsgText
+      type: string
+      description: >-
+        CISCO-SYSLOG-MIB - full text of the authentication message, truncated
+        to 254 bytes with a trailing '*' if longer.
+      ecs: event.original
+      status: partial
+      notes: >
+        carries the whole SEC_LOGIN / SSH / SYS / AAA sentence - the bracketed
+        [user:], [Source:], [localport:] and [Reason:] tokens, the trailing
+        device-local timestamp, and the SSH2_USERAUTH cipher/hmac names all
+        still have to be parsed out of it. Populated on failure too (IOS does
+        not mask the username the way ASA does), which keeps password-spraying
+        detectable through the trap - but only once the LOGIN_FAILED reparse
+        branch is built.
+    - vendor: clogHistMsgName
+      type: string
+      description: CISCO-SYSLOG-MIB - message name (the bare mnemonic), SIZE 1..30.
+      ecs: event.code
+      status: mapped
+      transform: >
+        LOGIN_SUCCESS / LOGIN_FAILED / QUIET_MODE_ON / LOGOUT / SSH2_USERAUTH
+        / PRIV_AUTH_PASS / PRIV_AUTH_FAIL. Because the reparse derives no
+        event.outcome for the unparsed members, this field is in practice the
+        only reliable outcome discriminator, so detections should test
+        event.code, not event.outcome.
+    - vendor: clogHistFacility
+      type: string
+      description: >-
+        CISCO-SYSLOG-MIB - facility name (e.g. 'SEC_LOGIN', 'SSH', 'SYS',
+        'AAA', 'RADIUS', 'TACACS'), SIZE 1..20.
+      ecs: null
+      status: unmapped
+      custom: cisco.ios.facility
+      notes: >
+        not mapped to log.syslog.facility.name for the same reason as the ACL
+        dataset. Note the trap makes the facility trap explicit and separable,
+        which helps here - SEC_LOGIN (login enhancements) and SEC (ACL
+        logging) both begin "SEC" and a prefix match over the syslog header
+        mixes authentication with ACL denies; clogHistFacility carries the
+        full name so the two are cleanly distinguishable.
+    - vendor: clogHistSeverity
+      type: integer
+      description: CISCO-SYSLOG-MIB - SyslogSeverity enum emergency(1)..debug(8).
+      ecs: event.severity
+      status: partial
+      transform: >
+        subtract one to recover the Cisco 0-7 digit (QUIET_MODE_ON=1,
+        LOGIN_FAILED=4, LOGIN_SUCCESS=5, LOGOUT=6); the digit is inverted
+        versus ECS, so drive log.level and thresholds from the shared lookup,
+        not the raw value.
+    - vendor: clogHistTimestamp
+      type: integer
+      description: >-
+        CISCO-SYSLOG-MIB - value of sysUpTime (device-uptime ticks) when the
+        message was generated.
+      ecs: null
+      status: unmapped
+      custom: cisco.ios.snmp.sysuptime
+      notes: >
+        uptime ticks, not wall-clock; @timestamp must come from the
+        trap-receiver arrival time. Distinct again from the SECOND,
+        device-local wall-clock timestamp the SEC_LOGIN body itself carries
+        inside clogHistMsgText - treat that body timestamp as a clock-drift
+        check, not a mapping source.
+    - vendor: clogHistIndex
+      type: integer
+      description: >-
+        CISCO-SYSLOG-MIB - monotonically increasing index of the message in
+        the syslog history table.
+      ecs: null
+      status: unmapped
+      custom: cisco.ios.snmp.history_index
+      notes: >-
+        gap/duplicate detection only, the trap analogue of the syslog sequence
+        number, since traps are unacknowledged UDP
+- id: config-change
+  name: Configuration and change events
+  description: >
+    Management-plane change tracking: %SYS-5-CONFIG_I when a user exits
+    configuration mode, %SYS-5-CONFIG / CONFIG_NV_I for network and NVRAM
+    sourced configuration, %PARSER-5-CFGLOG_LOGGEDCMD for individual logged
+    commands (requires `archive` / `log config` / `notify syslog`),
+    %SYS-5-RELOAD and %SYS-5-RESTART for reboots, and
+    %SYS-6-LOGGINGHOST_STARTSTOP when syslog forwarding itself is started or
+    stopped. Low volume, high value — this is the change-control and
+    anti-tamper dataset.
+  event_categories:
+  - configuration
+  - authentication
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same syslog listener as the other datasets. The logged command strings
+        from CFGLOG_LOGGEDCMD are unbounded operator free text and will need
+        length capping or content inspection before crossing, in the same way
+        linux-auditd EXECVE arguments do.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cisco_ios.log
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Same syslog listener as the other datasets. The logged command strings
+        from CFGLOG_LOGGEDCMD are unbounded operator free text and warrant
+        length capping at ingest, in the same way linux-auditd EXECVE
+        arguments do.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cisco_ios.log
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: elastic-integration
+      artifact: Cisco IOS integration (cisco_ios), data stream logs-cisco_ios.log
+      notes: >
+        No stock branch parses this family either — the header is extracted
+        and the body stays in `message`. A small Cribl pipeline (or a custom
+        ingest pipeline) covering CONFIG_I and CFGLOG_LOGGEDCMD gives the CSOC
+        "who changed what, from where" for a handful of regexes and is the
+        highest value-per-effort parsing work in this file.
+    fields:
+    - vendor: mnemonic
+      type: string
+      description: Message code identifying which change event occurred
+      ecs: event.code
+      status: mapped
+      transform: >-
+        CONFIG_I / CONFIG / CONFIG_NV_I / CFGLOG_LOGGEDCMD / RELOAD / RESTART
+        / LOGGINGHOST_STARTSTOP; drives event.action via a lookup since no
+        message in the family carries an action token
+    - vendor: severity
+      type: integer
+      description: Single digit 0-7 in the message header indicating message importance
+      ecs: event.severity
+      status: partial
+      notes: >-
+        same inverted 0-7 scale as the other datasets; the whole family sits
+        at 5 or 6, so severity carries no triage signal here
+    - vendor: Configured from <source>
+      type: enum
+      description: Where the applied configuration came from
+      ecs: null
+      status: unmapped
+      custom: cisco.ios.config_source
+      notes: >
+        console, memory, network or nvram. `Configured from memory by console`
+        is the benign boot-time replay and is by far the most common value —
+        filtering it out is the first step in making this dataset alertable.
+        `Configured from network` means a remote copy/TFTP push and deserves
+        its own alert.
+    - vendor: by <user>
+      type: string
+      description: Account that left configuration mode, from the CONFIG_I body
+      ecs: user.name
+      status: partial
+      notes: >
+        the token after `by`. IOS prints a LINE here rather than a username
+        when AAA per-command accounting is not configured — the classic
+        `Configured from console by vty2 (10.34.195.36)` has NO human name in
+        it at all. Confirm the device's aaa configuration before treating this
+        as an identity field; otherwise correlate to the login-aaa dataset by
+        source address and time instead.
+    - vendor: on <line>
+      type: string
+      description: Terminal line the configuration session used
+      ecs: null
+      status: unmapped
+      custom: cisco.ios.line
+      notes: >-
+        con0, vty0..vty15, aux0; same line-identifier semantics as
+        cisco.ios.session.number in the login dataset
+    - vendor: (<ip>)
+      type: ip
+      description: Address of the management station that made the change
+      ecs: source.ip
+      status: partial
+      notes: >
+        the parenthesised address at the end of the CONFIG_I body. Absent
+        entirely for console and boot-time changes, so roughly half the
+        dataset has no source.ip — a "config change from unexpected address"
+        detection must handle null explicitly rather than excluding it.
+    - vendor: User:<name>
+      type: string
+      description: Account credited with an individually logged configuration command
+      ecs: user.name
+      status: partial
+      notes: >
+        from %PARSER-5-CFGLOG_LOGGEDCMD. Prints the literal `console` for
+        console sessions rather than a name. Note the template uses two spaces
+        before `logged command:` on many releases, which breaks naive
+        single-space dissect patterns.
+    - vendor: logged command:<cmd>
+      type: string
+      description: The individual configuration command as entered
+      ecs: process.command_line
+      status: partial
+      notes: >
+        mapping to process.command_line is a convenience so existing
+        command-line detection content can be reused; no OS process exists, so
+        event.category must stay configuration rather than process. With
+        `hidekeys` configured, key material is replaced before logging —
+        without it, this field can carry plaintext secrets across the
+        boundary, which is a guard-policy concern as much as a mapping one.
+    - vendor: 'Reload Reason:'
+      type: string
+      description: Documented reason the device reloaded
+      ecs: event.reason
+      status: mapped
+      notes: >-
+        from %SYS-5-RELOAD (`Reload Command`, `Reload requested by user`) and
+        the reason trailer on %SYS-5-RESTART; an unexpected reason such as a
+        watchdog or power-on reset on a device nobody touched is the alertable
+        case
+    - vendor: System restarted -- <version banner>
+      type: string
+      description: IOS version and image banner reprinted after a restart
+      ecs: observer.version
+      status: partial
+      notes: >
+        the multi-line banner following %SYS-5-RESTART. Only the version
+        substring belongs in observer.version; the rest is image path and
+        copyright text. Useful as a passive software-inventory feed since
+        nothing else in the syslog stream reports the running version.
+    - vendor: Logging to host <ip>
+      type: ip
+      description: Syslog collector address named in a logging start/stop message
+      ecs: destination.ip
+      status: mapped
+      notes: >
+        from %SYS-6-LOGGINGHOST_STARTSTOP. A `stopped - CLI initiated` record
+        naming the Cribl collector is an anti-forensics signal — the device is
+        announcing that it is about to go dark. Pair it with the sequence-gap
+        check below.
+    - vendor: uptime
+      type: string
+      description: >-
+        Time since boot printed in the header when `service timestamps log
+        uptime` is configured
+      ecs: null
+      status: unmapped
+      custom: cisco.ios.uptime
+      notes: >
+        formatted as hh:mm:ss or 1w2d3h, not a duration in nanoseconds, so it
+        cannot go to ECS host.uptime without parsing. Its presence also means
+        the device is NOT stamping absolute times, in which case @timestamp
+        comes from the syslog receiver and carries transit delay.
+    - vendor: sequence number
+      type: long
+      description: >-
+        Per-device monotonic message counter emitted when `service
+        sequence-numbers` is configured
+      ecs: event.sequence
+      status: mapped
+      notes: >-
+        for this dataset specifically, a gap spanning a CONFIG_I is the
+        difference between "we saw the change" and "we saw a change" — worth a
+        dedicated integrity check
+    - vendor: hostname
+      type: string
+      description: Device name carried in the syslog header
+      ecs: log.syslog.hostname
+      status: partial
+      notes: >-
+        same identity gap as the ACL dataset — observer.name is never
+        populated, so change events cannot be joined to a CMDB without
+        enrichment
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Mask key material low-side before anything leaves the enclave —
+          devices without `hidekeys` emit plaintext secrets inside the logged
+          command string — and cap that field's length so a pasted banner or
+          certificate cannot produce a kilobyte-wide value. Keep _raw (this is
+          the anti-tamper record and the volume is trivial), set observer.name
+          from the source metadata, and route the logging-host "stopped"
+          records that name the Cribl collector onto a priority stream, since
+          that is the device announcing it is about to go dark.
+        elastic: >
+          Extend the logs-cisco_ios.log@custom pipeline with CONFIG_I and
+          CFGLOG_LOGGEDCMD branches extracting account, line, source address
+          and the command string — allowing for the two-space variant before
+          the `logged command:` literal — and drive event.action from
+          event.code by lookup, since no message in this family carries an
+          action token. Keep event.category as configuration even though the
+          command lands in process.command_line, and treat the `by <user>`
+          token as an identity only where AAA per-command accounting is
+          confirmed, otherwise correlate to the login-aaa dataset by source
+          address and time. Filter the benign boot-time `Configured from
+          memory by console` replay out of alerting content while alerting
+          separately on network-sourced configuration, add custom-namespace
+          mappings for config source, line and uptime, and run a sequence-gap
+          integrity check spanning CONFIG_I events.
+        relay: >
+          The unbounded operator free text in the logged command field is the
+          hardest content-filter problem in this file, in the same way
+          linux-auditd EXECVE arguments are: cap length, strip non-ASCII and
+          mask secrets low-side before the crossing rather than relying on
+          guard-side rejection. Low-side instances cross with the thin
+          envelope and hybrid parsing behind a Persistent Queue and a
+          dead-letter route; make this the last dataset to lose _raw at the
+          crossing — the volume is low and the record is the change-control
+          evidence.
+      direct:
+        parse_location: high
+        cribl: >
+          Mask key material at ingest — devices without `hidekeys` emit
+          plaintext secrets inside the logged command string — and cap that
+          field's length so a pasted banner or certificate cannot produce a
+          kilobyte-wide value. Keep _raw (this is the anti-tamper record and
+          the volume is trivial), set observer.name from the source metadata,
+          and route the logging-host "stopped" records that name the Cribl
+          collector onto a priority stream, since that is the device
+          announcing it is about to go dark.
+        elastic: >
+          Extend the logs-cisco_ios.log@custom pipeline with CONFIG_I and
+          CFGLOG_LOGGEDCMD branches extracting account, line, source address
+          and the command string — allowing for the two-space variant before
+          the `logged command:` literal — and drive event.action from
+          event.code by lookup, since no message in this family carries an
+          action token. Keep event.category as configuration even though the
+          command lands in process.command_line, and treat the `by <user>`
+          token as an identity only where AAA per-command accounting is
+          confirmed, otherwise correlate to the login-aaa dataset by source
+          address and time. Filter the benign boot-time `Configured from
+          memory by console` replay out of alerting content while alerting
+          separately on network-sourced configuration, add custom-namespace
+          mappings for config source, line and uptime, and run a sequence-gap
+          integrity check spanning CONFIG_I events.
+  - format: snmp-trap
+    enable: >
+      Set `logging history informational` (level 6) so the severity-6
+      LOGGINGHOST_STARTSTOP records and the severity-5 CONFIG_I / CFGLOG /
+      RELOAD / RESTART records all enter the history table, and size it with
+      `logging history size <1-500>`. The per-command CFGLOG_LOGGEDCMD records
+      additionally require `archive` / `log config` / `notify syslog` on the
+      device, independent of the trap. Enable the trap with `snmp-server
+      enable traps syslog` and add the host with `snmp-server host
+      <manager-ip> version 3 <user> syslog`; because logged command strings
+      can echo secrets on devices without `hidekeys`, use SNMPv3 auth+priv so
+      the trap contents are encrypted in transit, and apply the same low-side
+      command redaction the syslog path uses.
+    references:
+    - >-
+      https://www.cisco.com/c/en/us/td/docs/ios-xml/ios/snmp/configuration/15-sy/snmp-15-sy-book/nm-snmp-cfg-snmp-support.html
+    - >-
+      https://www.cisco.com/c/en/us/td/docs/ios-xml/ios/snmp/command/nm-snmp-cr-book/nm-snmp-cr-s3.html
+    - https://web.mit.edu/outland/share/snmp/mibs/CISCO-SYSLOG-MIB.my
+    - https://github.com/cisco/cisco-mibs/blob/main/schema/CISCO-SYSLOG-MIB.schema
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom IOS SNMP-trap (CISCO-SYSLOG-MIB) reparse pipeline
+      notes: >
+        A trap receiver terminates the PDU; the pipeline copies
+        clogHistMsgText to event.original and reparses the body, which is
+        net-new work here too - no stock cisco_ios branch parses this family,
+        so today the header varbinds resolve and the body stays in
+        event.original. A small set of CONFIG_I and CFGLOG_LOGGEDCMD regexes
+        gives the CSOC "who changed what, from where" and is the highest
+        value-per-effort parsing in the file; allow for the two-space variant
+        before the `logged command:` literal that breaks naive single-space
+        dissects.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Terminate the trap low-side, decode the varbinds and reparse
+          clogHistMsgText. Mask key material low-side before anything leaves
+          the enclave - devices without `hidekeys` emit plaintext secrets
+          inside the logged command string - and cap that field's length so a
+          pasted banner or certificate cannot produce a kilobyte-wide value
+          (the trap's own 254-byte cap will already have clipped it, which is
+          itself a fidelity loss to flag). Keep event.original (this is the
+          anti-tamper record and the volume is trivial), set observer.name
+          from the receiver metadata, and route the LOGGINGHOST_STARTSTOP
+          "stopped" records that name the collector onto a priority stream -
+          that is the device announcing it is about to go dark.
+        elastic: >
+          Extend the logs-cisco_ios.log@custom pipeline with CONFIG_I and
+          CFGLOG_LOGGEDCMD branches extracting account, line, source address
+          and the command string, drive event.action from event.code
+          (clogHistMsgName) by lookup since no message in this family carries
+          an action token, and keep event.category=configuration even though
+          the command lands in process.command_line. Filter the benign
+          boot-time `Configured from memory by console` replay out of alerting
+          while alerting separately on `Configured from network`, apply the
+          clogHistSeverity minus-one conversion (the whole family sits at 5-6
+          so severity carries no triage signal), and add custom-namespace
+          mappings for config source, line and the reload reason. Run a
+          history-index gap check spanning CONFIG_I events.
+        relay: >
+          The unbounded command free text is the hardest content-filter
+          problem in this file, in the same way linux-auditd EXECVE arguments
+          are: cap length, strip non-ASCII and mask secrets low-side before
+          the crossing rather than relying on guard-side rejection. Cross the
+          decoded record behind a Persistent Queue and a dead-letter route;
+          make this the last dataset to lose event.original at the crossing -
+          the volume is low and the record is the change-control evidence -
+          and alert on trailing-'*' truncation so a clipped command line is
+          visible as a gap.
+      direct:
+        parse_location: high
+        cribl: >
+          For a high-side device, terminate the trap on an SNMP receiver and
+          forward decoded varbinds. Given the truncation risk on command
+          strings, adopt the trap for this dataset only where SNMP is the
+          existing collection path; otherwise the syslog-raw feed is strictly
+          better for the CFGLOG_LOGGEDCMD records. Do not run trap and
+          `logging trap` as dual authoritative feeds for one device.
+        elastic: >
+          A logs-cisco_ios.log@custom pipeline with CONFIG_I and
+          CFGLOG_LOGGEDCMD branches extracting account, line, source address
+          and the command string, driving event.action from event.code
+          (clogHistMsgName) by lookup since no message in this family carries
+          an action token, and keeping event.category=configuration even
+          though the command lands in process.command_line. Filter the benign
+          boot-time `Configured from memory by console` replay out of alerting
+          while alerting separately on `Configured from network`, apply the
+          clogHistSeverity minus-one conversion (the whole family sits at 5-6
+          so severity carries no triage signal), add custom-namespace mappings
+          for config source, line and the reload reason, and run a
+          history-index gap check spanning CONFIG_I events. Retain full
+          command lines where they fit; alert on trailing-'*' truncation so an
+          analyst knows a logged command was clipped by the 254-byte cap - for
+          this dataset that clip lands squarely on the forensic payload.
+    fields:
+    - vendor: clogHistMsgText
+      type: string
+      description: >-
+        CISCO-SYSLOG-MIB - full text of the change-event message, truncated to
+        254 bytes with a trailing '*' if longer.
+      ecs: event.original
+      status: partial
+      notes: >
+        contains the whole CONFIG_I / CFGLOG_LOGGEDCMD / RELOAD / RESTART /
+        LOGGINGHOST_STARTSTOP sentence, including the executed configuration
+        command for CFGLOG_LOGGEDCMD and the multi-line version banner after
+        RESTART. The 254-byte cap frequently clips the unbounded command
+        strings, which is the single biggest fidelity loss of this transport
+        for this dataset.
+    - vendor: clogHistMsgName
+      type: string
+      description: CISCO-SYSLOG-MIB - message name (the bare mnemonic), SIZE 1..30.
+      ecs: event.code
+      status: mapped
+      transform: >
+        CONFIG_I / CONFIG / CONFIG_NV_I / CFGLOG_LOGGEDCMD / RELOAD / RESTART
+        / LOGGINGHOST_STARTSTOP; drives event.action via a lookup since no
+        message in the family carries an action token.
+    - vendor: clogHistFacility
+      type: string
+      description: 'CISCO-SYSLOG-MIB - facility name (e.g. ''SYS'', ''PARSER''), SIZE 1..20.'
+      ecs: null
+      status: unmapped
+      custom: cisco.ios.facility
+      notes: >
+        SYS for the config/reload records, PARSER for CFGLOG_LOGGEDCMD; not
+        mapped to log.syslog.facility.name for the same reason as the other
+        datasets.
+    - vendor: clogHistSeverity
+      type: integer
+      description: CISCO-SYSLOG-MIB - SyslogSeverity enum emergency(1)..debug(8).
+      ecs: event.severity
+      status: partial
+      transform: >
+        subtract one to recover the Cisco 0-7 digit; the whole family sits at
+        5 or 6 so severity carries no triage signal here, but the inverted
+        scale still requires the shared lookup rather than a raw threshold.
+    - vendor: clogHistTimestamp
+      type: integer
+      description: >-
+        CISCO-SYSLOG-MIB - value of sysUpTime (device-uptime ticks) when the
+        message was generated.
+      ecs: null
+      status: unmapped
+      custom: cisco.ios.snmp.sysuptime
+      notes: >
+        uptime ticks, not wall-clock; @timestamp must come from the
+        trap-receiver arrival time. Its presence is also the trap-side echo of
+        the syslog `service timestamps log uptime` caveat - the device is not
+        stamping absolute times, so transit delay is baked into @timestamp.
+    - vendor: clogHistIndex
+      type: integer
+      description: >-
+        CISCO-SYSLOG-MIB - monotonically increasing index of the message in
+        the syslog history table.
+      ecs: null
+      status: unmapped
+      custom: cisco.ios.snmp.history_index
+      notes: >
+        for this dataset a gap spanning a CONFIG_I is the difference between
+        "we saw the change" and "we saw a change" - worth a dedicated
+        integrity check, the trap equivalent of the syslog sequence-gap check.
+- id: interface-state
+  name: Interface and system state
+  description: >
+    Thin starter for control-plane and physical-layer state: %LINK-3-UPDOWN
+    (physical link) and %LINEPROTO-5-UPDOWN (line protocol) on every interface
+    transition, plus the neighbour-adjacency messages %OSPF-5-ADJCHG and
+    %DUAL-5-NBRCHANGE. Not a security dataset on its own, but it is what tells
+    a CSOC whether a gap in another dataset was an attack, a maintenance
+    window, or a link that flapped.
+  event_categories:
+  - configuration
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same syslog listener as the other datasets. Interface descriptions and
+        neighbour addresses in this family disclose internal topology and are
+        a plausible target for guard filtering.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cisco_ios.log
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Same syslog listener as the other datasets.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cisco_ios.log
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: elastic-integration
+      artifact: Cisco IOS integration (cisco_ios), data stream logs-cisco_ios.log
+      notes: >
+        Header-only parsing again — no branch extracts the interface name or
+        the up/down state. A flapping access port can emit these in pairs at
+        high rate, so a Cribl-side suppression or aggregation step in front of
+        the integration is worth costing before this dataset is enabled
+        estate-wide.
+    fields:
+    - vendor: mnemonic
+      type: string
+      description: Message code identifying the state-change type
+      ecs: event.code
+      status: mapped
+      transform: >-
+        UPDOWN (shared by LINK and LINEPROTO — the facility is what
+        distinguishes them), ADJCHG, NBRCHANGE
+    - vendor: facility
+      type: string
+      description: Subsystem that raised the message
+      ecs: null
+      status: unmapped
+      custom: cisco.ios.facility
+      notes: >
+        LINK, LINEPROTO, OSPF or DUAL. Critically, LINK-3-UPDOWN and
+        LINEPROTO-5-UPDOWN share the mnemonic UPDOWN, so event.code alone
+        cannot tell a physical-layer failure from a protocol-layer one — every
+        query over this dataset must filter on facility as well. The
+        integration also uses LINK/LINEPROTO to set observer.type=switch.
+    - vendor: severity
+      type: integer
+      description: Single digit 0-7 in the message header indicating message importance
+      ecs: event.severity
+      status: partial
+      notes: >-
+        LINK is severity 3 and LINEPROTO is 5 for the same physical event,
+        which is the clearest illustration of why the inverted Cisco scale
+        needs a lookup before thresholding
+    - vendor: Interface <name>
+      type: string
+      description: Name of the interface whose state changed
+      ecs: observer.ingress.interface.name
+      status: partial
+      notes: >
+        e.g. GigabitEthernet1/0/1. ECS 9.4 still has no plain interface.name
+        fieldset, and the integration defines its own cisco.ios.interface.name
+        for this; observer.ingress.interface.name is the nearest ECS home but
+        is semantically wrong for a state change (nothing ingressed). Decide
+        between the custom field and the observer.* rename before writing
+        content — do not populate both.
+    - vendor: changed state to <up|down>
+      type: enum
+      description: The new state of the link or line protocol
+      ecs: event.action
+      status: partial
+      transform: >
+        normalize to interface-up / interface-down for event.action. ECS
+        service.state is a tempting alternative but is scoped to services, not
+        interfaces. IOS also emits `administratively down` as a third value on
+        LINK-3-UPDOWN, which must be distinguished from an unplanned down or
+        every maintenance shutdown becomes an alert.
+    - vendor: neighbour address
+      type: ip
+      description: Peer address in an OSPF or EIGRP adjacency-change message
+      ecs: null
+      status: unmapped
+      custom: cisco.ios.neighbor.ip
+      notes: >
+        from `%OSPF-5-ADJCHG: Process 1, Nbr 10.1.1.2 on GigabitEthernet0/1
+        from FULL to DOWN` and the DUAL equivalent. Neither source.ip nor
+        destination.ip fits (there is no packet and no direction), so it is
+        kept custom. An adjacency dropping to a neighbour that is NOT a known
+        peer address is a routing-attack indicator.
+    - vendor: adjacency state transition
+      type: string
+      description: Old and new adjacency states in an OSPF neighbour change
+      ecs: null
+      status: unmapped
+      custom: cisco.ios.adjacency_state
+      notes: >-
+        printed as `from FULL to DOWN`; ECS has no state-transition concept,
+        and the two halves need splitting before either is queryable
+    - vendor: uptime
+      type: string
+      description: >-
+        Time since boot printed in the header when `service timestamps log
+        uptime` is configured
+      ecs: null
+      status: unmapped
+      custom: cisco.ios.uptime
+      notes: >-
+        same hh:mm:ss / 1w2d3h formatting caveat as the config dataset; on
+        this dataset it doubles as a cheap check for whether a "link down" was
+        actually a device reboot
+    - vendor: sequence number
+      type: long
+      description: >-
+        Per-device monotonic message counter emitted when `service
+        sequence-numbers` is configured
+      ecs: event.sequence
+      status: mapped
+    - vendor: hostname
+      type: string
+      description: Device name carried in the syslog header
+      ecs: log.syslog.hostname
+      status: partial
+      notes: same identity gap as the other datasets
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Cost and build a low-side suppression or aggregation step before
+          enabling this estate-wide — a flapping access port emits LINK and
+          LINEPROTO pairs at high rate — collapsing repeated transitions on
+          one interface into a windowed summary instead of forwarding every
+          pair. Drop _raw first on this dataset (lowest forensic value in the
+          file), attach the interface-to-site lookup while the interface names
+          still have local meaning, and set observer.name from the source
+          metadata.
+        elastic: >
+          Extend the logs-cisco_ios.log@custom pipeline with UPDOWN, ADJCHG
+          and NBRCHANGE branches that key on facility as well as event.code,
+          because LINK and LINEPROTO share the UPDOWN mnemonic and event.code
+          alone cannot separate a physical-layer failure from a protocol-layer
+          one. Normalize the state token to interface-up / interface-down for
+          event.action while keeping `administratively down` as a distinct
+          value so maintenance shutdowns do not alert, and split the adjacency
+          transition into two separately queryable old/new fields. Settle the
+          interface-name home on the custom cisco.ios.interface.name rather
+          than observer.ingress.interface.name and populate only one, and map
+          the neighbour address as a custom ip field so adjacencies dropping
+          to unknown peers are detectable.
+        relay: >
+          On the low-side crossing, interface descriptions and neighbour
+          addresses are the disclosure risk here, so constrain them low-side —
+          and consider dropping the neighbour and adjacency fields entirely
+          rather than relying on guard-side filtering to catch topology
+          leakage. Cross with the thin envelope behind a Persistent Queue and
+          a dead-letter route, and drop _raw from the crossing on this dataset
+          first, since the low-side aggregation already reduces each record to
+          what the CSOC needs for attributing gaps in the other datasets.
+      direct:
+        parse_location: high
+        cribl: >
+          Cost and build a suppression or aggregation step at the ingest
+          worker group before enabling this estate-wide — a flapping access
+          port emits LINK and LINEPROTO pairs at high rate — collapsing
+          repeated transitions on one interface into a windowed summary
+          instead of forwarding every pair. Drop _raw first on this dataset
+          (lowest forensic value in the file), attach the interface-to-site
+          lookup, and set observer.name from the source metadata.
+        elastic: >
+          Extend the logs-cisco_ios.log@custom pipeline with UPDOWN, ADJCHG
+          and NBRCHANGE branches that key on facility as well as event.code,
+          because LINK and LINEPROTO share the UPDOWN mnemonic and event.code
+          alone cannot separate a physical-layer failure from a protocol-layer
+          one. Normalize the state token to interface-up / interface-down for
+          event.action while keeping `administratively down` as a distinct
+          value so maintenance shutdowns do not alert, and split the adjacency
+          transition into two separately queryable old/new fields. Settle the
+          interface-name home on the custom cisco.ios.interface.name rather
+          than observer.ingress.interface.name and populate only one, and map
+          the neighbour address as a custom ip field so adjacencies dropping
+          to unknown peers are detectable.
+  - format: snmp-trap
+    enable: >
+      Set `logging history notifications` (level 5) so the LINEPROTO, OSPF and
+      DUAL records enter the history table - LINK at severity 3 is captured at
+      any level - and size it generously with `logging history size <1-500>`
+      because a flap storm can overrun a small table between trap sends.
+      Enable the trap with `snmp-server enable traps syslog` and add the host
+      with `snmp-server host <manager-ip> [version {2c <community> | 3
+      <user>}] syslog`. Interface descriptions and neighbour addresses in this
+      family disclose internal topology, so use SNMPv3 on any device whose
+      trap path leaves a trusted segment. Do not confuse this with the
+      dedicated `snmp-server enable traps snmp linkdown linkup` IF-MIB
+      linkUp/linkDown traps - those are a different notification with a
+      different (ifIndex-keyed) shape and are not the syslog %LINK/%LINEPROTO
+      message this dataset covers.
+    references:
+    - >-
+      https://www.cisco.com/c/en/us/td/docs/ios-xml/ios/snmp/configuration/15-sy/snmp-15-sy-book/nm-snmp-cfg-snmp-support.html
+    - >-
+      https://www.cisco.com/c/en/us/td/docs/ios-xml/ios/snmp/command/nm-snmp-cr-book/nm-snmp-cr-s3.html
+    - https://web.mit.edu/outland/share/snmp/mibs/CISCO-SYSLOG-MIB.my
+    - https://github.com/cisco/cisco-mibs/blob/main/schema/CISCO-SYSLOG-MIB.schema
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom IOS SNMP-trap (CISCO-SYSLOG-MIB) reparse pipeline
+      notes: >
+        A trap receiver terminates the PDU; the pipeline copies
+        clogHistMsgText to event.original and reparses it - net-new work
+        again, since no stock branch extracts the interface name or the
+        up/down state. The reparse branches must key on clogHistFacility as
+        well as clogHistMsgName because LINK and LINEPROTO share the UPDOWN
+        mnemonic and the mnemonic alone cannot separate a physical-layer
+        failure from a protocol-layer one. A Cribl-side suppression or
+        windowed aggregation step in front of the reparse is worth costing
+        before this dataset is trapped estate-wide.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Cost and build a low-side suppression or aggregation step before
+          enabling this over the trap estate-wide - a flapping access port
+          emits LINK and LINEPROTO trap pairs at high rate - collapsing
+          repeated transitions on one interface into a windowed summary
+          instead of forwarding every pair. Terminate the trap low-side,
+          decode the varbinds, reparse the interface name and state, drop
+          event.original first on this dataset (lowest forensic value in the
+          file), attach the interface-to-site lookup while the names still
+          have local meaning, and set observer.name from the receiver
+          metadata.
+        elastic: >
+          Extend the logs-cisco_ios.log@custom pipeline with UPDOWN, ADJCHG
+          and NBRCHANGE branches that key on clogHistFacility as well as
+          event.code, normalise the state token to interface-up /
+          interface-down for event.action while keeping `administratively
+          down` distinct so maintenance shutdowns do not alert, and split the
+          adjacency transition into separate old/new fields. Settle the
+          interface-name home on the custom cisco.ios.interface.name rather
+          than observer.ingress.interface.name and populate only one, map the
+          neighbour address as a custom ip field, and apply the
+          clogHistSeverity minus-one conversion (LINK=3 and LINEPROTO=5 for
+          the same physical event is the clearest illustration of why the
+          inverted scale needs the lookup before thresholding).
+        relay: >
+          Interface descriptions and neighbour addresses are the disclosure
+          risk here, so constrain them low-side - and consider dropping the
+          neighbour and adjacency fields entirely rather than relying on
+          guard-side filtering to catch topology leakage. Cross the decoded
+          record behind a Persistent Queue and a dead-letter route, and drop
+          event.original from the crossing on this dataset first, since the
+          low-side aggregation already reduces each record to what the CSOC
+          needs for attributing gaps in the other datasets.
+      direct:
+        parse_location: high
+        cribl: >
+          For a high-side device, terminate the trap on an SNMP receiver and
+          forward decoded varbinds through the aggregation step. The trap adds
+          nothing over plain syslog for interface state and carries real
+          per-transition PDU overhead at flap volume, so adopt it only where
+          SNMP is the existing path. Do not run trap and `logging trap` as
+          dual authoritative feeds for one device.
+        elastic: >
+          A logs-cisco_ios.log@custom pipeline with UPDOWN, ADJCHG and
+          NBRCHANGE branches that key on clogHistFacility as well as
+          event.code, since LINK and LINEPROTO share the UPDOWN mnemonic.
+          Normalise the state token to interface-up / interface-down for
+          event.action while keeping `administratively down` distinct so
+          maintenance shutdowns do not alert, split the adjacency transition
+          into separate old/new fields, settle the interface-name home on the
+          custom cisco.ios.interface.name rather than
+          observer.ingress.interface.name and populate only one, map the
+          neighbour address as a custom ip field, and apply the
+          clogHistSeverity minus-one conversion. Accept the 254-byte
+          truncation as a non-issue for this family (the messages are short),
+          and treat the trap purely as a transport choice, not a fidelity
+          improvement over syslog.
+    fields:
+    - vendor: clogHistMsgText
+      type: string
+      description: >-
+        CISCO-SYSLOG-MIB - full text of the state-change message; short enough
+        that the 254-byte truncation rarely bites this family.
+      ecs: event.original
+      status: partial
+      notes: >
+        carries the whole %LINK-3-UPDOWN / %LINEPROTO-5-UPDOWN /
+        %OSPF-5-ADJCHG / %DUAL-5-NBRCHANGE sentence; the interface name, the
+        `changed state to <up|down>` token, the neighbour address and the
+        `from <old> to <new>` adjacency transition all still have to be parsed
+        out of it.
+    - vendor: clogHistMsgName
+      type: string
+      description: CISCO-SYSLOG-MIB - message name (the bare mnemonic), SIZE 1..30.
+      ecs: event.code
+      status: mapped
+      transform: >
+        UPDOWN (shared by LINK and LINEPROTO - clogHistFacility is what
+        distinguishes them), ADJCHG, NBRCHANGE. Because UPDOWN is shared,
+        every query over this dataset must filter on clogHistFacility as well
+        as event.code.
+    - vendor: clogHistFacility
+      type: string
+      description: >-
+        CISCO-SYSLOG-MIB - facility name (e.g. 'LINK', 'LINEPROTO', 'OSPF',
+        'DUAL'), SIZE 1..20.
+      ecs: null
+      status: unmapped
+      custom: cisco.ios.facility
+      notes: >
+        critically, LINK-3-UPDOWN and LINEPROTO-5-UPDOWN share the UPDOWN
+        mnemonic, so event.code alone cannot tell a physical-layer failure
+        from a protocol-layer one - the separately-carried facility name is
+        what resolves it, which is one place the trap's broken-out facility
+        varbind is genuinely convenient. The reparse also uses LINK/LINEPROTO
+        to set observer.type=switch. Not mapped to log.syslog.facility.name
+        for the same reason as the other datasets.
+    - vendor: clogHistSeverity
+      type: integer
+      description: CISCO-SYSLOG-MIB - SyslogSeverity enum emergency(1)..debug(8).
+      ecs: event.severity
+      status: partial
+      transform: >
+        subtract one to recover the Cisco 0-7 digit; LINK is 3 and LINEPROTO
+        is 5 for the same physical event, so the inverted scale absolutely
+        needs the shared lookup before any threshold.
+    - vendor: clogHistTimestamp
+      type: integer
+      description: >-
+        CISCO-SYSLOG-MIB - value of sysUpTime (device-uptime ticks) when the
+        message was generated.
+      ecs: null
+      status: unmapped
+      custom: cisco.ios.snmp.sysuptime
+      notes: >
+        uptime ticks, not wall-clock; @timestamp must come from the
+        trap-receiver arrival time. On this dataset the ticks double as a
+        cheap check for whether a "link down" was actually a device reboot
+        (the value resets to near zero).
+    - vendor: clogHistIndex
+      type: integer
+      description: >-
+        CISCO-SYSLOG-MIB - monotonically increasing index of the message in
+        the syslog history table.
+      ecs: null
+      status: unmapped
+      custom: cisco.ios.snmp.history_index
+      notes: >-
+        gap/duplicate detection only, the trap analogue of the syslog sequence
+        number; useful for spotting traps lost during a flap storm

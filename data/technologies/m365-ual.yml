@@ -1,0 +1,2567 @@
+id: m365-ual
+name: M365 GCC Unified Audit Log
+vendor: Microsoft
+versions: >-
+  Office 365 Management Activity API v1.0; GCC (manage-gcc.office.com) and GCC
+  High (manage.office365.us) tenants
+draft: true
+references:
+- >-
+  https://learn.microsoft.com/en-us/office/office-365-management-api/office-365-management-activity-api-schema
+- >-
+  https://learn.microsoft.com/en-us/office/office-365-management-api/office-365-management-activity-api-reference
+- https://www.elastic.co/docs/reference/integrations/o365
+- >-
+  https://github.com/elastic/integrations/tree/main/packages/o365/data_stream/audit
+- https://docs.cribl.io/stream/sources-microsoft-365-activity/
+- >-
+  https://learn.microsoft.com/en-us/microsoft-365/enterprise/microsoft-365-u-s-government-gcc-high-endpoints
+datasets:
+- id: exchange-online
+  name: Exchange Online mailbox and admin activity
+  description: >
+    Exchange Online records from the Audit.Exchange content type - RecordType
+    1 (ExchangeAdmin, remote PowerShell cmdlets such as Set-Mailbox and
+    New-InboxRule), RecordType 2 (ExchangeItem, single-item mailbox actions)
+    and RecordType 50 (ExchangeItemAggregated, the MailItemsAccessed action
+    that underwrites compromised-mailbox scoping). Every record carries the
+    API's Common schema (CreationTime, Id, Operation, RecordType,
+    ResultStatus, UserId, UserType, ClientIP, ObjectId, Workload,
+    OrganizationId) plus the Exchange Mailbox / Exchange Admin extensions. Two
+    properties dominate ingest design: MailItemsAccessed is throttled into
+    aggregated records once a mailbox exceeds roughly 1,000 bindings in 24
+    hours, so OperationCount rather than document count is the real access
+    volume; and the API retains content blobs for only about seven days, which
+    is the entire replay window if collection stalls. This is the cloud
+    counterpart to the on-prem `exchange` map - message tracking and IIS HTTP
+    proxy logs are not in the UAL and stay on that map.
+  event_categories:
+  - authentication
+  - configuration
+  route:
+    guarded:
+    - hop: other
+      name: Office 365 Management Activity API (GCC endpoint)
+      notes: >
+        Records are pulled, not pushed. A subscription is started per content
+        type and the collector then walks content blob URIs on the tenant's
+        plan-specific root - manage-gcc.office.com for GCC,
+        manage.office365.us for GCC High, manage.protection.apps.mil for DoD -
+        authenticating against login.microsoftonline.us for the .us clouds.
+        Blobs expire after about seven days; there is no on-prem appliance to
+        replay from.
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Cribl's Microsoft 365 Activity source polls the API directly and its
+        endpoint selector already carries the GCC High value
+        (manage.office365.us); the collector runs in the low-side enclave and
+        pushes across the guard.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-o365.audit
+    direct:
+    - hop: other
+      name: Office 365 Management Activity API (GCC endpoint)
+      notes: >
+        Records are pulled, not pushed. A subscription is started per content
+        type and the collector then walks content blob URIs on the tenant's
+        plan-specific root - manage-gcc.office.com for GCC,
+        manage.office365.us for GCC High, manage.protection.apps.mil for DoD -
+        authenticating against login.microsoftonline.us for the .us clouds.
+        Blobs expire after about seven days; there is no on-prem appliance to
+        replay from.
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Cribl's Microsoft 365 Activity source polls the API directly and its
+        endpoint selector already carries the GCC High value
+        (manage.office365.us); the poller sits alongside the Elastic stack.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-o365.audit
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: Microsoft Office 365 integration (o365.audit data stream)
+      notes: >
+        The o365 integration's audit data stream is the parser. Its variables
+        are endpoint-configurable - url (default https://manage.office.com),
+        token_url (default https://login.microsoftonline.com) and token_scopes
+        (default https://manage.office.com/.default) all have to be repointed
+        at the Government values, which is the single most common cause of a
+        silent auth failure on a GCC tenant. As of integration 1.18.0 the
+        legacy o365audit input is deprecated in favour of the CEL input and
+        certificate-based auth is gone, so client-secret rotation becomes an
+        operational dependency. Note the integration writes every workload
+        into the one logs-o365.audit data stream, so the four datasets on this
+        map are separated only by RecordType/Workload, not by index.
+    fields:
+    - vendor: CreationTime
+      type: timestamp
+      description: UTC date and time the audit record was generated
+      ecs: '@timestamp'
+      status: mapped
+      transform: parsed from ISO8601; this is record-generation time, not collection time
+    - vendor: Id
+      type: string
+      description: GUID uniquely identifying the audit record
+      ecs: event.id
+      status: mapped
+    - vendor: RecordType
+      type: enum
+      description: numeric AuditLogRecordType identifying the schema of the record
+      ecs: event.code
+      status: mapped
+      transform: >
+        numeric enum resolved to its member name by lookup (1=ExchangeAdmin,
+        2=ExchangeItem, 50=ExchangeItemAggregated); the raw integer is what
+        the API emits
+    - vendor: Operation
+      type: string
+      description: >-
+        name of the user or admin activity, e.g. MailItemsAccessed,
+        New-InboxRule, SendAs
+      ecs: event.action
+      status: mapped
+    - vendor: ResultStatus
+      type: enum
+      description: outcome of the operation - Succeeded, PartiallySucceeded or Failed
+      ecs: event.outcome
+      status: partial
+      notes: >
+        absent on a large share of mailbox records, and PartiallySucceeded has
+        no ECS equivalent; event.outcome has to be derived rather than copied
+      transform: >-
+        Succeeded to success, Failed to failure, PartiallySucceeded needs an
+        explicit policy decision
+    - vendor: Workload
+      type: string
+      description: Microsoft 365 service the activity occurred in (Exchange)
+      ecs: event.provider
+      status: mapped
+    - vendor: OrganizationId
+      type: string
+      description: GUID of the tenant the record belongs to
+      ecs: organization.id
+      status: mapped
+    - vendor: UserId
+      type: string
+      description: UPN of the user or service principal that performed the action
+      ecs: user.name
+      status: partial
+      notes: >
+        a UPN, but the stock pipeline copies it to user.id; it also carries
+        non-user principals (app GUIDs, S-1-5-18, "Microsoft Operator") that
+        should not populate user.name unqualified
+    - vendor: UserType
+      type: enum
+      description: >-
+        numeric type of the acting principal (Regular, Admin, DcAdmin, System,
+        Application, ServicePrincipal)
+      ecs: null
+      status: unmapped
+      custom: o365.audit.user_type
+      notes: >
+        needs a lookup to become readable; the stock pipeline also uses this
+        value to fill event.provider when Workload is null, which pollutes
+        provider-scoped queries
+    - vendor: ClientIPAddress
+      type: ip
+      description: IPv4 or IPv6 address of the device that accessed the mailbox
+      ecs: source.ip
+      status: partial
+      notes: >
+        the stock pipeline routes this to client.ip/client.address only, so
+        source.ip-keyed correlation misses it
+      transform: >-
+        values frequently arrive as address:port or as a bracketed IPv6
+        literal and must be split before conversion
+    - vendor: MailboxOwnerUPN
+      type: string
+      description: email address of the owner of the mailbox that was accessed
+      ecs: user.target.email
+      status: partial
+      notes: >
+        the stock pipeline renames this to user.email, which conflates the
+        mailbox owner with the acting user on every delegate or admin access -
+        exactly the case the field exists to expose
+    - vendor: MailboxGuid
+      type: string
+      description: Exchange GUID of the mailbox that was accessed
+      ecs: null
+      status: unmapped
+      custom: o365.audit.mailbox_guid
+    - vendor: LogonType
+      type: enum
+      description: numeric type of user that accessed the mailbox
+      ecs: null
+      status: unmapped
+      custom: o365.audit.logon_type
+      notes: >
+        0=Owner, 1=Admin, 2=Delegated, 3=Transport, 4=SystemService,
+        5=BestAccess, 6=DelegatedAdmin; the non-Owner values are the detection
+        signal and there is no ECS home for a mailbox logon type
+    - vendor: ExternalAccess
+      type: boolean
+      description: >-
+        true when the acting user's domain differs from the mailbox owner's,
+        or when a datacenter/delegated admin acted
+      ecs: null
+      status: unmapped
+      custom: o365.audit.external_access
+    - vendor: ClientInfoString
+      type: string
+      description: >-
+        description of the email client used - browser build, Outlook version,
+        or mobile device string
+      ecs: user_agent.original
+      status: partial
+      notes: >
+        semi-structured Exchange-specific text (Client=OWA;...,
+        Client=REST;...) rather than an HTTP User-Agent, so user_agent parsers
+        produce garbage on it; keep the raw string and parse the Client= token
+        separately
+    - vendor: SessionId
+      type: string
+      description: unique identifier for the session the operation belongs to
+      ecs: null
+      status: unmapped
+      custom: o365.audit.session_id
+      notes: >-
+        documented specifically for separating attacker activity from
+        day-to-day use on a compromised account
+    - vendor: OperationCount
+      type: integer
+      description: >-
+        total number of operations aggregated into a single
+        ExchangeItemAggregated record
+      ecs: null
+      status: unmapped
+      custom: o365.audit.operation_count
+      notes: >
+        one throttled MailItemsAccessed record can represent hundreds of
+        bindings, so document counts understate real access volume; alerting
+        thresholds must sum this field
+    - vendor: AffectedItems.Subject
+      type: string
+      description: subject line of each mail item touched by the operation
+      ecs: email.subject
+      status: partial
+      notes: >
+        AffectedItems is a collection, so one record yields many subjects;
+        email.subject is single-valued in practice for alerting and the array
+        has to be flattened or the record split
+    - vendor: AffectedItems.InternetMessageId
+      type: string
+      description: RFC internet message identifier of each accessed mail item
+      ecs: email.message_id
+      status: partial
+      notes: >
+        same one-to-many problem as Subject, but this is the join key back to
+        the on-prem Exchange message-tracking dataset and is worth preserving
+        as an array even if email.message_id carries only the first value
+    - vendor: Parameters
+      type: string
+      description: name/value pairs of the parameters supplied to an admin cmdlet
+      ecs: null
+      status: unmapped
+      custom: o365.audit.cmdlet_parameters
+      notes: >
+        free-text collection; the ForwardTo, ForwardAsAttachmentTo and
+        RedirectTo keys inside it are the inbox-rule exfiltration detections,
+        so it cannot simply be dropped for size
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          If Cribl rather than Elastic Agent owns collection, run the
+          Microsoft 365 Activity source with the GCC endpoint selected and a
+          durable checkpoint, and pass records through unparsed - the
+          integration pipeline is the parser. Use Persistent Queue
+          backpressure on the Elastic destination rather than Block, because
+          the API's roughly seven-day blob retention is the only replay window
+          a stalled pipeline has. Split Audit.Exchange onto its own route so
+          the aggregated MailItemsAccessed volume can be shaped without
+          touching SharePoint or directory collection, and keep _raw end to
+          end - mailbox access records are the forensic core of any
+          account-compromise investigation.
+        elastic: >
+          Layer a logs-o365.audit@custom pipeline over the stock integration
+          for the mappings it gets wrong on Exchange records: UserId is a UPN
+          and is copied to user.id, so populate user.name and user.email from
+          it and reserve user.id for the UserKey PUID; MailboxOwnerUPN is
+          renamed to user.email, which conflates the mailbox owner with the
+          actor on every delegate access, so move it to user.target.email; and
+          ClientIPAddress lands on client.ip only, so copy it to source.ip
+          after stripping the appended port. Derive event.outcome explicitly
+          rather than trusting ResultStatus - it is absent on many mailbox
+          records and its PartiallySucceeded value has no ECS equivalent - and
+          expand the numeric LogonType and UserType enums through lookup
+          tables so delegate, admin and service-principal access are
+          queryable. Add typed custom-namespace index-template mappings for
+          o365.audit.logon_type, .mailbox_guid, .session_id and
+          .external_access as keyword/boolean, and .operation_count as long so
+          aggregated access volume can be summed.
+        relay: >
+          Low-side instances cross the guard: this route crosses as a thin
+          NDJSON envelope (_dataId, @timestamp, host, _raw) with extraction
+          left to the integration pipeline on the high side - the vendor feed
+          is JSON from an API, so nothing CEF-shaped crosses and there is no
+          low-side grammar to convert. The content-filter friction is
+          concentrated in three places: AffectedItems is an unbounded array of
+          mail items carrying user-authored Subject text and attachment names,
+          Parameters carries free-text cmdlet arguments, and both push nesting
+          well past two levels; flatten and length-cap them low-side with
+          explicit truncation flags so a custom NDJSON filter can stay simple.
+          Treat the crossing as at-most-once and reconcile low-side and
+          high-side record counts per (dataset, hour), remembering that one
+          aggregated record can represent hundreds of accesses so counts must
+          be compared alongside summed OperationCount.
+      direct:
+        parse_location: high
+        cribl: >
+          If Cribl rather than Elastic Agent owns collection, run the
+          Microsoft 365 Activity source with the GCC endpoint selected and a
+          durable checkpoint, and pass records through unparsed - the
+          integration pipeline is the parser. Use Persistent Queue
+          backpressure on the Elastic destination rather than Block, because
+          the API's roughly seven-day blob retention is the only replay window
+          a stalled pipeline has. Split Audit.Exchange onto its own route so
+          the aggregated MailItemsAccessed volume can be shaped without
+          touching SharePoint or directory collection, and keep _raw end to
+          end - mailbox access records are the forensic core of any
+          account-compromise investigation.
+        elastic: >
+          Layer a logs-o365.audit@custom pipeline over the stock integration
+          for the mappings it gets wrong on Exchange records: UserId is a UPN
+          and is copied to user.id, so populate user.name and user.email from
+          it and reserve user.id for the UserKey PUID; MailboxOwnerUPN is
+          renamed to user.email, which conflates the mailbox owner with the
+          actor on every delegate access, so move it to user.target.email; and
+          ClientIPAddress lands on client.ip only, so copy it to source.ip
+          after stripping the appended port. Derive event.outcome explicitly
+          rather than trusting ResultStatus - it is absent on many mailbox
+          records and its PartiallySucceeded value has no ECS equivalent - and
+          expand the numeric LogonType and UserType enums through lookup
+          tables so delegate, admin and service-principal access are
+          queryable. Add typed custom-namespace index-template mappings for
+          o365.audit.logon_type, .mailbox_guid, .session_id and
+          .external_access as keyword/boolean, and .operation_count as long so
+          aggregated access volume can be summed.
+  - format: api-pull
+    enable: >
+      Register an Entra app on the tenant and grant the workload-scoped audit
+      query permission AuditLogsQuery-Exchange.Read.All (application or
+      delegated); the broad AuditLogsQuery.Read.All also works. Collection is
+      an async three-step flow, not a blob walk: POST
+      /security/auditLog/queries with a body carrying filterStartDateTime /
+      filterEndDateTime and recordTypeFilters set to the Exchange record types
+      - exchangeAdmin, exchangeItem and exchangeItemAggregated
+      (exchangeItemGroup and exchangeAggregatedOperation exist on the same
+      enum) - optionally narrowed by operationFilters,
+      userPrincipalNameFilters or objectIdFilters; poll GET
+      /security/auditLog/queries/{id} until status is succeeded; then page GET
+      /security/auditLog/queries/{id}/records following @odata.nextLink. Each
+      record is an auditLogRecord: the camelCase common schema with the
+      Exchange mailbox/admin payload under auditData. GOV CAVEAT: this API is
+      global-only - it is unsupported in GCC High and DoD, so it is usable
+      only from a GCC (moderate) tenant against the worldwide
+      graph.microsoft.com with tokens from login.microsoftonline.com. On GCC
+      High and DoD, use the csv-file export below instead.
+    references:
+    - >-
+      https://learn.microsoft.com/en-us/graph/api/security-auditcoreroot-post-auditlogqueries?view=graph-rest-1.0
+    - >-
+      https://learn.microsoft.com/en-us/graph/api/security-auditlogquery-list-records?view=graph-rest-1.0
+    - >-
+      https://learn.microsoft.com/en-us/graph/api/resources/security-auditlogrecord?view=graph-rest-1.0
+    - https://learn.microsoft.com/en-us/graph/deployments
+    - >-
+      https://learn.microsoft.com/en-us/office/office-365-management-api/office-365-management-activity-api-schema
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        Cribl REST Collector running the Graph audit-query async flow, feeding
+        an unwrap/rename pipeline into logs-o365.audit
+      notes: >
+        The stock Elastic o365 integration polls the Management Activity API
+        (manage.office.com) over its CEL input and has no mode that drives the
+        Graph create-query/poll/page-records flow, so the realistic path is a
+        Cribl REST Collector that POSTs the query, polls status, and pages the
+        records endpoint, then a pipeline that lifts auditData to the top
+        level and renames the camelCase common fields back to the PascalCase
+        shape the o365.audit pipeline expects (createdDateTime ->
+        CreationTime, auditLogRecordType string -> the numeric RecordType,
+        userId -> UserId, clientIp -> ClientIP). Two reshape traps drive that
+        pipeline: the query is stateful and asynchronous, so the collector
+        owns query lifecycle and de-duplicates on id across overlapping
+        windows rather than checkpointing a stream; and auditLogRecordType
+        arrives as the STRING member name (exchangeItem,
+        exchangeItemAggregated) where the integration keys off the numeric
+        RecordType, so the rename must map names to integers or the RecordType
+        routing silently misfires.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Only a GCC-moderate low-side instance can use this source at all;
+          GCC High and DoD instances stay on the json feed or the csv-file
+          export. Where it is used, run the REST Collector on the low-side
+          worker group with egress to graph.microsoft.com, drive the async
+          query on a schedule, and pass records through unparsed for the high
+          side to extract. Split exchangeItemAggregated (the throttled
+          MailItemsAccessed volume) onto its own route so it can be shaped
+          without touching admin or single-item records, back the Elastic
+          destination with Persistent Queue rather than Block, and keep _raw
+          end to end - mailbox access records are the forensic core of an
+          account-compromise investigation. The Graph query's own retention
+          window, not a 7-day blob expiry, bounds replay here, which is one
+          operational reason to prefer it where it is available.
+        elastic: >
+          Once auditData is unwrapped the same logs-o365.audit@custom fixes as
+          the json feed apply, plus what this reshape makes cheaper. userType
+          arrives as a readable string (regular, admin, dcAdmin, system,
+          application, servicePrincipal, guest) rather than a numeric enum, so
+          the lookup the json feed needs is unnecessary - map it straight to
+          o365.audit.user_type. Split the promoted userPrincipalName (clean
+          UPN) from userId (which still carries app@sharepoint and system
+          principals) so user.name is populated only from the former, and
+          derive event.outcome from the auditData ResultStatus exactly as on
+          the base map since the reshape does not surface it at the top level.
+          Keep administrativeUnits, a first-class array this format adds, as a
+          custom keyword.
+        relay: >
+          Only relevant to a GCC-moderate low-side instance. The crossing
+          shape is the same thin NDJSON envelope (_dataId, @timestamp, host,
+          _raw) as the json feed - the payload is JSON from an API and nothing
+          CEF-shaped crosses - but the reshape nests the whole workload record
+          under auditData, pushing the AffectedItems array and the free-text
+          Parameters cmdlet arguments one level deeper than the flat
+          Common-schema feed. Lift and length-cap auditData.AffectedItems and
+          auditData.Parameters low-side with truncation flags so a custom
+          NDJSON filter can stay simple. Treat the crossing as at-most-once
+          and reconcile counts per (dataset, hour), remembering one
+          exchangeItemAggregated record can represent hundreds of accesses so
+          counts must be read alongside summed OperationCount.
+      direct:
+        parse_location: high
+        cribl: >
+          A GCC-moderate high-side instance with no guard can choose this pull
+          over the json blob walk on operational grounds: the query is scoped
+          server-side by recordTypeFilters and operationFilters, so
+          exchangeItemAggregated noise can be excluded before it is ever
+          collected, and the Graph retention window is longer than the 7-day
+          blob expiry. Run the REST Collector with the async flow,
+          de-duplicate on id, and pass through with _raw intact. GCC High and
+          DoD high-side instances cannot use this source.
+        elastic: >
+          Once auditData is unwrapped, map the readable userType string
+          without a lookup, keep userPrincipalName and userId apart, and
+          derive event.outcome from the auditData ResultStatus rather than
+          expecting a top-level outcome.
+    fields:
+    - vendor: createdDateTime
+      type: datetime
+      description: date and time in UTC when the user performed the activity
+      ecs: '@timestamp'
+      status: mapped
+      transform: >-
+        the camelCase form of the Management API CreationTime;
+        record-generation time, not collection time
+    - vendor: id
+      type: string
+      description: GUID uniquely identifying the audit log record
+      ecs: event.id
+      status: mapped
+      notes: the per-record de-duplication and cross-guard reconciliation key
+    - vendor: auditLogRecordType
+      type: string
+      description: >-
+        type of operation indicated by the record (exchangeAdmin,
+        exchangeItem, exchangeItemAggregated)
+      ecs: event.code
+      status: mapped
+      transform: >
+        Graph returns the STRING member name where the Management Activity API
+        and the CSV export emit the numeric AuditLogRecordType; map the name
+        to the integer the o365.audit pipeline routes on
+    - vendor: operation
+      type: string
+      description: >-
+        name of the user or admin activity, e.g. MailItemsAccessed,
+        New-InboxRule, SendAs
+      ecs: event.action
+      status: mapped
+    - vendor: organizationId
+      type: string
+      description: GUID of the tenant the record belongs to
+      ecs: organization.id
+      status: mapped
+    - vendor: service
+      type: string
+      description: Microsoft 365 service where the activity occurred (Exchange)
+      ecs: event.provider
+      status: mapped
+    - vendor: userType
+      type: string
+      description: >-
+        type of user that performed the operation (regular, reserved, admin,
+        dcAdmin, system, application, servicePrincipal, customPolicy,
+        systemPolicy, partnerTechnician, guest)
+      ecs: null
+      status: unmapped
+      custom: o365.audit.user_type
+      notes: >
+        a reshape win - Graph returns the readable string enum where the
+        Management API and CSV emit a numeric UserType that needs a lookup to
+        become readable
+    - vendor: userId
+      type: string
+      description: >-
+        the principal that performed the action; also carries system accounts
+        and app@sharepoint
+      ecs: null
+      status: unmapped
+      custom: o365.audit.user_id
+      notes: >
+        the raw acting principal; duplicates userPrincipalName for human users
+        but also carries app GUIDs, S-1-5-18 and "Microsoft Operator", so it
+        is the field to inspect before trusting userPrincipalName as a user
+    - vendor: userPrincipalName
+      type: string
+      description: UPN of the user who performed the action
+      ecs: user.name
+      status: partial
+      notes: >
+        the reshape splits the Management API's single UserId into userId and
+        this clean UPN; empty on system- and app-principal records where only
+        userId is populated
+      transform: derive user.email from it when it contains an "@"
+    - vendor: clientIp
+      type: ip
+      description: IP address of the device used when the activity was logged, in IPv4 or IPv6 form
+      ecs: source.ip
+      status: partial
+      notes: >-
+        the stock o365 pipeline routes this to client.ip/client.address only,
+        leaving source.ip-keyed correlation empty
+      transform: >-
+        may arrive as address:port or a bracketed IPv6 literal and must be
+        split before conversion
+    - vendor: objectId
+      type: string
+      description: for Exchange admin logging, the name of the object modified by the cmdlet
+      ecs: null
+      status: unmapped
+      custom: o365.audit.object_id
+      notes: >-
+        workload-dependent - the same common field holds a URL on SharePoint
+        records and a directory object name on Entra records
+    - vendor: administrativeUnits
+      type: string
+      description: administrative units tagged to the audit log record
+      ecs: null
+      status: unmapped
+      custom: o365.audit.administrative_units
+      notes: >-
+        a first-class string array this format promotes; the Management API
+        record has no equivalent top-level field
+    - vendor: auditData
+      type: object
+      description: nested JSON object carrying the actual workload-specific audit payload
+      ecs: null
+      status: unmapped
+      custom: o365.audit.audit_data
+      notes: >
+        carries the same PascalCase Exchange schema documented as the json
+        format on the base map - MailItemsAccessed, OperationCount,
+        AffectedItems.Subject/InternetMessageId, MailboxGuid, LogonType,
+        ClientInfoString, SessionId, Parameters - so every mailbox-forensic
+        field lives here and this is where the parser must dive
+  - format: csv-file
+    enable: >
+      Produce the CSV one of two equivalent ways. In the Microsoft Purview
+      portal, run an Audit search scoped to the Exchange activities and select
+      Export to download all matched records to a .csv. Or in Exchange Online
+      PowerShell run Search-UnifiedAuditLog -RecordType ExchangeItem (repeat
+      for ExchangeAdmin and ExchangeItemAggregated, appending) and pipe to
+      Export-Csv. Both emit the same shape: flat wrapper columns
+      (CreationDate, RecordType, UserIds, Operations, and Identity/RecordId,
+      ResultIndex, ResultCount) around an AuditData column that is the full
+      per-workload record as a JSON string. This is a batch/offline export,
+      not a streaming feed - it is the backfill and manual-investigation path.
+      Export is bounded to 50,000 records per search on Audit (Standard) and
+      1,000,000 on Audit (Premium); beyond that the file silently truncates,
+      so segment the date range. Unlike the Graph pull this path IS available
+      in GCC, GCC High and DoD, which is its reason to exist on this
+      technology.
+    references:
+    - https://learn.microsoft.com/en-us/purview/audit-log-export-records
+    - >-
+      https://learn.microsoft.com/en-us/powershell/module/exchangepowershell/search-unifiedauditlog?view=exchange-ps
+    - >-
+      https://learn.microsoft.com/en-us/office/office-365-management-api/office-365-management-activity-api-schema
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        Cribl filesystem Collector reading the exported CSV, with an
+        Extract-JSON pipeline unwrapping AuditData into logs-o365.audit
+      notes: >
+        Not a production streaming path - a Cribl filesystem Collector (or a
+        Workflow that watches a drop directory) reads the exported CSV, parses
+        the flat wrapper columns, and runs Extract-JSON on the AuditData
+        column to recover the same PascalCase record the o365.audit pipeline
+        already parses. Three export artifacts must be handled: the
+        Search-UnifiedAuditLog PSObject also serialises RunspaceId, IsValid
+        and ObjectState columns that are PowerShell noise and should be
+        dropped; RecordType renders as the numeric enum in the portal export
+        but as the string member name from the cmdlet, so normalise it before
+        routing; and the portal's own Power Query flow infers AuditData's
+        sub-columns from only the first 1,000 rows, so any downstream tool
+        that mimics that inference drops late-appearing properties - decode
+        the JSON per row instead.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          This is the gov-cloud-safe alternate: it works in GCC High and DoD
+          where the Graph pull does not. Treat it as a backfill/manual-export
+          lane, not a second live copy - a CSV re-imported alongside the API
+          feed will double every record, so tag CSV-sourced events with an
+          origin marker and reconcile rather than merge. Read the file on the
+          low-side worker group, Extract-JSON on AuditData, drop the
+          RunspaceId/IsValid/ObjectState noise columns, and pass the recovered
+          record through unparsed for the high side. Persistent Queue on the
+          Elastic destination; keep _raw for the mailbox access records.
+        elastic: >
+          After AuditData is decoded the record is byte-for-byte the Exchange
+          schema, so the full logs-o365.audit@custom fix set applies unchanged
+          - derive event.outcome from ResultStatus, split UserId's UPN from
+          the app/system principals, move MailboxOwnerUPN to
+          user.target.email, and expand the LogonType/UserType enums. The one
+          format-specific step is stripping the wrapper columns (ResultIndex,
+          ResultCount) so a pagination artifact never lands as an indexed
+          field.
+        relay: >
+          A manual export is unlikely to cross the guard as a live feed, but
+          if a CSV is relayed for backfill the friction is the AuditData JSON
+          string itself: it embeds the unbounded AffectedItems array and the
+          free-text Parameters cmdlet arguments as escaped JSON inside a CSV
+          cell, which a custom NDJSON content filter cannot reason about while
+          still encoded. Decode AuditData low-side, flatten and length-cap
+          AffectedItems and Parameters, then cross the same thin NDJSON
+          envelope as the other lanes. Reconcile on Identity/RecordId per
+          (dataset, hour).
+      direct:
+        parse_location: high
+        cribl: >
+          On a high-side instance (including GCC High and DoD, where this is
+          the only alternate available) the CSV lane is a backfill and
+          investigation tool: read the file, Extract-JSON on AuditData, drop
+          the PowerShell noise columns, tag with an origin marker to keep it
+          distinct from the live feed, and reconcile rather than merge.
+        elastic: >
+          Once AuditData is decoded, apply the Exchange @custom fix set
+          unchanged and strip the ResultIndex/ResultCount wrapper artifacts so
+          they are never indexed as event fields.
+    fields:
+    - vendor: CreationDate
+      type: datetime
+      description: date and time the audit record was created
+      ecs: '@timestamp'
+      status: mapped
+      transform: >-
+        rendered in the export's locale format rather than raw ISO8601, so
+        normalise before parsing; record-creation time, not export time
+    - vendor: RecordType
+      type: string
+      description: 'the record''s AuditLogRecordType'
+      ecs: event.code
+      status: mapped
+      transform: >-
+        the portal export renders the numeric enum while the
+        Search-UnifiedAuditLog cmdlet renders the string member name;
+        reconcile to one code before routing
+    - vendor: Operations
+      type: string
+      description: name of the activity, carried in a plural-named wrapper column
+      ecs: event.action
+      status: mapped
+      notes: >-
+        duplicates the Operation value inside AuditData; the wrapper column
+        name is plural but holds the single operation
+    - vendor: UserIds
+      type: string
+      description: the principal that performed the activity, in a plural-named wrapper column
+      ecs: user.name
+      status: partial
+      notes: >-
+        duplicates AuditData.UserId; the same non-user-principal caveat as the
+        API feed applies, so gate before populating user.name
+    - vendor: Identity
+      type: string
+      description: 'the record''s GUID identity in the Search-UnifiedAuditLog output'
+      ecs: event.id
+      status: partial
+      notes: >-
+        the portal export labels the same value RecordId; the per-record
+        de-duplication and reconciliation key
+    - vendor: AuditData
+      type: string
+      description: the full workload-specific audit record as a JSON string
+      ecs: null
+      status: unmapped
+      custom: o365.audit.audit_data
+      notes: >
+        a JSON STRING (not a nested object) holding the same PascalCase
+        Exchange schema documented as the json feed on the base map; must be
+        JSON-decoded before any workload field is addressable, and the
+        portal's Power Query column inference reads only the first 1,000 rows
+        so late-appearing properties are dropped unless the JSON is decoded
+        per row
+    - vendor: ResultIndex
+      type: integer
+      description: 1-based position of this record within the search result set
+      ecs: null
+      status: unmapped
+      custom: o365.audit.result_index
+      notes: a query/pagination artifact, not event data; strip before indexing
+    - vendor: ResultCount
+      type: integer
+      description: total number of records the search matched
+      ecs: null
+      status: unmapped
+      custom: o365.audit.result_count
+      notes: >-
+        identical on every row of a given search, so a query artifact rather
+        than a field; strip before indexing
+- id: sharepoint-onedrive
+  name: SharePoint and OneDrive file activity
+  description: >
+    Audit.SharePoint records covering file and folder access, download,
+    modification and sharing across SharePoint Online and OneDrive for
+    Business - RecordType 4 (SharePoint), 6 (SharePointFileOperation, the
+    FileAccessed/FileDownloaded/FileModified family) and 14
+    (SharePointSharingOperation, SharingSet/SharingInvitationCreated/
+    AnonymousLinkCreated). Records extend the Common schema with the
+    SharePoint Base layer (Site, ItemType, EventSource, UserAgent) and then
+    the file-operation or sharing layer. This is by volume the largest content
+    type in most tenants - FileAccessed alone can dwarf every other workload -
+    and it is also where external-sharing detections live, so volume shaping
+    and detection fidelity pull against each other.
+  event_categories:
+  - file
+  - web
+  route:
+    guarded:
+    - hop: other
+      name: Office 365 Management Activity API (GCC endpoint)
+      notes: >
+        Same subscription-scoped Audit.SharePoint content-type subscription
+        and blob walk as the Exchange dataset, on the tenant's plan-specific
+        root URL (manage-gcc.office.com for GCC, manage.office365.us for GCC
+        High).
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same collector placement as the Exchange dataset. This is the dataset
+        whose volume makes the guard a throughput question rather than only a
+        policy one.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-o365.audit
+    direct:
+    - hop: other
+      name: Office 365 Management Activity API (GCC endpoint)
+      notes: >
+        Same subscription-scoped Audit.SharePoint content-type subscription
+        and blob walk as the Exchange dataset, on the tenant's plan-specific
+        root URL (manage-gcc.office.com for GCC, manage.office365.us for GCC
+        High).
+    - hop: cribl
+      location: edge worker group
+      notes: Same collector placement as the Exchange dataset.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-o365.audit
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: Microsoft Office 365 integration (o365.audit data stream)
+      notes: >
+        The stock pipeline has its most complete coverage here - it renames
+        ObjectId to url.original, SourceFileName to file.name and
+        SourceFileExtension to file.extension for SharePoint operations - but
+        the sharing layer (TargetUserOrGroupName, TargetUserOrGroupType,
+        SharingType) is left entirely under o365.audit.*, which is where the
+        external-sharing detections need to read from.
+    fields:
+    - vendor: CreationTime
+      type: timestamp
+      description: UTC date and time the file or sharing event was recorded
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: RecordType
+      type: enum
+      description: >-
+        numeric AuditLogRecordType distinguishing SharePoint, file-operation
+        and sharing records
+      ecs: event.code
+      status: mapped
+      transform: >-
+        4=SharePoint, 6=SharePointFileOperation,
+        14=SharePointSharingOperation, resolved by lookup
+    - vendor: Operation
+      type: string
+      description: >-
+        activity name, e.g. FileAccessed, FileDownloaded, SharingSet,
+        AnonymousLinkCreated
+      ecs: event.action
+      status: mapped
+    - vendor: UserId
+      type: string
+      description: UPN of the user who performed the file or sharing operation
+      ecs: user.name
+      status: partial
+      notes: >-
+        same UPN-into-user.id issue as the Exchange dataset; app@sharepoint
+        and system principals appear here on workflow-driven events
+    - vendor: ClientIP
+      type: ip
+      description: IP address of the device used to perform the operation
+      ecs: source.ip
+      status: partial
+      notes: >-
+        stock pipeline consolidates this onto client.ip/client.address,
+        leaving source.ip unpopulated
+      transform: may include an appended port and must be split before ip conversion
+    - vendor: ObjectId
+      type: string
+      description: full URL of the file, folder or site the operation was performed on
+      ecs: url.original
+      status: mapped
+      notes: >-
+        the stock pipeline renames ObjectId to url.original for SharePoint
+        records specifically; on other workloads the same field holds
+        something else entirely
+    - vendor: SiteUrl
+      type: string
+      description: URL of the site where the file or folder accessed is located
+      ecs: null
+      status: unmapped
+      custom: o365.audit.site_url
+      notes: >-
+        kept custom rather than mapped to url.full because ObjectId already
+        owns the record's URL slot
+    - vendor: SourceFileName
+      type: string
+      description: name of the file or folder accessed
+      ecs: file.name
+      status: mapped
+    - vendor: SourceFileExtension
+      type: string
+      description: file extension, blank when the object is a folder
+      ecs: file.extension
+      status: mapped
+    - vendor: SourceRelativeUrl
+      type: string
+      description: URL of the folder that contains the accessed file, relative to the site
+      ecs: file.directory
+      status: partial
+      notes: >-
+        a site-relative web path rather than a filesystem directory, so it
+        needs the site prefix resolved before it reads correctly as
+        file.directory
+    - vendor: UserAgent
+      type: string
+      description: client or browser user-agent string used to perform the operation
+      ecs: user_agent.original
+      status: mapped
+    - vendor: ItemType
+      type: enum
+      description: >-
+        type of object accessed - File, Folder, Web, Site, Tenant,
+        DocumentLibrary or Page
+      ecs: null
+      status: unmapped
+      custom: o365.audit.item_type
+    - vendor: EventSource
+      type: enum
+      description: whether the event was raised by SharePoint itself or through the object model
+      ecs: null
+      status: unmapped
+      custom: o365.audit.event_source
+      notes: >-
+        ObjectModel indicates programmatic/API-driven access rather than a
+        user in a browser, which changes how a download should be triaged
+    - vendor: TargetUserOrGroupName
+      type: string
+      description: UPN or name of the user or group a resource was shared with
+      ecs: user.target.name
+      status: partial
+      notes: >
+        not mapped by the stock pipeline at all; the value is a user, a group
+        or an external email address depending on TargetUserOrGroupType, so it
+        should only reach user.target.name for the user cases and
+        user.target.group.name for groups
+    - vendor: TargetUserOrGroupType
+      type: enum
+      description: classification of the share target - Member, Guest, Group or Partner
+      ecs: null
+      status: unmapped
+      custom: o365.audit.target_user_or_group_type
+      notes: Guest and Partner are the external-sharing detection; keep as keyword
+    - vendor: SharingType
+      type: string
+      description: type of sharing permission assigned to the target
+      ecs: null
+      status: unmapped
+      custom: o365.audit.sharing_type
+    - vendor: EventData
+      type: string
+      description: additional detail about a follow-up sharing action
+      ecs: null
+      status: unmapped
+      custom: o365.audit.event_data
+      notes: >-
+        an XML fragment carried as a string inside the JSON record; unbounded,
+        awkward for content inspection, and needs parsing before any of it is
+        queryable
+    - vendor: MachineId
+      type: string
+      description: identifier of the device performing a sync operation
+      ecs: null
+      status: unmapped
+      custom: o365.audit.machine_id
+      notes: >-
+        documented by Microsoft as containing PII; paired with
+        MachineDomainInfo and worth a masking decision before it leaves the
+        enclave
+    - vendor: SensitivityLabelId
+      type: string
+      description: identifier of the sensitivity label currently applied to the file
+      ecs: null
+      status: unmapped
+      custom: o365.audit.sensitivity_label_id
+      notes: >-
+        a GUID; needs a label lookup to be usable in a detection, and pairs
+        with SourceLabel/DestinationLabel on relabel events
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Pass through unparsed and let the integration pipeline extract, but
+          own volume here rather than downstream: route FileAccessed and
+          FilePreviewed separately from FileDownloaded, FileUploaded and the
+          SharingSet family so the high-cardinality read traffic can be
+          sampled or aggregated without weakening exfiltration and
+          external-sharing coverage. This is the first dataset on this map
+          where dropping _raw after the integration parser is proven is
+          acceptable. Persistent Queue backpressure on the Elastic
+          destination, never Block.
+        elastic: >
+          Extend logs-o365.audit@custom for the sharing layer the stock
+          pipeline ignores: promote TargetUserOrGroupName to user.target.name
+          only when TargetUserOrGroupType is Member or Guest and to
+          user.target.group.name when it is Group, so external-sharing alerts
+          do not fire on group names, and keep the type itself as a keyword so
+          Guest and Partner shares are directly filterable. Parse the
+          EventData XML fragment into typed subfields rather than indexing it
+          as an opaque string, derive file.directory from SourceRelativeUrl
+          with the site prefix removed so it is not confused with a filesystem
+          path, and add custom-namespace keyword mappings for
+          o365.audit.item_type, .sharing_type, .target_user_or_group_type and
+          .sensitivity_label_id.
+        relay: >
+          Thin NDJSON envelope with high-side extraction is the right crossing
+          shape here too, but this is the dataset that makes the guard a
+          capacity question - FileAccessed volume should be shaped low-side
+          before the crossing, not after it. The specific content-filter
+          friction is EventData, an XML document embedded as a string inside
+          the JSON record: a custom NDJSON filter cannot reason about it, and
+          it should either be parsed into bounded key/value pairs low-side or
+          excluded from the crossing. SiteUrl, ObjectId and SourceRelativeUrl
+          are unbounded URL-shaped free text carrying user-chosen file names
+          and non-ASCII characters, so cap their length and normalise the
+          encoding before the guard destination.
+      direct:
+        parse_location: high
+        cribl: >
+          Pass through unparsed and let the integration pipeline extract, but
+          own volume here rather than downstream: route FileAccessed and
+          FilePreviewed separately from FileDownloaded, FileUploaded and the
+          SharingSet family so the high-cardinality read traffic can be
+          sampled or aggregated without weakening exfiltration and
+          external-sharing coverage. This is the first dataset on this map
+          where dropping _raw after the integration parser is proven is
+          acceptable. Persistent Queue backpressure on the Elastic
+          destination, never Block.
+        elastic: >
+          Extend logs-o365.audit@custom for the sharing layer the stock
+          pipeline ignores: promote TargetUserOrGroupName to user.target.name
+          only when TargetUserOrGroupType is Member or Guest and to
+          user.target.group.name when it is Group, so external-sharing alerts
+          do not fire on group names, and keep the type itself as a keyword so
+          Guest and Partner shares are directly filterable. Parse the
+          EventData XML fragment into typed subfields rather than indexing it
+          as an opaque string, derive file.directory from SourceRelativeUrl
+          with the site prefix removed so it is not confused with a filesystem
+          path, and add custom-namespace keyword mappings for
+          o365.audit.item_type, .sharing_type, .target_user_or_group_type and
+          .sensitivity_label_id.
+  - format: api-pull
+    enable: >
+      Grant the Entra app the workload-scoped audit query permissions
+      AuditLogsQuery-SharePoint.Read.All and AuditLogsQuery-OneDrive.Read.All
+      (or the broad AuditLogsQuery.Read.All). Collect with the async flow:
+      POST /security/auditLog/queries with recordTypeFilters set to the
+      SharePoint and OneDrive record types - sharePoint,
+      sharePointFileOperation, oneDrive and sharePointSharingOperation - and a
+      filterStartDateTime/filterEndDateTime window; poll GET
+      /security/auditLog/queries/{id} until succeeded; then page GET
+      /security/auditLog/queries/{id}/records via @odata.nextLink. Each record
+      is an auditLogRecord with the SharePoint file/sharing payload under
+      auditData. GOV CAVEAT: global-only - unsupported in GCC High and DoD, so
+      usable only from a GCC (moderate) tenant against graph.microsoft.com.
+      Use the csv-file export on GCC High and DoD.
+    references:
+    - >-
+      https://learn.microsoft.com/en-us/graph/api/security-auditcoreroot-post-auditlogqueries?view=graph-rest-1.0
+    - >-
+      https://learn.microsoft.com/en-us/graph/api/security-auditlogquery-list-records?view=graph-rest-1.0
+    - >-
+      https://learn.microsoft.com/en-us/graph/api/resources/security-auditlogrecord?view=graph-rest-1.0
+    - https://learn.microsoft.com/en-us/graph/deployments
+    - >-
+      https://learn.microsoft.com/en-us/office/office-365-management-api/office-365-management-activity-api-schema
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        Cribl REST Collector running the Graph audit-query async flow, feeding
+        an unwrap/rename pipeline into logs-o365.audit
+      notes: >
+        Same REST-Collector-plus-unwrap path as the Exchange dataset: the
+        integration's CEL input cannot drive the Graph create/poll/page flow,
+        so a Cribl pipeline lifts auditData and renames the camelCase common
+        fields to the PascalCase the o365.audit pipeline parses. This is the
+        highest-volume content type, so the query should scope
+        recordTypeFilters and operationFilters server-side - excluding
+        FileAccessed/FilePreviewed at the query where the read traffic is not
+        needed - rather than pulling everything and dropping downstream.
+        auditLogRecordType arrives as the string member name and must be
+        mapped to the numeric RecordType the routing keys on.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          GCC-moderate low-side only. Own volume at the query: scope the
+          recordTypeFilters and operationFilters so the high-cardinality
+          FileAccessed/FilePreviewed read traffic is separated from
+          FileDownloaded, FileUploaded and the SharingSet family, letting
+          reads be sampled without weakening exfiltration and external-sharing
+          coverage. Pass through unparsed for the high side, Persistent Queue
+          on the Elastic destination, and this is the first dataset where
+          dropping _raw after the parser is proven is acceptable.
+        elastic: >
+          After auditData is unwrapped the SharePoint @custom fixes apply -
+          promote the sharing layer (TargetUserOrGroupName conditional on
+          TargetUserOrGroupType, SharingType kept as keyword), parse the
+          EventData XML fragment, and derive file.directory from
+          SourceRelativeUrl with the site prefix removed. objectId is the
+          file/folder/site URL on this workload and maps to url.original as on
+          the json feed. Take the reshape's readable userType string and the
+          promoted administrativeUnits array for free.
+        relay: >
+          GCC-moderate low-side only. This is the dataset that makes the guard
+          a capacity question, so shape FileAccessed volume at the query
+          before the crossing. The specific friction survives the reshape:
+          auditData.EventData is an XML document embedded as a string inside
+          the record, and now sits one level deeper under auditData - parse it
+          into bounded key/value pairs low-side or exclude it from the
+          crossing. Cap SiteUrl, objectId and SourceRelativeUrl length and
+          normalise their non-ASCII encoding before the guard. Reconcile on id
+          per (dataset, hour).
+      direct:
+        parse_location: high
+        cribl: >
+          GCC-moderate high-side with no guard: the pull's draw here is
+          server-side volume scoping - the FileAccessed read flood can be
+          excluded in the query itself. Run the async flow with scoped
+          recordTypeFilters, de-duplicate on id, pass through. GCC High and
+          DoD high-side instances cannot use this source.
+        elastic: >
+          Once auditData is unwrapped, map objectId to url.original, promote
+          the sharing layer, parse EventData, and take the readable userType
+          string.
+    fields:
+    - vendor: createdDateTime
+      type: datetime
+      description: date and time in UTC the file or sharing event was recorded
+      ecs: '@timestamp'
+      status: mapped
+      transform: the camelCase form of CreationTime; event time, not collection time
+    - vendor: id
+      type: string
+      description: GUID uniquely identifying the audit log record
+      ecs: event.id
+      status: mapped
+      notes: the per-record de-duplication and cross-guard reconciliation key
+    - vendor: auditLogRecordType
+      type: string
+      description: >-
+        type of record (sharePoint, sharePointFileOperation, oneDrive,
+        sharePointSharingOperation)
+      ecs: event.code
+      status: mapped
+      transform: >-
+        the string member name where the Management API and CSV emit the
+        numeric enum; map to the integer for routing
+    - vendor: operation
+      type: string
+      description: >-
+        activity name, e.g. FileAccessed, FileDownloaded, SharingSet,
+        AnonymousLinkCreated
+      ecs: event.action
+      status: mapped
+    - vendor: organizationId
+      type: string
+      description: GUID of the tenant the record belongs to
+      ecs: organization.id
+      status: mapped
+    - vendor: service
+      type: string
+      description: Microsoft 365 service where the activity occurred (SharePoint/OneDrive)
+      ecs: event.provider
+      status: mapped
+    - vendor: userType
+      type: string
+      description: >-
+        type of user that performed the operation (regular, admin, dcAdmin,
+        system, application, servicePrincipal, guest, ...)
+      ecs: null
+      status: unmapped
+      custom: o365.audit.user_type
+      notes: >-
+        readable string enum here where the Management API and CSV emit a
+        numeric UserType needing a lookup
+    - vendor: userId
+      type: string
+      description: >-
+        the principal that performed the operation; also carries
+        app@sharepoint and system accounts on workflow-driven events
+      ecs: null
+      status: unmapped
+      custom: o365.audit.user_id
+      notes: >-
+        duplicates userPrincipalName for human users but carries system and
+        app principals, so inspect it before trusting userPrincipalName
+    - vendor: userPrincipalName
+      type: string
+      description: UPN of the user who performed the file or sharing operation
+      ecs: user.name
+      status: partial
+      notes: >-
+        the promoted clean UPN; empty on app@sharepoint and system-driven
+        events where only userId is populated
+    - vendor: clientIp
+      type: ip
+      description: IP address of the device used to perform the operation
+      ecs: source.ip
+      status: partial
+      notes: >-
+        the stock pipeline consolidates this onto client.ip, leaving source.ip
+        unpopulated
+      transform: may include an appended port and must be split before conversion
+    - vendor: objectId
+      type: string
+      description: full URL path of the file, folder or site the operation was performed on
+      ecs: url.original
+      status: mapped
+      notes: >-
+        the stock pipeline maps ObjectId to url.original for SharePoint
+        records; on other workloads the same common field holds something else
+    - vendor: administrativeUnits
+      type: string
+      description: administrative units tagged to the audit log record
+      ecs: null
+      status: unmapped
+      custom: o365.audit.administrative_units
+      notes: >-
+        a first-class array this format promotes; no equivalent top-level
+        field on the Management API record
+    - vendor: auditData
+      type: object
+      description: nested JSON object carrying the SharePoint/OneDrive file and sharing payload
+      ecs: null
+      status: unmapped
+      custom: o365.audit.audit_data
+      notes: >
+        carries the same PascalCase SharePoint schema documented as the json
+        feed on the base map - Site/SiteUrl, ItemType, EventSource,
+        SourceFileName, SourceRelativeUrl, the TargetUserOrGroupName/Type
+        sharing layer, SharingType, EventData XML, MachineId and
+        SensitivityLabelId - so all file and sharing detail lives here and
+        this is where the parser must dive
+  - format: csv-file
+    enable: >
+      Produce the CSV from the Purview portal Audit search (scope to
+      SharePoint and OneDrive activities, then Export) or from
+      Search-UnifiedAuditLog -RecordType SharePointFileOperation (repeat for
+      SharePoint, SharePointSharingOperation and OneDrive, appending) piped to
+      Export-Csv. Both emit the flat wrapper columns (CreationDate,
+      RecordType, UserIds, Operations, Identity/RecordId, ResultIndex,
+      ResultCount) around the AuditData JSON string. Batch/offline export, not
+      a streaming feed; bounded to 50,000 records/search on Audit (Standard)
+      and 1,000,000 on Audit (Premium), which on this highest-volume content
+      type means tight date segmentation. Available in GCC, GCC High and DoD,
+      so it is the gov-cloud alternate where the Graph pull is not.
+    references:
+    - https://learn.microsoft.com/en-us/purview/audit-log-export-records
+    - >-
+      https://learn.microsoft.com/en-us/powershell/module/exchangepowershell/search-unifiedauditlog?view=exchange-ps
+    - >-
+      https://learn.microsoft.com/en-us/office/office-365-management-api/office-365-management-activity-api-schema
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        Cribl filesystem Collector reading the exported CSV, with an
+        Extract-JSON pipeline unwrapping AuditData into logs-o365.audit
+      notes: >
+        A filesystem Collector reads the CSV, parses the wrapper columns and
+        runs Extract-JSON on AuditData to recover the SharePoint record. Drop
+        the RunspaceId/IsValid/ObjectState PowerShell columns, normalise
+        RecordType (numeric in the portal export, string from the cmdlet), and
+        decode AuditData per row rather than relying on first-1,000-row column
+        inference - on this highest-volume content type the sharing layer
+        fields appear only on the sparse SharingSet records and are exactly
+        the properties a row-count-based inference drops.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          The gov-cloud-safe lane (works in GCC High and DoD). Treat it as
+          backfill/manual export, not a live copy - tag CSV-sourced events
+          with an origin marker and reconcile rather than merge to avoid
+          doubling the highest-volume dataset. Read on the low-side worker
+          group, Extract-JSON on AuditData, drop the noise columns, and pass
+          the recovered record through. Persistent Queue on the Elastic
+          destination.
+        elastic: >
+          After AuditData is decoded the record is the SharePoint schema, so
+          the full @custom fix set applies - promote the sharing layer, parse
+          EventData, derive file.directory from SourceRelativeUrl. Strip the
+          ResultIndex/ResultCount wrapper artifacts before indexing.
+        relay: >
+          If a CSV is relayed for backfill, the friction is the AuditData JSON
+          string carrying the EventData XML fragment and the unbounded,
+          non-ASCII URL fields (SiteUrl, SourceRelativeUrl) as escaped JSON
+          inside a CSV cell. Decode AuditData low-side, parse or exclude
+          EventData, length-cap and normalise the URL fields, then cross the
+          thin NDJSON envelope. Reconcile on Identity/RecordId per (dataset,
+          hour).
+      direct:
+        parse_location: high
+        cribl: >
+          On GCC High and DoD high-side instances this is the only alternate
+          lane: read the CSV, Extract-JSON on AuditData, drop the PowerShell
+          noise columns, tag with an origin marker to stay distinct from the
+          live feed.
+        elastic: >
+          Decode AuditData, apply the SharePoint @custom fixes, and strip the
+          wrapper artifacts before indexing.
+    fields:
+    - vendor: CreationDate
+      type: datetime
+      description: date and time the audit record was created
+      ecs: '@timestamp'
+      status: mapped
+      transform: >-
+        rendered in the export's locale format rather than raw ISO8601;
+        normalise before parsing
+    - vendor: RecordType
+      type: string
+      description: 'the record''s AuditLogRecordType'
+      ecs: event.code
+      status: mapped
+      transform: >-
+        numeric enum in the portal export, string member name from the cmdlet;
+        reconcile to one code
+    - vendor: Operations
+      type: string
+      description: name of the activity, in a plural-named wrapper column
+      ecs: event.action
+      status: mapped
+      notes: duplicates the Operation value inside AuditData
+    - vendor: UserIds
+      type: string
+      description: the principal that performed the activity, in a plural-named wrapper column
+      ecs: user.name
+      status: partial
+      notes: >-
+        duplicates AuditData.UserId; same non-user-principal caveat, so gate
+        before populating user.name
+    - vendor: Identity
+      type: string
+      description: 'the record''s GUID identity in the Search-UnifiedAuditLog output'
+      ecs: event.id
+      status: partial
+      notes: >-
+        the portal export labels the same value RecordId; the de-duplication
+        and reconciliation key
+    - vendor: AuditData
+      type: string
+      description: the full SharePoint/OneDrive record as a JSON string
+      ecs: null
+      status: unmapped
+      custom: o365.audit.audit_data
+      notes: >
+        JSON string holding the SharePoint schema; must be decoded before any
+        file or sharing field is addressable, and the portal's first-1,000-row
+        column inference drops the sparse sharing-layer properties unless the
+        JSON is decoded per row
+    - vendor: ResultIndex
+      type: integer
+      description: 1-based position of this record within the search result set
+      ecs: null
+      status: unmapped
+      custom: o365.audit.result_index
+      notes: a query/pagination artifact, not event data; strip before indexing
+    - vendor: ResultCount
+      type: integer
+      description: total number of records the search matched
+      ecs: null
+      status: unmapped
+      custom: o365.audit.result_count
+      notes: identical on every row of a search; strip before indexing
+- id: entra-signin-directory
+  name: Entra ID sign-in and directory activity (via UAL)
+  description: >
+    Audit.AzureActiveDirectory records - RecordType 15
+    (AzureActiveDirectoryStsLogon, the token-service sign-in events),
+    RecordType 8 (AzureActiveDirectory, directory changes such as role and
+    application grants) and the deprecated RecordType 9 account-logon events.
+    This dataset deliberately overlaps the `entra-id` map and is the
+    lower-fidelity copy of it. The diagnostic-setting feed on that map carries
+    conditional-access evaluation, risk state, authentication-method detail
+    and full device context; the UAL copy carries an AADSTS ErrorCode, a
+    LogonError string and whatever the tenant happens to put in
+    ExtendedProperties, and Microsoft documents ClientIP as null on many Entra
+    ID records. Keep it because it is the only sign-in view available when the
+    diagnostic-setting/Event Hubs path is not yet stood up, because it
+    correlates directly with the other UAL workloads on a shared CorrelationId
+    and SessionId, and because directory changes made by Microsoft-side
+    principals surface here; do not treat it as a substitute for
+    logs-azure.signinlogs.
+  event_categories:
+  - authentication
+  - iam
+  route:
+    guarded:
+    - hop: other
+      name: Office 365 Management Activity API (GCC endpoint)
+      notes: >
+        Audit.AzureActiveDirectory content type on the same plan-specific root
+        URL. Note this is a genuinely different collection path from the
+        entra-id map's Event Hubs feed - the same underlying sign-in can
+        arrive twice, by two routes, with different field coverage.
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same collector placement as the other UAL content types. The sibling
+        entra-id Event Hubs feed crosses on the low side too, so the two
+        copies of a sign-in differ in field fidelity rather than in guard
+        treatment - but they cross independently, so their latencies are not
+        tied together.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-o365.audit
+    direct:
+    - hop: other
+      name: Office 365 Management Activity API (GCC endpoint)
+      notes: >
+        Audit.AzureActiveDirectory content type on the same plan-specific root
+        URL. Note this is a genuinely different collection path from the
+        entra-id map's Event Hubs feed - the same underlying sign-in can
+        arrive twice, by two routes, with different field coverage.
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Same collector placement as the other UAL content types. The sibling
+        entra-id Event Hubs feed is a second copy of the same sign-in with
+        different field fidelity, collected independently.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-o365.audit
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: Microsoft Office 365 integration (o365.audit data stream)
+      notes: >
+        The stock pipeline copies ObjectId to user.target.id only where
+        event.code is AzureActiveDirectory - RecordType 8, so the RecordType
+        15 StsLogon and RecordType 9 records get no target at all - and leaves
+        ErrorCode and LogonError unmapped. Because these records land in
+        logs-o365.audit rather than logs-azure.signinlogs, no deduplication
+        against the entra-id map happens anywhere in the pipeline - the two
+        copies coexist and any correlation is the CSOC's problem to state
+        explicitly in its rules.
+    fields:
+    - vendor: CreationTime
+      type: timestamp
+      description: UTC date and time the sign-in or directory change was recorded
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: RecordType
+      type: enum
+      description: >-
+        numeric AuditLogRecordType distinguishing STS logon, directory and
+        legacy account-logon records
+      ecs: event.code
+      status: mapped
+      transform: >-
+        8=AzureActiveDirectory, 9=AzureActiveDirectoryAccountLogon
+        (deprecated), 15=AzureActiveDirectoryStsLogon
+    - vendor: Operation
+      type: string
+      description: activity name, e.g. UserLoggedIn, UserLoginFailed, Add member to role.
+      ecs: event.action
+      status: mapped
+    - vendor: AzureActiveDirectoryEventType
+      type: enum
+      description: whether the record is an account logon or an application audit event
+      ecs: null
+      status: unmapped
+      custom: o365.audit.azure_ad_event_type
+      notes: >-
+        AccountLogon or AzureApplicationAuditEvent; determines which of the
+        two Entra sub-schemas the rest of the record follows
+    - vendor: UserId
+      type: string
+      description: UPN of the user the sign-in or directory operation relates to
+      ecs: user.name
+      status: partial
+      notes: >-
+        same UPN-into-user.id issue as the other datasets; on directory
+        records this is the actor, while the object of the change is in
+        ObjectId/Target
+    - vendor: UserKey
+      type: string
+      description: alternative identifier for the user, typically the PUID
+      ecs: user.id
+      status: partial
+      notes: >-
+        a PUID, not the Entra objectId that logs-azure.signinlogs carries in
+        user.id, so the two feeds do not join on this field without a
+        translation
+    - vendor: ClientIP
+      type: ip
+      description: IP address of the device the sign-in came from
+      ecs: source.ip
+      status: partial
+      notes: >
+        Microsoft documents this as null on many Microsoft Entra ID records,
+        which is the single biggest fidelity gap against the entra-id map; the
+        stock pipeline also routes it to client.ip rather than source.ip
+    - vendor: ObjectId
+      type: string
+      description: >-
+        the target object the operation acted on; on Entra operations this is
+        the account name or the GUID value of the account
+      ecs: user.target.name
+      status: partial
+      transform: >-
+        branch on the value's shape - the account-name form carries an "@" and
+        is a login, so it belongs on user.target.name, while the GUID form is
+        an object identifier and belongs on user.target.id
+      notes: >
+        the stock pipeline copies this to user.target.id wherever event.code
+        is AzureActiveDirectory - RecordType 8 only, so RecordType 15 StsLogon
+        and RecordType 9 records get no target - and that copy drops the
+        account-name form into an id field; a later pipeline script splits an
+        "@"-shaped user.target.id into user.target.name/email/domain but
+        leaves the account name sitting in user.target.id, so joins against
+        the entra-id map's GUID-valued user.target.id do not line up. The
+        object is also often an application, service principal or policy
+        rather than a user, so the object-type gate applies on top of the
+        shape branch
+    - vendor: ApplicationId
+      type: string
+      description: GUID of the application the sign-in was requested for
+      ecs: null
+      status: unmapped
+      custom: o365.audit.application_id
+      notes: >-
+        needs the tenant's app registration list to become a readable name;
+        there is no ECS field for a relying-party application id
+    - vendor: ErrorCode
+      type: string
+      description: AADSTS error code for a failed sign-in, or 0 for a successful one
+      ecs: error.code
+      status: partial
+      notes: >-
+        not mapped by the stock pipeline at all; it is also the most reliable
+        source of event.outcome on this dataset, more so than ResultStatus
+      transform: >-
+        0 means success and any non-zero AADSTS value means failure; the
+        numeric code needs a lookup to become a readable reason
+    - vendor: LogonError
+      type: string
+      description: human-readable description of why a sign-in failed
+      ecs: null
+      status: unmapped
+      custom: o365.audit.logon_error
+      notes: >-
+        free-text companion to ErrorCode, e.g. InvalidUserNameOrPassword,
+        UserStrongAuthEnrollmentRequired
+    - vendor: ResultStatus
+      type: enum
+      description: coarse outcome of the operation as reported in the Common schema
+      ecs: event.outcome
+      status: partial
+      notes: >-
+        on sign-in records this is frequently Success even where ErrorCode is
+        non-zero, so ErrorCode should win when both are present
+    - vendor: ExtendedProperties
+      type: string
+      description: collection of name/value pairs carrying the Entra-specific detail of the event
+      ecs: null
+      status: unmapped
+      custom: o365.audit.extended_properties
+      notes: >-
+        holds UserAgent, RequestType and ResultStatusDetail among others; this
+        is where most of this feed's usable client context actually lives
+    - vendor: ModifiedProperties
+      type: string
+      description: property name with its new and previous value for a directory change
+      ecs: null
+      status: unmapped
+      custom: o365.audit.modified_properties
+      notes: >-
+        the role-assignment and application-permission deltas live here as an
+        unbounded collection; values can run to kilobytes
+    - vendor: DeviceProperties
+      type: string
+      description: >-
+        collection of device details including Id, OS, Browser, IsCompliant
+        and DeviceTrustType
+      ecs: null
+      status: unmapped
+      custom: o365.audit.device_properties
+      notes: >
+        DeviceTrustType 0=Entra registered, 1=Entra joined, 2=Hybrid Entra
+        joined; flattening this is what makes device.id and compliance state
+        queryable, and it is far thinner than the entra-id map's deviceDetail
+    - vendor: Workload
+      type: string
+      description: Microsoft 365 service the activity occurred in (AzureActiveDirectory)
+      ecs: event.provider
+      status: mapped
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Pass through unparsed; the value to add low-side is routing, not
+          parsing. Split Audit.AzureActiveDirectory onto its own route so it
+          can be throttled or suspended independently once the higher-fidelity
+          entra-id diagnostic feed is live, and tag the records at the source
+          with a feed identifier so a query can tell a UAL-sourced sign-in
+          from an Event Hubs-sourced one without inspecting field presence.
+          Persistent Queue backpressure on the Elastic destination.
+        elastic: >
+          In logs-o365.audit@custom, derive event.outcome from ErrorCode (0
+          means success, any AADSTS value means failure) rather than from
+          ResultStatus, promote ErrorCode to error.code and resolve it to a
+          readable reason through the same enrich policy the entra-id map uses
+          so one lookup serves both feeds. Flatten ExtendedProperties and
+          DeviceProperties from name/value collections into typed subfields -
+          the UserAgent, ResultStatusDetail and RequestType values buried in
+          ExtendedProperties are the only client context this feed has.
+          Replace the stock ObjectId handling, which is a copy to
+          user.target.id gated on event.code AzureActiveDirectory - RecordType
+          8 alone, so RecordType 15 StsLogon and RecordType 9 records get no
+          target and the records that do fire land account names in an id
+          field: gate it on the object being a user rather than an
+          application, service principal or policy, then branch on the value's
+          shape, sending the "@"-shaped account name to user.target.name and
+          the GUID to user.target.id so target joins against
+          logs-azure.signinlogs line up. Document in the index template which
+          fields are UAL-only so the CSOC can write rules that prefer
+          logs-azure.signinlogs and fall back here.
+        relay: >
+          Thin NDJSON envelope as with the other UAL content types; nothing
+          CEF-shaped crosses because the feed is JSON from an API. The
+          content-filter friction is ModifiedProperties and ExtendedProperties
+          - arbitrary-depth name/value collections whose values include full
+          security descriptors and role-assignment blobs that can run to
+          kilobytes. Flatten both to bounded key/value pairs low-side with an
+          allowlisted key set so a custom filter stays simple. Because this
+          feed duplicates the entra-id one, decide explicitly whether both
+          copies should cross the guard at all, and reconcile low-side and
+          high-side counts per (dataset, hour) given there is no return
+          channel.
+      direct:
+        parse_location: high
+        cribl: >
+          Pass through unparsed; the value to add is routing, not parsing.
+          Split Audit.AzureActiveDirectory onto its own route so it can be
+          throttled or suspended independently once the higher-fidelity
+          entra-id diagnostic feed is live, and tag the records at the source
+          with a feed identifier so a query can tell a UAL-sourced sign-in
+          from an Event Hubs-sourced one without inspecting field presence.
+          Persistent Queue backpressure on the Elastic destination.
+        elastic: >
+          In logs-o365.audit@custom, derive event.outcome from ErrorCode (0
+          means success, any AADSTS value means failure) rather than from
+          ResultStatus, promote ErrorCode to error.code and resolve it to a
+          readable reason through the same enrich policy the entra-id map uses
+          so one lookup serves both feeds. Flatten ExtendedProperties and
+          DeviceProperties from name/value collections into typed subfields -
+          the UserAgent, ResultStatusDetail and RequestType values buried in
+          ExtendedProperties are the only client context this feed has.
+          Replace the stock ObjectId handling, which is a copy to
+          user.target.id gated on event.code AzureActiveDirectory - RecordType
+          8 alone, so RecordType 15 StsLogon and RecordType 9 records get no
+          target and the records that do fire land account names in an id
+          field: gate it on the object being a user rather than an
+          application, service principal or policy, then branch on the value's
+          shape, sending the "@"-shaped account name to user.target.name and
+          the GUID to user.target.id so target joins against
+          logs-azure.signinlogs line up. Document in the index template which
+          fields are UAL-only so the CSOC can write rules that prefer
+          logs-azure.signinlogs and fall back here.
+  - format: api-pull
+    enable: >
+      Grant the Entra app the workload-scoped audit query permission
+      AuditLogsQuery-Entra.Read.All (the least-privileged scope on this API)
+      or the broad AuditLogsQuery.Read.All. Collect with the async flow: POST
+      /security/auditLog/queries with recordTypeFilters set to the Entra
+      record types - azureActiveDirectory, azureActiveDirectoryStsLogon and
+      the deprecated azureActiveDirectoryAccountLogon - and a filter window;
+      poll GET /security/auditLog/queries/{id} until succeeded; then page GET
+      /security/auditLog/queries/{id}/records. Each record is an
+      auditLogRecord with the Entra sign-in/directory payload under auditData.
+      GOV CAVEAT: global-only - unsupported in GCC High and DoD, so usable
+      only from a GCC (moderate) tenant against graph.microsoft.com. Note this
+      is a third collection path for the same sign-in that the entra-id map's
+      Event Hubs feed and the Management Activity API already carry, so the
+      same event can now arrive by three routes with different field coverage;
+      on GCC High and DoD only the csv-file export and the json feed are
+      available.
+    references:
+    - >-
+      https://learn.microsoft.com/en-us/graph/api/security-auditcoreroot-post-auditlogqueries?view=graph-rest-1.0
+    - >-
+      https://learn.microsoft.com/en-us/graph/api/security-auditlogquery-list-records?view=graph-rest-1.0
+    - >-
+      https://learn.microsoft.com/en-us/graph/api/resources/security-auditlogrecord?view=graph-rest-1.0
+    - https://learn.microsoft.com/en-us/graph/deployments
+    - >-
+      https://learn.microsoft.com/en-us/office/office-365-management-api/office-365-management-activity-api-schema
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        Cribl REST Collector running the Graph audit-query async flow, feeding
+        an unwrap/rename pipeline into logs-o365.audit
+      notes: >
+        Same REST-Collector-plus-unwrap path: a Cribl pipeline drives the
+        async query, lifts auditData and renames the camelCase common fields
+        to the PascalCase the o365.audit pipeline parses. Because these
+        records land in logs-o365.audit rather than logs-azure.signinlogs, no
+        deduplication against the entra-id map happens in the pipeline - now
+        compounded by a third possible copy from this Graph pull, so the
+        collector must tag records with a feed identifier. The
+        ErrorCode/LogonError sign-in outcome fields live inside auditData and
+        stay unmapped by the stock pipeline exactly as on the json feed.
+        auditLogRecordType arrives as the string name and must be mapped to
+        the numeric RecordType.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          GCC-moderate low-side only. The value to add is routing and tagging,
+          not parsing: split azureActiveDirectoryStsLogon onto its own route
+          so it can be throttled independently once the higher-fidelity
+          entra-id diagnostic feed is live, and tag every record with a feed
+          identifier so a query can tell a Graph-audit-sourced sign-in from a
+          Management-API- or Event-Hubs-sourced one. Pass through unparsed,
+          Persistent Queue on the Elastic destination.
+        elastic: >
+          After auditData is unwrapped the Entra @custom fixes apply - derive
+          event.outcome from the auditData ErrorCode (0 success, any AADSTS
+          value failure) rather than ResultStatus, promote ErrorCode to
+          error.code, flatten ExtendedProperties/DeviceProperties. objectId is
+          the target directory object here and arrives as either an account
+          name or an account GUID, so gate it on the object being a user
+          rather than an application, service principal or policy and then
+          branch on shape - the "@"-shaped account name to user.target.name,
+          the GUID to user.target.id. Take the readable userType string
+          without a lookup, and document that these records are UAL-sourced so
+          the CSOC prefers logs-azure.signinlogs and falls back here.
+        relay: >
+          GCC-moderate low-side only. Same thin NDJSON envelope as the other
+          lanes; the friction is auditData.ModifiedProperties and
+          auditData.ExtendedProperties - arbitrary-depth name/value
+          collections whose values include security descriptors and
+          role-assignment blobs running to kilobytes, now nested one level
+          deeper under auditData. Flatten both to bounded, allow-listed
+          key/value pairs low-side. Because this Graph pull can duplicate the
+          json feed AND the entra-id Event Hubs feed, decide explicitly
+          whether it should cross the guard at all, and reconcile counts per
+          (dataset, hour) on id.
+      direct:
+        parse_location: high
+        cribl: >
+          GCC-moderate high-side with no guard: the pull is a topology
+          alternative to the json blob walk, its draw being server-side
+          scoping by recordTypeFilters. Run the async flow, tag with a feed
+          identifier, de-duplicate on id, pass through. GCC High and DoD
+          high-side instances cannot use this source.
+        elastic: >
+          Once auditData is unwrapped, derive event.outcome from ErrorCode,
+          gate objectId on the object being a user and branch it by shape -
+          account name to user.target.name, GUID to user.target.id - and take
+          the readable userType string.
+    fields:
+    - vendor: createdDateTime
+      type: datetime
+      description: date and time in UTC the sign-in or directory change was recorded
+      ecs: '@timestamp'
+      status: mapped
+      transform: the camelCase form of CreationTime; event time, not collection time
+    - vendor: id
+      type: string
+      description: GUID uniquely identifying the audit log record
+      ecs: event.id
+      status: mapped
+      notes: the per-record de-duplication and cross-guard reconciliation key
+    - vendor: auditLogRecordType
+      type: string
+      description: >-
+        type of record (azureActiveDirectory, azureActiveDirectoryStsLogon,
+        azureActiveDirectoryAccountLogon)
+      ecs: event.code
+      status: mapped
+      transform: >-
+        the string member name where the Management API and CSV emit the
+        numeric enum; azureActiveDirectoryAccountLogon is deprecated
+    - vendor: operation
+      type: string
+      description: activity name, e.g. UserLoggedIn, UserLoginFailed, Add member to role
+      ecs: event.action
+      status: mapped
+    - vendor: organizationId
+      type: string
+      description: GUID of the tenant the record belongs to
+      ecs: organization.id
+      status: mapped
+    - vendor: service
+      type: string
+      description: Microsoft 365 service where the activity occurred (AzureActiveDirectory)
+      ecs: event.provider
+      status: mapped
+    - vendor: userType
+      type: string
+      description: >-
+        type of principal that performed the operation (regular, admin,
+        dcAdmin, system, application, servicePrincipal, guest, ...)
+      ecs: null
+      status: unmapped
+      custom: o365.audit.user_type
+      notes: >-
+        readable string enum here where the Management API and CSV emit a
+        numeric UserType needing a lookup
+    - vendor: userId
+      type: string
+      description: >-
+        the principal the sign-in or directory operation relates to; carries
+        app and system principals on directory records
+      ecs: null
+      status: unmapped
+      custom: o365.audit.user_id
+      notes: >-
+        on directory records this is the actor while objectId is the object of
+        the change; carries non-user principals so inspect before trusting
+        userPrincipalName
+    - vendor: userPrincipalName
+      type: string
+      description: UPN of the user the sign-in or directory operation relates to
+      ecs: user.name
+      status: partial
+      notes: >-
+        the promoted clean UPN; empty on service-principal and system records
+        where only userId is populated
+    - vendor: clientIp
+      type: ip
+      description: IP address the sign-in came from
+      ecs: source.ip
+      status: partial
+      notes: >
+        Microsoft documents this as null on many Entra ID records - the single
+        biggest fidelity gap against the entra-id map; the stock pipeline also
+        routes it to client.ip rather than source.ip
+    - vendor: objectId
+      type: string
+      description: >-
+        the target object the operation acted on; on Entra operations this is
+        the account name or the GUID value of the account
+      ecs: user.target.name
+      status: partial
+      transform: >-
+        branch on the value's shape - the "@"-shaped account name is a login
+        and belongs on user.target.name, the GUID form is an object identifier
+        and belongs on user.target.id
+      notes: >-
+        the object is often an application, service principal or policy rather
+        than a user, so the object-type gate applies on top of the shape
+        branch; the sibling entra-id map carries the same distinction across
+        two vendor fields, with properties.targetResources[].userPrincipalName
+        on user.target.name and properties.targetResources[].id on
+        user.target.id
+    - vendor: administrativeUnits
+      type: string
+      description: administrative units tagged to the audit log record
+      ecs: null
+      status: unmapped
+      custom: o365.audit.administrative_units
+      notes: >-
+        a first-class array this format promotes; especially relevant on
+        directory records scoped to an administrative unit
+    - vendor: auditData
+      type: object
+      description: nested JSON object carrying the Entra sign-in and directory payload
+      ecs: null
+      status: unmapped
+      custom: o365.audit.audit_data
+      notes: >
+        carries the same PascalCase Entra schema documented as the json feed
+        on the base map - AzureActiveDirectoryEventType, UserKey (PUID),
+        ApplicationId, ErrorCode, LogonError, ExtendedProperties,
+        ModifiedProperties, DeviceProperties - so the AADSTS outcome and all
+        directory-change detail live here and this is where the parser must
+        dive
+  - format: csv-file
+    enable: >
+      Produce the CSV from the Purview portal Audit search (scope to Microsoft
+      Entra activities, then Export) or from Search-UnifiedAuditLog
+      -RecordType AzureActiveDirectoryStsLogon (repeat for
+      AzureActiveDirectory, appending) piped to Export-Csv. Both emit the flat
+      wrapper columns (CreationDate, RecordType, UserIds, Operations,
+      Identity/RecordId, ResultIndex, ResultCount) around the AuditData JSON
+      string. Batch/offline export; bounded to 50,000 records/search on Audit
+      (Standard) and 1,000,000 on Audit (Premium). Available in GCC, GCC High
+      and DoD, so it is the gov-cloud alternate where the Graph pull is not -
+      and on GCC High/DoD the only reshaped export of these records other than
+      the json feed.
+    references:
+    - https://learn.microsoft.com/en-us/purview/audit-log-export-records
+    - >-
+      https://learn.microsoft.com/en-us/powershell/module/exchangepowershell/search-unifiedauditlog?view=exchange-ps
+    - >-
+      https://learn.microsoft.com/en-us/office/office-365-management-api/office-365-management-activity-api-schema
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        Cribl filesystem Collector reading the exported CSV, with an
+        Extract-JSON pipeline unwrapping AuditData into logs-o365.audit
+      notes: >
+        A filesystem Collector reads the CSV, parses the wrapper columns and
+        runs Extract-JSON on AuditData to recover the Entra record. Drop the
+        RunspaceId/IsValid/ObjectState PowerShell columns and normalise
+        RecordType. The auditData for these records carries deeply nested
+        ExtendedProperties and ModifiedProperties collections whose keys vary
+        widely, so decode per row - the portal's first-1,000-row column
+        inference is especially lossy on this workload's heterogeneous
+        directory records.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          The gov-cloud-safe lane (works in GCC High and DoD). Treat as
+          backfill/manual export; tag CSV-sourced events with an origin marker
+          and reconcile rather than merge, which matters more here because a
+          third copy of a sign-in that already arrives from the json feed and
+          the entra-id Event Hubs feed is easy to double. Read on the low-side
+          worker group, Extract-JSON on AuditData, drop noise columns, pass
+          through. Persistent Queue on the Elastic destination.
+        elastic: >
+          After AuditData is decoded the record is the Entra schema, so the
+          full @custom fix set applies - derive event.outcome from ErrorCode,
+          promote ErrorCode to error.code, flatten
+          ExtendedProperties/DeviceProperties, gate ObjectId on a user object
+          and branch it by shape - account name to user.target.name, GUID to
+          user.target.id. Strip the ResultIndex/ResultCount wrapper artifacts
+          before indexing.
+        relay: >
+          If a CSV is relayed for backfill, the friction is the AuditData JSON
+          string carrying ModifiedProperties and ExtendedProperties -
+          kilobyte-scale name/value blobs as escaped JSON inside a CSV cell.
+          Decode AuditData low-side, flatten and allow-list those keys, then
+          cross the thin NDJSON envelope. Because this duplicates two other
+          feeds of the same sign-in, decide whether it should cross at all and
+          reconcile on Identity/RecordId per (dataset, hour).
+      direct:
+        parse_location: high
+        cribl: >
+          On GCC High and DoD high-side instances this is the only reshaped
+          alternate: read the CSV, Extract-JSON on AuditData, drop the
+          PowerShell noise columns, tag with an origin marker to stay distinct
+          from the json and entra-id feeds.
+        elastic: >
+          Decode AuditData, apply the Entra @custom fixes, and strip the
+          wrapper artifacts before indexing.
+    fields:
+    - vendor: CreationDate
+      type: datetime
+      description: date and time the audit record was created
+      ecs: '@timestamp'
+      status: mapped
+      transform: >-
+        rendered in the export's locale format rather than raw ISO8601;
+        normalise before parsing
+    - vendor: RecordType
+      type: string
+      description: 'the record''s AuditLogRecordType'
+      ecs: event.code
+      status: mapped
+      transform: >-
+        numeric enum in the portal export, string member name from the cmdlet;
+        reconcile to one code
+    - vendor: Operations
+      type: string
+      description: name of the activity, in a plural-named wrapper column
+      ecs: event.action
+      status: mapped
+      notes: duplicates the Operation value inside AuditData
+    - vendor: UserIds
+      type: string
+      description: the principal the activity relates to, in a plural-named wrapper column
+      ecs: user.name
+      status: partial
+      notes: >-
+        duplicates AuditData.UserId; carries service-principal and system
+        actors on directory records, so gate before populating user.name
+    - vendor: Identity
+      type: string
+      description: 'the record''s GUID identity in the Search-UnifiedAuditLog output'
+      ecs: event.id
+      status: partial
+      notes: >-
+        the portal export labels the same value RecordId; the de-duplication
+        and reconciliation key
+    - vendor: AuditData
+      type: string
+      description: the full Entra sign-in/directory record as a JSON string
+      ecs: null
+      status: unmapped
+      custom: o365.audit.audit_data
+      notes: >
+        JSON string holding the Entra schema (ErrorCode, LogonError,
+        ExtendedProperties, ModifiedProperties, DeviceProperties, UserKey);
+        must be decoded before the AADSTS outcome or any directory-change
+        detail is addressable, and the heterogeneous keys defeat
+        first-1,000-row column inference, so decode per row
+    - vendor: ResultIndex
+      type: integer
+      description: 1-based position of this record within the search result set
+      ecs: null
+      status: unmapped
+      custom: o365.audit.result_index
+      notes: a query/pagination artifact, not event data; strip before indexing
+    - vendor: ResultCount
+      type: integer
+      description: total number of records the search matched
+      ecs: null
+      status: unmapped
+      custom: o365.audit.result_count
+      notes: identical on every row of a search; strip before indexing
+- id: teams
+  name: Microsoft Teams activity
+  description: >
+    RecordType 25 (MicrosoftTeams) and the related admin record types,
+    covering team and channel lifecycle, membership and role changes, guest
+    access, app/bot/connector and tab additions, and tenant-level Teams
+    settings changes. Thin starter relative to the other three datasets: the
+    Teams schema is a wide union in which most fields are present only for a
+    specific operation family, so field coverage here is best read as the
+    subset a SOC actually alerts on - guest and owner additions, external
+    federation settings, and add-on installs.
+  event_categories:
+  - iam
+  - configuration
+  route:
+    guarded:
+    - hop: other
+      name: Office 365 Management Activity API (GCC endpoint)
+      notes: >-
+        Teams records arrive under the Audit.General content type on the same
+        plan-specific root URL as the other workloads
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: Same collector placement as the rest of the UAL.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-o365.audit
+    direct:
+    - hop: other
+      name: Office 365 Management Activity API (GCC endpoint)
+      notes: >-
+        Teams records arrive under the Audit.General content type on the same
+        plan-specific root URL as the other workloads
+    - hop: cribl
+      location: edge worker group
+      notes: Same collector placement as the rest of the UAL.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-o365.audit
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: Microsoft Office 365 integration (o365.audit data stream)
+      notes: >
+        The integration carries TeamName, TeamGuid and Members as declared
+        fields but performs no Teams-specific ECS normalisation, so everything
+        below the Common schema stays under o365.audit.*.
+    fields:
+    - vendor: CreationTime
+      type: timestamp
+      description: UTC date and time the Teams event was recorded
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: Operation
+      type: string
+      description: >-
+        activity name, e.g. TeamCreated, MemberAdded, MemberRoleChanged,
+        AppInstalled, TeamSettingChanged
+      ecs: event.action
+      status: mapped
+    - vendor: RecordType
+      type: enum
+      description: numeric AuditLogRecordType for Teams records
+      ecs: event.code
+      status: mapped
+      transform: >-
+        25=MicrosoftTeams, with 57=MicrosoftTeamsAdmin and
+        59=MicrosoftTeamsDevice on the same route
+    - vendor: UserId
+      type: string
+      description: UPN of the user who performed the Teams operation
+      ecs: user.name
+      status: partial
+      notes: same UPN-into-user.id issue as the other datasets on this map
+    - vendor: ClientIP
+      type: ip
+      description: IP address of the device used to perform the operation
+      ecs: source.ip
+      status: partial
+      notes: >-
+        stock pipeline routes this to client.ip; frequently absent on
+        service-initiated Teams events
+    - vendor: TeamName
+      type: string
+      description: name of the team being audited
+      ecs: group.name
+      status: partial
+      notes: >
+        a Teams team rather than a security group, so group.name is an
+        approximation; kept mapped because membership alerting reads more
+        naturally against it than against a custom field
+    - vendor: TeamGuid
+      type: string
+      description: unique identifier for the team being audited
+      ecs: group.id
+      status: partial
+      notes: >-
+        pairs with TeamName under the same approximation; this is the stable
+        key when a team is renamed
+    - vendor: ChannelName
+      type: string
+      description: name of the channel being audited
+      ecs: null
+      status: unmapped
+      custom: o365.audit.channel_name
+    - vendor: ChannelType
+      type: enum
+      description: type of channel being audited - Standard, Private or Shared
+      ecs: null
+      status: unmapped
+      custom: o365.audit.channel_type
+      notes: >-
+        private and shared channels are the ones worth alerting on for
+        external membership
+    - vendor: Members
+      type: string
+      description: collection of users within a team, each with UPN, DisplayName and Role
+      ecs: null
+      status: unmapped
+      custom: o365.audit.members
+      notes: >
+        Role is numeric - 0=Member, 1=Owner, 2=Guest - and a Guest addition is
+        the primary detection here; needs nested mapping so UPN and role can
+        be queried together rather than flattened independently
+    - vendor: AddOnType
+      type: enum
+      description: type of add-on that generated the event
+      ecs: null
+      status: unmapped
+      custom: o365.audit.addon_type
+      transform: numeric enum 1=Bot, 2=Connector, 3=Tab resolved by lookup
+    - vendor: AddOnName
+      type: string
+      description: name of the add-on that generated the event
+      ecs: null
+      status: unmapped
+      custom: o365.audit.addon_name
+    - vendor: Name
+      type: string
+      description: name of the Teams setting that changed, present only on settings events
+      ecs: null
+      status: unmapped
+      custom: o365.audit.setting_name
+    - vendor: OldValue
+      type: string
+      description: previous value of the changed Teams setting
+      ecs: null
+      status: unmapped
+      custom: o365.audit.setting_old_value
+    - vendor: NewValue
+      type: string
+      description: new value of the changed Teams setting
+      ecs: null
+      status: unmapped
+      custom: o365.audit.setting_new_value
+    - vendor: MessageURLs
+      type: string
+      description: URLs present in a Teams chat or channel message
+      ecs: null
+      status: unmapped
+      custom: o365.audit.message_urls
+      notes: >-
+        only populated where message-level auditing is enabled; unbounded list
+        and the main content-filter concern on this dataset
+    - vendor: ExtraProperties
+      type: string
+      description: collection of additional key/value properties specific to the operation
+      ecs: null
+      status: unmapped
+      custom: o365.audit.extra_properties
+    - vendor: Workload
+      type: string
+      description: Microsoft 365 service the activity occurred in (MicrosoftTeams)
+      ecs: event.provider
+      status: mapped
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Pass through unparsed on the same route as the rest of
+          Audit.General; Teams volume does not justify its own shaping. If
+          MessageURLs or message metadata is ever enabled at scale, split it
+          off then rather than now. Persistent Queue backpressure on the
+          Elastic destination, and _raw can be dropped once the integration
+          parser is proven since these records are configuration evidence
+          rather than forensic content.
+        elastic: >
+          In logs-o365.audit@custom, expand the Members collection into
+          per-member documents or a nested field so a Role of 2 (Guest) is
+          directly alertable rather than buried in an array, and resolve the
+          numeric AddOnType (1=Bot, 2=Connector, 3=Tab) through a lookup.
+          Normalise the settings-event triple Name/OldValue/NewValue into a
+          consistent change shape so Teams federation and external-access
+          changes can be queried alongside other configuration datasets. Add
+          custom-namespace keyword mappings for o365.audit.channel_type,
+          .addon_type, .setting_name and nested mapping for o365.audit.members
+          so member UPN and role can be queried together.
+        relay: >
+          Thin NDJSON envelope as with the other UAL content types. The
+          specific friction is Members, ExtraProperties and MessageURLs -
+          variable-length collections carrying user-authored names and full
+          URLs, including non-ASCII display names - so flatten them, cap
+          length and normalise encoding low-side. This is the lowest-volume
+          and lowest-forensic-value dataset on the map, so if guard throughput
+          becomes the binding constraint it is the first candidate to be
+          sampled or held back rather than shaped further.
+      direct:
+        parse_location: high
+        cribl: >
+          Pass through unparsed on the same route as the rest of
+          Audit.General; Teams volume does not justify its own shaping. If
+          MessageURLs or message metadata is ever enabled at scale, split it
+          off then rather than now. Persistent Queue backpressure on the
+          Elastic destination, and _raw can be dropped once the integration
+          parser is proven since these records are configuration evidence
+          rather than forensic content.
+        elastic: >
+          In logs-o365.audit@custom, expand the Members collection into
+          per-member documents or a nested field so a Role of 2 (Guest) is
+          directly alertable rather than buried in an array, and resolve the
+          numeric AddOnType (1=Bot, 2=Connector, 3=Tab) through a lookup.
+          Normalise the settings-event triple Name/OldValue/NewValue into a
+          consistent change shape so Teams federation and external-access
+          changes can be queried alongside other configuration datasets. Add
+          custom-namespace keyword mappings for o365.audit.channel_type,
+          .addon_type, .setting_name and nested mapping for o365.audit.members
+          so member UPN and role can be queried together.
+  - format: api-pull
+    enable: >
+      Grant the Entra app the broad AuditLogsQuery.Read.All permission - the
+      audit query API exposes no Teams-specific scope, so the workload-scoped
+      least-privileged permissions do not cover Teams and the broad scope is
+      required. Collect with the async flow: POST /security/auditLog/queries
+      with recordTypeFilters set to the Teams record types - microsoftTeams,
+      microsoftTeamsAdmin and microsoftTeamsDevice - and a filter window; poll
+      GET /security/auditLog/queries/{id} until succeeded; then page GET
+      /security/auditLog/queries/{id}/records. Each record is an
+      auditLogRecord with the Teams payload under auditData. GOV CAVEAT:
+      global-only - unsupported in GCC High and DoD, so usable only from a GCC
+      (moderate) tenant against graph.microsoft.com. Use the csv-file export
+      on GCC High and DoD.
+    references:
+    - >-
+      https://learn.microsoft.com/en-us/graph/api/security-auditcoreroot-post-auditlogqueries?view=graph-rest-1.0
+    - >-
+      https://learn.microsoft.com/en-us/graph/api/security-auditlogquery-list-records?view=graph-rest-1.0
+    - >-
+      https://learn.microsoft.com/en-us/graph/api/resources/security-auditlogrecord?view=graph-rest-1.0
+    - https://learn.microsoft.com/en-us/graph/deployments
+    - >-
+      https://learn.microsoft.com/en-us/office/office-365-management-api/office-365-management-activity-api-schema
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        Cribl REST Collector running the Graph audit-query async flow, feeding
+        an unwrap/rename pipeline into logs-o365.audit
+      notes: >
+        Same REST-Collector-plus-unwrap path: a Cribl pipeline drives the
+        async query, lifts auditData and renames the camelCase common fields
+        to PascalCase for the o365.audit pipeline. On the json feed Teams
+        records arrive under the Audit.General content type; here they are
+        selected directly by the three Teams recordTypeFilters, which is
+        cleaner than filtering Audit.General downstream. The integration
+        performs no Teams-specific ECS normalisation, so everything below the
+        common schema stays under o365.audit.* whichever way it is collected.
+        auditLogRecordType arrives as the string name and must be mapped to
+        the numeric RecordType.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          GCC-moderate low-side only. Teams volume does not justify its own
+          shaping - run it on a shared route and pass through unparsed. The
+          one advantage to take is that the three Teams record types can be
+          selected at the query rather than filtered out of Audit.General, so
+          no unrelated Audit.General traffic is pulled. Persistent Queue on
+          the Elastic destination; _raw can be dropped once the parser is
+          proven since these are configuration evidence.
+        elastic: >
+          After auditData is unwrapped the Teams @custom fixes apply - expand
+          the Members collection so a Role of 2 (Guest) is directly alertable,
+          resolve the numeric AddOnType, normalise the Name/OldValue/NewValue
+          settings triple. Take the readable userType string without a lookup.
+          objectId varies by Teams operation family and stays custom.
+        relay: >
+          GCC-moderate low-side only. Same thin NDJSON envelope; the friction
+          is auditData.Members, auditData.ExtraProperties and
+          auditData.MessageURLs - variable-length collections with
+          user-authored names and full URLs including non-ASCII display names,
+          now nested under auditData. Flatten, length-cap and normalise
+          encoding low-side. This is the lowest-volume, lowest-forensic-value
+          dataset on the map, so if guard throughput binds it is the first
+          candidate to be sampled or held back. Reconcile on id per (dataset,
+          hour).
+      direct:
+        parse_location: high
+        cribl: >
+          GCC-moderate high-side with no guard: the pull selects the Teams
+          record types at the query, avoiding a downstream Audit.General
+          filter. Run the async flow, de-duplicate on id, pass through. GCC
+          High and DoD high-side instances cannot use this source.
+        elastic: >
+          Once auditData is unwrapped, expand the Members collection, resolve
+          AddOnType, and take the readable userType string.
+    fields:
+    - vendor: createdDateTime
+      type: datetime
+      description: date and time in UTC the Teams event was recorded
+      ecs: '@timestamp'
+      status: mapped
+      transform: the camelCase form of CreationTime; event time, not collection time
+    - vendor: id
+      type: string
+      description: GUID uniquely identifying the audit log record
+      ecs: event.id
+      status: mapped
+      notes: the per-record de-duplication and cross-guard reconciliation key
+    - vendor: auditLogRecordType
+      type: string
+      description: type of record (microsoftTeams, microsoftTeamsAdmin, microsoftTeamsDevice)
+      ecs: event.code
+      status: mapped
+      transform: >-
+        the string member name where the Management API and CSV emit the
+        numeric enum; map to the integer for routing
+    - vendor: operation
+      type: string
+      description: >-
+        activity name, e.g. TeamCreated, MemberAdded, MemberRoleChanged,
+        AppInstalled, TeamSettingChanged
+      ecs: event.action
+      status: mapped
+    - vendor: organizationId
+      type: string
+      description: GUID of the tenant the record belongs to
+      ecs: organization.id
+      status: mapped
+    - vendor: service
+      type: string
+      description: Microsoft 365 service where the activity occurred (MicrosoftTeams)
+      ecs: event.provider
+      status: mapped
+    - vendor: userType
+      type: string
+      description: >-
+        type of user that performed the operation (regular, admin, dcAdmin,
+        system, application, servicePrincipal, guest, ...)
+      ecs: null
+      status: unmapped
+      custom: o365.audit.user_type
+      notes: >-
+        readable string enum here where the Management API and CSV emit a
+        numeric UserType needing a lookup
+    - vendor: userId
+      type: string
+      description: >-
+        the principal that performed the Teams operation; carries service
+        principals on bot- and connector-driven events
+      ecs: null
+      status: unmapped
+      custom: o365.audit.user_id
+      notes: >-
+        duplicates userPrincipalName for human users but carries non-user
+        principals, so inspect before trusting userPrincipalName
+    - vendor: userPrincipalName
+      type: string
+      description: UPN of the user who performed the Teams operation
+      ecs: user.name
+      status: partial
+      notes: >-
+        the promoted clean UPN; frequently empty on service-initiated Teams
+        events where only userId is populated
+    - vendor: clientIp
+      type: ip
+      description: IP address of the device used to perform the operation
+      ecs: source.ip
+      status: partial
+      notes: >-
+        the stock pipeline routes this to client.ip; frequently absent on
+        service-initiated Teams events
+    - vendor: objectId
+      type: string
+      description: the object the Teams operation acted on; varies by operation family
+      ecs: null
+      status: unmapped
+      custom: o365.audit.object_id
+      notes: >-
+        workload-dependent - holds a URL on SharePoint records and a directory
+        object name on Entra records
+    - vendor: administrativeUnits
+      type: string
+      description: administrative units tagged to the audit log record
+      ecs: null
+      status: unmapped
+      custom: o365.audit.administrative_units
+      notes: >-
+        a first-class array this format promotes; no equivalent top-level
+        field on the Management API record
+    - vendor: auditData
+      type: object
+      description: nested JSON object carrying the Teams payload
+      ecs: null
+      status: unmapped
+      custom: o365.audit.audit_data
+      notes: >
+        carries the same PascalCase Teams schema documented as the json feed
+        on the base map - TeamName, TeamGuid, ChannelName, ChannelType, the
+        Members collection with per-member Role, AddOnType/AddOnName, the
+        Name/OldValue/ NewValue settings triple, MessageURLs and
+        ExtraProperties - so all Teams detail lives here and this is where the
+        parser must dive
+  - format: csv-file
+    enable: >
+      Produce the CSV from the Purview portal Audit search (scope to Microsoft
+      Teams activities, then Export) or from Search-UnifiedAuditLog
+      -RecordType MicrosoftTeams (repeat for MicrosoftTeamsAdmin and
+      MicrosoftTeamsDevice, appending) piped to Export-Csv. Both emit the flat
+      wrapper columns (CreationDate, RecordType, UserIds, Operations,
+      Identity/RecordId, ResultIndex, ResultCount) around the AuditData JSON
+      string. Batch/offline export; bounded to 50,000 records/search on Audit
+      (Standard) and 1,000,000 on Audit (Premium). Available in GCC, GCC High
+      and DoD, so it is the gov-cloud alternate where the Graph pull is not.
+    references:
+    - https://learn.microsoft.com/en-us/purview/audit-log-export-records
+    - >-
+      https://learn.microsoft.com/en-us/powershell/module/exchangepowershell/search-unifiedauditlog?view=exchange-ps
+    - >-
+      https://learn.microsoft.com/en-us/office/office-365-management-api/office-365-management-activity-api-schema
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        Cribl filesystem Collector reading the exported CSV, with an
+        Extract-JSON pipeline unwrapping AuditData into logs-o365.audit
+      notes: >
+        A filesystem Collector reads the CSV, parses the wrapper columns and
+        runs Extract-JSON on AuditData to recover the Teams record. Drop the
+        RunspaceId/IsValid/ObjectState PowerShell columns and normalise
+        RecordType. Decode AuditData per row - the Teams schema is a wide
+        union where most fields are present only for one operation family,
+        exactly the case first-1,000-row column inference handles worst.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          The gov-cloud-safe lane (works in GCC High and DoD). Treat as
+          backfill/manual export; tag CSV-sourced events with an origin marker
+          and reconcile rather than merge. Read on the low-side worker group,
+          Extract-JSON on AuditData, drop noise columns, pass through.
+          Persistent Queue on the Elastic destination.
+        elastic: >
+          After AuditData is decoded the record is the Teams schema, so the
+          full @custom fix set applies - expand Members, resolve AddOnType,
+          normalise the settings triple. Strip the ResultIndex/ResultCount
+          wrapper artifacts before indexing.
+        relay: >
+          If a CSV is relayed for backfill, the friction is the AuditData JSON
+          string carrying Members, MessageURLs and ExtraProperties -
+          variable-length, non-ASCII collections as escaped JSON inside a CSV
+          cell. Decode AuditData low-side, flatten and length-cap those
+          collections, then cross the thin NDJSON envelope. Reconcile on
+          Identity/RecordId per (dataset, hour).
+      direct:
+        parse_location: high
+        cribl: >
+          On GCC High and DoD high-side instances this is the only alternate
+          lane: read the CSV, Extract-JSON on AuditData, drop the PowerShell
+          noise columns, tag with an origin marker.
+        elastic: >
+          Decode AuditData, apply the Teams @custom fixes, and strip the
+          wrapper artifacts before indexing.
+    fields:
+    - vendor: CreationDate
+      type: datetime
+      description: date and time the audit record was created
+      ecs: '@timestamp'
+      status: mapped
+      transform: >-
+        rendered in the export's locale format rather than raw ISO8601;
+        normalise before parsing
+    - vendor: RecordType
+      type: string
+      description: 'the record''s AuditLogRecordType'
+      ecs: event.code
+      status: mapped
+      transform: >-
+        numeric enum in the portal export, string member name from the cmdlet;
+        reconcile to one code
+    - vendor: Operations
+      type: string
+      description: name of the activity, in a plural-named wrapper column
+      ecs: event.action
+      status: mapped
+      notes: duplicates the Operation value inside AuditData
+    - vendor: UserIds
+      type: string
+      description: the principal that performed the activity, in a plural-named wrapper column
+      ecs: user.name
+      status: partial
+      notes: >-
+        duplicates AuditData.UserId; carries service principals on
+        bot/connector events, so gate before populating user.name
+    - vendor: Identity
+      type: string
+      description: 'the record''s GUID identity in the Search-UnifiedAuditLog output'
+      ecs: event.id
+      status: partial
+      notes: >-
+        the portal export labels the same value RecordId; the de-duplication
+        and reconciliation key
+    - vendor: AuditData
+      type: string
+      description: the full Teams record as a JSON string
+      ecs: null
+      status: unmapped
+      custom: o365.audit.audit_data
+      notes: >
+        JSON string holding the Teams schema (TeamName, TeamGuid, Members,
+        AddOnType, the settings triple, MessageURLs); must be decoded before
+        any Teams field is addressable, and the wide-union schema defeats
+        first-1,000-row column inference, so decode per row
+    - vendor: ResultIndex
+      type: integer
+      description: 1-based position of this record within the search result set
+      ecs: null
+      status: unmapped
+      custom: o365.audit.result_index
+      notes: a query/pagination artifact, not event data; strip before indexing
+    - vendor: ResultCount
+      type: integer
+      description: total number of records the search matched
+      ecs: null
+      status: unmapped
+      custom: o365.audit.result_count
+      notes: identical on every row of a search; strip before indexing

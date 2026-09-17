@@ -1,0 +1,1339 @@
+id: sqlserver-audit
+name: SQL Server Audit
+vendor: Microsoft
+versions: SQL Server 2017 (14.x), 2019 (15.x), 2022 (16.x)
+draft: true
+references:
+- >-
+  https://learn.microsoft.com/en-us/sql/relational-databases/system-functions/sys-fn-get-audit-file-transact-sql
+- >-
+  https://learn.microsoft.com/en-us/sql/relational-databases/security/auditing/sql-server-audit-action-groups-and-actions
+- >-
+  https://learn.microsoft.com/en-us/sql/relational-databases/system-dynamic-management-views/sys-dm-audit-actions-transact-sql
+- >-
+  https://learn.microsoft.com/en-us/sql/relational-databases/errors-events/mssqlserver-18456-database-engine-error
+- https://www.elastic.co/docs/reference/integrations/microsoft_sqlserver
+- https://github.com/elastic/integrations/tree/main/packages/microsoft_sqlserver
+- https://docs.nxlog.co/userguide/integrate/mssql-server.html
+datasets:
+- id: audit-security-log
+  name: SQL Server Audit record (Security channel, event 33205)
+  description: >
+    Server- and database-level audit records produced by SQL Server Audit
+    specifications (SUCCESSFUL_LOGIN_GROUP, FAILED_LOGIN_GROUP,
+    SCHEMA_OBJECT_ACCESS_GROUP, permission- and principal-change groups, and
+    per-object SELECT/INSERT/UPDATE/DELETE/EXECUTE actions). A server audit
+    created with TO SECURITY_LOG writes each record into the Windows Security
+    channel as event 33205 under the MSSQLSERVER (or MSSQL$<instance>) source,
+    with the audit-record columns rendered as a name:value list inside the
+    event message; this is the path a SIEM actually collects, because
+    sys.fn_get_audit_file cannot read an audit configured for SECURITY_LOG and
+    the alternative .sqlaudit binary file target requires a T-SQL pull. Field
+    names below are the audit-record column names documented for
+    sys.fn_get_audit_file, which are the same names rendered into the 33205
+    message. permission_bitmask, additional_information, transaction_id and
+    the sp_audit_write user-defined columns are present in the record but not
+    yet mapped here.
+  event_categories:
+  - authentication
+  - iam
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Windows event collection (Elastic Agent / WEF) delivers the
+        Security-channel 33205 events to Cribl on the same path as the Windows
+        Security log.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-microsoft_sqlserver.audit
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Windows event collection (Elastic Agent / WEF) delivers the
+        Security-channel 33205 events to Cribl on the same path as the Windows
+        Security log.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-microsoft_sqlserver.audit
+  formats:
+  - format: windows-event
+    parsing:
+      mechanism: elastic-integration
+      artifact: Microsoft SQL Server integration (audit data stream)
+      notes: >
+        The stock integration reads the configured Windows event log channel
+        and lands the audit-record columns under sqlserver.audit.*; it does
+        not resolve the action_id or class_type short codes into readable
+        names, which is the main gap a custom pipeline has to close.
+    fields:
+    - vendor: EventID
+      type: integer
+      description: Windows Security-channel event ID carrying the SQL Server audit record (33205)
+      ecs: event.code
+      status: mapped
+    - vendor: event_time
+      type: timestamp
+      description: UTC date and time when the auditable action fired (datetime2)
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: sequence_number
+      type: integer
+      description: >-
+        sequence of records within a single audit record that was too large to
+        fit the audit write buffer
+      ecs: event.sequence
+      status: mapped
+      notes: >
+        an oversized audit record (typically a long statement) is emitted as
+        several 33205 events sharing an event_time; consumers must treat
+        sequence_number > 1 as a continuation rather than a distinct action
+    - vendor: action_id
+      type: string
+      description: >-
+        four-character code identifying the audited action, e.g. LGIS/LGIF for
+        login success and failure or SL/IN/UP/DL/EX for the DML actions
+      ecs: event.action
+      status: partial
+      transform: >
+        varchar(4) code that is not human-readable on its own; resolve against
+        a sys.dm_audit_actions export (action_id → name) to produce a readable
+        event.action, keeping the raw code alongside
+    - vendor: succeeded
+      type: boolean
+      description: >-
+        bit flag indicating whether the action that triggered the event
+        succeeded (1) or failed (0)
+      ecs: event.outcome
+      status: mapped
+      transform: >
+        bit 1/0 is translated to success/failure; note the documented caveat
+        that for everything except login events this reports only whether the
+        permission check passed, not whether the statement itself succeeded
+    - vendor: class_type
+      type: string
+      description: >-
+        two-character code for the type of auditable entity the audit occurred
+        on (varchar(2))
+      ecs: null
+      status: unmapped
+      custom: sqlserver.audit.class_type
+      notes: >-
+        opaque object-class code (server, database, schema object, login,
+        ...); needs a lookup table to become legible, and has no ECS
+        equivalent
+    - vendor: session_id
+      type: integer
+      description: ID of the SQL Server session (SPID) on which the event occurred (smallint)
+      ecs: null
+      status: unmapped
+      custom: sqlserver.audit.session_id
+      notes: >-
+        ECS has no session identifier field; kept custom so per-session
+        activity can still be reconstructed alongside connection_id
+    - vendor: server_principal_name
+      type: string
+      description: current login the audited action was performed under
+      ecs: user.name
+      status: mapped
+    - vendor: session_server_principal_name
+      type: string
+      description: >-
+        server principal for the session — the original login connected to the
+        instance, retained across explicit or implicit context switches
+      ecs: user.effective.name
+      status: partial
+      notes: >
+        ECS treats user.effective as the identity that was assumed, while SQL
+        Server puts the assumed login in server_principal_name and the
+        original login here, so under EXECUTE AS the two are semantically
+        reversed; pick one direction in the pipeline and apply it consistently
+        rather than leaving both populated ambiguously
+    - vendor: server_principal_sid
+      type: string
+      description: security identifier (SID) of the current login (varbinary)
+      ecs: user.id
+      status: partial
+      transform: >-
+        rendered as a varbinary hex string in the 33205 message; convert to
+        the canonical S-1-5-… SID form before writing user.id so it joins
+        against Windows and Active Directory events
+    - vendor: database_principal_name
+      type: string
+      description: current database user context the action was performed in
+      ecs: null
+      status: unmapped
+      custom: sqlserver.audit.database_principal_name
+      notes: >-
+        the database-scoped user, distinct from the server login in user.name;
+        no ECS field distinguishes the two so it is kept custom
+    - vendor: target_server_principal_name
+      type: string
+      description: >-
+        target login of the action, populated for GRANT/DENY/REVOKE and
+        principal-management actions
+      ecs: user.target.name
+      status: mapped
+    - vendor: server_instance_name
+      type: string
+      description: >-
+        name of the server instance where the audit occurred, in the standard
+        server\instance format
+      ecs: service.name
+      status: partial
+      notes: >
+        single value carrying both the host and the named instance; split on
+        the backslash so the host portion populates host.name and only the
+        instance name lands in service.name, otherwise instance-scoped and
+        host-scoped queries collide
+    - vendor: database_name
+      type: string
+      description: database context in which the action occurred; null for server-level audits
+      ecs: null
+      status: unmapped
+      custom: sqlserver.audit.database_name
+      notes: >-
+        ECS 9.4 has no database namespace, so the database context stays
+        custom; this is the primary scoping field for CSOC queries against
+        this dataset
+    - vendor: schema_name
+      type: string
+      description: schema context in which the action occurred; null for audits outside a schema
+      ecs: null
+      status: unmapped
+      custom: sqlserver.audit.schema_name
+    - vendor: object_name
+      type: string
+      description: >-
+        name of the entity the audit occurred on — server object, database,
+        database object or schema object
+      ecs: null
+      status: unmapped
+      custom: sqlserver.audit.object_name
+      notes: >
+        no ECS field models a database object; deliberately not mapped to
+        file.name or registry-style fields, which would misrepresent a table
+        or stored procedure as a filesystem artifact
+    - vendor: statement
+      type: string
+      description: >-
+        the Transact-SQL statement associated with the action, where one
+        exists (nvarchar(4000))
+      ecs: null
+      status: unmapped
+      custom: sqlserver.audit.statement
+      notes: >
+        unbounded free text truncated by the engine at 4000 characters; it can
+        contain cleartext credentials from CREATE/ALTER LOGIN and
+        linked-server statements as well as parameterized values, so it needs
+        redaction before forwarding and an explicit text (not keyword) mapping
+        in the index template
+    - vendor: client_ip
+      type: string
+      description: >-
+        source IP of the client application that caused the audit event
+        (nvarchar(128), SQL Server 2017 and later)
+      ecs: source.ip
+      status: partial
+      transform: >
+        declared nvarchar, not an IP type, and legitimately carries
+        non-address literals such as "<local machine>" and "<named pipe>";
+        these must be routed to a text field rather than coerced, or the
+        ingest pipeline drops the whole document on an ip parse failure
+    - vendor: application_name
+      type: string
+      description: >-
+        name of the client application that executed the statement causing the
+        audit event (SQL Server 2017 and later)
+      ecs: null
+      status: unmapped
+      custom: sqlserver.audit.application_name
+      notes: >
+        client-declared connection-string attribute (e.g. "Microsoft SQL
+        Server Management Studio", ".Net SqlClient Data Provider"), freely
+        spoofable and not an observed process, so it is deliberately not
+        mapped to process.name despite being a high-value triage pivot
+    - vendor: host_name
+      type: string
+      description: host name of the client machine that opened the connection
+      ecs: source.address
+      status: mapped
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Keep the core worker group a pass-through for this route and let the
+          integration's ingest pipeline be the parser; audit records are
+          forensically load-bearing, so carry _raw end-to-end rather than
+          trimming it. The one piece of real low-side work is redaction: the
+          statement column carries verbatim T-SQL, so mask credential-bearing
+          patterns (CREATE/ALTER LOGIN ... WITH PASSWORD, OPENROWSET
+          connection strings, sp_addlinkedsrvlogin) and cap statement length
+          with an explicit truncation flag before the record leaves the
+          enclave. Run Persistent Queue backpressure on the Elastic
+          destination and do host→site / instance→owner enrichment here where
+          it is cheaper than an enrich processor.
+        elastic: >
+          Parse with the microsoft_sqlserver integration's audit pipeline and
+          add a logs-microsoft_sqlserver.audit@custom pipeline that resolves
+          the two opaque short codes through enrich policies built from a
+          sys.dm_audit_actions and class-type export — action_id into a
+          readable event.action, class_type into the audited object class —
+          because neither is legible to an analyst as shipped. In the same
+          pipeline split server_instance_name on the backslash into host.name
+          plus service.name, reject non-address literals such as "<local
+          machine>" and "<named pipe>" before client_ip is coerced to
+          source.ip, and settle one consistent direction for the
+          server_principal_name / session_server_principal_name pair under
+          EXECUTE AS context switches. Add explicit keyword index-template
+          mappings for the sqlserver.audit.* custom fields the map carries
+          (class_type, session_id, database_name, schema_name, object_name,
+          database_principal_name, application_name) and map statement as text
+          so it stays searchable without blowing up the keyword field limit.
+        relay: >
+          Low-side instances cross the guard with the thin envelope (_dataId,
+          @timestamp, host, _raw) as NDJSON — UTF-8, LF-terminated,
+          compression disabled, nesting depth ≤2 — and keep the integration
+          pipeline as the parser on the high side. The content-filter friction
+          to settle with the guard owner is the statement column: unbounded
+          nvarchar(4000) free-text T-SQL that can carry non-ASCII identifiers,
+          embedded literals and kilobyte-scale values, plus
+          additional_information carrying escaped XML; both should be
+          length-capped and allowlisted low-side so a custom NDJSON filter can
+          stay simple. The feed is Windows-event rather than CEF, so nothing
+          CEF-shaped crosses; with no return channel, detect silent drops by
+          reconciling low-side and high-side counts per (dataset, hour).
+      direct:
+        parse_location: high
+        cribl: >
+          Keep the core worker group a pass-through for this route and let the
+          integration's ingest pipeline be the parser; audit records are
+          forensically load-bearing, so carry _raw end-to-end rather than
+          trimming it. The one piece of real work at the collecting edge
+          worker group is redaction: the statement column carries verbatim
+          T-SQL, so mask credential-bearing patterns (CREATE/ALTER LOGIN ...
+          WITH PASSWORD, OPENROWSET connection strings, sp_addlinkedsrvlogin)
+          and cap statement length with an explicit truncation flag before the
+          record is forwarded. Run Persistent Queue backpressure on the
+          Elastic destination and do host→site / instance→owner enrichment
+          here where it is cheaper than an enrich processor.
+        elastic: >
+          Parse with the microsoft_sqlserver integration's audit pipeline and
+          add a logs-microsoft_sqlserver.audit@custom pipeline that resolves
+          the two opaque short codes through enrich policies built from a
+          sys.dm_audit_actions and class-type export — action_id into a
+          readable event.action, class_type into the audited object class —
+          because neither is legible to an analyst as shipped. In the same
+          pipeline split server_instance_name on the backslash into host.name
+          plus service.name, reject non-address literals such as "<local
+          machine>" and "<named pipe>" before client_ip is coerced to
+          source.ip, and settle one consistent direction for the
+          server_principal_name / session_server_principal_name pair under
+          EXECUTE AS context switches. Add explicit keyword index-template
+          mappings for the sqlserver.audit.* custom fields the map carries
+          (class_type, session_id, database_name, schema_name, object_name,
+          database_principal_name, application_name) and map statement as text
+          so it stays searchable without blowing up the keyword field limit.
+  - format: jdbc-sql
+    enable: >
+      Point the same audit specifications at a file audit instead of the
+      Security channel: CREATE SERVER AUDIT <name> TO FILE (FILEPATH =
+      'D:\SQLAudit\', MAXSIZE = 256 MB, MAX_ROLLOVER_FILES = 20), then the
+      matching CREATE SERVER AUDIT SPECIFICATION / CREATE DATABASE AUDIT
+      SPECIFICATION for the same action groups and ALTER SERVER AUDIT <name>
+      WITH (STATE = ON). SQL Server writes a rolling set of binary .sqlaudit
+      files, which you read with SELECT * FROM sys.fn_get_audit_file(
+      'D:\SQLAudit\*.sqlaudit', DEFAULT, DEFAULT). Because the reader is a
+      table-valued function, collection is a scheduled T-SQL pull, paginated
+      across restarts with the function's initial_file_name +
+      audit_record_offset cursor (SQL Server 2022 adds
+      sys.fn_get_audit_file_v2 with native time-range filtering for the same
+      purpose). This is a distinct audit object, not a switch on the
+      windows-event feed: fn_get_audit_file cannot read an audit created TO
+      SECURITY_LOG or TO APPLICATION_LOG. Reading requires VIEW SERVER
+      SECURITY AUDIT on SQL Server 2022 (16.x) and later, or CONTROL SERVER on
+      2019 (15.x) and earlier.
+    references:
+    - >-
+      https://learn.microsoft.com/en-us/sql/relational-databases/system-functions/sys-fn-get-audit-file-transact-sql
+    - >-
+      https://learn.microsoft.com/en-us/sql/t-sql/statements/create-server-audit-transact-sql
+    - >-
+      https://learn.microsoft.com/en-us/sql/relational-databases/security/auditing/write-sql-server-audit-events-to-the-security-log
+    parsing:
+      mechanism: elastic-ingest-pipeline
+      artifact: >-
+        custom logs-microsoft_sqlserver.audit ingest pipeline
+        (fn_get_audit_file result-set branch)
+      notes: >
+        No stock integration reads the binary audit file - the Elastic
+        microsoft_sqlserver integration's audit data stream is winlog-only,
+        bound to the Windows event channel. This target is collected as a SQL
+        result set (a Logstash jdbc input, an Elastic Agent sql input, or a
+        scheduled T-SQL job feeding Cribl), so the columns arrive already
+        typed and split under their native names and none of the KEY:value
+        envelope grok the 33205 message needs applies. What does still apply
+        is the two code resolutions the winlog @custom pipeline also carries -
+        action_id through a sys.dm_audit_actions export into a readable
+        event.action, and class_type through a class-type lookup - because
+        those short codes are opaque in every rendering. This branch
+        additionally exposes the richer columns the Security-channel render
+        drops (permission_bitmask, is_column_permission, object_id, the
+        principal *_id columns, additional_information and the sp_audit_write
+        user_defined_* columns), which the pipeline maps as custom fields. SQL
+        Server 2022 and 2025 add four further columns beyond the set tabled
+        here - session_context, client_tls_version, client_tls_version_name
+        and database_transaction_id - which a pipeline on those versions
+        carries as additional custom fields.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          The DB-side collector (Logstash jdbc / Elastic Agent sql input /
+          scheduled T-SQL job) runs in the low enclave beside the instance;
+          keep the core worker group a pass-through and let the ingest
+          pipeline be the parser, exactly as the windows-event feed does. The
+          real low-side work is redaction, and it is wider here than on the
+          33205 feed: mask credential-bearing patterns in statement
+          (CREATE/ALTER LOGIN ... WITH PASSWORD, OPENROWSET connection
+          strings, sp_addlinkedsrvlogin) and cap its length, and give the same
+          treatment to additional_information (escaped XML tsql_stack) and
+          user_defined_information (free text an application hands to
+          sp_audit_write), neither of which the Security-channel render even
+          carries. Carry file_name and audit_file_offset forward as the
+          collection cursor and dedupe key so a re-pull after a worker restart
+          cannot double-count, and run Persistent Queue backpressure on the
+          Elastic destination, never Block.
+        elastic: >
+          Land in a custom logs-microsoft_sqlserver.audit ingest pipeline. The
+          fields arrive typed and split so the envelope grok is unnecessary,
+          but the two opaque short codes stay: resolve action_id into
+          event.action through a sys.dm_audit_actions enrich policy and
+          class_type into the audited object class through a class-type
+          enrich, keeping the raw codes alongside. Convert
+          server_principal_sid and target_server_principal_sid from the
+          varbinary form to the canonical S-1-5-... SID before writing user.id
+          / user.target.id so they join Windows and Active Directory events,
+          split server_instance_name on the backslash into host.name plus
+          service.name, reject the non-address literals "<local machine>" and
+          "<named pipe>" before client_ip is coerced to source.ip, and settle
+          one direction for the server_principal_name /
+          session_server_principal_name pair under EXECUTE AS context
+          switches. Add keyword index-template mappings for the
+          sqlserver.audit.* custom fields this branch carries beyond the 33205
+          set - permission_bitmask, is_column_permission, object_id,
+          transaction_id, sequence_group_id and the principal *_id columns -
+          and map statement and additional_information as text. Because
+          permission_bitmask and is_column_permission are present here,
+          GRANT/DENY/REVOKE actions become analyzable at the column level
+          where the Security-channel feed leaves them opaque.
+        relay: >
+          Low-side instances cross the guard with the thin envelope (_dataId,
+          @timestamp, host, _raw) as NDJSON - UTF-8, LF-terminated,
+          compression disabled, nesting depth <=2 - and keep the ingest
+          pipeline as the parser high-side. The pull is structured, so nothing
+          CEF- or Windows-event-shaped crosses. The content-filter friction to
+          settle with the guard owner is the free-text triplet statement
+          (unbounded nvarchar(4000) T-SQL with non-ASCII identifiers and
+          embedded literals), additional_information (escaped XML) and
+          user_defined_information; all three should be length-capped and
+          allowlisted low-side so a custom NDJSON filter stays simple. Unlike
+          the at-most-once 33205 feed this pull carries a replayable
+          per-record cursor (file_name + audit_file_offset), so with no return
+          channel the crossing can be run at-least-once and reconciled exactly
+          per (dataset, hour) with dedupe on the offset key high-side.
+      direct:
+        parse_location: high
+        cribl: >
+          High-side instances run the result-set pull plus the near
+          pass-through core group and land direct to Elastic (cribl -> elastic
+          direct) on Persistent Queue backpressure. The operational decision
+          is FILE versus SECURITY_LOG: the file target is more
+          tamper-resistant than the Security channel, carries the richer
+          column set and a replayable offset cursor, and cannot be cycled out
+          from under the collector under high load the way the Security or
+          Application log can - at the cost of a scheduled pull and the VIEW
+          SERVER SECURITY AUDIT / CONTROL SERVER read permission. Standardize
+          the pipeline on the columnar input so either target lands in one
+          data stream.
+        elastic: >
+          Land in a custom logs-microsoft_sqlserver.audit ingest pipeline. The
+          fields arrive typed and split so the envelope grok is unnecessary,
+          but the two opaque short codes stay: resolve action_id into
+          event.action through a sys.dm_audit_actions enrich policy and
+          class_type into the audited object class through a class-type
+          enrich, keeping the raw codes alongside. Convert
+          server_principal_sid and target_server_principal_sid from the
+          varbinary form to the canonical S-1-5-... SID before writing user.id
+          / user.target.id so they join Windows and Active Directory events,
+          split server_instance_name on the backslash into host.name plus
+          service.name, reject the non-address literals "<local machine>" and
+          "<named pipe>" before client_ip is coerced to source.ip, and settle
+          one direction for the server_principal_name /
+          session_server_principal_name pair under EXECUTE AS context
+          switches. Add keyword index-template mappings for the
+          sqlserver.audit.* custom fields this branch carries beyond the 33205
+          set - permission_bitmask, is_column_permission, object_id,
+          transaction_id, sequence_group_id and the principal *_id columns -
+          and map statement and additional_information as text; because
+          permission_bitmask and is_column_permission are present here,
+          GRANT/DENY/REVOKE actions become analyzable at the column level
+          where the Security-channel feed leaves them opaque. Tag the input so
+          file-sourced records (which carry the extra columns and the offset
+          cursor) stay separable from Security-channel records if an estate
+          runs both during a migration.
+    fields:
+    - vendor: event_time
+      type: timestamp
+      description: UTC date and time when the auditable action fired (datetime2)
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: sequence_number
+      type: integer
+      description: >-
+        sequence of records within a single audit record too large to fit the
+        audit write buffer
+      ecs: event.sequence
+      status: mapped
+      notes: >-
+        an oversized record (usually a long statement) is emitted as several
+        rows sharing an event_time; sequence_number > 1 is a continuation, not
+        a distinct action
+    - vendor: action_id
+      type: string
+      description: >-
+        four-character code identifying the audited action, e.g. LGIS/LGIF for
+        login success and failure or SL/IN/UP/DL/EX for the DML actions
+        (varchar(4))
+      ecs: event.action
+      status: partial
+      transform: >-
+        not human-readable on its own; resolve against a sys.dm_audit_actions
+        export (action_id -> name) to produce a readable event.action, keeping
+        the raw code alongside
+    - vendor: succeeded
+      type: boolean
+      description: >-
+        bit flag indicating whether the action that triggered the event
+        succeeded (1) or failed (0)
+      ecs: event.outcome
+      status: mapped
+      transform: >-
+        bit 1/0 to success/failure; for everything except login events this
+        reports only whether the permission check passed, not whether the
+        statement itself succeeded
+    - vendor: permission_bitmask
+      type: string
+      description: >-
+        bitmask of the permissions granted, denied or revoked by the action,
+        on the actions that carry one (varbinary(16))
+      ecs: null
+      status: unmapped
+      custom: sqlserver.audit.permission_bitmask
+      notes: >-
+        dropped from the Security-channel render; present here, so with
+        class_type and is_column_permission it makes GRANT/DENY/REVOKE actions
+        analyzable rather than opaque
+    - vendor: is_column_permission
+      type: boolean
+      description: >-
+        flag indicating the permission_bitmask is a column-level permission; 0
+        when permission_bitmask is 0 (bit)
+      ecs: null
+      status: unmapped
+      custom: sqlserver.audit.is_column_permission
+    - vendor: session_id
+      type: integer
+      description: ID of the SQL Server session (SPID) on which the event occurred (smallint)
+      ecs: null
+      status: unmapped
+      custom: sqlserver.audit.session_id
+      notes: >-
+        ECS has no session identifier field; kept custom so per-session
+        activity can be reconstructed
+    - vendor: server_principal_id
+      type: integer
+      description: ID of the login context the action was performed in (int)
+      ecs: null
+      status: unmapped
+      custom: sqlserver.audit.server_principal_id
+      notes: >-
+        numeric principal id absent from the 33205 render; correlates to
+        sys.server_principals, distinct from the resolved
+        server_principal_name in user.name
+    - vendor: database_principal_id
+      type: integer
+      description: >-
+        ID of the database user context the action was performed in; 0 for
+        server-level operations (int)
+      ecs: null
+      status: unmapped
+      custom: sqlserver.audit.database_principal_id
+    - vendor: target_server_principal_id
+      type: integer
+      description: >-
+        server principal the GRANT/DENY/REVOKE operation was performed on; 0
+        when not applicable (int)
+      ecs: null
+      status: unmapped
+      custom: sqlserver.audit.target_server_principal_id
+    - vendor: target_database_principal_id
+      type: integer
+      description: >-
+        database principal the GRANT/DENY/REVOKE operation was performed on; 0
+        when not applicable (int)
+      ecs: null
+      status: unmapped
+      custom: sqlserver.audit.target_database_principal_id
+    - vendor: object_id
+      type: integer
+      description: >-
+        ID of the entity the audit occurred on - server object, database,
+        database object or schema object; 0 for the server itself or a
+        non-object-level audit (int)
+      ecs: null
+      status: unmapped
+      custom: sqlserver.audit.object_id
+      notes: >-
+        the numeric join key into sys.objects that the Security-channel render
+        omits, letting object_name be corroborated against the catalog rather
+        than trusted as text
+    - vendor: class_type
+      type: string
+      description: >-
+        two-character code for the type of auditable entity the audit occurred
+        on (varchar(2))
+      ecs: null
+      status: unmapped
+      custom: sqlserver.audit.class_type
+      notes: >-
+        opaque object-class code (server, database, schema object, login,
+        ...); needs a lookup table to become legible and has no ECS equivalent
+    - vendor: session_server_principal_name
+      type: string
+      description: >-
+        server principal for the session - the original login connected to the
+        instance, retained across explicit or implicit context switches
+        (sysname)
+      ecs: user.effective.name
+      status: partial
+      notes: >-
+        ECS treats user.effective as the assumed identity while SQL Server
+        puts the assumed login in server_principal_name and the original login
+        here, so under EXECUTE AS the two are semantically reversed; pick one
+        direction consistently
+    - vendor: server_principal_name
+      type: string
+      description: current login the audited action was performed under (sysname)
+      ecs: user.name
+      status: mapped
+    - vendor: server_principal_sid
+      type: string
+      description: security identifier (SID) of the current login (varbinary)
+      ecs: user.id
+      status: partial
+      transform: >-
+        rendered as varbinary; convert to the canonical S-1-5-... SID form
+        before writing user.id so it joins against Windows and Active
+        Directory events
+    - vendor: database_principal_name
+      type: string
+      description: current database user context the action was performed in (sysname)
+      ecs: null
+      status: unmapped
+      custom: sqlserver.audit.database_principal_name
+      notes: >-
+        the database-scoped user, distinct from the server login in user.name;
+        no ECS field distinguishes the two
+    - vendor: target_server_principal_name
+      type: string
+      description: >-
+        target login of the action, populated for GRANT/DENY/REVOKE and
+        principal-management actions (sysname)
+      ecs: user.target.name
+      status: mapped
+    - vendor: target_server_principal_sid
+      type: string
+      description: SID of the target login; null when not applicable (varbinary)
+      ecs: user.target.id
+      status: partial
+      transform: >-
+        convert the varbinary to the canonical S-1-5-... SID form before
+        writing user.target.id, the same treatment server_principal_sid needs
+        for user.id
+    - vendor: target_database_principal_name
+      type: string
+      description: target database user of the action; null when not applicable (sysname)
+      ecs: null
+      status: unmapped
+      custom: sqlserver.audit.target_database_principal_name
+    - vendor: server_instance_name
+      type: string
+      description: >-
+        name of the server instance where the audit occurred, in the standard
+        server\instance format (sysname)
+      ecs: service.name
+      status: partial
+      notes: >-
+        single value carrying both host and named instance; split on the
+        backslash so the host portion populates host.name and only the
+        instance name lands in service.name
+    - vendor: database_name
+      type: string
+      description: >-
+        database context in which the action occurred; null for server-level
+        audits (sysname)
+      ecs: null
+      status: unmapped
+      custom: sqlserver.audit.database_name
+      notes: >-
+        ECS 9.4 has no database namespace, so this stays custom; it is the
+        primary scoping field for CSOC queries against this dataset
+    - vendor: schema_name
+      type: string
+      description: >-
+        schema context in which the action occurred; null for audits outside a
+        schema (sysname)
+      ecs: null
+      status: unmapped
+      custom: sqlserver.audit.schema_name
+    - vendor: object_name
+      type: string
+      description: >-
+        name of the entity the audit occurred on - server object, database,
+        database object or schema object (sysname)
+      ecs: null
+      status: unmapped
+      custom: sqlserver.audit.object_name
+      notes: >-
+        no ECS field models a database object; deliberately not mapped to
+        file.name or registry fields, which would misrepresent a table or
+        stored procedure as a filesystem artifact
+    - vendor: statement
+      type: string
+      description: >-
+        the Transact-SQL statement associated with the action, where one
+        exists (nvarchar(4000))
+      ecs: null
+      status: unmapped
+      custom: sqlserver.audit.statement
+      notes: >-
+        unbounded free text the engine truncates at 4000 characters; can
+        contain cleartext credentials from CREATE/ALTER LOGIN and
+        linked-server statements, so it needs redaction before forwarding and
+        a text (not keyword) index-template mapping
+    - vendor: additional_information
+      type: string
+      description: >-
+        event-specific detail returned as XML - one level of T-SQL stack
+        (nest_level, database/schema/object name) for actions that carry a
+        stack; null when the event reports none (nvarchar(4000))
+      ecs: null
+      status: unmapped
+      custom: sqlserver.audit.additional_information
+      notes: >-
+        escaped XML dropped from the Security-channel render; carries
+        free-text module names, so it inherits the same low-side length-cap
+        and charset restriction as statement
+    - vendor: file_name
+      type: string
+      description: path and name of the .sqlaudit file the record was read from (varchar(260))
+      ecs: log.file.path
+      status: mapped
+      notes: >-
+        absent from every Windows-event rendering; with audit_file_offset it
+        is the collection cursor and dedupe key for the pull
+    - vendor: audit_file_offset
+      type: integer
+      description: buffer offset within file_name that contains the audit record (bigint)
+      ecs: null
+      status: unmapped
+      custom: sqlserver.audit.audit_file_offset
+      notes: >-
+        the replayable per-record cursor unique to this target; pass into the
+        function's audit_record_offset argument to resume a pull, and dedupe
+        on (file_name, audit_file_offset) high-side
+    - vendor: user_defined_event_id
+      type: integer
+      description: >-
+        user-defined event ID passed to sp_audit_write; null for system
+        events, non-zero for a user-defined event (smallint)
+      ecs: null
+      status: unmapped
+      custom: sqlserver.audit.user_defined_event_id
+    - vendor: user_defined_information
+      type: string
+      description: >-
+        free text an application records into the audit log via sp_audit_write
+        (nvarchar(4000))
+      ecs: null
+      status: unmapped
+      custom: sqlserver.audit.user_defined_information
+      notes: >-
+        application-supplied free text with no counterpart on the 33205 feed;
+        inherits the same redaction and length-cap requirement as statement
+    - vendor: audit_schema_version
+      type: integer
+      description: audit schema version, always 1 (int)
+      ecs: null
+      status: unmapped
+      custom: sqlserver.audit.audit_schema_version
+      notes: >-
+        constant provenance marker of no analytic value on its own; retained
+        only so the column inventory is complete
+    - vendor: sequence_group_id
+      type: string
+      description: >-
+        unique identifier grouping the rows of one oversized audit record
+        (varbinary, SQL Server 2016 and later)
+      ecs: null
+      status: unmapped
+      custom: sqlserver.audit.sequence_group_id
+      notes: pairs with sequence_number to reassemble a record split across the write buffer
+    - vendor: transaction_id
+      type: integer
+      description: >-
+        identifier grouping multiple audit events emitted within one
+        transaction (bigint, SQL Server 2016 and later)
+      ecs: null
+      status: unmapped
+      custom: sqlserver.audit.transaction_id
+      notes: >-
+        correlates every audited action of a single transaction; absent from
+        the Security-channel render
+    - vendor: client_ip
+      type: string
+      description: >-
+        source IP of the client application that caused the audit event
+        (nvarchar(128), SQL Server 2017 and later)
+      ecs: source.ip
+      status: partial
+      transform: >-
+        declared nvarchar, not an IP type, and legitimately carries the
+        literals "<local machine>" and "<named pipe>"; route those to a text
+        field rather than coercing them, or the pipeline drops the document on
+        an ip parse failure
+    - vendor: application_name
+      type: string
+      description: >-
+        name of the client application that executed the statement causing the
+        audit event (nvarchar(128), SQL Server 2017 and later)
+      ecs: null
+      status: unmapped
+      custom: sqlserver.audit.application_name
+      notes: >-
+        client-declared connection-string attribute, freely spoofable and not
+        an observed process, so deliberately not mapped to process.name
+        despite being a high-value triage pivot
+    - vendor: host_name
+      type: string
+      description: host name of the client machine that opened the connection (nvarchar(128))
+      ecs: source.address
+      status: mapped
+- id: errorlog-logon
+  name: ERRORLOG logon events
+  description: >
+    Login success and failure messages written by the Database Engine to the
+    SQL Server ERRORLOG flat file (and its sp_readerrorlog view), collected by
+    tailing the file rather than through Windows eventing. Failed logins
+    appear as a paired ERRORLOG entry — an "Error: 18456, Severity: 14, State:
+    <n>." line from the Logon source followed by "Login failed for user
+    '<user>'. Reason: <text> [CLIENT: <address>]" — where the numeric state is
+    the only field that distinguishes a bad password from a disabled account
+    or a missing login, because the message returned to the client
+    deliberately hides it. Successful logins are logged as 18453 (Windows
+    authentication) and 18454 (SQL Server authentication) only when login
+    auditing is set to log successful logins. This dataset is the fallback
+    where SQL Server Audit specifications are not deployed, and the
+    corroborating record where they are.
+  event_categories:
+  - authentication
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Flat-file tail (Elastic Agent logfile input) on the same path as the
+        audit dataset above.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-microsoft_sqlserver.log
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Flat-file tail (Elastic Agent logfile input) on the same path as the
+        audit dataset above.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-microsoft_sqlserver.log
+  formats:
+  - format: other
+    parsing:
+      mechanism: elastic-integration
+      artifact: Microsoft SQL Server integration (log data stream)
+      notes: >
+        The stock log data stream extracts only the timestamp, the origin
+        column and the message body; the 18456 error/severity/state triple and
+        the user, reason and CLIENT components inside the message text are not
+        broken out, so an @custom pipeline is required for this to be
+        alertable.
+    fields:
+    - vendor: LogDate
+      type: timestamp
+      description: 'date and time the ERRORLOG line was written, in the server''s local time zone'
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: ProcessInfo
+      type: string
+      description: >-
+        originating component column of the ERRORLOG line — Server, Logon, or
+        the session id such as spid51
+      ecs: null
+      status: unmapped
+      custom: microsoft_sqlserver.log.origin
+      notes: >-
+        the Elastic integration already lands this as
+        microsoft_sqlserver.log.origin; Logon is the value that scopes this
+        dataset
+    - vendor: Text
+      type: string
+      description: the rendered ERRORLOG message body
+      ecs: message
+      status: mapped
+    - vendor: Error
+      type: integer
+      description: >-
+        Database Engine error number on a Logon-source line, e.g. 18456
+        (LOGON_FAILED), 18453, 18454
+      ecs: error.code
+      status: mapped
+      transform: >-
+        numeric in the source text; ECS error.code is a keyword, so cast to
+        string rather than leaving it long
+    - vendor: Severity
+      type: integer
+      description: SQL Server severity class of the error, 14 for the logon-failure class
+      ecs: event.severity
+      status: mapped
+      notes: >
+        SQL Server severity classes are not comparable to other sources'
+        scales and sit at a constant 14 for logon errors, so this carries
+        almost no triage signal on this dataset — the State value does
+    - vendor: State
+      type: integer
+      description: >-
+        error state code that identifies the actual login failure reason, only
+        ever written to the ERRORLOG and never returned to the client
+      ecs: null
+      status: partial
+      custom: microsoft_sqlserver.log.login_failure_state
+      notes: >
+        documented codes include 2/5 user id not valid, 6 Windows login used
+        with SQL authentication, 7 login disabled and password incorrect, 8
+        password incorrect, 11/12 login valid but server access failed, 18
+        password must be changed, 38/46 database not found, 58 SQL
+        authentication against a Windows-only instance, 62 SID mismatch,
+        122-124 empty user name or password, 126 database does not exist;
+        needs a lookup table before it is usable in an alert
+    - vendor: 'Login failed for user ''<user>'''
+      type: string
+      description: >-
+        account name extracted from the login failure message, either a SQL
+        login or DOMAIN\user
+      ecs: user.name
+      status: mapped
+    - vendor: 'Reason: <text>'
+      type: string
+      description: human-readable failure explanation appended to the login failure message
+      ecs: event.reason
+      status: mapped
+      notes: >
+        free text such as "Password did not match that for the login
+        provided." or "Could not find a login matching the name provided.";
+        present only on some failure states, so it cannot replace the State
+        lookup
+    - vendor: '[CLIENT: <address>]'
+      type: string
+      description: >-
+        address of the client that attempted the login, appended in brackets
+        to the message
+      ecs: source.ip
+      status: partial
+      transform: >
+        usually an IPv4/IPv6 literal but documented to also carry "<local
+        machine>", "<named pipe>" or an empty value on token-validation
+        failures; route the non-address forms to a text field instead of
+        coercing them to ip
+    - vendor: Login succeeded / Login failed message prefix
+      type: enum
+      description: whether the ERRORLOG line records a successful or failed login attempt
+      ecs: event.outcome
+      status: mapped
+      transform: >-
+        derive from the error number rather than the text — 18453/18454/18455
+        to success, 18456 to failure — so localized or reworded message text
+        cannot break the mapping
+    - vendor: Connection made using <mode> authentication
+      type: enum
+      description: >-
+        authentication mode clause on a successful login message,
+        distinguishing Windows from SQL Server authentication
+      ecs: null
+      status: unmapped
+      custom: microsoft_sqlserver.log.authentication_mode
+      notes: >-
+        implied by the message number (18453 Windows, 18454 SQL Server) as
+        well as the text; no ECS field models the authentication mechanism for
+        a database login
+    - vendor: 'Failed to open the explicitly specified database ''<db>'''
+      type: string
+      description: >-
+        database name from the failure reason when the login is valid but its
+        requested or default database is unavailable (states 38/46)
+      ecs: null
+      status: unmapped
+      custom: microsoft_sqlserver.log.database_name
+      notes: >-
+        kept under the same custom namespace as the audit dataset's database
+        context so the two datasets can be pivoted together; ECS has no
+        database namespace
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Pass ERRORLOG lines through the core worker group unparsed with
+          Persistent Queue backpressure, but do the two things that are
+          genuinely cheaper at the source: join wrapped continuation lines
+          (stack dumps and multi-line startup banners) into a single event so
+          the high-side grok sees whole messages, and keep the Error/Logon
+          origin lines while rate-limiting the high-volume, low-value Server
+          origin chatter (backup completion, checkpoint, log rotation). This
+          is the lower-forensic-value of the two datasets, so it is where _raw
+          gets dropped first once the parser is proven.
+        elastic: >
+          Layer a logs-microsoft_sqlserver.log@custom pipeline on the
+          integration's log data stream that groks the "Error: <n>, Severity:
+          <n>, State: <n>." line and stitches it to the following "Login
+          failed for user …" line by origin and timestamp, since the error
+          number and the user name arrive on separate records. Drive
+          event.outcome off the message number (18453/18454/18455 success,
+          18456 failure) rather than any text match, and resolve the login
+          failure state through an enrich lookup into a readable reason — 2/5
+          unknown user, 7 disabled login with bad password, 8 bad password,
+          11/12 valid login but server access failed, 18 password expired,
+          38/46 database not found, 58 SQL auth against a Windows-only
+          instance — because that code is the entire triage signal for a
+          brute-force versus misconfiguration call. Map
+          microsoft_sqlserver.log.origin and the custom state and
+          authentication-mode fields as keyword in the index template, and
+          guard the CLIENT address extraction against the "<local machine>"
+          and "<named pipe>" literals before writing source.ip.
+        relay: >
+          On the low-side instances the thin envelope (_dataId, @timestamp,
+          host, _raw) crosses as NDJSON with the grok work staying high-side,
+          since the messages are short and bounded. The content-filter
+          friction here is narrower than the audit dataset but real: the user
+          name inside "Login failed for user '<user>'" is attacker-controlled
+          free text on exactly the records a SOC cares about, so cap and
+          normalize it low-side rather than letting a custom filter reject the
+          record and silently lose the failure evidence.
+      direct:
+        parse_location: high
+        cribl: >
+          Pass ERRORLOG lines through the core worker group unparsed with
+          Persistent Queue backpressure, but do the two things that are
+          genuinely cheaper at the source: join wrapped continuation lines
+          (stack dumps and multi-line startup banners) into a single event so
+          the high-side grok sees whole messages, and keep the Error/Logon
+          origin lines while rate-limiting the high-volume, low-value Server
+          origin chatter (backup completion, checkpoint, log rotation). This
+          is the lower-forensic-value of the two datasets, so it is where _raw
+          gets dropped first once the parser is proven.
+        elastic: >
+          Layer a logs-microsoft_sqlserver.log@custom pipeline on the
+          integration's log data stream that groks the "Error: <n>, Severity:
+          <n>, State: <n>." line and stitches it to the following "Login
+          failed for user …" line by origin and timestamp, since the error
+          number and the user name arrive on separate records. Drive
+          event.outcome off the message number (18453/18454/18455 success,
+          18456 failure) rather than any text match, and resolve the login
+          failure state through an enrich lookup into a readable reason — 2/5
+          unknown user, 7 disabled login with bad password, 8 bad password,
+          11/12 valid login but server access failed, 18 password expired,
+          38/46 database not found, 58 SQL auth against a Windows-only
+          instance — because that code is the entire triage signal for a
+          brute-force versus misconfiguration call. Map
+          microsoft_sqlserver.log.origin and the custom state and
+          authentication-mode fields as keyword in the index template, and
+          guard the CLIENT address extraction against the "<local machine>"
+          and "<named pipe>" literals before writing source.ip.
+  - format: windows-event
+    enable: >
+      No change to the Database Engine beyond the login-auditing level: with
+      login auditing set to Failed logins only, Successful logins only, or
+      Both (Server Properties > Security > Login auditing, or the LoginMode /
+      AuditLevel the installer writes), SQL Server records the same login
+      events it writes to the ERRORLOG file into the Windows Application event
+      log as well - failures as Event ID 18456 (symbolic name LOGON_FAILED)
+      and successes as 18453 (Windows authentication) / 18454 (SQL Server
+      authentication) / 18455, under the source MSSQLSERVER for a default
+      instance or MSSQL$<instance> for a named one. Collect them with a
+      Windows event log input (Elastic Agent or Winlogbeat winlog input, or a
+      Cribl Windows Event source) filtered to that provider and those event
+      IDs, instead of tailing the ERRORLOG file. The rendered message is the
+      same "Login failed for user '<user>'. Reason: <text> [CLIENT:
+      <address>]" body the file carries, with the Error/Severity/State triple
+      in the text; the Windows envelope adds the event id, the source, the
+      computer name and a structured TimeCreated.
+    references:
+    - >-
+      https://learn.microsoft.com/en-us/sql/relational-databases/errors-events/mssqlserver-18456-database-engine-error
+    - >-
+      https://learn.microsoft.com/en-us/sql/database-engine/configure-windows/server-properties-security-page
+    - >-
+      https://learn.microsoft.com/en-us/sql/relational-databases/security/auditing/write-sql-server-audit-events-to-the-security-log
+    parsing:
+      mechanism: elastic-ingest-pipeline
+      artifact: >-
+        custom logs-microsoft_sqlserver.log ingest pipeline (Windows
+        Application-log branch)
+      notes: >
+        A Windows event collector parses the envelope - Provider, EventID,
+        Level, TimeCreated, Computer - but no stock integration breaks the
+        18456 State code or the user/reason/CLIENT components out of the
+        rendered message, exactly the gap the ERRORLOG log data stream has. So
+        the same logs-microsoft_sqlserver.log@custom grok work applies, on a
+        simpler front end: because each login event is one discrete Windows
+        event, the paired "Error: 18456, Severity: 14, State: n." and "Login
+        failed for user ..." lines that arrive as two records on the file tail
+        are already a single rendered message here, removing the timestamp-
+        plus-origin line-stitching the flat file needs.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Collect off the Windows Application log with a winlog input filtered
+          to the MSSQLSERVER / MSSQL$<instance> provider and event IDs
+          18453/18454/18455/18456, in the same enclave as the instance. Take
+          the two signals the flat file lacks straight from the envelope: pin
+          @timestamp from TimeCreated (a structured, timezone-qualified write
+          time rather than the ERRORLOG's local-time header) and set host.name
+          from Computer. The multi-line reassembly and the Server-origin
+          rate-limiting the ERRORLOG tail needs both fall away - each event is
+          one discrete record and the Application log carries only the SQL
+          event source, not the engine's checkpoint/backup chatter - so keep
+          _raw until the grok is proven and run Persistent Queue backpressure,
+          never Block.
+        elastic: >
+          Layer a logs-microsoft_sqlserver.log@custom pipeline that groks the
+          single rendered message for the user name, the Reason text and the
+          [CLIENT: <address>] token, and reads the State from the "Error: <n>,
+          Severity: <n>, State: <n>." clause in the same message rather than
+          from a following record. Drive event.outcome off the event id
+          (18453/18454/18455 success, 18456 failure) rather than any text
+          match, and resolve the login-failure State through an enrich lookup
+          into a readable reason - 2/5 unknown user, 6 Windows login used with
+          SQL authentication, 7 disabled login with bad password, 8 bad
+          password, 11/12 valid login but server access failed, 18 password
+          expired, 38/46 database not found, 58 SQL auth against a
+          Windows-only instance, 122-124 empty user or password, 126 database
+          does not exist. Map event.provider and the custom state and
+          authentication-mode fields as keyword, derive the authentication
+          mode from the event id (18453 Windows, 18454 SQL Server) so
+          localized message text cannot break it, and guard the CLIENT
+          extraction against the "<local machine>" and "<named pipe>" literals
+          before writing source.ip.
+        relay: >
+          Full ECS-shaped NDJSON crosses (envelope mode B) - the login
+          messages are short and bounded, and the Windows envelope is stripped
+          low-side so nothing Windows-event-shaped reaches the boundary. The
+          content-filter friction is narrower than the audit dataset but real:
+          the user name inside "Login failed for user '<user>'" is
+          attacker-controlled free text on exactly the records a SOC cares
+          about, so cap and normalize it low-side rather than letting a custom
+          filter reject the record and silently lose the failure evidence.
+          Because the envelope carries a per-record id and a structured
+          TimeCreated, per-(dataset, hour) reconciliation on this
+          at-most-once, no-return-channel path is exact rather than
+          approximate.
+      direct:
+        parse_location: high
+        cribl: >
+          High-side instances run the winlog collection and land direct to
+          Elastic (cribl -> elastic direct) on Persistent Queue backpressure.
+          The decision is Application-log winlog versus ERRORLOG tail: prefer
+          the winlog where a Windows event collector already runs, since it
+          adds host.name and a structured write time and removes the
+          multi-line reassembly and prefix-timezone guesswork - but the
+          ERRORLOG also carries Server-origin operational lines (backup,
+          checkpoint, startup) the Application log does not, so a site that
+          wants engine-health telemetry as well as login events still tails
+          the file. Standardize the pipeline on the rendered message so either
+          input lands one vocabulary.
+        elastic: >
+          Layer a logs-microsoft_sqlserver.log@custom pipeline that groks the
+          single rendered message for the user name, the Reason text and the
+          [CLIENT: <address>] token, and reads the State from the "Error: <n>,
+          Severity: <n>, State: <n>." clause in the same message rather than
+          from a following record. Drive event.outcome off the event id
+          (18453/18454/18455 success, 18456 failure) rather than any text
+          match, and resolve the login-failure State through an enrich lookup
+          into a readable reason - 2/5 unknown user, 6 Windows login used with
+          SQL authentication, 7 disabled login with bad password, 8 bad
+          password, 11/12 valid login but server access failed, 18 password
+          expired, 38/46 database not found, 58 SQL auth against a
+          Windows-only instance, 122-124 empty user or password, 126 database
+          does not exist. Map event.provider and the custom state and
+          authentication-mode fields as keyword, derive the authentication
+          mode from the event id (18453 Windows, 18454 SQL Server) so
+          localized message text cannot break it, and guard the CLIENT
+          extraction against the "<local machine>" and "<named pipe>" literals
+          before writing source.ip. Tag the input so Windows-event-sourced
+          records stay separable from file-tailed ones if a host feeds both
+          during a migration.
+    fields:
+    - vendor: EventID
+      type: integer
+      description: >-
+        Windows Application-log event id for the login event - 18456 failure,
+        18453/18454/18455 success
+      ecs: event.code
+      status: mapped
+      notes: >-
+        the discrete envelope id that replaces the ERRORLOG's inline "Error
+        <n>" text; drive event.outcome and the authentication mode off this
+        rather than the message body
+    - vendor: Provider Name
+      type: string
+      description: >-
+        Windows event source that identifies the emitting instance -
+        MSSQLSERVER for a default instance, MSSQL$<instance> for a named one
+      ecs: event.provider
+      status: mapped
+      notes: >-
+        identifies the instance, not the audited action; the named-instance
+        form also carries the instance name the flat-file tail derives from
+        its path
+    - vendor: Computer
+      type: string
+      description: hostname of the Windows database server that generated the event
+      ecs: host.name
+      status: mapped
+      notes: >-
+        server host identity the ERRORLOG payload never carries; new to this
+        container and worth mapping because the record is otherwise anonymous
+        as to which host emitted it
+    - vendor: TimeCreated
+      type: timestamp
+      description: >-
+        time the Windows Event Log wrote the login event, timezone-qualified
+        in the envelope
+      ecs: '@timestamp'
+      status: mapped
+      notes: >-
+        a structured write time, unlike the ERRORLOG's offset-less local-time
+        header, so it needs no timezone attachment; it is the log-write time,
+        effectively the event time for a login attempt
+    - vendor: Level
+      type: enum
+      description: >-
+        Windows event severity - Error for a failed login (18456), Information
+        for a successful one
+      ecs: log.level
+      status: partial
+      transform: >-
+        map the Windows level string to the ECS log.level vocabulary for the
+        log-severity field only; derive event.outcome from the event id, not
+        from this level
+    - vendor: 'Login failed for user ''<user>'' / for user ''<user>'''
+      type: string
+      description: account name extracted from the login message, either a SQL login or DOMAIN\user
+      ecs: user.name
+      status: mapped
+    - vendor: 'State (Error: <n>, Severity: <n>, State: <n>.)'
+      type: integer
+      description: >-
+        error state code inside the rendered message that identifies the
+        actual login-failure reason
+      ecs: null
+      status: partial
+      custom: microsoft_sqlserver.log.login_failure_state
+      notes: >-
+        documented codes include 2/5 invalid user id, 6 Windows login used
+        with SQL authentication, 7 disabled login and bad password, 8 bad
+        password, 11/12 server access failed, 18 password must change, 38/46
+        database not found, 58 SQL auth against a Windows-only instance,
+        122-124 empty user or password, 126 database does not exist; needs a
+        lookup table before it is usable in an alert
+    - vendor: 'Reason: <text>'
+      type: string
+      description: human-readable failure explanation appended to the login-failure message
+      ecs: event.reason
+      status: mapped
+      notes: >-
+        free text such as "Password did not match that for the login
+        provided."; present only on some states, so it cannot replace the
+        State lookup
+    - vendor: '[CLIENT: <address>]'
+      type: string
+      description: >-
+        address of the client that attempted the login, appended in brackets
+        to the message
+      ecs: source.ip
+      status: partial
+      transform: >-
+        usually an IPv4/IPv6 literal but documented to also carry "<local
+        machine>", "<named pipe>" or an empty value on token-validation
+        failures; route the non-address forms to a text field rather than
+        coercing them to ip
+    - vendor: authentication mode (event id 18453 Windows / 18454 SQL Server)
+      type: enum
+      description: >-
+        authentication mode of a successful login, distinguished by the event
+        id and the message text
+      ecs: null
+      status: unmapped
+      custom: microsoft_sqlserver.log.authentication_mode
+      notes: >-
+        implied by the message number (18453 Windows, 18454 SQL Server); no
+        ECS field models the authentication mechanism for a database login, so
+        kept under the same custom namespace as the ERRORLOG dataset
+    - vendor: Login succeeded / Login failed outcome
+      type: enum
+      description: whether the event records a successful or failed login attempt
+      ecs: event.outcome
+      status: mapped
+      transform: >-
+        derive from the event id (18453/18454/18455 to success, 18456 to
+        failure) so localized or reworded message text cannot break the
+        mapping

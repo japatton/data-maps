@@ -1,0 +1,1135 @@
+id: ibm-guardium
+name: IBM Guardium DAM
+vendor: IBM
+versions: Guardium Data Protection 11.x, 12.x
+draft: true
+references:
+- >-
+  https://community.opentext.com/cfs-file/__key/telligent-evolution-components-attachments/00-224-00-00-00-34-87-12/Guardium-CEF.pdf
+- >-
+  https://www.juniper.net/documentation/us/en/software/jsa7.5.0/jsa-dsm/topics/concept/concept-jsa-dsm-ibm-guardium.html
+- >-
+  https://documentation.securonix.com/bundle/securonix-on-prem-user-guide/page/content/active-deployment-guides/ibm-guardium-syslog-cef.htm
+- https://docs.cyderes.cloud/parser-knowledge-base/ibm_guardium/
+- https://www.ibm.com/support/pages/apar/GA17140
+- https://www.ibm.com/docs/en/gdp/11.4.0?topic=processes-exporting-audit-results
+- https://www.ibm.com/docs/en/gdp/11.4.0?topic=reports-data-mart
+datasets:
+- id: policy-violation-alerts
+  name: Policy violation real-time alert
+  description: >
+    Real-time alerts emitted by a Guardium collector when a Policy Builder
+    rule fires against observed database traffic - failed logins, SQL errors,
+    and access to sensitive objects by unauthorized or privileged users. The
+    rule action (Alert Per Match, Alert Daily, Alert Once Per Session, Alert
+    Per Time Granularity) selects the alert receiver SYSLOG, and the
+    appliance-wide Global Profile message template decides the wire format.
+    This map models the shipped CEF template; sites that select the QRadar
+    template get the same variables rendered as LEEF instead, so the low-side
+    pipeline must key on the format banner rather than assume one. Payloads
+    arrive wrapped by the Guardium sender process, e.g. a syslog line from
+    GuardiumSniffer or guard_sender carrying a quoted subject "SQLGUARD ALERT"
+    ahead of the CEF record.
+  event_categories:
+  - authentication
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Guardium collectors (and the aggregator, where alerting is
+        centralized) forward syslog over UDP/TCP straight to Cribl using the
+        CLI 'store remotelog add' facility.priority target. Guardium is
+        deployed inside the same enclave as the databases it taps, so this
+        enclave's collector feeds this worker group and crosses the Everfox
+        HSG as shown.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-guardium.policy_violation
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Guardium collectors (and the aggregator, where alerting is
+        centralized) forward syslog over UDP/TCP straight to Cribl using the
+        CLI 'store remotelog add' facility.priority target. Guardium is
+        deployed inside the same enclave as the databases it taps, so this
+        enclave's collector feeds this worker group and lands direct to
+        Elastic.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-guardium.policy_violation
+  formats:
+  - format: syslog-cef
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Guardium CEF pipeline
+      notes: >
+        No Elastic integration package and no Cribl pack exists for Guardium,
+        so this is hand-built. The pipeline must strip the Guardium syslog
+        wrapper, resolve CEF csN/cnN Label indirection (cs1Label=Severity,
+        cs2Label=Server Type, and so on) rather than hard-coding slot numbers
+        - the Global Profile template is site-editable, so slot assignments
+        drift between appliances - and tolerate the malformed header from APAR
+        GA17140, where affected builds emit an extra space after "CEF:" and
+        defeat strict parsers.
+    fields:
+    - vendor: rt
+      type: timestamp
+      description: time the alert occurred, from %%receiptTimeMills
+      ecs: '@timestamp'
+      status: mapped
+      transform: >
+        milliseconds since epoch as a positive integer; the companion
+        %%receiptTime variable renders the same instant as a yyyy-mm-dd
+        hh:mm:ss datetime if the site edits the template
+    - vendor: CEF signature id (%%ruleID)
+      type: integer
+      description: >-
+        rule number of the Policy Builder rule that fired, carried in the CEF
+        header signature-id position
+      ecs: rule.id
+      status: mapped
+      notes: >
+        rule.id and rule.name describe the SAME object here - the Guardium
+        policy rule - so the pair belongs together on rule.*. The id is only
+        unique within an installed policy, not globally, so pair it with the
+        policy name where dashboards need stability across policy revisions.
+    - vendor: CEF name (%%ruleDescription)
+      type: string
+      description: >-
+        rule description from the policy rule definition, carried in the CEF
+        header name position (varchar 100)
+      ecs: rule.name
+      status: mapped
+    - vendor: cs1
+      type: enum
+      description: severity from the rule definition - INFO, LOW, MED or HIGH (cs1Label=Severity)
+      ecs: event.severity
+      status: partial
+      transform: >
+        vendor emits the strings INFO/LOW/MED/HIGH; needs a lookup to ECS's
+        numeric event.severity scale before alerting thresholds work
+      notes: >
+        this is the only real severity on the record. The shipped CEF template
+        hard-codes the header severity to the constant 5 for every alert
+        regardless of rule severity, so the CEF header severity must be
+        ignored rather than mapped - reading it yields a flat, meaningless
+        priority for the whole feed.
+    - vendor: cs2
+      type: enum
+      description: >-
+        database server type - ORACLE, MS SQL SERVER, SYBASE, DB2, INFORMIX,
+        MYSQL, TERADATA, IBM ISERIES, CIFS, FTP (cs2Label=Server Type)
+      ecs: null
+      status: unmapped
+      custom: guardium.alert.server_type
+      notes: >
+        monitored database platform. Not service.type: ECS service.* models
+        the service the data is collected FROM (the Guardium collector), not
+        the database instance being observed.
+    - vendor: cat
+      type: string
+      description: >-
+        category from the rule definition, a site-defined grouping such as PCI
+        or SOX (varchar 60)
+      ecs: rule.category
+      status: mapped
+      notes: >-
+        user-defined organizing label attached to the rule, not a vendor-fixed
+        taxonomy, so values vary per installed policy
+    - vendor: app
+      type: string
+      description: >-
+        database protocol carried over the connection - TNS, mysql, and
+        similar (%%DBProtocol)
+      ecs: network.protocol
+      status: mapped
+    - vendor: suser
+      type: string
+      description: >-
+        application user name from the application layer, e.g. an Oracle EBS,
+        SAP or PeopleSoft user (%%AppUserName, varchar 240)
+      ecs: source.user.name
+      status: partial
+      notes: >
+        populated only where Guardium application user translation is
+        configured; empty on most records, and distinct from the database
+        credential in duser. Do not collapse the two - the whole point of the
+        field is attributing pooled connections to a real end user.
+    - vendor: sproc
+      type: string
+      description: >-
+        name of the client program accessing the database, e.g. JDBC THIN
+        CLIENT or sqlplus (%%SourceProgram, varchar 255)
+      ecs: process.name
+      status: partial
+      notes: >
+        a client program label reported by the database driver, not an
+        observed OS process on a host Guardium monitors; there is no pid or
+        executable path to accompany it, so process.* stays thin here
+    - vendor: act
+      type: integer
+      description: request type that triggered the alert (%%requestType)
+      ecs: event.action
+      status: partial
+      transform: >
+        the v7-era template renders a numeric code (0=unknown, 1=sql access,
+        2=sql error, 3=login failed, 8=RPC, 9=SQL Success, 11=RAW statement,
+        12=bind data, 15=data value) while newer appliances render a string
+        such as LOGIN_FAILED, so the pipeline must accept both and normalize
+        to one vocabulary. The same value is the only source of event.outcome
+        on this dataset - 2 (sql error) and 3 (login failed) are failures, 9
+        (SQL Success) is a success, and the remainder carry no outcome and
+        should leave the field unset rather than defaulting.
+    - vendor: start
+      type: timestamp
+      description: >-
+        start of the database session in which the alert occurred, from
+        %%sessionStartMills
+      ecs: event.start
+      status: mapped
+      transform: >-
+        milliseconds since epoch; %%sessionStart renders the same value as a
+        yyyy-mm-dd hh:mm:ss datetime
+    - vendor: externalId
+      type: integer
+      description: >-
+        POLICY_VIOLATION_LOG_ID of this alert in GDM_POLICY_VIOLATION_LOG
+        (%%violationID)
+      ecs: null
+      status: unmapped
+      custom: guardium.alert.violation_id
+      notes: >
+        same value as the Violation Log Id column in the Policy Violations /
+        Incident Management report, so it is the join key between this
+        real-time feed and the audit-report export dataset; keep it queryable
+        rather than letting dynamic mapping decide
+    - vendor: duser
+      type: string
+      description: database user name that connected to the database server (%%DBUser, varchar 255)
+      ecs: user.name
+      status: mapped
+      notes: >-
+        the acting database credential, and the principal a CSOC analyst
+        pivots on; the application-layer identity, where it exists, is in
+        suser
+    - vendor: dst
+      type: ip
+      description: database server IP for request events (%%serverIP)
+      ecs: destination.ip
+      status: partial
+      notes: >
+        documented as carrying the CLIENT IP for exception-class events and
+        the SERVER IP otherwise, so the address pair is inverted on exactly
+        the failed-login and SQL-error records a SOC cares most about.
+        Un-invert on the requestType before mapping, or every failed-login
+        alert will point at the wrong end of the connection.
+    - vendor: dpt
+      type: port
+      description: database server port for request events (%%serverPort)
+      ecs: destination.port
+      status: partial
+      notes: inverted alongside dst - carries the client port on exception-class events
+    - vendor: src
+      type: ip
+      description: database client IP for request events (%%clientIP)
+      ecs: source.ip
+      status: partial
+      notes: inverted alongside dst - carries the server IP on exception-class events
+    - vendor: spt
+      type: port
+      description: database client port for request events (%%clientPort)
+      ecs: source.port
+      status: partial
+      notes: inverted alongside dst - carries the server port on exception-class events
+    - vendor: proto
+      type: string
+      description: network protocol of the database connection (%%netProtocol, varchar 20)
+      ecs: network.transport
+      status: partial
+      notes: >
+        values include TCP but also local IPC mechanisms - Named Pipes, Shared
+        Memory, Bequeath (BEQ), IPC - which are not network transports at all.
+        Map TCP through and route the local-IPC values to a custom field
+        instead of forcing them into network.transport, or local-access alerts
+        will pollute network dashboards.
+    - vendor: msg
+      type: string
+      description: the SQL statement that fired the alert (%%SQLString, unlimited text)
+      ecs: message
+      status: mapped
+      notes: >
+        unbounded free text and the highest-risk content on the feed - it
+        reproduces the literal statement, which can embed credentials, bind
+        values and regulated data. Redact and length-cap before storage, and
+        index it as text rather than keyword.
+    - vendor: syslog header hostname
+      type: string
+      description: >-
+        hostname of the Guardium appliance that emitted the alert, from the
+        syslog header ahead of the CEF payload
+      ecs: observer.name
+      status: mapped
+      notes: >
+        identifies the collector or aggregator, NOT the monitored database
+        server. The shipped CEF template carries no database server hostname
+        variable at all, so host.name has to be derived from destination.ip by
+        enrichment - a real gap, since both alerting profiles this dataset
+        claims require host.name.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Build the CEF parse on the core worker group: strip the
+          GuardiumSniffer/guard_sender syslog wrapper and the quoted "SQLGUARD
+          ALERT" subject, tolerate the extra space after the "CEF:" banner
+          that APAR GA17140 introduces, and resolve every csN value through
+          its companion csNLabel instead of by slot number so a site-edited
+          Global Profile template does not silently remap Severity onto Server
+          Type. Do the three normalizations here rather than downstream:
+          un-invert src/dst and spt/dpt for exception-class events, translate
+          the numeric requestType into an action label plus a derived
+          event.outcome, and convert the info/low/med/high severity string to
+          the numeric ECS scale. Mask literal credentials and bind values out
+          of the SQL string and cap its length before it leaves the worker
+          group, since it is an unbounded text field carrying the exact
+          statement a user ran against production data.
+        elastic: >
+          Own a custom logs-guardium.policy_violation ingest pipeline that
+          finishes only what the low side cannot, and add explicitly typed
+          custom-namespace index-template mappings -
+          guardium.alert.server_type, .classification and .violation_id as
+          keyword, with .violation_id kept queryable because it is the join
+          key back to the Policy Violations / Incident Management report and
+          to the audit-report export dataset. Assert in the template that
+          event.severity arrives as a long rather than the vendor string, and
+          that host.name is populated: the shipped CEF template carries no
+          database server hostname, so the pipeline must resolve it from
+          destination.ip through an enrich policy or the feed will fail the
+          authentication and network alerting profiles.
+        relay: >
+          Low-side instances cross the guard: full ECS-shaped NDJSON crosses
+          rather than the CEF the vendor emits today - the CEF-to-JSON
+          conversion happens low-side and CEF no longer reaches the boundary.
+          The content filter's real friction on this feed is the SQL string:
+          an unbounded text field that routinely carries kilobyte statements,
+          embedded literals, and non-ASCII data values, so cap and redact it
+          low-side rather than expecting a custom NDJSON filter rule to make
+          field-aware decisions about SQL. Hold the JSON to two levels of
+          nesting with short ASCII keys, use Persistent Queue backpressure on
+          the guard destination, and reconcile low-side and high-side counts
+          per (dataset, hour) - policy violations are individually
+          significant, so a silently dropped alert is a missed detection, not
+          a statistics problem.
+      direct:
+        parse_location: low
+        cribl: >
+          Build the CEF parse on the core worker group: strip the
+          GuardiumSniffer/guard_sender syslog wrapper and the quoted "SQLGUARD
+          ALERT" subject, tolerate the extra space after the "CEF:" banner
+          that APAR GA17140 introduces, and resolve every csN value through
+          its companion csNLabel instead of by slot number so a site-edited
+          Global Profile template does not silently remap Severity onto Server
+          Type. Do the three normalizations here rather than downstream:
+          un-invert src/dst and spt/dpt for exception-class events, translate
+          the numeric requestType into an action label plus a derived
+          event.outcome, and convert the info/low/med/high severity string to
+          the numeric ECS scale. Mask literal credentials and bind values out
+          of the SQL string and cap its length before it leaves the worker
+          group, since it is an unbounded text field carrying the exact
+          statement a user ran against production data.
+        elastic: >
+          Own a custom logs-guardium.policy_violation ingest pipeline that
+          finishes only what the Cribl parse cannot, and add explicitly typed
+          custom-namespace index-template mappings -
+          guardium.alert.server_type, .classification and .violation_id as
+          keyword, with .violation_id kept queryable because it is the join
+          key back to the Policy Violations / Incident Management report and
+          to the audit-report export dataset. Assert in the template that
+          event.severity arrives as a long rather than the vendor string, and
+          that host.name is populated: the shipped CEF template carries no
+          database server hostname, so the pipeline must resolve it from
+          destination.ip through an enrich policy or the feed will fail the
+          authentication and network alerting profiles.
+  - format: syslog-leef
+    enable: >
+      Select the QRadar alert message template in the Global Profile (Setup >
+      Tools and Views > Global Profile / Administration Console > Local
+      Settings > Global Profile, depending on release): where the CEF feed
+      uses the CEF template, the QRadar template renders the identical alert
+      variables as LEEF instead. Attach that template to the Policy Builder
+      rule whose action is an Alert (Alert Per Match, Alert Daily, Alert Once
+      Per Session or Alert Per Time Granularity) with SYSLOG chosen as the
+      notification receiver; the collector then forwards over the same CLI
+      'store remotelog add <facility.priority> <host>' syslog target the CEF
+      feed uses, so the transport is unchanged and only the on-wire encoding
+      differs. The line is
+      LEEF:1.0|IBM|Guardium|<appVersion>|<EventName>|key=value|key=value...
+      where EventName repeats the rule description; an optional RFC 3164 /
+      5424 syslog header, when present, precedes the LEEF header separated by
+      a single space. Because QRadar's stock Guardium DSM does not parse a
+      custom LEEF template, IBM's own guidance is to add a QRadar log- source
+      extension - the same "the parser must key on the format banner"
+      discipline the CEF pipeline needs, since a Global-Profile template is
+      appliance-wide and site-editable.
+    references:
+    - >-
+      https://www.juniper.net/documentation/us/en/software/jsa7.5.0/jsa-dsm/topics/concept/concept-jsa-dsm-ibm-guardium.html
+    - https://docs.cyderes.cloud/parser-knowledge-base/ibm_guardium/
+    - >-
+      https://www.ibm.com/support/pages/qradar-how-configure-non-default-events-ibm-guardium-dsm
+    - >-
+      https://www.ibm.com/support/pages/ibm-security-guardium-additional-parameter-leef-message-template-object-name
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: 'custom Guardium LEEF pipeline (shares the CEF pipeline''s normalizations)'
+      notes: >
+        No Elastic integration package and no Cribl pack parses Guardium in
+        either encoding, so this is the CEF pipeline's sibling branch: strip
+        the GuardiumSniffer/guard_sender syslog wrapper and the quoted
+        "SQLGUARD ALERT" subject, then split the LEEF attribute list on its
+        delimiter. LEEF is friendlier than the CEF form in one respect - it
+        carries named keys (severity, dbUser, violationID) rather than csN/cnN
+        slots resolved through companion Label keys, so the slot- drift hazard
+        the CEF pipeline fights does not exist here. The expensive
+        normalizations are shared with CEF and must still run: un-invert
+        src/dst and srcPort/dstPort for exception-class events, map the
+        request type in 'type' to an action plus a derived outcome, convert
+        the INFO/LOW/MED/HIGH 'severity' string to the numeric ECS scale, and
+        mask/length-cap the 'sql' statement.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Run the LEEF parse on the low-side worker group as a branch of the
+          Guardium alert pipeline, keyed on the "LEEF:" banner so an appliance
+          flipped between the CEF and QRadar templates is handled without a
+          config change downstream. Do the same three normalizations here as
+          on the CEF feed: un-invert src/dst and the port pair for the
+          exception-class events (failed login, SQL error) where Guardium
+          documents the address pair as reversed, translate the 'type' request
+          class into event.action plus a derived event.outcome, and convert
+          the severity string to the numeric ECS scale. Mask literal
+          credentials and bind values out of 'sql' and cap its length before
+          it leaves the worker group, exactly as the CEF path does - the SQL
+          text is identical between the two encodings and is the highest-risk
+          field on the feed.
+        elastic: >
+          Land in the same custom logs-guardium.policy_violation ingest
+          pipeline and index template as the CEF feed so the two encodings are
+          queried as one data stream: assert event.severity as a long, keep
+          guardium.alert.violation_id queryable as the join key back to the
+          audit-report export and the Incident Management report, and type
+          guardium.alert.server_type and .classification as keyword. LEEF adds
+          classification and dbProtocolVersion that the shipped CEF template
+          does not carry, so extend the template with those two custom keys.
+          host.name still has to be resolved from destination.ip by enrich
+          policy - LEEF, like the CEF template, carries the collector hostname
+          in the syslog header but no database-server hostname - or the feed
+          fails the authentication and network alerting profiles.
+        relay: >
+          Low-side instances cross the guard as ECS-shaped NDJSON, so LEEF no
+          longer reaches the boundary any more than CEF does - the encoding is
+          resolved low-side and a uniform JSON envelope crosses whichever
+          template the appliance is set to. The content filter's real friction
+          is unchanged from the CEF feed: the 'sql' string is an unbounded
+          text field carrying kilobyte statements, embedded literals and
+          non-ASCII data values, so cap and redact it low-side rather than
+          expecting a field-aware NDJSON rule at the crossing. Hold the JSON
+          to two levels of nesting with short ASCII keys, use Persistent Queue
+          backpressure on the guard destination, and reconcile low- and
+          high-side counts per (dataset, hour) - a silently dropped
+          policy-violation alert is a missed detection, not a statistics
+          problem.
+      direct:
+        parse_location: low
+        cribl: >
+          Run the LEEF parse as a branch of the Guardium alert pipeline on the
+          edge worker group, keyed on the "LEEF:" banner so an appliance
+          flipped between the CEF and QRadar templates is handled without a
+          config change downstream, then land direct to Elastic. Do the same
+          three normalizations as on the CEF feed: un-invert src/dst and the
+          port pair for the exception-class events (failed login, SQL error)
+          where Guardium documents the address pair as reversed, translate the
+          'type' request class into event.action plus a derived event.outcome,
+          and convert the severity string to the numeric ECS scale. Mask
+          literal credentials and bind values out of 'sql' and cap its length,
+          exactly as the CEF path does - the SQL text is identical between the
+          two encodings and is the highest-risk field on the feed. Because the
+          Global Profile template is appliance-wide, a site cannot mix CEF and
+          LEEF per rule, so standardize the parser on the banner and let
+          either encoding land in the same pipeline rather than pinning the
+          feed to one template.
+        elastic: >
+          Land in the same custom logs-guardium.policy_violation ingest
+          pipeline and index template as the CEF feed so the two encodings are
+          queried as one data stream: assert event.severity as a long, keep
+          guardium.alert.violation_id queryable as the join key back to the
+          audit-report export and the Incident Management report, and type
+          guardium.alert.server_type and .classification as keyword. LEEF adds
+          classification and dbProtocolVersion that the shipped CEF template
+          does not carry, so extend the template with those two custom keys,
+          and host.name still has to be resolved from destination.ip by enrich
+          policy since the LEEF template carries the collector hostname but no
+          database-server hostname. Tag the input so LEEF-sourced records
+          remain separable from CEF-sourced ones if a site migrates templates
+          mid-stream, and keep the severity-string lookup and the src/dst
+          un-inversion identical across both so dashboards do not shift when
+          the template changes.
+    fields:
+    - vendor: devTime
+      type: timestamp
+      description: >-
+        time the alert occurred, rendered as a yyyy-mm-dd hh:mm:ss.SSSSSS
+        datetime (LEEF devTime attribute)
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        LEEF renders devTime as a naive local datetime with microseconds and
+        no offset (e.g. 2022-09-02 08:34:22.976000), so the appliance timezone
+        must be applied at parse time; the companion 'start' attribute carries
+        the session start as epoch milliseconds
+    - vendor: ruleID
+      type: integer
+      description: rule number of the Policy Builder rule that fired
+      ecs: rule.id
+      status: mapped
+      notes: >
+        same identifier the CEF header carries in the signature-id position;
+        unique only within an installed policy, so pair it with the policy
+        name where dashboards need stability across policy revisions
+    - vendor: ruleDesc
+      type: string
+      description: >-
+        rule description from the policy rule definition, also repeated as the
+        LEEF header EventName
+      ecs: rule.name
+      status: mapped
+      notes: >-
+        rule.id and rule.name describe the same Guardium policy rule, so the
+        pair belongs together on rule.*
+    - vendor: severity
+      type: enum
+      description: severity from the rule definition - INFO, LOW, MED or HIGH
+      ecs: event.severity
+      status: partial
+      transform: >
+        vendor emits the strings INFO/LOW/MED/HIGH; needs a lookup to the
+        numeric ECS event.severity scale before alerting thresholds work.
+        Unlike the CEF form, LEEF carries the real rule severity in a named
+        key rather than hard-coding the header severity to a constant, so this
+        attribute is the one true severity on the record
+    - vendor: serverType
+      type: enum
+      description: >-
+        database server type - ORACLE, MS SQL SERVER, SYBASE, DB2, INFORMIX,
+        MYSQL, TERADATA, IBM ISERIES, CIFS, FTP
+      ecs: null
+      status: unmapped
+      custom: guardium.alert.server_type
+      notes: >
+        monitored database platform, the LEEF-key equivalent of the CEF
+        cs2/cs2Label=Server Type slot. Not service.type: ECS service.* models
+        the Guardium collector the data is gathered from, not the observed
+        database instance
+    - vendor: classification
+      type: string
+      description: >-
+        classification label attached to the fired rule, e.g. Priv. Users or
+        Data Privacy
+      ecs: null
+      status: unmapped
+      custom: guardium.alert.classification
+      notes: >
+        a named LEEF attribute the shipped CEF template does not emit; a
+        rule-level grouping distinct from category, so keep it on its own
+        custom key rather than folding it into rule.category
+    - vendor: category
+      type: string
+      description: >-
+        category from the rule definition, a site-defined grouping such as
+        Security, PCI or SOX
+      ecs: rule.category
+      status: mapped
+      notes: >
+        the LEEF-key equivalent of the CEF 'cat' field; a user-defined
+        organizing label on the rule, not a vendor-fixed taxonomy, so values
+        vary per installed policy
+    - vendor: dbProtocolVersion
+      type: string
+      description: >-
+        version of the database wire protocol carried over the monitored
+        connection, e.g. 3.14
+      ecs: null
+      status: unmapped
+      custom: guardium.alert.db_protocol_version
+      notes: >
+        a protocol version string, not the protocol name - it is not
+        network.protocol and not network.version (which would describe the
+        observer's own protocol); the CEF template's %%DBProtocol name field
+        is absent from this LEEF sample, so only the version crosses
+    - vendor: usrName
+      type: string
+      description: >-
+        application-layer user name attributed to the connection, e.g. an
+        Oracle EBS, SAP or PeopleSoft user
+      ecs: source.user.name
+      status: partial
+      notes: >
+        the LEEF usrName key maps to the Guardium application user
+        (%%AppUserName), not the database credential - populated only where
+        application user translation is configured, empty on most records, and
+        distinct from dbUser. Do not collapse the two; attributing pooled
+        connections to a real end user is the point of the field
+    - vendor: sourceProgram
+      type: string
+      description: >-
+        name of the client program accessing the database, e.g. PROWIN32.EXE,
+        JDBC THIN CLIENT or sqlplus
+      ecs: process.name
+      status: partial
+      notes: >
+        a client program label reported by the database driver, not an
+        observed OS process on a Guardium-monitored host; there is no pid or
+        executable path to accompany it, so process.* stays thin
+    - vendor: start
+      type: timestamp
+      description: start of the database session in which the alert occurred, as epoch milliseconds
+      ecs: event.start
+      status: mapped
+      transform: >-
+        milliseconds since epoch; the datetime rendering of the same instant
+        is in devTime's companion, not here
+    - vendor: dbUser
+      type: string
+      description: database user name that connected to the database server
+      ecs: user.name
+      status: mapped
+      notes: >-
+        the acting database credential and the principal a CSOC analyst pivots
+        on; the application-layer identity, where it exists, is in usrName
+    - vendor: dst
+      type: ip
+      description: database server IP for request events
+      ecs: destination.ip
+      status: partial
+      notes: >
+        carries the CLIENT IP for exception-class events (failed login, SQL
+        error) and the SERVER IP otherwise, exactly as the CEF 'dst' does, so
+        the address pair is inverted on the records a SOC cares most about.
+        Un-invert on the request type before mapping
+    - vendor: dstPort
+      type: port
+      description: database server port for request events
+      ecs: destination.port
+      status: partial
+      notes: inverted alongside dst - carries the client port on exception-class events
+    - vendor: src
+      type: ip
+      description: database client IP for request events
+      ecs: source.ip
+      status: partial
+      notes: inverted alongside dst - carries the server IP on exception-class events
+    - vendor: srcPort
+      type: port
+      description: database client port for request events
+      ecs: source.port
+      status: partial
+      notes: inverted alongside dst - carries the server port on exception-class events
+    - vendor: protocol
+      type: string
+      description: network protocol of the database connection, e.g. TCP
+      ecs: network.transport
+      status: partial
+      notes: >
+        same caveat as the CEF 'proto' field - values include TCP but also
+        local IPC mechanisms (Named Pipes, Shared Memory, Bequeath, IPC) that
+        are not network transports. Map TCP through and route the local-IPC
+        values to a custom field, or local-access alerts pollute network
+        dashboards
+    - vendor: type
+      type: string
+      description: request/SQL type that triggered the alert, e.g. SQL_LANG, LOGIN_FAILED
+      ecs: event.action
+      status: partial
+      transform: >
+        LEEF renders this as a string class rather than the CEF template's
+        numeric requestType code; normalize to one action vocabulary. It is
+        also the primary outcome source together with the 'error' key -
+        LOGIN_FAILED and SQL-error classes are failures - so derive
+        event.outcome here and leave it unset for classes that carry no
+        outcome rather than defaulting
+    - vendor: violationID
+      type: integer
+      description: POLICY_VIOLATION_LOG_ID of this alert in GDM_POLICY_VIOLATION_LOG
+      ecs: null
+      status: unmapped
+      custom: guardium.alert.violation_id
+      notes: >
+        same value the CEF feed carries in externalId and the audit-report
+        export carries as Violation Log Id, so it is the join key across all
+        three; keep it queryable rather than letting dynamic mapping decide
+    - vendor: sql
+      type: string
+      description: the SQL statement that fired the alert (unlimited text)
+      ecs: message
+      status: mapped
+      notes: >
+        unbounded free text and the highest-risk content on the feed - it
+        reproduces the literal statement, which can embed credentials, bind
+        values and regulated data. Redact and length-cap before storage and
+        index as text, not keyword. Guardium redacts it to 'redacted' when
+        policy-level SQL redaction is enabled
+    - vendor: error
+      type: string
+      description: database error text or code recorded with the event, empty on non-error records
+      ecs: error.message
+      status: partial
+      notes: >
+        populated on SQL-error and failed-login classes and empty otherwise,
+        so it doubles as an outcome signal alongside 'type'; where it carries
+        a numeric SQL error code rather than text, split the code to
+        error.code
+    - vendor: syslog header hostname
+      type: string
+      description: >-
+        hostname of the Guardium appliance that emitted the alert, from the
+        syslog header ahead of the LEEF payload
+      ecs: observer.name
+      status: mapped
+      notes: >
+        identifies the collector or aggregator, not the monitored database
+        server - the LEEF template, like the CEF one, carries no database-
+        server hostname, so host.name must be derived from destination.ip by
+        enrichment
+- id: audit-report-exports
+  name: Audit process report export
+  description: >
+    Scheduled batch results from Guardium audit processes - the Policy
+    Violations / Incident Management report modeled here, plus the
+    entitlement, privileged-user and full-SQL reports a compliance programme
+    runs on the same machinery. An audit task runs a report over a
+    QUERY_FROM_DATE/QUERY_TO_DATE window and, with Export CSV file checked,
+    writes a labelled CSV that the CSV/CEF Export function moves off the
+    appliance to a destination host. Data mart extractions are the same idea
+    at higher volume, summarizing to hour, day, week or month granularity into
+    CSV for export. Column sets are per-report and site-tunable, so the field
+    list here is the common violation-report spine rather than a fixed schema.
+  event_categories:
+  - authentication
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Not a syslog feed - Cribl collects the exported CSV on a schedule
+        (Filesystem or object-store collector against the export destination
+        host, or the GuardAPI REST endpoint) rather than receiving a push, so
+        this enclave's collector runs alongside the databases and pushes
+        across the Everfox HSG as shown. This batch file crossing has a
+        materially different story from the streaming alert feed.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-guardium.audit_report
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Not a syslog feed - Cribl collects the exported CSV on a schedule
+        (Filesystem or object-store collector against the export destination
+        host, or the GuardAPI REST endpoint) rather than receiving a push,
+        then lands direct to Elastic. This batch pull has a materially
+        different story from the streaming alert feed.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-guardium.audit_report
+  formats:
+  - format: api-pull
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Guardium audit-export pipeline
+      notes: >
+        Hand-built CSV pipeline keyed on the CSV/CEF File Label set on the
+        audit task, since one collector emits several differently-shaped
+        reports through the same export path. Header rows are present and the
+        SHOW_ALIASES task parameter changes whether columns carry raw values
+        or Guardium aliases, so the pipeline must read the header rather than
+        assume positional columns.
+    fields:
+    - vendor: Violation Log Id
+      type: integer
+      description: identifier of the policy violation record, matching GDM_POLICY_VIOLATION_LOG
+      ecs: null
+      status: unmapped
+      custom: guardium.report.violation_log_id
+      notes: >-
+        same identifier the real-time alert feed emits as externalId; the join
+        key between the two datasets and the deduplication key for overlapping
+        export windows
+    - vendor: Timestamp
+      type: timestamp
+      description: 'time the violation was logged, rendered in the appliance''s configured timezone'
+      ecs: '@timestamp'
+      status: partial
+      notes: >
+        rendered as a local datetime string rather than epoch or ISO-8601 with
+        an offset, so it needs the appliance timezone applied at parse time; a
+        batch export also backfills events hours old, so this must not be
+        confused with collection time
+    - vendor: Category Name
+      type: string
+      description: category from the rule definition that the violation matched
+      ecs: rule.category
+      status: mapped
+    - vendor: Access Rule Description
+      type: string
+      description: description of the policy rule that was violated
+      ecs: rule.name
+      status: mapped
+      notes: >-
+        same value the alert feed carries in the CEF header name position; the
+        report does not include the numeric rule id, so rule.id is unpopulated
+        on this dataset
+    - vendor: Severity Description
+      type: enum
+      description: severity of the violated rule - INFO, LOW, MED or HIGH
+      ecs: event.severity
+      status: partial
+      transform: >-
+        same string vocabulary as the alert feed's cs1; needs the same lookup
+        to ECS's numeric event.severity scale
+    - vendor: Client IP
+      type: ip
+      description: IP address of the database client
+      ecs: source.ip
+      status: mapped
+      notes: >-
+        unlike the CEF alert feed, the report columns are named explicitly and
+        are not inverted for exception events
+    - vendor: Server IP
+      type: ip
+      description: IP address of the monitored database server
+      ecs: destination.ip
+      status: mapped
+    - vendor: Server Host Name
+      type: string
+      description: hostname of the monitored database server
+      ecs: host.name
+      status: mapped
+      notes: >-
+        present in report output but absent from the real-time CEF template,
+        so the batch feed satisfies the host.name profile requirement that the
+        alert feed has to derive by enrichment
+    - vendor: DB User Name
+      type: string
+      description: database account used for the connection
+      ecs: user.name
+      status: mapped
+    - vendor: OS User
+      type: string
+      description: operating-system account on the client host that owns the database connection
+      ecs: null
+      status: unmapped
+      custom: guardium.session.os_user
+      notes: >
+        the client-side OS account, distinct from both the database credential
+        in user.name and the application identity in source.user.name; kept
+        custom rather than overloading either
+    - vendor: Application User Name
+      type: string
+      description: application-layer end user attributed to the connection
+      ecs: source.user.name
+      status: partial
+      notes: >-
+        only populated where application user translation is configured, same
+        caveat as the alert feed's suser
+    - vendor: Source Program
+      type: string
+      description: client program that accessed the database
+      ecs: process.name
+      status: partial
+      notes: >-
+        client program label reported by the driver, with no pid or executable
+        path to accompany it
+    - vendor: Database Name
+      type: string
+      description: name of the database the session connected to
+      ecs: null
+      status: unmapped
+      custom: guardium.session.db_name
+      notes: >-
+        ECS has no database-object namespace; kept custom rather than forced
+        onto service.name, which models the service the data is collected from
+    - vendor: Service Name
+      type: string
+      description: database service or instance identifier, e.g. an Oracle SID or service name
+      ecs: null
+      status: unmapped
+      custom: guardium.session.service_name
+      notes: >-
+        identifies the monitored database instance, not the Guardium collector
+        emitting the data, so ECS service.name would misdescribe it
+    - vendor: Server Type
+      type: enum
+      description: database platform - ORACLE, MS SQL SERVER, DB2, MYSQL, TERADATA and similar
+      ecs: null
+      status: unmapped
+      custom: guardium.session.server_type
+      notes: >-
+        same vocabulary as the alert feed's cs2; keep the two custom fields on
+        one namespace so cross-dataset filters work
+    - vendor: Net Protocol
+      type: string
+      description: network protocol of the database connection
+      ecs: network.transport
+      status: partial
+      notes: >-
+        same caveat as the alert feed's proto - local IPC values such as
+        Shared Memory and Bequeath are not network transports
+    - vendor: Session Id
+      type: integer
+      description: Guardium identifier for the monitored database session
+      ecs: null
+      status: unmapped
+      custom: guardium.session.id
+      notes: >-
+        appliance-local session identifier with no ECS equivalent; groups all
+        activity from one database connection and is the key for
+        reconstructing a session from report rows
+    - vendor: Full SQL String
+      type: string
+      description: complete SQL statement recorded for the violation
+      ecs: message
+      status: mapped
+      notes: >
+        unbounded free text carrying literal statements including embedded
+        credentials, bind values and regulated data; redact and length-cap on
+        the same rules as the alert feed's msg
+    - vendor: Incident Number
+      type: integer
+      description: >-
+        incident identifier when the violation has been escalated through
+        Guardium Incident Management, 0 otherwise
+      ecs: null
+      status: unmapped
+      custom: guardium.report.incident_number
+      notes: >-
+        zero for unescalated violations, so treat it as a presence flag rather
+        than a numeric measure
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Key the collector on the CSV/CEF File Label so each audit task lands
+          in its own pipeline branch, and parse from the header row rather
+          than by column position - SHOW_ALIASES and per-site report column
+          edits both move columns underneath a positional parser. Suppress
+          re-ingest of overlapping QUERY_FROM_DATE windows by deduplicating on
+          the Violation Log Id, which is the same identifier the real-time
+          alert feed carries in externalId, so the two datasets can be
+          correlated rather than double-counted. Apply the same severity
+          lookup and SQL redaction rules as the alert pipeline here, and
+          validate against a Schema Library schema with a dead-letter route,
+          because a malformed batch file fails as a whole file rather than as
+          one event.
+        elastic: >
+          Land in logs-guardium.audit_report through a custom ingest pipeline
+          and map the session-context custom namespace explicitly -
+          guardium.session.db_name, .service_name, .server_type, .os_user and
+          .id as keyword, guardium.report.violation_log_id and
+          .incident_number as keyword - so batch and streaming views join on
+          the same identifiers. Set event.kind and a synthetic event.action
+          from the report name during ingest: the export carries no action or
+          outcome column at all, so leave event.outcome unset rather than
+          inferring it, and use @timestamp from the report's own timestamp
+          column while recording the collection time separately, because a
+          batch pull backfills hours-old events and will otherwise look like
+          an ingest-lag spike.
+        relay: >
+          A batch file crossing is a better fit for the guard's Automated
+          Secure Transfer drop-box path than the alert stream is, but the file
+          must still be converted to NDJSON low-side - one JSON object per
+          row, UTF-8, LF-terminated, compression explicitly disabled - rather
+          than crossing as CSV, so the high side sees the same envelope as
+          every other dataset. The Full SQL String column is the content
+          filter's friction here exactly as it is on the alert feed: cap and
+          redact it before the crossing. Because the crossing is at-most-once
+          with no acknowledgement, reconcile per-file row counts low-side
+          against high-side, which is easier here than on the streaming feed
+          since each export is a bounded, countable unit.
+      direct:
+        parse_location: low
+        cribl: >
+          Key the collector on the CSV/CEF File Label so each audit task lands
+          in its own pipeline branch, and parse from the header row rather
+          than by column position - SHOW_ALIASES and per-site report column
+          edits both move columns underneath a positional parser. Suppress
+          re-ingest of overlapping QUERY_FROM_DATE windows by deduplicating on
+          the Violation Log Id, which is the same identifier the real-time
+          alert feed carries in externalId, so the two datasets can be
+          correlated rather than double-counted. Apply the same severity
+          lookup and SQL redaction rules as the alert pipeline here, and
+          validate against a Schema Library schema with a dead-letter route,
+          because a malformed batch file fails as a whole file rather than as
+          one event.
+        elastic: >
+          Land in logs-guardium.audit_report through a custom ingest pipeline
+          and map the session-context custom namespace explicitly -
+          guardium.session.db_name, .service_name, .server_type, .os_user and
+          .id as keyword, guardium.report.violation_log_id and
+          .incident_number as keyword - so batch and streaming views join on
+          the same identifiers. Set event.kind and a synthetic event.action
+          from the report name during ingest: the export carries no action or
+          outcome column at all, so leave event.outcome unset rather than
+          inferring it, and use @timestamp from the report's own timestamp
+          column while recording the collection time separately, because a
+          batch pull backfills hours-old events and will otherwise look like
+          an ingest-lag spike.
+  - format: syslog-cef
+    enable: >
+      The same audit process that writes the CSV can emit CEF instead: on the
+      audit task, check Export CEF file rather than (or in addition to) Export
+      CSV file, and the appliance writes a labelled CEF file named
+      <process>_<task>_<datetime>. The CSV/CEF Export function (Administration
+      Console) moves those files off the appliance to a destination host as
+      the pulled CSV feed does, but IBM additionally documents that CEF file
+      output can be written to syslog: with the remote syslog capability
+      enabled, each exported CEF file is forwarded immediately to the
+      configured remote syslog location(s), turning the batch report into a
+      CEF-over-syslog push rather than the pulled-CSV collection. This is
+      IBM's documented path for feeding audit results to a CEF SIEM (QRadar,
+      ArcSight, and similar). One CEF record is emitted per report row, so the
+      record count equals the report row count.
+    references:
+    - https://www.ibm.com/docs/en/gdp/10.5?topic=system-exporting-results-csv-cef-pdf
+    - https://www.ibm.com/docs/en/gdp/11.4.0?topic=processes-exporting-audit-results
+    - >-
+      https://www.ibm.com/docs/en/gdp/11.5.0?topic=pi-combining-real-time-alerts-correlation-analysis-siem-products
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Guardium audit-CEF pipeline
+      notes: >
+        Hand-built, since no Elastic integration or Cribl pack parses Guardium
+        in any encoding. The CEF export serializes the same per- report column
+        spine the CSV carries (Violation Log Id, Timestamp, Severity
+        Description, Client/Server IP, DB User Name, Full SQL String and the
+        session-context columns) as CEF extensions, but the extension KEY
+        NAMES are derived per report from the CSV/CEF File Label and column
+        set rather than published as a fixed schema - so the pipeline must
+        read the CEF extension keys from the actual export rather than assume
+        slot numbers, and dead-letter a record whose keys do not match the
+        expected report. Apply the same severity-string lookup and SQL
+        redaction rules as the CSV pipeline, and deduplicate on Violation Log
+        Id against both the CSV export and the real-time alert feed so
+        overlapping export windows are not double-counted.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Terminate the CEF-over-syslog push on the low-side worker group, key
+          each record on the CSV/CEF File Label so each audit task lands in
+          its own pipeline branch, and read the CEF extension keys from the
+          record rather than by position - a per-site report column edit moves
+          the keys underneath a positional parser exactly as it does on the
+          CSV feed. Suppress re-ingest of overlapping QUERY_FROM_DATE windows
+          by deduplicating on Violation Log Id, the same identifier the alert
+          feed carries in externalId/violationID, so the batch and streaming
+          datasets correlate rather than double-count. Apply the severity
+          lookup and the SQL redaction/length-cap from the CSV pipeline here,
+          since the Full SQL String column is emitted in this encoding too.
+        elastic: >
+          Land in the same logs-guardium.audit_report data stream and custom
+          ingest pipeline as the pulled CSV, so the encoding a site chooses
+          does not fork the schema: map the session-context custom namespace
+          explicitly (guardium.session.db_name, .service_name, .server_type,
+          .os_user, .id and guardium.report.violation_log_id, .incident_number
+          as keyword). Set event.kind and a synthetic event.action from the
+          report name, leave event.outcome unset (the export carries no
+          outcome column in either encoding), and take @timestamp from the
+          report's own timestamp column while recording collection time
+          separately, because a pushed CEF file still backfills hours-old
+          events and would otherwise look like an ingest-lag spike.
+        relay: >
+          A CEF-over-syslog push is a worse fit for the guard than the
+          batch-file drop: the file's Automated Secure Transfer drop-box
+          crossing is replaced by a syslog stream, so the CEF must still be
+          converted to NDJSON low-side (one JSON object per row, UTF-8,
+          LF-terminated, compression disabled) rather than crossing as CEF,
+          and the high side then sees the same envelope as every other
+          dataset. The Full SQL String field is the content filter's friction
+          here exactly as on the alert feed - cap and redact it low-side. The
+          push has no per-record acknowledgement, so reconcile per-(report,
+          hour) record counts low-side against high-side, and because one CEF
+          record equals one report row the count is exact.
+      direct:
+        parse_location: low
+        cribl: >
+          Terminate the CEF-over-syslog push on the edge worker group, key
+          each record on the CSV/CEF File Label so each audit task lands in
+          its own pipeline branch, and read the CEF extension keys from the
+          record rather than by position - a per-site report column edit moves
+          the keys underneath a positional parser exactly as it does on the
+          CSV feed. Suppress re-ingest of overlapping QUERY_FROM_DATE windows
+          by deduplicating on Violation Log Id, the same identifier the alert
+          feed carries in externalId/violationID, so the batch and streaming
+          datasets correlate rather than double-count. Apply the severity
+          lookup and the SQL redaction/length-cap from the CSV pipeline, then
+          land direct to Elastic. The decision that matters is CSV-pull vs
+          CEF-push for the batch feed: the pulled CSV gives a bounded,
+          countable file with named column headers and a natural dedup unit,
+          while the CEF-over-syslog push trades that for immediacy at the cost
+          of report-derived extension keys the parser must discover per report
+          - prefer it only where a CEF SIEM is the consumer or where the
+          export destination host cannot be reached by a collector.
+        elastic: >
+          Land in the same logs-guardium.audit_report data stream and custom
+          ingest pipeline as the pulled CSV, so the encoding a site chooses
+          does not fork the schema: map the session-context custom namespace
+          explicitly (guardium.session.db_name, .service_name, .server_type,
+          .os_user, .id and guardium.report.violation_log_id, .incident_number
+          as keyword). Set event.kind and a synthetic event.action from the
+          report name, leave event.outcome unset (the export carries no
+          outcome column in either encoding), and take @timestamp from the
+          report's own timestamp column while recording collection time
+          separately, because a pushed CEF file still backfills hours-old
+          events and would otherwise look like an ingest-lag spike. Tag the
+          input so CEF-push records stay separable from pulled-CSV records if
+          a site runs both, and keep the Violation Log Id dedup active across
+          both so the two transports of the same report do not double-count.
+    fields_omitted: >
+      The CEF export serializes the same per-report column spine the api-pull
+      CSV entry inventories, but the extension key names are derived per
+      report from the CSV/CEF File Label and the task's selected column set
+      rather than published as a fixed vendor schema, so there is no stable
+      key list to table — the pipeline must read the keys from each actual
+      export.
+    fields: []

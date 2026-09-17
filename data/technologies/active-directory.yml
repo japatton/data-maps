@@ -1,0 +1,1056 @@
+id: active-directory
+name: Active Directory Domain Services
+vendor: Microsoft
+versions: Windows Server 2016, 2019, 2022, 2025 (AD DS domain controllers)
+draft: true
+references:
+- >-
+  https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-4768
+- >-
+  https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-4769
+- >-
+  https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-4771
+- >-
+  https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-4776
+- >-
+  https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-5136
+- >-
+  https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-5137
+- >-
+  https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-5141
+- >-
+  https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-4720
+- >-
+  https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-4732
+- >-
+  https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/audit-security-group-management
+- https://www.ultimatewindowssecurity.com/securitylog/encyclopedia/default.aspx
+- https://www.elastic.co/docs/reference/integrations/system
+- >-
+  https://github.com/elastic/integrations/tree/main/packages/system/data_stream/security
+datasets:
+- id: kerberos-authentication
+  name: Kerberos authentication service and TGS events
+  description: >
+    Domain-controller-side Kerberos KDC audit records - 4768 (TGT requested),
+    4769 (service ticket requested) and 4771 (pre-authentication failed).
+    These only exist on DCs and are the authoritative record of who
+    authenticated to the domain and which service principals they requested
+    tickets for; the member-host view in the `windows` map (4624/4625) is the
+    consumer side of the same authentications, not a duplicate of it. 4772 is
+    documented by Microsoft but is never actually emitted - a 4768 Failure is
+    raised instead - so it is deliberately absent here.
+  event_categories:
+  - authentication
+  - iam
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Elastic Agent on each low-side domain controller reads the Security
+        channel and ships straight to the edge worker group; these forests'
+        DCs cross with the usual allow-list on the destination data stream.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-system.security
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Elastic Agent on each high-side domain controller reads the Security
+        channel and ships straight to the edge worker group, which forwards to
+        the core worker group and on to Elastic.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-system.security
+  formats:
+  - format: windows-event
+    parsing:
+      mechanism: elastic-integration
+      artifact: System integration (winlog input, Security channel)
+      notes: >
+        The Elastic System integration - not the Windows integration - owns
+        the Security channel; there is no logs-windows.security data stream.
+        If the DC events arrive by Windows Event Forwarding instead of a local
+        agent they land in logs-windows.forwarded, which re-invokes a trimmed
+        copy of the same pipelines and loses some categorization. Every
+        EventData element listed below is preserved verbatim at
+        winlog.event_data.<XmlName> in addition to any ECS mapping, so the
+        custom names given here are our normalized aliases, not a second copy.
+        Note the pipeline drops EventData entries whose value is null, empty,
+        "-" or an all-zero GUID.
+    fields:
+    - vendor: EventID
+      type: integer
+      description: numeric identifier of the KDC audit event (4768, 4769, 4771)
+      ecs: event.code
+      status: mapped
+    - vendor: Computer
+      type: string
+      description: hostname of the domain controller whose KDC serviced the request
+      ecs: host.name
+      status: mapped
+    - vendor: TargetUserName
+      type: string
+      description: account the ticket was requested for; a trailing $ marks a computer account
+      ecs: user.name
+      status: partial
+      transform: >
+        rendered bare on 4768/4771 but as a UPN (user@REALM) on 4769; the
+        realm suffix must be split off before it matches the plain account
+        name used on the 4768 record for the same session
+    - vendor: TargetDomainName
+      type: string
+      description: Kerberos realm the account belongs to (the "Supplied Realm Name")
+      ecs: user.domain
+      status: partial
+      notes: >
+        present on 4768 and 4769 but absent from 4771 entirely - correlation
+        logic that assumes a domain qualifier on every Kerberos record will
+        silently drop pre-auth failures
+    - vendor: TargetSid
+      type: string
+      description: SID of the account the ticket was requested for; a NULL SID on failure records
+      ecs: user.id
+      status: mapped
+    - vendor: ServiceName
+      type: string
+      description: service principal the ticket is for - krbtgt on 4768, the target SPN on 4769
+      ecs: service.name
+      status: mapped
+      notes: >
+        the single highest-value field in this dataset for detection - 4769
+        SPN patterns are what Kerberoasting and unconstrained-delegation hunts
+        key on. ECS 9.4 added host.target.* for the host acted upon, but this
+        element is a service principal - a computer account such as WS01$ or
+        an SPN such as MSSQLSvc/db01:1433 - not a hostname, so it stays on
+        service.name; a target host would have to be derived from the SPN's
+        host component and would be meaningless for the non-host-class SPNs
+        that carry most of the detection value
+    - vendor: ServiceSid
+      type: string
+      description: SID of the service account backing the requested service principal
+      ecs: null
+      status: unmapped
+      custom: activedirectory.kerberos.service_sid
+      notes: >-
+        no ECS field carries a service-account SID; service.id is reserved for
+        a running service instance, not a directory principal
+    - vendor: TicketOptions
+      type: string
+      description: >-
+        HexInt32 bitmask of the KDC options requested by the client
+        (forwardable, renewable, proxiable, ...)
+      ecs: null
+      status: partial
+      custom: activedirectory.kerberos.ticket_options
+      transform: >
+        hex bitmask that must be decoded to individual flag names before it is
+        usable; the System integration writes the decoded array to a separate
+        TicketOptionsDescription field rather than replacing the raw value
+    - vendor: TicketEncryptionType
+      type: string
+      description: >-
+        HexInt32 encryption type negotiated for the ticket (0x12 AES256, 0x17
+        RC4, 0xffffffff on failure)
+      ecs: null
+      status: partial
+      custom: activedirectory.kerberos.ticket_encryption_type
+      transform: >
+        numeric etype needs a lookup to a readable algorithm name; RC4 (0x17)
+        on a 4769 is the primary Kerberoasting signal, so the decode has to
+        happen before alerting, not at dashboard time
+    - vendor: Status
+      type: string
+      description: >-
+        HexInt32 KDC result code - 0x0 on success, otherwise the Kerberos
+        error (0x18 bad password, 0x12 account disabled/locked, 0x6 unknown
+        principal)
+      ecs: null
+      status: partial
+      custom: activedirectory.kerberos.status_code
+      transform: >
+        labelled "Result Code" on 4768 and "Failure Code" on 4769/4771 in the
+        Windows UI but the XML element is Status on all three; needs a KDC
+        error table to produce a human failure reason, and it is not by itself
+        the source of event.outcome
+    - vendor: PreAuthType
+      type: string
+      description: >-
+        pre-authentication type used (2 = encrypted timestamp, 15 =
+        smartcard/PKINIT, 138 = FAST/armored)
+      ecs: null
+      status: unmapped
+      custom: activedirectory.kerberos.pre_auth_type
+      notes: >-
+        present on 4768/4771 only; a value of 0 on a 4768 indicates
+        pre-authentication was not required, the AS-REP roasting precondition
+    - vendor: IpAddress
+      type: ip
+      description: IP address of the client that requested the ticket
+      ecs: source.ip
+      status: mapped
+      transform: >-
+        rendered as an IPv4-mapped IPv6 literal (::ffff:10.1.2.3); the ::ffff:
+        prefix is stripped before the value is written to source.ip
+    - vendor: IpPort
+      type: port
+      description: source port of the client request
+      ecs: source.port
+      status: mapped
+      transform: >-
+        emitted as a UnicodeString, not a number; must be parsed to an integer
+        before it will index as source.port
+    - vendor: LogonGuid
+      type: string
+      description: >-
+        GUID correlating the service ticket request back to the TGT issuance
+        and to the member host's 4624
+      ecs: null
+      status: unmapped
+      custom: activedirectory.kerberos.logon_guid
+      notes: >-
+        4769 only; the join key between this DC-side dataset and the
+        member-host security events covered by the windows map
+    - vendor: TransmittedServices
+      type: string
+      description: >-
+        list of intermediate service principals a delegated (S4U2Proxy) ticket
+        passed through
+      ecs: null
+      status: unmapped
+      custom: activedirectory.kerberos.transmitted_services
+      notes: >-
+        4769 only and usually "-", which the ingest pipeline discards; when
+        populated it is direct evidence of constrained delegation being
+        exercised
+    - vendor: CertIssuerName
+      type: string
+      description: issuing CA of the smartcard certificate used for PKINIT authentication
+      ecs: null
+      status: unmapped
+      custom: activedirectory.kerberos.certificate.issuer
+      notes: >-
+        populated on 4768 only when PreAuthType indicates PKINIT; the
+        identity-pki tie-in for CAC/PIV logons
+    - vendor: CertSerialNumber
+      type: string
+      description: serial number of the smartcard certificate presented for PKINIT
+      ecs: null
+      status: unmapped
+      custom: activedirectory.kerberos.certificate.serial_number
+      notes: >
+        ECS 9.4 reuses x509.* only under file.*, tls.client/tls.server and
+        threat.indicator.*, none of which describes a smartcard certificate
+        presented to the KDC, so this stays custom; if it is ever aligned to
+        an x509 reuse point, 9.4 requires the serial as base-16 with no colons
+        and uppercase letters, which the Windows-rendered value is not
+    - vendor: CertThumbprint
+      type: string
+      description: SHA-1 thumbprint of the smartcard certificate presented for PKINIT
+      ecs: null
+      status: unmapped
+      custom: activedirectory.kerberos.certificate.thumbprint
+      notes: >-
+        documented as always empty on 4771, so absence here is not evidence
+        that PKINIT was not attempted
+    - vendor: Keywords
+      type: string
+      description: HexInt64 keyword bitmask carrying the audit-success/audit-failure flag
+      ecs: event.outcome
+      status: mapped
+      transform: >
+        the audit-success/audit-failure keyword is the only reliable source of
+        event.outcome on these records - the System integration's ingest
+        pipelines do not derive outcome from Status, so a Status-only rule
+        will mis-score 4769 records
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Keep the core worker group a pass-through for this route — the
+          System integration's ingest pipeline is the parser, so do no
+          low-side field extraction — and carry the rendered event XML in _raw
+          end-to-end because DC-side Kerberos records are forensically
+          load-bearing. Add Persistent Queue backpressure on the Elastic
+          destination and a low-side tag distinguishing locally-shipped events
+          from WEF-forwarded ones, so the trimmed logs-windows.forwarded
+          pipeline's weaker categorization is visible downstream instead of
+          silently mixing with logs-system.security. Do DC→site/enclave
+          enrichment here rather than in an ingest pipeline.
+        elastic: >
+          Layer a logs-system.security@custom pipeline carrying enrich/lookup
+          tables for the three hex fields the integration leaves raw —
+          TicketOptions flag bits, TicketEncryptionType etype (so RC4 0x17 on
+          a 4769 is alertable at ingest, not dashboard time) and the KDC
+          Status error table — and split the realm suffix off the UPN-form
+          TargetUserName on 4769 so it joins the bare name on the matching
+          4768. Assert event.outcome is derived only from the Keywords
+          audit-success/audit-failure bit, never from Status, which mis-scores
+          4769. Mirror the same @custom logic onto logs-windows.forwarded and
+          add explicit keyword mappings for the activedirectory.kerberos.*
+          custom fields.
+        relay: >
+          Low-side instances cross the guard: this dataset is hybrid there and
+          crosses the thin {_dataId, @timestamp, host, _raw} envelope, since a
+          good Elastic integration already exists on the far side. The
+          content-filter friction is modest but real — SPN and
+          certificate-issuer DNs are unbounded free text and may carry
+          non-ASCII CN components — so bound those string lengths, keep
+          envelope nesting shallow, and validate with C.Schema immediately
+          before the guard destination with a low-side dead-letter route.
+          Treat the crossing as at-most-once and reconcile per-(dataset, hour)
+          counts across the two sides; this is the highest-volume dataset in
+          the map, so it is where guard throughput will bind first.
+      direct:
+        parse_location: high
+        cribl: >
+          Keep the core worker group a pass-through for this route — the
+          System integration's ingest pipeline is the parser, so do no
+          low-side field extraction — and carry the rendered event XML in _raw
+          end-to-end because DC-side Kerberos records are forensically
+          load-bearing. Add Persistent Queue backpressure on the Elastic
+          destination and a low-side tag distinguishing locally-shipped events
+          from WEF-forwarded ones, so the trimmed logs-windows.forwarded
+          pipeline's weaker categorization is visible downstream instead of
+          silently mixing with logs-system.security. Do DC→site/enclave
+          enrichment here rather than in an ingest pipeline.
+        elastic: >
+          Layer a logs-system.security@custom pipeline carrying enrich/lookup
+          tables for the three hex fields the integration leaves raw —
+          TicketOptions flag bits, TicketEncryptionType etype (so RC4 0x17 on
+          a 4769 is alertable at ingest, not dashboard time) and the KDC
+          Status error table — and split the realm suffix off the UPN-form
+          TargetUserName on 4769 so it joins the bare name on the matching
+          4768. Assert event.outcome is derived only from the Keywords
+          audit-success/audit-failure bit, never from Status, which mis-scores
+          4769. Mirror the same @custom logic onto logs-windows.forwarded and
+          add explicit keyword mappings for the activedirectory.kerberos.*
+          custom fields.
+- id: ntlm-validation
+  name: NTLM credential validation
+  description: >
+    Event 4776 - the domain controller validating credentials for an account
+    via the MSV1_0 authentication package. This is the only DC-side record of
+    NTLM authentication and is the fallback path Kerberos events never cover;
+    it is also the cheapest signal for legacy-protocol usage and for password
+    spraying against the domain. 4777 is documented but never emitted.
+  event_categories:
+  - authentication
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same low-side DC path as the Kerberos dataset.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-system.security
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Same high-side DC path as the Kerberos dataset.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-system.security
+  formats:
+  - format: windows-event
+    parsing:
+      mechanism: elastic-integration
+      artifact: System integration (winlog input, Security channel)
+      notes: >
+        4776 carries only four EventData elements, so nearly all enrichment
+        (resolving Workstation to a host, deriving a failure reason from
+        Status) has to happen downstream in Cribl or an ingest pipeline.
+    fields:
+    - vendor: EventID
+      type: integer
+      description: numeric identifier of the credential validation event (4776)
+      ecs: event.code
+      status: mapped
+    - vendor: Computer
+      type: string
+      description: hostname of the domain controller that performed the validation
+      ecs: host.name
+      status: mapped
+    - vendor: PackageName
+      type: string
+      description: >-
+        authentication package that performed the validation, in practice
+        always MICROSOFT_AUTHENTICATION_PACKAGE_V1_0
+      ecs: null
+      status: unmapped
+      custom: activedirectory.ntlm.package_name
+    - vendor: TargetUserName
+      type: string
+      description: >-
+        account name whose credentials were validated (shown as 'Logon
+        Account' in the Windows UI)
+      ecs: user.name
+      status: mapped
+      notes: >
+        4776 carries no subject element, so this is the authenticating
+        principal and the only account name in the record; it is the dataset's
+        sole source of user.name. The System integration's Copy Target User
+        script agrees - it lists 4776 and writes TargetUserName to user.name
+        whenever no subject has already claimed that field. The value is
+        rendered bare, so unlike the UPN-form TargetUserName on a Kerberos
+        4769 there is no realm suffix to split off; it may be a computer
+        account with a trailing $ or a well-known principal such as Local
+        Service.
+    - vendor: Workstation
+      type: string
+      description: NetBIOS name of the machine the authentication request originated from
+      ecs: source.address
+      status: partial
+      notes: >
+        a NetBIOS computer name, not an address - 4776 carries no source IP at
+        all, so this must be resolved against an asset inventory before the
+        event can be attributed to a host or geolocated
+    - vendor: Status
+      type: string
+      description: >-
+        NTSTATUS error code for the validation attempt - 0x0 success,
+        0xC000006A bad password, 0xC0000064 unknown user, 0xC0000234 account
+        locked out
+      ecs: null
+      status: partial
+      custom: activedirectory.ntlm.status_code
+      transform: >
+        hex NTSTATUS needing a lookup table to produce a readable reason;
+        distinguishing 0xC0000064 (unknown user) from 0xC000006A (bad
+        password) is what separates account enumeration from password
+        spraying, so the decode is required for alerting, not cosmetic
+    - vendor: Keywords
+      type: string
+      description: HexInt64 keyword bitmask carrying the audit-success/audit-failure flag
+      ecs: event.outcome
+      status: mapped
+      transform: >-
+        audit-success/audit-failure keyword is translated to success/failure;
+        Status alone does not set event.outcome
+    - vendor: Message
+      type: string
+      description: rendered human-readable event message text
+      ecs: message
+      status: mapped
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Pass these through unparsed with Persistent Queue backpressure and
+          keep _raw — the record is four elements wide, so retention costs
+          nothing. The one piece of genuine low-side work is the asset lookup:
+          resolve the NetBIOS Workstation name against the inventory near the
+          source and attach the host identity and address, because 4776
+          carries no source IP at all and an ingest-pipeline enrich policy
+          will be staler than a Cribl lookup file. Apply the same tagging of
+          WEF-forwarded copies used on the Kerberos dataset.
+        elastic: >
+          In logs-system.security@custom, decode the hex NTSTATUS through a
+          lookup table into a readable reason and keep the distinction between
+          0xC0000064 (unknown user, enumeration) and 0xC000006A (bad password,
+          spraying) as a discrete field detections can pivot on rather than a
+          rendered string. Confirm event.outcome comes from the Keywords bit
+          and not Status, and map activedirectory.ntlm.status_code and
+          .package_name as keyword in the custom-namespace index template so
+          spray/enumeration aggregations do not depend on dynamic mapping.
+        relay: >
+          On the guarded crossing this is the cheapest dataset to cross and
+          should stay a thin envelope. The specific friction is the rendered
+          Message element, which is multi-line free text — it has to be
+          JSON-escaped so no embedded newline can break the LF-terminated
+          one-object-per-line NDJSON framing, and length-capped so a custom
+          guard filter can stay simple. Reconcile counts per (dataset, hour)
+          rather than expecting acknowledgements.
+      direct:
+        parse_location: high
+        cribl: >
+          Pass these through unparsed with Persistent Queue backpressure and
+          keep _raw — the record is four elements wide, so retention costs
+          nothing. The one piece of genuine low-side work is the asset lookup:
+          resolve the NetBIOS Workstation name against the inventory near the
+          source and attach the host identity and address, because 4776
+          carries no source IP at all and an ingest-pipeline enrich policy
+          will be staler than a Cribl lookup file. Apply the same tagging of
+          WEF-forwarded copies used on the Kerberos dataset.
+        elastic: >
+          In logs-system.security@custom, decode the hex NTSTATUS through a
+          lookup table into a readable reason and keep the distinction between
+          0xC0000064 (unknown user, enumeration) and 0xC000006A (bad password,
+          spraying) as a discrete field detections can pivot on rather than a
+          rendered string. Confirm event.outcome comes from the Keywords bit
+          and not Status, and map activedirectory.ntlm.status_code and
+          .package_name as keyword in the custom-namespace index template so
+          spray/enumeration aggregations do not depend on dynamic mapping.
+- id: directory-service-changes
+  name: Directory Service object changes
+  description: >
+    Events 5136 (object modified), 5137 (created), 5139 (moved) and 5141
+    (deleted) from the Directory Service Changes subcategory - per-attribute
+    audit of the directory itself. This is how AD-specific persistence and
+    privilege-escalation shows up (ACL edits on the domain head,
+    servicePrincipalName additions, msDS-AllowedToActOnBehalfOfOtherIdentity,
+    GPO link changes) and it has no equivalent in the member-host `windows`
+    map. Requires the Directory Service Changes subcategory plus a SACL on the
+    containers of interest - it is off by default.
+  event_categories:
+  - configuration
+  - iam
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same low-side DC path as the other datasets here. AttributeValue is
+        the field most likely to be length-capped or filtered by content
+        inspection, which materially weakens the dataset on this crossing.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-system.security
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Same high-side DC path as the other datasets here. AttributeValue
+        passes no content inspection on this route, so the before/after
+        attribute values arrive at full length.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-system.security
+  formats:
+  - format: windows-event
+    parsing:
+      mechanism: elastic-integration
+      artifact: System integration (winlog input, Security channel)
+      notes: >
+        The System integration's Security pipeline sets event.action for 5136
+        (directory-service-object-modified) but does no decoding of the
+        %%-prefixed message IDs in OperationType or DSType, and does not pair
+        the two 5136 records a single attribute change produces - that
+        correlation is ours to build in Cribl or at query time.
+    fields:
+    - vendor: EventID
+      type: integer
+      description: numeric identifier of the directory-change event (5136, 5137, 5139, 5141)
+      ecs: event.code
+      status: mapped
+    - vendor: Computer
+      type: string
+      description: hostname of the domain controller that recorded the directory change
+      ecs: host.name
+      status: mapped
+    - vendor: SubjectUserName
+      type: string
+      description: account name of the principal that performed the directory operation
+      ecs: user.name
+      status: mapped
+    - vendor: SubjectUserSid
+      type: string
+      description: SID of the principal that performed the directory operation
+      ecs: user.id
+      status: mapped
+    - vendor: SubjectDomainName
+      type: string
+      description: domain of the principal that performed the directory operation
+      ecs: user.domain
+      status: mapped
+    - vendor: SubjectLogonId
+      type: string
+      description: >-
+        HexInt64 logon session id of the principal, correlating the change
+        back to that session's logon event
+      ecs: null
+      status: unmapped
+      custom: activedirectory.ds.logon_id
+      notes: >-
+        the System integration parks this at winlog.logon.id; there is no ECS
+        session-id field, so it stays custom
+    - vendor: DSType
+      type: string
+      description: >-
+        directory service the object lives in, rendered as a message id
+        (%%14676 = Active Directory Domain Services)
+      ecs: null
+      status: unmapped
+      custom: activedirectory.ds.directory_type
+      transform: >-
+        %%-prefixed message id requiring a lookup; effectively constant for AD
+        DS but varies on AD LDS instances
+    - vendor: ObjectDN
+      type: string
+      description: distinguished name of the directory object that was modified, created or deleted
+      ecs: null
+      status: partial
+      custom: activedirectory.ds.object_dn
+      notes: >
+        the primary subject of the event and the field every AD detection
+        filters on; ECS has no directory-object identifier, and forcing a DN
+        into file.path or url.path would be actively misleading
+    - vendor: ObjectGUID
+      type: string
+      description: GUID of the directory object, stable across renames and moves
+      ecs: null
+      status: unmapped
+      custom: activedirectory.ds.object_guid
+      notes: >-
+        the only durable object identity - ObjectDN changes on every 5139
+        move, so joins across time must use this
+    - vendor: ObjectClass
+      type: string
+      description: LDAP class of the object (user, computer, group, groupPolicyContainer, ...)
+      ecs: null
+      status: unmapped
+      custom: activedirectory.ds.object_class
+    - vendor: AttributeLDAPDisplayName
+      type: string
+      description: LDAP display name of the attribute that changed (5136 only)
+      ecs: null
+      status: unmapped
+      custom: activedirectory.ds.attribute_name
+      notes: >
+        carries the detection value - nTSecurityDescriptor,
+        servicePrincipalName, msDS-AllowedToActOnBehalfOfOtherIdentity and
+        scriptPath are the high-signal values
+    - vendor: AttributeSyntaxOID
+      type: string
+      description: >-
+        OID identifying the attribute's syntax, e.g. 2.5.5.9 for
+        Integer/Enumeration (5136 only)
+      ecs: null
+      status: unmapped
+      custom: activedirectory.ds.attribute_syntax_oid
+      notes: >-
+        needed to interpret AttributeValue correctly - the same rendered
+        string means different things under different syntaxes
+    - vendor: AttributeValue
+      type: string
+      description: the attribute value that was added or deleted (5136 only)
+      ecs: null
+      status: partial
+      custom: activedirectory.ds.attribute_value
+      notes: >
+        free-text and unbounded - a security descriptor value can be several
+        kilobytes of SDDL; expect truncation at the guard and at any Cribl
+        field-length limit, and treat a truncated value as unusable for
+        before/after diffing rather than as an empty change
+    - vendor: OperationType
+      type: string
+      description: >-
+        whether the attribute value was added or removed, as a message id
+        (%%14674 Value Added, %%14675 Value Deleted)
+      ecs: event.action
+      status: partial
+      transform: >
+        %%-prefixed message ids must be decoded to value-added/value-deleted
+        before they are usable as event.action; note that modifying a
+        single-valued attribute emits TWO 5136 records - a Value Deleted for
+        the old value then a Value Added for the new one
+    - vendor: OpCorrelationID
+      type: string
+      description: GUID grouping all records emitted by one LDAP operation
+      ecs: null
+      status: unmapped
+      custom: activedirectory.ds.operation_correlation_id
+      notes: >
+        the join key for the delete/add 5136 pair above; without it a
+        single-attribute edit reads as two unrelated changes and before/after
+        reconstruction is impossible
+    - vendor: DSName
+      type: string
+      description: root domain name of the directory the object belongs to
+      ecs: null
+      status: unmapped
+      custom: activedirectory.ds.directory_name
+    - vendor: OldObjectDN
+      type: string
+      description: distinguished name the object was moved from (5139 only)
+      ecs: null
+      status: unmapped
+      custom: activedirectory.ds.old_object_dn
+      notes: >-
+        not pre-declared in the System integration's field list, so it falls
+        through to the dynamic keyword template
+    - vendor: NewObjectDN
+      type: string
+      description: distinguished name the object was moved to (5139 only)
+      ecs: null
+      status: unmapped
+      custom: activedirectory.ds.new_object_dn
+    - vendor: Keywords
+      type: string
+      description: HexInt64 keyword bitmask carrying the audit-success/audit-failure flag
+      ecs: event.outcome
+      status: mapped
+      transform: audit-success/audit-failure keyword is translated to success/failure
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Pass-through with Persistent Queue backpressure and keep _raw — this
+          is the dataset where a lost or clipped value cannot be reconstructed
+          from anywhere else. Do not attempt stateful pairing of the
+          delete/add 5136 couple in Cribl; an at-most-once, possibly reordered
+          stream makes that unreliable, so leave the OpCorrelationID join to
+          query time. Instead instrument AttributeValue low-side: record its
+          original byte length and a hash of the full value before anything
+          downstream can cap it, so a truncated value is detectable rather
+          than passing as a smaller change.
+        elastic: >
+          Add a logs-system.security@custom pipeline that decodes the
+          %%-prefixed message ids the integration leaves alone — OperationType
+          %%14674/%%14675 into a value-added/value-deleted event.action, and
+          DSType into a directory-type label — and keeps AttributeSyntaxOID
+          alongside AttributeValue so the value is interpreted under the right
+          syntax. In the custom-namespace index template map
+          activedirectory.ds.object_dn, .object_guid, .attribute_name and
+          .object_class as keyword, and give .attribute_value an ignore_above
+          well above the 1024-byte default (or a wildcard/text field) so
+          kilobyte SDDL security descriptors are not silently dropped from the
+          index the same way a guard would clip them.
+        relay: >
+          The hop notes flag AttributeValue specifically because it is the
+          field most likely to be length-capped by content inspection, and a
+          silently truncated SDDL breaks before/after diffing outright. Cross
+          the thin envelope but negotiate an explicit per-field size allowance
+          with the guard owner for this dataset, and rather than accepting a
+          clip, dead-letter oversize records low-side and forward a marked
+          stub carrying the length and hash. Keep the JSON shallow and the key
+          set allow-listed so the custom NDJSON filter work stays simple, and
+          reconcile per-(dataset, hour) counts on both sides.
+      direct:
+        parse_location: high
+        cribl: >
+          Pass-through with Persistent Queue backpressure and keep _raw — this
+          is the dataset where a lost or clipped value cannot be reconstructed
+          from anywhere else. Do not attempt stateful pairing of the
+          delete/add 5136 couple in Cribl; an at-most-once, possibly reordered
+          stream makes that unreliable, so leave the OpCorrelationID join to
+          query time. Instead instrument AttributeValue low-side: record its
+          original byte length and a hash of the full value before anything
+          downstream can cap it, so a truncated value is detectable rather
+          than passing as a smaller change.
+        elastic: >
+          Add a logs-system.security@custom pipeline that decodes the
+          %%-prefixed message ids the integration leaves alone — OperationType
+          %%14674/%%14675 into a value-added/value-deleted event.action, and
+          DSType into a directory-type label — and keeps AttributeSyntaxOID
+          alongside AttributeValue so the value is interpreted under the right
+          syntax. In the custom-namespace index template map
+          activedirectory.ds.object_dn, .object_guid, .attribute_name and
+          .object_class as keyword, and give .attribute_value an ignore_above
+          well above the 1024-byte default (or a wildcard/text field) so
+          kilobyte SDDL security descriptors are not silently dropped from the
+          index the same way a guard would clip them.
+- id: account-management
+  name: Domain account and group management
+  description: >
+    User account lifecycle and security group membership changes recorded on
+    the domain controller - 4720 created, 4722 enabled, 4725 disabled, 4726
+    deleted, 4738 changed, and the group-membership family 4728/4729 (global),
+    4732/4733 (domain local) and 4756/4757 (universal). Microsoft documents
+    the six group events as schema-identical, so one field list covers all of
+    them. Domain-object changes here are authoritative in a way the
+    member-host equivalents in the `windows` map are not - those record only
+    local SAM accounts.
+  event_categories:
+  - iam
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same low-side DC path as the other datasets in this map.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-system.security
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Same high-side DC path as the other datasets in this map.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-system.security
+  formats:
+  - format: windows-event
+    parsing:
+      mechanism: elastic-integration
+      artifact: System integration (winlog input, Security channel)
+      notes: >
+        The integration sets event.action per event id (added-user-account,
+        added-member-to-group, ...) and parses MemberName's DN into
+        user.target.name, but leaves the %%-encoded UAC and password-timestamp
+        values untouched. Server 2016+ emits a version 2 of the group events
+        carrying a membership expiration time for temporary (PAM) memberships;
+        that element is not covered here and should be captured from a live
+        event before it is relied on.
+    fields:
+    - vendor: EventID
+      type: integer
+      description: >-
+        numeric identifier of the account-management event (4720, 4722, 4725,
+        4726, 4728, 4732, 4738, 4756, ...)
+      ecs: event.code
+      status: mapped
+    - vendor: Computer
+      type: string
+      description: hostname of the domain controller that recorded the change
+      ecs: host.name
+      status: mapped
+    - vendor: SubjectUserName
+      type: string
+      description: account name of the administrator or process that made the change
+      ecs: user.name
+      status: mapped
+    - vendor: SubjectUserSid
+      type: string
+      description: SID of the account that made the change
+      ecs: user.id
+      status: mapped
+    - vendor: SubjectDomainName
+      type: string
+      description: domain of the account that made the change
+      ecs: user.domain
+      status: mapped
+    - vendor: SubjectLogonId
+      type: string
+      description: HexInt64 logon session id of the account that made the change
+      ecs: null
+      status: unmapped
+      custom: activedirectory.accountmgmt.logon_id
+      notes: >-
+        joins the change back to the administrator's logon session; no ECS
+        session-id field exists
+    - vendor: TargetUserName
+      type: string
+      description: >-
+        name of the object the action was performed on - the user account on
+        4720/4722/4725/4726/4738, but the GROUP name on 4728/4732/4756 and
+        their removal counterparts
+      ecs: user.target.name
+      status: partial
+      notes: >
+        the sharpest mapping hazard in this map - on the six group events the
+        element still called TargetUserName holds a group name, so the default
+        mapping files a group into user.target.name; it should be routed to
+        user.target.group.name on those event ids instead
+    - vendor: TargetDomainName
+      type: string
+      description: domain of the target account or group (Builtin for built-in local groups)
+      ecs: user.target.domain
+      status: mapped
+    - vendor: TargetSid
+      type: string
+      description: SID of the target account or group
+      ecs: user.target.id
+      status: partial
+      notes: >
+        same hazard as TargetUserName - on group events this is a group SID
+        and belongs in user.target.group.id; it is also the only reliable way
+        to spot changes to the well-known privileged groups (-512 Domain
+        Admins, -519 Enterprise Admins) since those groups can be renamed
+    - vendor: MemberName
+      type: string
+      description: full distinguished name of the account added to or removed from the group
+      ecs: null
+      status: partial
+      custom: activedirectory.accountmgmt.member_dn
+      notes: >
+        the System integration parses this DN into user.target.name, which
+        collides with the group name TargetUserName writes to the same field
+        on exactly these events - one of the two is lost; kept as a custom
+        field here so the membership change stays reconstructable. Rendered as
+        "-" for some local-group operations, in which case only MemberSid
+        identifies the member
+    - vendor: MemberSid
+      type: string
+      description: SID of the account added to or removed from the group
+      ecs: null
+      status: unmapped
+      custom: activedirectory.accountmgmt.member_sid
+      notes: >-
+        receives no ECS normalization at all in the System integration - it
+        survives only under winlog.event_data, yet it is the sole identifier
+        when MemberName is "-"
+    - vendor: SamAccountName
+      type: string
+      description: pre-Windows-2000 logon name assigned to the account (4720/4738)
+      ecs: null
+      status: unmapped
+      custom: activedirectory.accountmgmt.sam_account_name
+    - vendor: UserPrincipalName
+      type: string
+      description: UPN assigned to the account, in user@domain form (4720/4738)
+      ecs: null
+      status: partial
+      custom: activedirectory.accountmgmt.user_principal_name
+      notes: >
+        shaped like an email address but not guaranteed to be one, so mapping
+        it to user.target.email would fabricate a mailbox; kept custom until
+        the domain's UPN suffix policy is confirmed
+    - vendor: DisplayName
+      type: string
+      description: display name assigned to the account (4720/4738)
+      ecs: user.target.full_name
+      status: mapped
+    - vendor: UserAccountControl
+      type: string
+      description: >-
+        space-separated list of %%-prefixed message ids describing which UAC
+        flags changed (4720/4738)
+      ecs: null
+      status: partial
+      custom: activedirectory.accountmgmt.uac_changes
+      transform: >
+        a list of change descriptions such as %%2080 (Account Enabled), not a
+        bitmask; each id needs a lookup and the list needs splitting before
+        "Don't Require Preauth" or "Password Not Required" can be alerted on
+    - vendor: NewUacValue
+      type: string
+      description: the userAccountControl bitmask after the change, in hex (4720/4738)
+      ecs: null
+      status: partial
+      custom: activedirectory.accountmgmt.uac_value_new
+      transform: >
+        hex bitmask that must be decoded against the userAccountControl flag
+        table; paired with OldUacValue it gives the true before/after, which
+        the message-id list above does not
+    - vendor: PasswordLastSet
+      type: string
+      description: timestamp the account password was last set (4720/4738)
+      ecs: null
+      status: partial
+      custom: activedirectory.accountmgmt.password_last_set
+      transform: >
+        a localized date string, or the message id %%1794 meaning <never>;
+        both forms have to be normalized before this can be indexed as a date,
+        and %%1794 must not be coerced to the epoch
+    - vendor: SidHistory
+      type: string
+      description: 'SIDs written into the account''s sIDHistory attribute (4720/4738)'
+      ecs: null
+      status: unmapped
+      custom: activedirectory.accountmgmt.sid_history
+      notes: >-
+        normally "-" and dropped by the pipeline; any populated value outside
+        an active domain migration is a SID-history injection candidate
+    - vendor: Keywords
+      type: string
+      description: HexInt64 keyword bitmask carrying the audit-success/audit-failure flag
+      ecs: event.outcome
+      status: mapped
+      transform: audit-success/audit-failure keyword is translated to success/failure
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Pass-through with Persistent Queue backpressure and full _raw
+          retention — this is the lowest-volume, highest-consequence dataset
+          in the map, so nothing here should be trimmed low-side. The one
+          useful near-source lookup is the well-known RID table (-512 Domain
+          Admins, -519 Enterprise Admins, -518, -520) applied to TargetSid and
+          MemberSid, so privileged-group changes stay identifiable even when
+          the groups have been renamed, and can be routed to a priority
+          destination independently of downstream parsing.
+        elastic: >
+          The critical fix belongs in a logs-system.security@custom pipeline:
+          on the six group events (4728/4729, 4732/4733, 4756/4757) move
+          TargetUserName and TargetSid off user.target.name/.id onto the group
+          target fields, which frees user.target.name for the MemberName DN
+          the integration parses into it and resolves the collision that
+          currently loses one of the two. Decode the %%-prefixed
+          UserAccountControl change list and the OldUacValue/NewUacValue
+          bitmasks into named flags so "Don't Require Preauth" and "Password
+          Not Required" are alertable, and normalize PasswordLastSet's
+          localized date while mapping %%1794 to null rather than coercing it
+          to the epoch. Map the activedirectory.accountmgmt.* customs —
+          member_sid especially, which gets no ECS normalization at all — as
+          keyword in the index template.
+        relay: >
+          Cross the thin envelope and give this dataset priority in the guard
+          throughput budget, since its volume is trivial next to the Kerberos
+          stream and its evidentiary value is the highest in the map. The
+          friction is that MemberName is a full distinguished name with
+          attacker-influenceable, potentially non-ASCII CN components — bound
+          its length, normalize to UTF-8 and keep the envelope keys
+          allow-listed so the custom NDJSON filter stays simple.
+      direct:
+        parse_location: high
+        cribl: >
+          Pass-through with Persistent Queue backpressure and full _raw
+          retention — this is the lowest-volume, highest-consequence dataset
+          in the map, so nothing here should be trimmed low-side. The one
+          useful near-source lookup is the well-known RID table (-512 Domain
+          Admins, -519 Enterprise Admins, -518, -520) applied to TargetSid and
+          MemberSid, so privileged-group changes stay identifiable even when
+          the groups have been renamed, and can be routed to a priority
+          destination independently of downstream parsing.
+        elastic: >
+          The critical fix belongs in a logs-system.security@custom pipeline:
+          on the six group events (4728/4729, 4732/4733, 4756/4757) move
+          TargetUserName and TargetSid off user.target.name/.id onto the group
+          target fields, which frees user.target.name for the MemberName DN
+          the integration parses into it and resolves the collision that
+          currently loses one of the two. Decode the %%-prefixed
+          UserAccountControl change list and the OldUacValue/NewUacValue
+          bitmasks into named flags so "Don't Require Preauth" and "Password
+          Not Required" are alertable, and normalize PasswordLastSet's
+          localized date while mapping %%1794 to null rather than coercing it
+          to the epoch. Map the activedirectory.accountmgmt.* customs —
+          member_sid especially, which gets no ECS normalization at all — as
+          keyword in the index template.

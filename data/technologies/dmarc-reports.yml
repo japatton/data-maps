@@ -1,0 +1,598 @@
+id: dmarc-reports
+name: DMARC Aggregate Reports
+vendor: Multiple
+versions: >-
+  RFC 7489 aggregate (rua) and RFC 6591 failure (ruf) reports; parsedmarc
+  8.x-10.x as the collector
+draft: true
+references:
+- https://datatracker.ietf.org/doc/html/rfc7489#appendix-C
+- https://datatracker.ietf.org/doc/html/rfc6591
+- https://domainaware.github.io/parsedmarc/
+- https://domainaware.github.io/parsedmarc/usage.html
+- https://github.com/domainaware/parsedmarc/blob/master/parsedmarc/elastic.py
+datasets:
+- id: aggregate
+  name: Aggregate report (rua)
+  description: >
+    The BOD 18-01 RUA feed. Receiving mail providers (Google, Microsoft,
+    Yahoo, and hundreds of smaller receivers) send one XML report per
+    reporting window per agency domain, zipped or gzipped as a mail attachment
+    to the address in the domain's DMARC rua= tag. Nothing here is syslog:
+    collection is a mailbox poll (IMAP, Microsoft Graph, or Gmail API),
+    attachment decompression, and XML parse, done by parsedmarc, which emits
+    one flat JSON document per record/row of the report. That fan-out matters
+    - a single report becomes many documents, and each document represents
+    message_count messages rather than one message. Detection value is
+    spoofing of agency domains - unauthenticated senders using header_from of
+    an agency domain, grouped by source IP and ASN.
+  event_categories:
+  - authentication
+  route:
+    guarded:
+    - hop: cribl
+      location: edge Cribl worker group, internet-facing mail enclave
+      notes: >
+        parsedmarc polls the RUA mailbox, unzips the attachments, parses the
+        RFC 7489 XML, and ships flattened per-row JSON to Cribl over its
+        syslog or webhook output. Because the RUA mailbox must be reachable
+        from the public internet while Elastic sits on the high side, the
+        internet-facing collector runs low-side and its records cross the
+        guard as shown.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-dmarc.aggregate
+    direct:
+    - hop: cribl
+      location: edge Cribl worker group, internet-facing mail collector
+      notes: >
+        parsedmarc polls the RUA mailbox, unzips the attachments, parses the
+        RFC 7489 XML, and ships flattened per-row JSON to Cribl over its
+        syslog or webhook output. Elastic sits on the same side, so records go
+        straight to the core worker group with no guard crossing.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-dmarc.aggregate
+  formats:
+  - format: json
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom parsedmarc-JSON normalization pipeline
+      notes: >
+        There is no Elastic integration and no Cribl pack for DMARC - the
+        elastic/integrations catalogue has no dmarc package, so nothing
+        upstream owns this schema. parsedmarc is the de-facto standard parser
+        and is treated here as the collector rather than the mapper: it
+        produces the field names below, and a hand-built Cribl pipeline is
+        what turns them into ECS. parsedmarc's own Elasticsearch output
+        (parsedmarc-aggregate-* indices) is deliberately not used, because it
+        bypasses Cribl and the data stream naming convention.
+    fields:
+    - vendor: org_name
+      type: string
+      description: >-
+        name of the receiving organization that generated the report
+        (report_metadata/org_name)
+      ecs: observer.name
+      status: partial
+      notes: >
+        the reporting receiver (google.com, Enterprise Outlook, Yahoo!Inc.);
+        ECS has no field for "the party that generated this report", and
+        observer.* is the closest fit because the receiver is what observed
+        the mail flow - do not confuse it with the reported-on agency domain
+        in published_policy.domain
+    - vendor: report_id
+      type: string
+      description: >-
+        unique identifier assigned to the report by the reporting organization
+        (report_metadata/report_id)
+      ecs: null
+      status: unmapped
+      custom: dmarc.report.id
+      notes: >
+        not unique per document - one report fans out to one document per
+        record/row - so it cannot be event.id; kept as the de-duplication key
+        (org_name + report_id) for reports that get delivered twice
+    - vendor: date_begin
+      type: timestamp
+      description: >-
+        start of the reporting window the rows were aggregated over
+        (report_metadata/date_range/begin)
+      ecs: event.start
+      status: mapped
+      transform: UNIX epoch seconds in the XML, converted to RFC 3339
+    - vendor: date_end
+      type: timestamp
+      description: >-
+        end of the reporting window the rows were aggregated over
+        (report_metadata/date_range/end)
+      ecs: event.end
+      status: mapped
+      transform: >
+        UNIX epoch seconds converted to RFC 3339; this is also the value
+        @timestamp must be derived from, because reports arrive 24-48 hours
+        after the window they describe and parse-time timestamps would place
+        every event in the wrong day
+    - vendor: published_policy.domain
+      type: string
+      description: the domain whose DMARC record the report is about (policy_published/domain)
+      ecs: null
+      status: unmapped
+      custom: dmarc.policy.domain
+      notes: >
+        the agency domain being protected and the primary pivot for this feed;
+        ECS has no field for "the domain a policy was published for" and the
+        email.* namespace models addresses rather than domains, so this stays
+        custom
+    - vendor: published_policy.p
+      type: enum
+      description: >-
+        the requested policy for the domain - none, quarantine, or reject
+        (policy_published/p)
+      ecs: null
+      status: unmapped
+      custom: dmarc.policy.p
+      notes: >
+        BOD 18-01 requires p=reject; the sibling policy_published values sp
+        (subdomain policy), pct (sampling rate), adkim and aspf (relaxed r /
+        strict s alignment) travel in the same object and should be carried on
+        dmarc.policy.* alongside this field - pct below 100 in particular
+        means the reported dispositions are a sample and volume comparisons
+        across domains are not like-for-like
+    - vendor: source_ip_address
+      type: ip
+      description: >-
+        IP address of the MTA that sent the messages this row aggregates
+        (record/row/source_ip)
+      ecs: source.ip
+      status: mapped
+    - vendor: source_reverse_dns
+      type: string
+      description: PTR record for the sending IP address
+      ecs: source.domain
+      status: mapped
+      notes: >
+        not in the RFC 7489 XML - added by the parser at collection time, so
+        it reflects DNS as of parse time and not as of the reporting window
+    - vendor: source_base_domain
+      type: string
+      description: registrable (eTLD+1) domain derived from the reverse DNS name
+      ecs: source.registered_domain
+      status: mapped
+    - vendor: source_country
+      type: string
+      description: country of the sending IP address from GeoIP lookup
+      ecs: source.geo.country_iso_code
+      status: partial
+      transform: >
+        emitted as an ISO 3166-1 alpha-2 code when the GeoIP database is
+        present and as a full country name or empty string when it is not;
+        normalize to the alpha-2 code and populate source.geo.country_name
+        separately rather than mapping both from one value
+    - vendor: source_asn
+      type: integer
+      description: autonomous system number the sending IP belongs to
+      ecs: source.as.number
+      status: mapped
+    - vendor: source_as_name
+      type: string
+      description: name of the autonomous system the sending IP belongs to
+      ecs: source.as.organization.name
+      status: mapped
+    - vendor: message_count
+      type: integer
+      description: >-
+        number of messages this row aggregates that shared the same source IP
+        and evaluation result (record/row/count)
+      ecs: null
+      status: unmapped
+      custom: dmarc.aggregate.message_count
+      notes: >
+        the single most important modelling hazard in this feed - each
+        document represents count messages, not one, so every rate, threshold,
+        and top-N must sum this field; ECS has no "this event stands for N
+        occurrences" field, and mapping it to anything in event.* would
+        misrepresent it
+    - vendor: disposition
+      type: enum
+      description: >-
+        policy the receiver actually applied to the messages - none,
+        quarantine, or reject (record/row/policy_evaluated/disposition)
+      ecs: event.action
+      status: mapped
+      notes: >
+        what the receiver did, which is not the same as whether authentication
+        passed - a receiver may apply none despite a failure because of a
+        local override, so this must not be used to derive event.outcome
+    - vendor: passed_dmarc
+      type: boolean
+      description: >-
+        whether the messages passed DMARC, i.e. at least one of DKIM or SPF
+        both authenticated and aligned
+      ecs: event.outcome
+      status: mapped
+      transform: >
+        parser-derived boolean from policy_evaluated/dkim and
+        policy_evaluated/spf; true maps to success and false to failure - this
+        is the authoritative source of event.outcome for the dataset
+    - vendor: policy_overrides.type
+      type: enum
+      description: >-
+        reason the receiver deviated from the published policy
+        (record/row/policy_evaluated/reason/type)
+      ecs: event.reason
+      status: partial
+      notes: >
+        enum of forwarded, sampled_out, trusted_forwarder, mailing_list,
+        local_policy, other; the free-text sibling policy_overrides.comment
+        explains it and is unbounded receiver-supplied text - concatenating
+        the two into event.reason loses the queryable enum, so keep the enum
+        here and carry the comment on dmarc.aggregate.override_comment
+    - vendor: header_from
+      type: string
+      description: >-
+        domain from the RFC 5322 From header of the reported messages
+        (record/identifiers/header_from)
+      ecs: null
+      status: unmapped
+      custom: dmarc.identifiers.header_from
+      notes: >
+        the identifier that makes this feed a spoofing detector, but aggregate
+        reports carry only the domain part and never the mailbox; ECS has
+        email.from.address and no email.from.domain, so populating
+        email.from.address would mix bare domains with real addresses and
+        break exact-address queries
+    - vendor: envelope_from
+      type: string
+      description: >-
+        domain from the RFC 5321 MailFrom (return-path) of the reported
+        messages (record/identifiers/envelope_from)
+      ecs: null
+      status: unmapped
+      custom: dmarc.identifiers.envelope_from
+      notes: >
+        domain-only for the same reason as header_from, so it is kept off
+        email.sender.address; a mismatch between this and header_from is the
+        classic indicator of a forwarded or spoofed message
+    - vendor: dkim_results.result
+      type: enum
+      description: >-
+        DKIM verification result for the signing domain
+        (record/auth_results/dkim/result)
+      ecs: null
+      status: unmapped
+      custom: dmarc.auth.dkim.result
+      notes: >
+        one of none, pass, fail, policy, neutral, temperror, permerror; this
+        is the raw DKIM result and is distinct from policy_evaluated/dkim,
+        which reports alignment - the sibling domain and selector values
+        belong on dmarc.auth.dkim.domain and dmarc.auth.dkim.selector and
+        identify which signing key was used
+    - vendor: spf_results.result
+      type: enum
+      description: >-
+        SPF verification result for the checked identity
+        (record/auth_results/spf/result)
+      ecs: null
+      status: unmapped
+      custom: dmarc.auth.spf.result
+      notes: >
+        one of none, neutral, pass, fail, softfail, temperror, permerror, with
+        a scope of mfrom or helo on the sibling dmarc.auth.spf.scope; like
+        DKIM this is the raw result, not the alignment verdict in
+        policy_evaluated/spf
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Fan the report out low-side so one JSON line equals one record/row
+          and the guard never sees a multi-megabyte XML blob, and stamp every
+          line with the report identity (org_name plus report_id) so
+          re-delivered reports can be de-duplicated after the crossing where
+          there is no return channel to ask for a resend. Build the full
+          ECS-shaped document here - epoch date_begin/date_end to RFC 3339
+          with @timestamp taken from date_end rather than arrival time,
+          passed_dmarc to event.outcome, disposition to event.action - and do
+          the source IP enrichment (reverse DNS, base domain, ASN, country) at
+          the edge where the resolver and the GeoIP/ASN databases actually
+          live. Gate the destination with C.Schema(...).validate plus a
+          dead-letter route, run it on Persistent Queue backpressure never
+          Block, and drop the zipped-XML _raw once the parse is proven since
+          the aggregate feed has no forensic value beyond its parsed fields.
+        elastic: >
+          Own a custom logs-dmarc.aggregate ingest pipeline and index template
+          - no stock integration exists, so every dmarc.* custom field needs
+          an explicit mapping rather than dynamic mapping.
+          dmarc.aggregate.message_count must be mapped as long and treated as
+          the unit of volume everywhere: dashboards and alert rules have to
+          sum it, because counting documents undercounts a spoofing campaign
+          by orders of magnitude when one row covers thousands of messages.
+          Map the policy, identifier, and auth-result fields
+          (dmarc.policy.domain, dmarc.identifiers.header_from,
+          dmarc.auth.dkim.result, dmarc.auth.spf.result) as keyword so the
+          "which agency domain is being spoofed, by whom" pivot works, and
+          assert event.outcome is derived from passed_dmarc rather than from
+          disposition, which reports what the receiver did and not whether
+          authentication succeeded.
+        relay: >
+          Full ECS-shaped NDJSON crosses (envelope mode B) - one row per line,
+          UTF-8, LF-terminated, compression explicitly disabled, nesting depth
+          two or less - because no Elastic integration exists to finish a thin
+          envelope on the high side. This is the friendliest dataset on the
+          estate for a custom content filter: after the low-side parse almost
+          every value is an enum, an IP, an integer, or a domain name, so an
+          allow-list of short ASCII keys with bounded values is achievable.
+          The friction to settle with the guard owner is the
+          attacker-controlled free text - policy_overrides.comment and the
+          human_result strings on the auth results, which are unbounded and
+          may carry non-ASCII - so cap and flag those low-side. Nothing
+          CEF-shaped is involved at any point; the wire format is XML in mail,
+          and it never leaves the low side in that form. With no
+          acknowledgements, detect silent drops by reconciling low-side and
+          high-side row counts per (dataset, hour) and by watching for report
+          identifiers whose row count does not match the report's own record
+          total.
+      direct:
+        parse_location: low
+        cribl: >
+          Fan the report out at the collector so one JSON line equals one
+          record/row and Elastic never ingests a multi-megabyte XML blob, and
+          stamp every line with the report identity (org_name plus report_id)
+          so reports that get delivered twice can be de-duplicated. Build the
+          full ECS-shaped document here - epoch date_begin/date_end to RFC
+          3339 with @timestamp taken from date_end rather than arrival time,
+          passed_dmarc to event.outcome, disposition to event.action - and do
+          the source IP enrichment (reverse DNS, base domain, ASN, country) at
+          the edge where the resolver and the GeoIP/ASN databases actually
+          live. Gate the destination with C.Schema(...).validate plus a
+          dead-letter route, run it on Persistent Queue backpressure never
+          Block, and drop the zipped-XML _raw once the parse is proven since
+          the aggregate feed has no forensic value beyond its parsed fields.
+        elastic: >
+          Own a custom logs-dmarc.aggregate ingest pipeline and index template
+          - no stock integration exists, so every dmarc.* custom field needs
+          an explicit mapping rather than dynamic mapping.
+          dmarc.aggregate.message_count must be mapped as long and treated as
+          the unit of volume everywhere: dashboards and alert rules have to
+          sum it, because counting documents undercounts a spoofing campaign
+          by orders of magnitude when one row covers thousands of messages.
+          Map the policy, identifier, and auth-result fields
+          (dmarc.policy.domain, dmarc.identifiers.header_from,
+          dmarc.auth.dkim.result, dmarc.auth.spf.result) as keyword so the
+          "which agency domain is being spoofed, by whom" pivot works, and
+          assert event.outcome is derived from passed_dmarc rather than from
+          disposition, which reports what the receiver did and not whether
+          authentication succeeded.
+- id: failure
+  name: Failure report (ruf)
+  description: >
+    Thin starter for the RFC 6591 failure (forensic) feed named by the DMARC
+    ruf= tag - a per-message ARF report sent when an individual message fails
+    DMARC. Rarely enabled: most large receivers do not send them at all, and
+    the reports carry the original message headers and sometimes the full
+    body, which is a privacy and spillage problem rather than a volume one.
+    Collected through the same mailbox poll as the aggregate feed. Include
+    this dataset only if the ruf= tag is actually published; otherwise it
+    stays empty by design.
+  event_categories:
+  - authentication
+  route:
+    guarded:
+    - hop: cribl
+      location: edge Cribl worker group, internet-facing mail enclave
+      notes: >
+        Same parsedmarc mailbox poll as the aggregate feed above; the crossing
+        is identical, but it matters far more here because the payload
+        includes attacker-supplied message content.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-dmarc.failure
+    direct:
+    - hop: cribl
+      location: edge Cribl worker group, internet-facing mail collector
+      notes: >
+        Same parsedmarc mailbox poll as the aggregate feed above. Elastic sits
+        on the same side, so records go straight to the core worker group with
+        no guard crossing.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-dmarc.failure
+  formats:
+  - format: json
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom parsedmarc-JSON normalization pipeline
+      notes: >
+        Same hand-built pipeline family as the aggregate dataset - no Elastic
+        integration or Cribl pack exists. parsedmarc parses the ARF wrapper
+        and the attached message sample into a nested sample object.
+    fields:
+    - vendor: feedback_type
+      type: string
+      description: ARF feedback type, always auth-failure for DMARC failure reports
+      ecs: null
+      status: unmapped
+      custom: dmarc.failure.feedback_type
+    - vendor: arrival_date
+      type: timestamp
+      description: date and time the failing message arrived at the reporting receiver
+      ecs: email.delivery_timestamp
+      status: mapped
+      transform: >-
+        RFC 5322 date string, converted to RFC 3339; also the source of
+        @timestamp for this dataset
+    - vendor: source_ip_address
+      type: ip
+      description: IP address the failing message was received from
+      ecs: source.ip
+      status: mapped
+    - vendor: original_mail_from
+      type: string
+      description: RFC 5321 MailFrom of the failing message
+      ecs: email.sender.address
+      status: mapped
+      notes: >
+        unlike the aggregate feed this is a full mailbox address rather than a
+        bare domain, so it maps cleanly
+    - vendor: original_rcpt_to
+      type: string
+      description: envelope recipient of the failing message
+      ecs: email.to.address
+      status: mapped
+      notes: >
+        a real third-party recipient address - the main reason failure reports
+        are a privacy problem and a candidate for low-side masking
+    - vendor: domain
+      type: string
+      description: the domain whose DMARC policy the message failed
+      ecs: null
+      status: unmapped
+      custom: dmarc.failure.reported_domain
+    - vendor: authentication_results
+      type: string
+      description: >-
+        verbatim Authentication-Results header content recorded by the
+        reporting receiver
+      ecs: null
+      status: unmapped
+      custom: dmarc.failure.authentication_results
+      notes: >
+        unparsed free-text string holding the SPF, DKIM, and DMARC verdicts
+        together; needs splitting before the individual results are queryable,
+        and it is receiver-formatted so no single grammar fits every sender
+    - vendor: delivery_result
+      type: enum
+      description: >-
+        what the receiver did with the failing message - delivered, spam,
+        policy, reject, or other
+      ecs: event.action
+      status: partial
+      notes: >
+        often absent, and it describes the receiver's disposition rather than
+        the authentication verdict, so event.outcome must be derived from the
+        DMARC result in authentication_results instead
+    - vendor: sample.subject
+      type: string
+      description: Subject header of the failing message
+      ecs: email.subject
+      status: mapped
+      notes: attacker-controlled free text - bound its length before the guard
+    - vendor: sample.headers.Message-ID
+      type: string
+      description: Message-ID header of the failing message
+      ecs: email.message_id
+      status: mapped
+    - vendor: sample.body
+      type: string
+      description: >-
+        body of the failing message, present only when the receiver sends a
+        full sample rather than headers only
+      ecs: null
+      status: unmapped
+      custom: dmarc.failure.sample.body
+      notes: >
+        the highest-risk value in the feed - a full attacker-supplied message
+        body; the sample.headers_only boolean says whether it is present, and
+        the default posture should be to drop this field low-side
+    - vendor: sample.attachments.filename
+      type: string
+      description: filename of an attachment on the failing message
+      ecs: email.attachments.file.name
+      status: mapped
+      notes: >
+        the sibling sample.attachments.sha256 maps to
+        email.attachments.file.hash.sha256 and is the useful pivot into
+        malware tooling
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Treat redaction as the primary low-side job on this route: drop
+          sample.body outright unless the mission explicitly needs it, and
+          hash or truncate the remaining sample content before it leaves the
+          enclave, because these reports carry attacker-controlled message
+          bodies and third-party recipient addresses that no downstream
+          consumer needs in full. Flatten the nested sample object to two
+          levels and cap every string, map the ARF delivery_result and the
+          DMARC verdict to event.action and event.outcome, and validate
+          against a schema with a dead-letter route - the ARF format is far
+          looser in practice than the RFC and malformed samples are common.
+          Keep volume-based alerting off this feed entirely; a receiver that
+          turns ruf on can flood the mailbox.
+        elastic: >
+          Extend the same custom logs-dmarc.* index template with keyword
+          mappings for dmarc.failure.feedback_type,
+          dmarc.failure.reported_domain, and
+          dmarc.failure.authentication_results, and put the retained sample
+          fields under the standard email.* mappings so failure reports join
+          the mail-gateway datasets on email.message_id and
+          email.attachments.file.hash.sha256. Apply a shorter ILM retention
+          here than on the aggregate feed to bound the exposure of retained
+          message content, and derive event.outcome from the DMARC verdict
+          rather than the ARF Delivery-Result, which describes what the
+          receiver did with the message.
+        relay: >
+          Full ECS-shaped NDJSON crosses (envelope mode B), but this is the
+          hardest dataset on the estate for a custom guard content filter and
+          should be raised with the guard owner as such: the sample carries
+          arbitrary attacker-controlled headers, subjects, bodies, and
+          filenames - unbounded free text, kilobyte-scale values, arbitrary
+          unicode and encoded content - which is exactly what a simple
+          allow-list filter cannot inspect. The practical answer is to reduce
+          what crosses rather than to make the filter smarter: cap and
+          allow-list low-side, and drop _raw and sample.body before the guard
+          rather than carrying them and hoping the filter passes them. As with
+          the aggregate feed the crossing is at-most-once with no return
+          channel, and the wire format is never CEF.
+      direct:
+        parse_location: low
+        cribl: >
+          Treat redaction as the primary job on this route: drop sample.body
+          outright unless the mission explicitly needs it, and hash or
+          truncate the remaining sample content, because these reports carry
+          attacker-controlled message bodies and third-party recipient
+          addresses that no downstream consumer needs in full. Flatten the
+          nested sample object to two levels and cap every string, map the ARF
+          delivery_result and the DMARC verdict to event.action and
+          event.outcome, and validate against a schema with a dead-letter
+          route - the ARF format is far looser in practice than the RFC and
+          malformed samples are common. Keep volume-based alerting off this
+          feed entirely; a receiver that turns ruf on can flood the mailbox.
+        elastic: >
+          Extend the same custom logs-dmarc.* index template with keyword
+          mappings for dmarc.failure.feedback_type,
+          dmarc.failure.reported_domain, and
+          dmarc.failure.authentication_results, and put the retained sample
+          fields under the standard email.* mappings so failure reports join
+          the mail-gateway datasets on email.message_id and
+          email.attachments.file.hash.sha256. Apply a shorter ILM retention
+          here than on the aggregate feed to bound the exposure of retained
+          message content, and derive event.outcome from the DMARC verdict
+          rather than the ARF Delivery-Result, which describes what the
+          receiver did with the message.

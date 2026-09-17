@@ -1,0 +1,608 @@
+id: symantec-proxysg
+name: Symantec ProxySG / Edge SWG
+vendor: Broadcom
+versions: >-
+  ProxySG / Edge SWG 6.7-7.4, sold as Blue Coat ProxySG before the Symantec
+  acquisition and as Symantec Secure Web Gateway before the Broadcom one
+draft: true
+references:
+- >-
+  https://techdocs.broadcom.com/us/en/symantec-security-software/web-and-network-security/edge-swg/7-4/getting-started/page-help-administration/page-help-logging/log-formats/default-formats.html
+- >-
+  https://knowledge.broadcom.com/external/article/240610/edge-swg-proxysg-access-log-fields.html
+- https://www.elastic.co/docs/reference/integrations/proxysg
+- >-
+  https://knowledge.broadcom.com/external/article/168187/main-http-and-https-access-log-fields-re.html
+datasets:
+- id: access-main
+  name: HTTP and HTTPS access log (bcreportermain_v1)
+  description: |
+    The proxy's record of every web request: who asked, for what, what the policy decided, and what came back. In an estate that decrypts, this is the most complete record of user web activity anywhere in the environment, which makes it both the highest-value web telemetry and the feed with the sharpest privacy and content-filter constraints.
+    bcreportermain_v1 is a reserved format that cannot be edited, so its field list is fixed and identical across appliances - unusually convenient for a migration, because the parser does not have to be rebuilt per site. A site running a custom format instead has changed the field order, and the positional parse will silently mis-assign every column.
+  event_categories:
+  - web
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Receives ELFF over a syslog or TCP listener. Full URLs including query
+        strings are the highest-risk content on this feed for a
+        content-inspection policy - a query string can carry anything a user
+        typed.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes. This is the highest-volume feed in the catalogue
+        by request count; edge reduction is a guard throughput question before
+        it is an Elastic storage one.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-proxysg.log
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Receives ELFF over a syslog or TCP listener.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-proxysg.log
+  formats:
+  - format: syslog-csv
+    recommended: true
+    recommended_because: >-
+      Streaming ELFF to a collector is the only delivery that arrives in near
+      real time. The appliance's traditional path uploads gzipped log files to
+      an FTP or HTTPS target on a schedule, which is fine for Reporter and
+      useless for detection - a scheduled upload sets a floor on time-to-alert
+      equal to the upload interval.
+    parsing:
+      mechanism: elastic-integration
+      artifact: elastic/integrations proxysg, data stream log
+      notes: |
+        One of the few feeds here with a shipped Elastic integration. It supports exactly the four reserved formats - main, bcreportermain_v1, ssl and bcreporterssl_v1 - and puts vendor fields under the proxysg.* namespace while promoting the common ones to ECS. Use it rather than hand-building: the value this map adds is naming which fields reach ECS and which stay vendor-namespaced, not re-deriving the parse.
+        ELFF is positional and space-delimited with a #Fields header. The header is what makes the parse safe; a stream that drops it, or a site that switched to a custom format, produces a confidently wrong column assignment rather than an error. The format's first column is x-bluecoat-placeholder, a reserved column that is always empty and carries nothing; it has no field row below because it has no destination, but a positional parser that skips it shifts every subsequent column by one, which is the classic way this feed is mis-parsed.
+    fields:
+    - vendor: date
+      type: date
+      description: UTC date of the request
+      ecs: '@timestamp'
+      status: partial
+      transform: concatenate with time, parse as UTC
+      notes: >-
+        date and time are separate columns in ELFF and neither is a timestamp
+        on its own; the appliance logs UTC regardless of its display timezone
+    - vendor: time
+      type: string
+      description: UTC time of the request
+      ecs: '@timestamp'
+      status: partial
+      transform: concatenate with date, parse as UTC
+    - vendor: time-taken
+      type: integer
+      description: milliseconds the appliance took to serve the request
+      ecs: event.duration
+      status: partial
+      transform: multiply by 1000000 - ECS event.duration is nanoseconds
+      notes: >-
+        the unit mismatch is the single most common error on this feed; left
+        unconverted every request looks a million times faster than it was
+    - vendor: c-ip
+      type: ip
+      description: IP address of the requesting client
+      ecs: source.ip
+      status: mapped
+    - vendor: c-port
+      type: integer
+      description: source port on the client
+      ecs: source.port
+      status: mapped
+    - vendor: cs-username
+      type: string
+      description: authenticated user making the request
+      ecs: user.name
+      status: partial
+      transform: split DOMAIN\user into user.domain and user.name
+      notes: >
+        empty, or a literal hyphen, on unauthenticated requests - which
+        includes every request from an unauthenticated subnet and every
+        request that bypassed authentication by policy. Absence means the
+        proxy did not authenticate, not that nobody was there, and a rule that
+        treats a missing user as anomalous fires on normal traffic.
+    - vendor: cs-auth-group
+      type: string
+      description: authorization group the user matched
+      ecs: user.group.name
+      status: mapped
+      notes: >-
+        the group policy was evaluated against, which is not necessarily every
+        group the user belongs to
+    - vendor: s-supplier-name
+      type: string
+      description: hostname the appliance actually fetched the content from
+      ecs: server.domain
+      status: partial
+      notes: >
+        not the same as cs-host. cs-host is what the client asked for; this is
+        where the content came from, which differs whenever an upstream proxy
+        in a hierarchy served it, and is empty on a cache hit because nothing
+        was fetched.
+    - vendor: s-supplier-ip
+      type: ip
+      description: IP address the content was fetched from
+      ecs: destination.ip
+      status: partial
+      notes: >-
+        shares destination.ip with r-ip and the two disagree in a proxy
+        hierarchy; the pipeline must pick one deterministically, and this one
+        is preferred because it is where the bytes actually came from
+    - vendor: x-exception-id
+      type: string
+      description: >-
+        the exception the appliance returned instead of the content, e.g.
+        policy_denied, dns_unresolved_hostname
+      ecs: event.reason
+      status: partial
+      notes: >-
+        present only when the request did not complete normally; this is the
+        field that says why a block was a block rather than an error
+    - vendor: sc-filter-result
+      type: string
+      description: the policy verdict - OBSERVED, PROXIED or DENIED
+      ecs: event.outcome
+      status: partial
+      transform: map DENIED to failure, OBSERVED and PROXIED to success
+      notes: >
+        the vendor vocabulary is three-valued and ECS event.outcome is not.
+        OBSERVED means policy watched and allowed; PROXIED means the appliance
+        handled it; only DENIED is a block. Collapsing all three to success
+        would hide every block, and treating OBSERVED as anything other than
+        allowed is the usual mis-reading.
+    - vendor: cs-categories
+      type: string
+      description: web-filter categories the URL matched
+      ecs: rule.category
+      status: partial
+      notes: >
+        ECS has no url.category, so the closest home is rule.category - the
+        categorisation the filtering entity applied. A URL commonly matches
+        several categories at once and the appliance emits them
+        semicolon-separated inside one column, so the pipeline must split to
+        an array or every multi-category URL becomes its own unique value and
+        the field is useless for aggregation.
+    - vendor: cs(Referer)
+      type: string
+      description: HTTP Referer header sent by the client
+      ecs: http.request.referrer
+      status: mapped
+      notes: >-
+        spelled with the historical single-r of the HTTP header in the vendor
+        field name, and with the double-r in ECS
+    - vendor: sc-status
+      type: integer
+      description: HTTP status code returned to the client
+      ecs: http.response.status_code
+      status: mapped
+      notes: >-
+        the code the client saw, which on a block is the appliance's own 403
+        or 407 rather than anything the origin said
+    - vendor: s-action
+      type: string
+      description: what the appliance did, e.g. TCP_HIT, TCP_MISS, TCP_DENIED, TCP_TUNNELED
+      ecs: event.action
+      status: mapped
+      notes: >-
+        TCP_TUNNELED is the one to watch in a decrypting estate - it means the
+        session was not inspected, so nothing else on the record describes the
+        content
+    - vendor: cs-method
+      type: string
+      description: HTTP request method
+      ecs: http.request.method
+      status: mapped
+    - vendor: rs(Content-Type)
+      type: string
+      description: Content-Type header returned by the server
+      ecs: http.response.mime_type
+      status: mapped
+    - vendor: cs-uri-scheme
+      type: string
+      description: scheme of the requested URL
+      ecs: url.scheme
+      status: mapped
+    - vendor: cs-host
+      type: string
+      description: hostname the client requested
+      ecs: url.domain
+      status: mapped
+      notes: >-
+        also copied to destination.domain, because a hunt for traffic to a
+        domain should not have to know this feed calls it a URL component
+    - vendor: cs-uri-port
+      type: integer
+      description: port of the requested URL
+      ecs: url.port
+      status: mapped
+    - vendor: cs-uri-path
+      type: string
+      description: path of the requested URL, without the query string
+      ecs: url.path
+      status: mapped
+    - vendor: cs-uri-query
+      type: string
+      description: query string of the requested URL
+      ecs: url.query
+      status: partial
+      notes: >
+        the highest-sensitivity field on the feed: search terms, tokens and
+        occasionally credentials appear here. It is the first candidate for
+        redaction at the edge, and the field most likely to be rejected by a
+        guard content filter. Dropping it is a defensible local decision - say
+        so in the pipeline rather than letting it fail silently at the guard.
+    - vendor: cs-uri-extension
+      type: string
+      description: file extension of the requested URL
+      ecs: url.extension
+      status: mapped
+    - vendor: cs(User-Agent)
+      type: string
+      description: User-Agent header sent by the client
+      ecs: user_agent.original
+      status: mapped
+      notes: >-
+        the integration runs a user_agent processor over it, so the parsed
+        user_agent.* subfields are populated downstream of this raw value
+    - vendor: r-ip
+      type: ip
+      description: IP address of the remote server for the request
+      ecs: destination.ip
+      status: partial
+      notes: >
+        shares destination.ip with s-supplier-ip. The vendor notes that the
+        default Reporter format does not log the destination address at all on
+        older releases, so this column is present in the format but empty in
+        some deployments - check a live record before building a detection
+        that requires it.
+    - vendor: r-port
+      type: integer
+      description: port on the remote server
+      ecs: destination.port
+      status: mapped
+    - vendor: sc-bytes
+      type: integer
+      description: bytes sent from the appliance to the client
+      ecs: server.bytes
+      status: mapped
+      notes: >-
+        cs and sc are read from the appliance's point of view - cs is
+        client-to-server, sc is server-to-client - so the response size is
+        sc-bytes and reversing the two inverts every upload/download ratio
+    - vendor: cs-bytes
+      type: integer
+      description: bytes sent from the client to the appliance
+      ecs: client.bytes
+      status: mapped
+    - vendor: x-virus-id
+      type: string
+      description: name of the malware the ICAP scanner identified
+      ecs: threat.software.name
+      status: partial
+      notes: >-
+        populated only where an ICAP AV service is in the path; empty is the
+        normal case and does not mean the object was scanned and found clean
+    - vendor: x-bluecoat-application-name
+      type: string
+      description: the application the appliance classified the traffic as, e.g. Dropbox, Facebook
+      ecs: network.application
+      status: mapped
+      notes: >-
+        this is the appliance's classification rather than an observed
+        protocol, and it is what makes shadow-IT reporting possible from this
+        feed
+    - vendor: x-bluecoat-application-operation
+      type: string
+      description: the operation within the application, e.g. upload, download, post_message
+      ecs: null
+      status: partial
+      custom: proxysg.application.operation
+      notes: >
+        deliberately withheld from event.action, which already carries
+        s-action. The two answer different questions - what the proxy did
+        against what the user did inside the application - and collapsing them
+        loses the one that matters for data-movement detections.
+    - vendor: x-bluecoat-transaction-uuid
+      type: string
+      description: unique identifier of the transaction
+      ecs: event.id
+      status: mapped
+      notes: >-
+        the join key to the SSL access log for the same session, and the only
+        reliable way to correlate the two feeds
+    - vendor: x-icap-reqmod-header(X-ICAP-Metadata)
+      type: string
+      description: metadata returned by the ICAP request-modification service
+      ecs: null
+      status: unmapped
+      custom: proxysg.icap.reqmod_metadata
+    - vendor: x-icap-respmod-header(X-ICAP-Metadata)
+      type: string
+      description: metadata returned by the ICAP response-modification service
+      ecs: null
+      status: unmapped
+      custom: proxysg.icap.respmod_metadata
+      notes: >-
+        where a DLP or sandbox verdict arrives when one is chained in;
+        contents are service-specific and not parseable generically
+    - vendor: s-ip
+      type: ip
+      description: IP address of the appliance interface that served the request
+      ecs: observer.ip
+      status: mapped
+      notes: >-
+        the proxy itself - not destination.ip, which is where the request was
+        going, and not source.ip, which is the client
+    - vendor: cs(X-Forwarded-For)
+      type: string
+      description: X-Forwarded-For header presented by the client
+      ecs: network.forwarded_ip
+      status: partial
+      notes: >
+        when the appliance sits behind another proxy or a load balancer, this
+        and not c-ip is the real client. It is also client-supplied and
+        trivially forged, so it is recorded rather than substituted for
+        source.ip - a decision worth stating because the opposite choice is
+        common and it lets a client spoof its own attribution.
+    - vendor: s-sitename
+      type: string
+      description: the proxy service that handled the request, e.g. http, tcp
+      ecs: null
+      status: unmapped
+      custom: proxysg.service.name
+  - format: csv-file
+    parsing:
+      mechanism: elastic-integration
+      artifact: elastic/integrations proxysg, data stream log, logfile input
+      notes: >
+        The appliance's traditional delivery: gzipped ELFF files uploaded to
+        an FTP or HTTPS target on a schedule or size trigger. Same field list
+        as the streamed format - it is the same reserved format, only batched
+        - so the field table above applies unchanged and is not repeated. Kept
+        as a documented alternative because an existing ArcSight estate is
+        often fed this way and the upload target is a migration dependency
+        someone has to decommission.
+    fields: []
+    fields_omitted: >-
+      Identical to the streamed format's field list; bcreportermain_v1 is a
+      reserved format and the delivery mechanism does not change its columns.
+      Restating thirty-eight rows to say "and also by file" would be
+      duplication that drifts.
+- id: access-ssl
+  name: SSL session log (bcreporterssl_v1)
+  description: |
+    One record per TLS session rather than per request: what was negotiated, whose certificate was presented, and whether it validated. This is the feed that answers questions the HTTP log cannot - weak cipher use, expired or self-signed certificates on the wire, and what was inside a tunnel the proxy chose not to decrypt.
+    It is also the compliance feed. Where a policy mandates TLS 1.2 or better, this is the evidence, and x-cs-connection-negotiated-ssl-version is the field an auditor is really asking for.
+  event_categories:
+  - network
+  - web
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Receives ELFF over a syslog or TCP listener. Lower volume than the
+        main access log - one record per session rather than per request - and
+        structurally cleaner, with no free-text URL.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes. Certificate subjects are the only free-text
+        field here and they are attacker-controlled on a hostile site.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-proxysg.log
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Receives ELFF over a syslog or TCP listener.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-proxysg.log
+  formats:
+  - format: syslog-csv
+    parsing:
+      mechanism: elastic-integration
+      artifact: elastic/integrations proxysg, data stream log
+      notes: >
+        bcreporterssl_v1 is a reserved format and cannot be edited, so the
+        column list is fixed. Note that it lands in the same proxysg.log data
+        stream as the main access log, so a query that does not discriminate
+        will mix per-request and per-session records - filter on the presence
+        of the negotiated-cipher fields, or route the two to different
+        namespaces at the edge.
+    fields:
+    - vendor: date
+      type: date
+      description: UTC date of the session
+      ecs: '@timestamp'
+      status: partial
+      transform: concatenate with time, parse as UTC
+    - vendor: time
+      type: string
+      description: UTC time of the session
+      ecs: '@timestamp'
+      status: partial
+      transform: concatenate with date, parse as UTC
+    - vendor: time-taken
+      type: integer
+      description: milliseconds the session took
+      ecs: event.duration
+      status: partial
+      transform: multiply by 1000000 - ECS event.duration is nanoseconds
+    - vendor: c-ip
+      type: ip
+      description: IP address of the client
+      ecs: source.ip
+      status: mapped
+    - vendor: s-action
+      type: string
+      description: what the appliance did with the session
+      ecs: event.action
+      status: mapped
+    - vendor: x-rs-certificate-validate-status
+      type: string
+      description: result of validating the server certificate the origin presented
+      ecs: event.outcome
+      status: partial
+      transform: map the vendor vocabulary to success or failure
+      notes: >
+        the security question this dataset exists to answer. A failure here
+        with a session that proceeded anyway means policy allowed an untrusted
+        certificate, which is worth alerting on by itself.
+    - vendor: x-rs-certificate-observed-errors
+      type: string
+      description: the specific certificate errors observed
+      ecs: null
+      status: partial
+      custom: proxysg.tls.certificate_errors
+      notes: >-
+        names which validation failed - expired, hostname mismatch, unknown
+        issuer - and those mean very different things; ECS has no field for a
+        certificate-validation error list
+    - vendor: x-cs-ocsp-error
+      type: string
+      description: OCSP error on the client-facing connection
+      ecs: null
+      status: unmapped
+      custom: proxysg.tls.client_ocsp_error
+    - vendor: x-rs-ocsp-error
+      type: string
+      description: 'OCSP error checking the origin''s certificate'
+      ecs: null
+      status: unmapped
+      custom: proxysg.tls.server_ocsp_error
+      notes: >-
+        an OCSP failure is not a revocation - it means the check could not be
+        completed, which in an air-gapped enclave is the normal case because
+        the responder is unreachable
+    - vendor: cs-host
+      type: string
+      description: hostname the client requested
+      ecs: destination.domain
+      status: mapped
+      notes: >-
+        on an undecrypted session this comes from SNI, so it is
+        client-supplied and does not have to match the certificate
+    - vendor: s-supplier-name
+      type: string
+      description: hostname the appliance connected to
+      ecs: server.domain
+      status: mapped
+    - vendor: x-rs-connection-negotiated-ssl-version
+      type: string
+      description: TLS version negotiated with the origin server
+      ecs: tls.version
+      status: partial
+      notes: >
+        the appliance negotiates two separate sessions when it decrypts - one
+        with the client and one with the origin - and they can differ. ECS
+        tls.version is singular, so only one can hold it; the origin-side
+        version is chosen because it is the one describing the internet-facing
+        risk, and the client-side value is kept custom.
+    - vendor: x-rs-connection-negotiated-cipher
+      type: string
+      description: cipher negotiated with the origin server
+      ecs: tls.cipher
+      status: partial
+      notes: same two-session reasoning as the negotiated version
+    - vendor: x-rs-connection-negotiated-cipher-size
+      type: integer
+      description: cipher key size in bits, origin side
+      ecs: null
+      status: unmapped
+      custom: proxysg.tls.server_cipher_bits
+    - vendor: x-rs-certificate-hostname
+      type: string
+      description: 'hostname in the origin server''s certificate'
+      ecs: tls.server.x509.subject.common_name
+      status: partial
+      notes: >-
+        compare against cs-host: a mismatch between the requested SNI and the
+        certificate name is the signal, and it is only visible because both
+        are on the same record
+    - vendor: x-rs-certificate-hostname-category
+      type: string
+      description: web-filter category of the certificate hostname
+      ecs: null
+      status: partial
+      custom: proxysg.tls.certificate_hostname_category
+      notes: >-
+        categorising the certificate name rather than the requested name
+        catches a tunnel whose SNI says one thing and whose certificate says
+        another
+    - vendor: x-cs-connection-negotiated-ssl-version
+      type: string
+      description: TLS version negotiated with the client
+      ecs: null
+      status: partial
+      custom: proxysg.tls.client_version
+      notes: >
+        withheld from tls.version, which the origin-side value holds. This is
+        the field a TLS-1.2-or-better mandate is actually about, because it
+        describes what the endpoint negotiated, so it is worth a named custom
+        rather than being dropped.
+    - vendor: x-cs-connection-negotiated-cipher
+      type: string
+      description: cipher negotiated with the client
+      ecs: null
+      status: partial
+      custom: proxysg.tls.client_cipher
+      notes: same withholding as the client-side version
+    - vendor: x-cs-connection-negotiated-cipher-size
+      type: integer
+      description: cipher key size in bits, client side
+      ecs: null
+      status: unmapped
+      custom: proxysg.tls.client_cipher_bits
+    - vendor: x-cs-certificate-subject
+      type: string
+      description: subject of the certificate the appliance presented to the client
+      ecs: tls.client.x509.subject.common_name
+      status: partial
+      notes: >
+        in a decrypting estate this is the appliance's own re-signed
+        certificate, not anything the origin issued - so it is nearly
+        constant, and a change in it means the interception certificate
+        changed, which is a configuration event worth noticing
+    - vendor: s-ip
+      type: ip
+      description: IP address of the appliance interface
+      ecs: observer.ip
+      status: mapped
+    - vendor: s-sitename
+      type: string
+      description: the proxy service that handled the session
+      ecs: null
+      status: unmapped
+      custom: proxysg.service.name

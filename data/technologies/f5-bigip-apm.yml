@@ -1,0 +1,1192 @@
+id: f5-bigip-apm
+name: F5 BIG-IP APM
+vendor: F5
+versions: BIG-IP 15.1, 16.1, 17.1 (TMOS)
+draft: true
+references:
+- >-
+  https://techdocs.f5.com/en-us/bigip-21-1-0/big-ip-access-policy-manager-network-access/logging-and-reporting.html
+- >-
+  https://techdocs.f5.com/kb/en-us/products/big-ip_apm/manuals/product/apm-implementations-13-1-0/19.html
+- >-
+  https://techdocs.f5.com/kb/en-us/products/big-ip_apm/manuals/product/apm-portal-access-13-0-0/9.html
+- >-
+  https://techdocs.f5.com/kb/en-us/products/big-ip_apm/manuals/product/apm-config-11-4-0/apm_config_sessionvars.html
+- >-
+  https://techdocs.f5.com/en-us/bigip-15-1-0/big-ip-access-policy-manager-implementations/configuring-dynamic-acls.html
+- >-
+  https://techdocs.f5.com/en-us/bigip-21-1-0/big-ip-access-policy-manager-network-access/configure-access-control-lists.html
+- https://my.f5.com/manage/s/article/K24826763
+- https://my.f5.com/manage/s/article/K11253
+- https://my.f5.com/manage/s/article/K05847240
+- >-
+  https://techdocs.f5.com/kb/en-us/products/big-ip_ltm/releasenotes/related/log-messages.html
+- https://www.elastic.co/docs/reference/integrations/f5_bigip
+datasets:
+- id: access-policy
+  name: Access policy / session log
+  description: >
+    The primary APM feed: the per-session record of an access policy running -
+    session creation, the client's geolocation and reputation at the VIP, the
+    logon name presented, each branch rule the visual policy took out of each
+    policy item, the ending the policy terminated on, and the eventual session
+    teardown. Written by apmd (apd on releases before 13.x) and tmm to
+    /var/log/apm and forwarded off-box through an APM log setting bound to a
+    log publisher. Two facts shape every parsing decision here. First, APM
+    access system logs can only leave the box as BSD (RFC 3164) remote syslog
+    - F5 restricts the ArcSight/CEF and Splunk formatted destinations to AFM,
+    ASM and the Secure Web Gateway component, so unlike the ASM feed there is
+    no CEF variant of this log to retire and no RFC 5424 option to switch to.
+    Second, the default Access Policy log level of Notice does NOT emit
+    session variables; the session.* variable records (01490113, 01490115)
+    only appear at Informational or Debug, which F5 recommends enabling only
+    temporarily. Deployment has to decide deliberately whether the extra
+    identity context is worth the permanent load, because half the useful
+    attribution on this technology lives in those records. SSO and
+    per-request-policy events share the same syslog line format and the same
+    session id but are separate event types in the log setting and are out of
+    scope here.
+  event_categories:
+  - authentication
+  - iam
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        APM log publisher sends to a Cribl syslog source over TCP. An APM box
+        terminates untrusted remote users at the perimeter, so the low-side
+        path carries the bulk of this technology's estate.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-f5_bigip.apm_access
+      notes: >
+        custom data stream in the f5_bigip namespace; the stock integration's
+        single logs-f5_bigip.log stream accepts only Telemetry Streaming JSON
+        and does not parse syslog.
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        APM log publisher sends to a Cribl syslog source over TCP; a high-side
+        APM box routes straight through to Elastic with no guard crossing.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-f5_bigip.apm_access
+      notes: >
+        custom data stream in the f5_bigip namespace; the stock integration's
+        single logs-f5_bigip.log stream accepts only Telemetry Streaming JSON
+        and does not parse syslog.
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: cribl-pipeline
+      notes: >
+        There is no Elastic integration for this feed. The f5_bigip package
+        ships exactly one data stream, ingests only F5 Telemetry Streaming
+        JSON over an Elastic Agent HTTP endpoint or S3, and states that
+        parsing operating-system-level syslog is not supported; there is no
+        APM package in the Elastic package registry at all, and the old
+        Filebeat f5/bigipapm fileset was removed. The community Cribl pack for
+        F5 covers LTM/ASM syslog and does not claim APM coverage - evaluate
+        it, but expect to write the APM grammar. Build the pipeline as a
+        dispatch table keyed on the 8-digit message id, not on the
+        human-readable text, which F5 rewords between releases.
+    fields:
+    - vendor: message_id
+      type: string
+      description: 8-digit hexadecimal BIG-IP message identifier selecting the record shape
+      ecs: event.code
+      status: mapped
+      notes: >
+        the only stable parse and detection key on this dataset. The ones a
+        SOC actually uses - 01490005 branch rule taken, 01490010 username
+        presented, 01490102 access policy result, 01490500 new session from
+        client IP at VIP, 01490113 and 01490115 session variable set, 01490501
+        session deleted on user logout, 01490505 session deleted on inactivity
+        or error, 01490567 session deleted on expiry.
+    - vendor: level_number
+      type: integer
+      description: single-digit syslog severity following the message id, 0 (emerg) to 7 (debug)
+      ecs: log.syslog.severity.code
+      status: mapped
+      notes: >
+        index as a number, not a string - the APM log level is the one knob
+        that changes this feed's volume by an order of magnitude and threshold
+        alerts on it are the early warning that someone left a policy at Debug
+    - vendor: service
+      type: string
+      description: >-
+        daemon that emitted the record - apmd for access policy evaluation,
+        tmm for session lifecycle and traffic events
+      ecs: process.name
+      status: mapped
+      notes: >
+        releases before 13.x name the policy daemon apd rather than apmd, and
+        tmm appears as tmm, tmm0, tmm1 ... with the TMM instance index
+        appended, so any equality match on this value breaks on a multi-core
+        box; normalise to a family name and keep the instance separately if it
+        is needed
+    - vendor: pid
+      type: integer
+      description: process id of the emitting daemon, carried in brackets after the daemon name
+      ecs: process.pid
+      status: mapped
+    - vendor: hostname
+      type: string
+      description: BIG-IP host name from the syslog header
+      ecs: observer.hostname
+      status: mapped
+      notes: >
+        the APM box is the observer, not the host under analysis - do not also
+        land this on host.name or every VPN concentrator becomes an endpoint
+        in host-centric dashboards
+    - vendor: timestamp
+      type: timestamp
+      description: date and time from the syslog header
+      ecs: '@timestamp'
+      status: partial
+      notes: >
+        APM access system logs support only the BSD (RFC 3164) remote syslog
+        format, so the header carries neither year nor timezone and - unlike
+        the LTM system log - there is no RFC 5424 destination to switch to.
+        Both must be applied at the Cribl source from a per-device timezone.
+    - vendor: message
+      type: string
+      description: free-text description of the event following the message id and severity digit
+      ecs: message
+      status: mapped
+    - vendor: access_profile
+      type: string
+      description: >-
+        full partition path of the access profile that evaluated the session,
+        e.g. /Common/for_reports
+      ecs: rule.ruleset
+      status: partial
+      notes: >
+        an access profile is a named collection of policy items and branch
+        rules, so it is modelled as the ruleset exactly as an ASM security
+        policy is on f5-bigip-asm; rule.name is occupied by the branch rule
+        below
+    - vendor: partition
+      type: string
+      description: >-
+        administrative partition the session belongs to - the second
+        colon-delimited element of the profile:partition:sessionid triple
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.apm.partition
+      notes: >
+        duplicates the leading path element of access_profile on most
+        deployments but diverges in multi-tenant configurations, which is
+        precisely where it matters
+    - vendor: session_id
+      type: string
+      description: >-
+        8-hex-digit APM session identifier shared by every record belonging to
+        one user session (session.user.sessionid)
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.apm.session.id
+      notes: >
+        the join key across all three APM datasets and the value an analyst
+        pastes into the BIG-IP session report, so keep it a keyword and
+        preserve case verbatim. Deliberately not event.id - dozens of records
+        share one session id, so an event identifier field would be false -
+        and ECS has no session-identity field to hold it.
+    - vendor: client_ip
+      type: ip
+      description: >-
+        IP address the client connected from, reported on the new-session
+        record and in the session.user.clientip variable
+      ecs: source.ip
+      status: mapped
+    - vendor: vip
+      type: ip
+      description: IP address of the virtual server the client connected to, from "at VIP 20.0.0.1"
+      ecs: destination.ip
+      status: mapped
+    - vendor: listener
+      type: string
+      description: >-
+        full path of the APM listener that accepted the connection, from
+        "Listener /Common/site1_http"
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.apm.listener
+      notes: >
+        same gap as f5.ltm.virtual_server on the LTM map - ECS has no field
+        for a load-balancer listener object, and destination.* is already
+        spent on the VIP address the client addressed
+    - vendor: CC
+      type: string
+      description: >-
+        two-letter client country code from the (ST=/CC=/C=) geolocation
+        triple on the new-session record
+      ecs: source.geo.country_iso_code
+      status: partial
+      transform: >
+        all three elements are emitted empty when no geolocation database is
+        installed or the address is private, so drop the empty value rather
+        than indexing a blank country code; ST is the region and C the
+        continent from the same triple
+    - vendor: Reputation
+      type: enum
+      description: >-
+        IP intelligence classification of the client address on the
+        new-session record, e.g. (Reputation=Unknown)
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.apm.client.reputation
+      notes: >
+        the literal Unknown unless an IP Intelligence subscription is licensed
+        and current, so alerting on it before confirming the subscription
+        produces nothing. Deliberately not mapped to any threat.indicator.*
+        field: those model a threat-intel provider's indicator identity, not a
+        vendor's reputation verdict on an observed address.
+    - vendor: username
+      type: string
+      description: >-
+        logon name presented to the authentication agent (01490010), mirrored
+        by the session.logon.last.username variable
+      ecs: user.name
+      status: mapped
+      notes: >
+        absent from the new-session and teardown records, which carry a
+        session id and no user, so the parser must stitch identity by session
+        id rather than requiring this field on every record. Case and
+        domain-qualification vary by logon page - normalise once, and copy to
+        related.user.
+    - vendor: policy_result
+      type: string
+      description: >-
+        ending the access policy terminated on, from "Access policy result:
+        <ending>" (01490102) and the session.policy.result variable
+      ecs: event.outcome
+      status: partial
+      transform: >
+        the value is an administrator-named ending, not an enum - Allow, Deny
+        and Logon_Deny are conventional but a site can name an ending anything
+        - so drive event.outcome from a site-maintained lookup that defaults
+        to unknown, and keep the verbatim ending in f5.apm.policy.ending
+        rather than discarding it
+    - vendor: rule
+      type: string
+      description: >-
+        branch rule the policy took out of a policy item, from "Following rule
+        'fallback' from item ... to ending ..." (01490005)
+      ecs: rule.name
+      status: mapped
+      notes: >
+        a named branch inside the access profile held in rule.ruleset, so name
+        and ruleset describe consistent objects. There is no numeric
+        identifier for a branch rule, so rule.id is deliberately left
+        unpopulated rather than filled from the session id.
+    - vendor: item
+      type: string
+      description: >-
+        name of the access policy item the branch was taken out of, e.g. Logon
+        Page, AD Auth, Machine Cert Check (01490005)
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.apm.policy.item
+      notes: >
+        the single most useful triage field on the dataset - it says which
+        check a denied session actually failed - and it has no ECS home;
+        event.action would be wrong because the item is a stage in a policy,
+        not an action taken
+    - vendor: session.ad.last.authresult
+      type: integer
+      description: >-
+        per-agent authentication outcome session variable, 0 failed and 1
+        passed; session.ldap.$name.authresult and
+        session.radius.$name.authresult have the same shape
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.apm.auth.result
+      transform: >
+        translate 0/1 into a readable success/failure alongside the agent name
+        lifted from the variable path, and let the policy-level event.outcome
+        come from policy_result instead - a session can pass AD auth and still
+        be denied by a later item
+      notes: >
+        session variable records are emitted only when the Access Policy log
+        level is Informational or Debug; at the default Notice level this
+        field and every other session.* value is simply absent, so confirm the
+        configured level before writing any detection that depends on it
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Split the line into a stable header (message id, severity digit,
+          daemon, pid, access profile, partition, session id) and a
+          per-message-id extractor, so an unrecognised id still lands with
+          event.code and message populated instead of being dropped. Set the
+          year and timezone at the Cribl source - APM is locked to BSD syslog
+          and there is no RFC 5424 escape - and do the identity stitching
+          here: a session-id keyed lookup that back-fills the username from
+          the 01490010 record onto the 01490500 and teardown records, which
+          carry a session id but no user. Mask any session variable whose name
+          matches a password or token pattern before it leaves the worker
+          group, and dead-letter records whose header does not match so a
+          policy that has been switched to Debug shows up as a parse anomaly
+          rather than a volume spike.
+        elastic: >
+          Land in logs-f5_bigip.apm_access with the f5_bigip.apm.* namespace
+          mapped explicitly as keyword - session.id, listener, policy.item,
+          client.reputation and partition - rather than trusting dynamic
+          mapping, since session.id is the join key for the other two datasets
+          and must not be typed as a number. Keep an enrich index of message
+          id to a stable description so detections key on event.code, and add
+          an ingest processor that turns the administrator-named ending in
+          policy_result into event.outcome through a site-maintained lookup,
+          defaulting to unknown rather than guessing from the string. Populate
+          related.user and related.ip on ingest so a VPN account can be
+          pivoted from one query.
+        relay: >
+          Full ECS-shaped JSON crosses the guard rather than a thin envelope,
+          because there is no Elastic parser waiting on the high side to make
+          sense of a raw BSD syslog line. Content-filter friction is modest
+          but real: the free-text message tail, the administrator-named policy
+          item and ending strings, and any session variable value are
+          unbounded and can carry unicode, so length-cap and
+          control-character-strip those before the guard destination and hold
+          the JSON to two levels of nesting with short ASCII keys. These are
+          low-volume, individually significant identity events, so keep _raw
+          across the crossing until the parser is proven, use Persistent Queue
+          backpressure rather than Block, and reconcile low- and high-side
+          counts per hour to catch at-most-once drops.
+      direct:
+        parse_location: low
+        cribl: >
+          Split the line into a stable header (message id, severity digit,
+          daemon, pid, access profile, partition, session id) and a
+          per-message-id extractor, so an unrecognised id still lands with
+          event.code and message populated instead of being dropped. Set the
+          year and timezone at the Cribl source - APM is locked to BSD syslog
+          and there is no RFC 5424 escape - and do the identity stitching
+          here: a session-id keyed lookup that back-fills the username from
+          the 01490010 record onto the 01490500 and teardown records, which
+          carry a session id but no user. Mask any session variable whose name
+          matches a password or token pattern before it leaves the worker
+          group, and dead-letter records whose header does not match so a
+          policy that has been switched to Debug shows up as a parse anomaly
+          rather than a volume spike.
+        elastic: >
+          Land in logs-f5_bigip.apm_access with the f5_bigip.apm.* namespace
+          mapped explicitly as keyword - session.id, listener, policy.item,
+          client.reputation and partition - rather than trusting dynamic
+          mapping, since session.id is the join key for the other two datasets
+          and must not be typed as a number. Keep an enrich index of message
+          id to a stable description so detections key on event.code, and add
+          an ingest processor that turns the administrator-named ending in
+          policy_result into event.outcome through a site-maintained lookup,
+          defaulting to unknown rather than guessing from the string. Populate
+          related.user and related.ip on ingest so a VPN account can be
+          pivoted from one query.
+  - format: json
+    enable: >
+      Deploy the f5-telemetry-streaming iApp/RPM and POST a telemetry
+      declaration with a Telemetry_Listener (the local Event Listener, default
+      port 6514, which opens TCP + UDPv4 + UDPv6). Wire APM to it with an HSL
+      log destination that forwards to the listener, a log publisher over that
+      destination, and an APM access log-setting bound to the publisher:
+      `create apm log-setting telemetry access replace-all-with { access {
+      publisher telemetry_publisher } }`, then attach that log-setting to the
+      access profile and the virtual server. TS classifies the incoming APM
+      events, normalises each to a JSON document keyed telemetryEventCategory
+      "APM", and forwards it to whatever Telemetry_Consumer is declared
+      (Elastic, a generic HTTP collector, Splunk, Kafka, etc.). No
+      user-defined format string is set on the APM log-setting - TS parses the
+      structured APM access event directly and preserves the vendor field
+      names.
+    references:
+    - >-
+      https://clouddocs.f5.com/products/extensions/f5-telemetry-streaming/latest/event-listener.html
+    - >-
+      https://github.com/F5Networks/f5-telemetry-streaming/blob/master/examples/output/request_logs/apm_request_log.json
+    - https://www.elastic.co/docs/reference/integrations/f5_bigip
+    - https://my.f5.com/manage/s/article/K43227542
+    parsing:
+      mechanism: elastic-integration
+      artifact: >-
+        Elastic f5_bigip integration, data stream logs-f5_bigip.log (Agent
+        HTTP endpoint, TS JSON)
+      notes: >
+        This is the only APM form the stock f5_bigip package can read: its
+        single logs-f5_bigip.log stream accepts Telemetry Streaming JSON over
+        an Elastic Agent HTTP endpoint (or S3) and cannot parse
+        operating-system syslog. The stream flattens every TS category - LTM,
+        ASM, AFM, APM, AVR - into one data stream, so route on
+        telemetryEventCategory "APM" and land APM in a dedicated
+        logs-f5_bigip.apm_access stream rather than the shared one. The
+        published TS example is the 01490102 result event; key up any pipeline
+        on the bare 8-digit id parsed out of errdefs_msgno (which arrives as
+        "01490102:5:", id:severity:), not on the human text, exactly as on the
+        raw-syslog form, and tolerate the per-message-id key variance. TS's
+        APM output is thinner than the raw syslog - no branch-rule text, no
+        geolocation triple, and no username on the result or teardown shapes -
+        so the session-id-to-username stitch is still required for
+        attribution.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          TS JSON is the one APM form that crosses cleanly, because it is
+          already structured NDJSON a content filter can inspect rather than a
+          raw BSD syslog line - but do the identity work LOW-SIDE anyway,
+          since the result and new-session shapes carry a session id and no
+          username: maintain the session-id-to-username lookup in the worker
+          group and back-fill related.user before the crossing. Split
+          errdefs_msgno on the colon so the bare 8-digit id lands in
+          event.code and the middle digit in the severity, drop the redundant
+          TitleCase Partition/Session_Id duplicate keys, and length-cap the
+          administrator-named Access_Profile and Access_Policy_Result strings,
+          which are unbounded. Schema-validate into a low-side dead-letter
+          route and run the forwarding destination on Persistent Queue
+          backpressure, never Block.
+        elastic: >
+          Land in a dedicated logs-f5_bigip.apm_access stream with
+          f5_bigip.apm.* mapped explicitly as keyword - session.id, partition,
+          listener - not trusting dynamic mapping, since session.id is the
+          join key to the network-access and acl datasets and must stay a
+          keyword. Convert Access_Policy_Result to event.outcome through the
+          SAME site-maintained ending lookup the raw-syslog form uses so the
+          two forms agree, keep the verbatim ending in f5.apm.policy.ending,
+          and map f5telemetry_timestamp to event.ingested while keeping
+          @timestamp from the parsed event - TS's stamp is normalisation time,
+          not the on-box event time. Populate related.user and related.ip on
+          ingest so a VPN account pivots from one query, as on the syslog
+          form.
+        relay: >
+          Full ECS-shaped or redacted NDJSON crosses - this is the friendliest
+          APM content-filter surface, one flat document per event with short
+          ASCII keys, and unlike the raw BSD syslog it has a high-side parser
+          waiting. Hold it to the two nesting levels TS already produces,
+          length-cap and control-character-strip the free-text Access_Profile
+          and Access_Policy_Result and any Listener path, and because the
+          emitted key set varies by errdefs_msgno let the filter rule admit a
+          superset rather than a fixed schema. These stay low-volume,
+          individually significant identity events, so retain them across the
+          crossing, use Persistent Queue backpressure rather than Block, and
+          reconcile low- and high-side counts per hour against the raw-syslog
+          form of the same events to catch at-most-once drops.
+      direct:
+        parse_location: high
+        cribl: >
+          For a high-side APM box with no guard, TS JSON needs no low-side
+          grammar: point the Telemetry_Consumer (or an Elastic Agent HTTP
+          endpoint) at the stack and interpose Cribl only for routing and the
+          session-id enrichment. Decide per appliance whether the TS JSON form
+          or the raw-syslog form is the authoritative access-policy feed and
+          avoid landing the same 01490102 event twice.
+        elastic: >
+          Run the stock f5_bigip integration or a custom apm_access stream;
+          the TS JSON parses high-side natively, which is its whole advantage
+          over the raw syslog. With no boundary, treat it as the low-friction
+          form but keep the raw-syslog feed for the fields TS drops - the
+          branch-rule taken (01490005), the geolocation and reputation triple
+          on the new-session record, and the session.* variable records -
+          since a detection that needs those cannot run on the TS output
+          alone.
+    fields:
+    - vendor: hostname
+      type: string
+      description: BIG-IP host name TS carries from the source appliance
+      ecs: observer.hostname
+      status: mapped
+      notes: >
+        the APM box is the observer, not a host under analysis - keep it off
+        host.name as on the raw-syslog form or every VPN concentrator becomes
+        an endpoint in host-centric dashboards
+    - vendor: errdefs_msgno
+      type: string
+      description: >-
+        BIG-IP message identifier with severity, emitted as
+        "<8-hex-id>:<severity>:" e.g. "01490102:5:"
+      ecs: event.code
+      status: partial
+      transform: >
+        split on the colon: the leading 8-digit id is the stable parse and
+        detection key (event.code) and the middle single digit is the syslog
+        severity (log.syslog.severity.code); do not index the composite
+        string, and key any dispatch table on the bare id, which F5 keeps
+        stable while rewording the human text between releases
+    - vendor: Access_Profile
+      type: string
+      description: >-
+        full partition path of the access profile that evaluated the session,
+        e.g. /Common/access_app
+      ecs: rule.ruleset
+      status: partial
+      notes: >
+        modelled as the ruleset exactly as on the raw-syslog form and as an
+        ASM security policy is on f5-bigip-asm; rule.name is reserved for the
+        branch rule, which the TS result event does not carry
+    - vendor: Access_Policy_Result
+      type: string
+      description: >-
+        ending the access policy terminated on, e.g. Logon_Deny (from the
+        01490102 result event)
+      ecs: event.outcome
+      status: partial
+      transform: >
+        an administrator-named ending, not an enum - Allow, Deny and
+        Logon_Deny are conventional but a site can name an ending anything -
+        so drive event.outcome from a site-maintained lookup defaulting to
+        unknown, and keep the verbatim ending in f5.apm.policy.ending, the
+        same treatment the raw-syslog policy_result field gets so the two
+        forms agree
+    - vendor: session_id
+      type: string
+      description: >-
+        8-hex-digit APM session identifier shared by every record of one user
+        session, e.g. ec7fd55d
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.apm.session.id
+      notes: >
+        TS emits this key twice - lowercase session_id and TitleCase
+        Session_Id with the same value - so dedupe to one field on ingest. The
+        join key across all three APM datasets and the value pasted into the
+        BIG-IP session report, so keep it keyword and preserve case;
+        deliberately not event.id, since dozens of records share one session
+        id. Absent a username on the result event, stitch identity by this id
+    - vendor: partition_name
+      type: string
+      description: administrative partition the session belongs to, e.g. Common
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.apm.partition
+      notes: >
+        TS emits this twice - lowercase partition_name and TitleCase Partition
+        with the same value - so dedupe on ingest. Duplicates the leading path
+        element of Access_Profile on most deployments but diverges in
+        multi-tenant configurations, which is exactly where it matters
+    - vendor: tenant
+      type: string
+      description: BIG-IP tenant namespace TS injects into every document, e.g. Common
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.apm.tenant
+      notes: >
+        a TS-injected envelope field, not APM log content - it holds the
+        partition/tenant name and duplicates partition_name on a classic
+        (non-AS3) box, so treat it as routing metadata rather than a second
+        partition signal
+    - vendor: application
+      type: string
+      description: >-
+        AS3 application name TS injects; empty string on classic (non-AS3)
+        configurations
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.apm.application
+      notes: >
+        a TS-injected envelope field that is populated only when the virtual
+        server was deployed by AS3 with an application label; the published
+        example carries it empty, so do not index the blank value
+    - vendor: telemetryEventCategory
+      type: string
+      description: 'TS classifier tagging the event''s source module, the literal "APM" on this feed'
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.apm.telemetry_event_category
+      notes: >
+        TS envelope metadata, not APM log content - it is the value the
+        consumer routes on to separate APM from the LTM/ASM/AFM/AVR events the
+        same logs-f5_bigip.log stream carries; keep it as the routing key
+        rather than mapping it to an ECS field
+    - vendor: f5telemetry_timestamp
+      type: timestamp
+      description: >-
+        ISO8601 time with timezone at which TS normalised the event, e.g.
+        2020-12-03T22:10:07.783Z
+      ecs: event.ingested
+      status: mapped
+      notes: >
+        unlike the raw BSD syslog header this is a fully qualified timestamp
+        with a timezone, but it is TS's processing time, NOT the on-box event
+        time - keep it on event.ingested and derive @timestamp from the parsed
+        event rather than using this value, or every event's clock drifts to
+        the TS pipeline's
+- id: network-access
+  name: Network access (VPN) tunnel log
+  description: >
+    The VPN half of APM: tmm records covering tunnel establishment for a
+    Network Access resource, the lease-pool address assigned to the client,
+    the Edge Client or browser characteristics APM observed, and the byte
+    counters emitted when the tunnel tears down. These records carry a session
+    id but no username, so they are only useful once they have been stitched
+    to the access-policy dataset on that id - which is what makes "which
+    internal address was this user holding at 14:07" answerable at all. The
+    lease-pool assignment record is the operationally load-bearing one:
+    without it, every internal flow from a VPN client is attributable to a
+    rotating pool address and to nobody.
+  event_categories:
+  - network
+  - authentication
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same APM log publisher and Cribl syslog source as the access-policy
+        dataset. This dataset and the access-policy dataset must cross the
+        guard together and in order, because the session-id join that makes
+        either one useful spans both.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-f5_bigip.apm_network_access
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Same APM log publisher and Cribl syslog source as the access-policy
+        dataset; the session-id join that makes either dataset useful spans
+        both, so they are enriched and landed together.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-f5_bigip.apm_network_access
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: cribl-pipeline
+      notes: >
+        No Elastic integration and no Cribl pack covers APM network access.
+        Parse in Cribl with per-message-id extractors: 01490549 for the PPP
+        address assignment, 01490544 for the received client info, 01490521
+        for the closing session statistics. The 01490549 text differs between
+        static and dynamic assignment ("Assigned PPP Static IPv4" versus
+        "Assigned PPP Dynamic IPv4") and gains a trailing "- Reconnect" on
+        tunnel re-establishment, so the extractor has to tolerate all four
+        shapes rather than matching one literal.
+    fields:
+    - vendor: message_id
+      type: string
+      description: >-
+        8-digit hexadecimal message identifier - 01490549 PPP address
+        assignment, 01490544 received client info, 01490521 closing session
+        statistics
+      ecs: event.code
+      status: mapped
+    - vendor: timestamp
+      type: timestamp
+      description: date and time from the BSD syslog header
+      ecs: '@timestamp'
+      status: partial
+      notes: >-
+        no year or timezone in the RFC 3164 header; apply the device timezone
+        at the Cribl source as on the access-policy dataset
+    - vendor: hostname
+      type: string
+      description: BIG-IP host name from the syslog header
+      ecs: observer.hostname
+      status: mapped
+    - vendor: session_id
+      type: string
+      description: >-
+        APM session identifier tying these tunnel records to the access-policy
+        records for the same user session
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.apm.session.id
+      notes: >
+        the only identity on these records - tmm emits no username here - so
+        an unstitched network-access feed cannot answer any user-centric
+        question on its own
+    - vendor: access_profile
+      type: string
+      description: full partition path of the access profile the tunnel belongs to
+      ecs: rule.ruleset
+      status: partial
+    - vendor: Client IP
+      type: ip
+      description: >-
+        public address the VPN client connected from, from the "Client IP:
+        172.2.2.2" element of the PPP assignment record
+      ecs: source.ip
+      status: mapped
+    - vendor: Assigned PPP Dynamic IPv4
+      type: ip
+      description: >-
+        lease-pool address APM assigned to the tunnel, also exposed as the
+        session.assigned.clientip variable
+      ecs: source.nat.ip
+      status: partial
+      transform: >
+        the message text is "Assigned PPP Static IPv4" when the address comes
+        from a static assignment rather than a lease pool, and an IPv6 variant
+        exists; capture the assignment type separately instead of writing four
+        regexes
+      notes: >
+        the most consequential mapping decision on this technology. ECS has no
+        VPN-assigned-address field, and source.nat.ip is the closest true
+        statement - the client's traffic appears on the internal network under
+        this address, which is exactly what a source-NAT translation means -
+        but it is a borrowed home and must be documented in the index template
+        so NAT analytics do not silently absorb VPN leases. Without this field
+        no internal flow from a VPN client is attributable to a user.
+    - vendor: ID
+      type: string
+      description: tunnel identifier assigned to the PPP connection, e.g. 033d0635
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.apm.tunnel.id
+      notes: >-
+        distinct from the session id - one session can rebuild several
+        tunnels, and the pair is what distinguishes a reconnect from a new
+        logon
+    - vendor: Tunnel Type
+      type: enum
+      description: >-
+        transport the tunnel was established over - VPN_TUNNELTYPE_TLS,
+        VPN_TUNNELTYPE_DTLS
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.apm.tunnel.type
+      notes: >
+        network.protocol is deliberately not used - these are F5 tunnel mode
+        constants, not IANA protocol names. A population that silently falls
+        back from DTLS to TLS is a path-MTU or UDP-blocking signal worth
+        charting.
+    - vendor: NA Resource
+      type: string
+      description: >-
+        full path of the Network Access resource that provisioned the tunnel,
+        e.g. /Common/AP_policy_na_res
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.apm.network_access.resource
+      notes: >-
+        the resource carries the split-tunnel, DNS and ACL configuration the
+        session got, so it is the closest thing to an authorization profile on
+        this feed
+    - vendor: Reconnect
+      type: boolean
+      description: >-
+        trailing marker on the PPP assignment record indicating the tunnel was
+        re-established rather than newly created
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.apm.tunnel.reconnect
+      transform: >
+        derived from the presence of the literal "- Reconnect" suffix rather
+        than a named field; set false explicitly when absent so the two cases
+        are distinguishable from a missing parse
+      notes: >
+        a reconnect storm across many users points at the network path or the
+        BIG-IP rather than at any one client, which is why F5 support asks for
+        this first
+    - vendor: bytes in
+      type: long
+      description: >-
+        bytes received from the client over the session, from "Session
+        statistics - bytes in: 3637, bytes out: 6572" (01490521)
+      ecs: source.bytes
+      status: partial
+      notes: >
+        a session total emitted once at teardown, not a per-flow counter, so
+        it must not be summed alongside per-connection byte fields from the
+        LTM feeds; direction is from the BIG-IP's point of view, with "in"
+        meaning client to BIG-IP
+    - vendor: bytes out
+      type: long
+      description: bytes sent to the client over the session (01490521)
+      ecs: destination.bytes
+      status: partial
+      notes: >-
+        same teardown-total caveat as bytes in; the pair is the cheapest
+        bulk-exfiltration signal APM produces
+    - vendor: Type
+      type: string
+      description: >-
+        client type APM detected, from "Received client info - Type: Mozilla
+        ..." (01490544) - Mozilla, Standalone, activesync, unknown
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.apm.client.type
+      notes: >-
+        distinguishes an Edge Client tunnel from a browser webtop session from
+        a non-browser client such as ActiveSync; the literal "unknown" is
+        common and should not be dropped
+    - vendor: Platform
+      type: string
+      description: >-
+        client operating platform reported in the client info record (Win7,
+        WinXP, MacOS, Linux, iOS, Android, PocketPC), matching the
+        session.client.platform variable
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.apm.client.platform
+      notes: >
+        deliberately not host.os.platform or host.target.os.*: the remote
+        endpoint is neither the observer nor a host being administered, and
+        the settled convention reserves host.target.* for a device acted upon.
+        The value is client-asserted and trivially spoofed, so treat it as
+        triage context, not evidence.
+    - vendor: UI Mode
+      type: string
+      description: >-
+        interface mode of the client session (Full, Normal, Active Sync) from
+        the client info record
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.apm.client.ui_mode
+    - vendor: session.assigned.leasepool
+      type: string
+      description: name of the lease pool the tunnel address was allocated from
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.apm.lease_pool
+      notes: >
+        emitted as a session variable, so present only at Informational or
+        Debug log level; pool exhaustion is the most common cause of a failed
+        VPN logon that looks like an authentication problem
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Maintain the session-id to username and client-IP lookup in the
+          worker group and enrich these records as they pass, so the tunnel
+          and byte-count events reach Elastic already attributed - doing it
+          high-side means a transform or a join at query time on every VPN
+          investigation. Normalise the four 01490549 text shapes
+          (static/dynamic, with and without the Reconnect suffix) into one
+          document with an explicit assignment_type and reconnect flag, and
+          emit the lease address as a real IP type so it can be range-queried
+          against internal flow data. Add Schema Library validation with a
+          dead-letter route ahead of the destination and Persistent Queue
+          backpressure, never Block.
+        elastic: >
+          Land in logs-f5_bigip.apm_network_access and map f5.apm.tunnel.*,
+          f5.apm.network_access.resource and f5.apm.lease_pool as keyword with
+          the lease address as ip, so an analyst can answer "who held
+          10.10.1.20 at 14:07" with a range query instead of a wildcard. Add
+          an ingest processor that sets event.start on the assignment record
+          and event.end plus event.outcome on the session-statistics record,
+          and be explicit in the index template that source.nat.ip holds the
+          tunnel address - the field is being borrowed for a VPN assignment
+          and downstream NAT analytics need to know it.
+        relay: >
+          Full ECS-shaped JSON should cross rather than a thin envelope, since
+          no high-side parser exists for this text and the low side is where
+          the session-id enrichment lives. Content is unusually friendly to a
+          simple custom NDJSON filter rule - addresses, enumerated tunnel
+          types, integers, and short client-info tokens, with no request
+          payload and nothing attacker-controlled beyond the client platform
+          string, which should still be length-capped. Volume is low and each
+          record is individually significant, so retain _raw across the
+          crossing, use Persistent Queue backpressure, and reconcile
+          per-(dataset, hour) counts between the low and high sides as the
+          only available drop detection.
+      direct:
+        parse_location: low
+        cribl: >
+          Maintain the session-id to username and client-IP lookup in the edge
+          worker group and enrich these records as they pass, so the tunnel
+          and byte-count events reach Elastic already attributed - deferring
+          it to query time means a transform or a join on every VPN
+          investigation. Normalise the four 01490549 text shapes
+          (static/dynamic, with and without the Reconnect suffix) into one
+          document with an explicit assignment_type and reconnect flag, and
+          emit the lease address as a real IP type so it can be range-queried
+          against internal flow data. Add Schema Library validation with a
+          dead-letter route ahead of the destination and Persistent Queue
+          backpressure, never Block.
+        elastic: >
+          Land in logs-f5_bigip.apm_network_access and map f5.apm.tunnel.*,
+          f5.apm.network_access.resource and f5.apm.lease_pool as keyword with
+          the lease address as ip, so an analyst can answer "who held
+          10.10.1.20 at 14:07" with a range query instead of a wildcard. Add
+          an ingest processor that sets event.start on the assignment record
+          and event.end plus event.outcome on the session-statistics record,
+          and be explicit in the index template that source.nat.ip holds the
+          tunnel address - the field is being borrowed for a VPN assignment
+          and downstream NAT analytics need to know it.
+- id: acl
+  name: APM ACL enforcement log
+  description: >
+    Per-packet allow and discard records produced when an APM access control
+    list matches traffic inside an established session - the authorization
+    half of remote access, as distinct from the authentication half in the
+    access-policy dataset. Written by tmm to /var/log/pktfilter under the
+    0158xxxx message family rather than the 01490xxx access family, and
+    emitted only for ACL entries whose Log setting is Packet rather than None,
+    which makes coverage a configuration property rather than a product
+    property. L4 entries log addresses and ports; L7 entries additionally log
+    the URL the packet was carrying, which is what makes this the record that
+    shows a VPN user probing a resource they were not entitled to.
+  event_categories:
+  - network
+  - web
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        ACL records are a separate event type in the APM log setting and can
+        be published to the same destination as the access-policy feed. This
+        is the highest-volume of the three APM datasets and the one where a
+        per-packet logging entry left on by accident will dominate the
+        crossing budget.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (the __syslogout internal
+        field carrying a CEF-structured string), being retired; plan of
+        record: Cribl HTTP Destination -> guard -> Cribl HTTP Source carrying
+        NDJSON. The high side parses _raw (Extract JSON) then adds Cribl
+        fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-f5_bigip.apm_acl
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        ACL records are a separate event type in the APM log setting and can
+        be published to the same destination as the access-policy feed. This
+        is the highest-volume of the three APM datasets, so the per-packet
+        allow volume is the sizing concern on this route.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-f5_bigip.apm_acl
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: cribl-pipeline
+      notes: >
+        No integration or pack parses this format. The record is a BSD syslog
+        line whose tail is positional rather than key=value - "<action> ACL:
+        <acl>@<session>:<index> packet: <url> <proto> <src>:<port> ->
+        <dst>:<port>" - so the pipeline needs an anchored pattern per action
+        value with the URL element treated as optional, because L4-only
+        matches omit it entirely.
+    fields:
+    - vendor: message_id
+      type: string
+      description: >-
+        8-digit hexadecimal message identifier for APM ACL enforcement, e.g.
+        01580005 and 01580002
+      ecs: event.code
+      status: mapped
+      notes: >
+        the 0158xxxx family, not the 01490xxx access-policy family - a Cribl
+        route that filters APM traffic on an 01490 prefix will silently
+        discard every ACL record. Confirm the exact ids in use from a sample
+        on the local platform version rather than hard-coding these two.
+    - vendor: timestamp
+      type: timestamp
+      description: date and time from the BSD syslog header
+      ecs: '@timestamp'
+      status: partial
+      notes: no year or timezone, as on the other two APM datasets
+    - vendor: hostname
+      type: string
+      description: BIG-IP host name from the syslog header
+      ecs: observer.hostname
+      status: mapped
+    - vendor: service
+      type: string
+      description: >-
+        emitting TMM instance, rendered with the instance index appended -
+        tmm, tmm1, tmm2
+      ecs: process.name
+      status: mapped
+      notes: >
+        the instance index is genuinely variable here because ACL enforcement
+        happens on whichever TMM owns the flow; normalise to "tmm" for
+        aggregation or every dashboard fragments by core
+    - vendor: access_profile
+      type: string
+      description: full partition path of the access profile the enforcing session belongs to
+      ecs: rule.ruleset
+      status: partial
+      notes: >-
+        consistent with the other two datasets - the profile is the ruleset,
+        the ACL is the rule
+    - vendor: session_id
+      type: string
+      description: >-
+        APM session identifier of the session the packet belonged to,
+        appearing both in the profile triple and after the @ in the ACL token
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.apm.session.id
+      notes: >-
+        the only route to a username on this dataset; the record itself
+        carries no identity
+    - vendor: action
+      type: enum
+      description: what the matching ACL entry did to the packet - allow, discard, reject, continue
+      ecs: event.action
+      status: mapped
+      transform: >
+        discard drops silently while reject drops and sends a TCP RST or ICMP
+        error, so they must not be collapsed into a single "deny"; continue
+        means evaluation moved to the next ACL and is not a terminal decision
+        at all
+    - vendor: acl_name
+      type: string
+      description: >-
+        full path of the ACL that matched, e.g. /Common/block-lab-SSH or a
+        dynamic ACL such as /Common/radius_apmdev03_dacl
+      ecs: rule.name
+      status: mapped
+      notes: >
+        dynamic ACLs delivered by a RADIUS or LDAP attribute appear here under
+        a generated name and are per-session, so a name that never repeats is
+        expected rather than a parse error. rule.id is left unpopulated: the
+        only candidate identifier is the entry index, which names a line
+        inside this ACL rather than the ACL itself.
+    - vendor: acl_entry_index
+      type: integer
+      description: >-
+        zero-based index of the matching entry within the ACL, the numeric
+        suffix after the session in "acl@session:0"
+      ecs: null
+      status: unmapped
+      custom: f5_bigip.apm.acl.entry_index
+      notes: >
+        the pair of acl_name and this index is what identifies the rule an
+        administrator has to edit; on its own the index is meaningless, which
+        is why it is not rule.id
+    - vendor: packet_url
+      type: string
+      description: >-
+        URL the matched packet was carrying, present only on L7 ACL matches -
+        "packet: http://zoltan.home/login.html"
+      ecs: url.original
+      status: partial
+      transform: >
+        absent entirely on L4-only matches, so the extractor must treat it as
+        optional; split into url.domain and url.path, and expect
+        percent-encoded and attacker-influenced values since this is traffic a
+        user was denied
+    - vendor: protocol
+      type: string
+      description: transport protocol of the matched packet - tcp, udp, icmp
+      ecs: network.transport
+      status: mapped
+      transform: lowercase to match the ECS convention
+    - vendor: source_ip
+      type: ip
+      description: >-
+        source address of the matched packet - the VPN client's assigned
+        tunnel address, not its public address
+      ecs: source.ip
+      status: mapped
+    - vendor: source_port
+      type: port
+      description: source port of the matched packet
+      ecs: source.port
+      status: mapped
+    - vendor: dest_ip
+      type: ip
+      description: >-
+        destination address of the matched packet - the internal resource the
+        session tried to reach
+      ecs: destination.ip
+      status: mapped
+      notes: >
+        this is the field that makes the dataset worth ingesting: it is the
+        only record of what a remote-access session actually reached for
+        inside the enclave
+    - vendor: dest_port
+      type: port
+      description: destination port of the matched packet
+      ecs: destination.port
+      status: mapped
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          This is where the volume decision belongs: sample or aggregate allow
+          records near the source and pass discard and reject records through
+          whole, because an ACL entry logging at Packet on a busy Network
+          Access resource can outproduce every other BIG-IP feed combined.
+          Parse the positional tail with the URL element optional so L4
+          matches do not fall through, split the acl_name@session:index token
+          into its three parts, and enrich with the session-id to username
+          lookup already maintained for the network-access dataset so a denial
+          arrives attributed. Length-cap the URL, which is the one
+          attacker-influenced value on the record.
+        elastic: >
+          Land in logs-f5_bigip.apm_acl and settle the action-to-outcome
+          direction once, matching the choice made on f5-bigip-asm's act
+          field, so a discarded packet does not read as a successful
+          mitigation in one dataset and a failed request in another. Map
+          f5.apm.acl.entry_index and f5.apm.session.id as keyword, set
+          event.type from the action (allowed versus denied) in an ingest
+          processor, and keep rule.name on the ACL name with rule.id
+          explicitly unset - the entry index identifies a line within the ACL,
+          not the same object the name describes.
+        relay: >
+          At the guard this dataset is the volume problem, not the content
+          problem: the fields are addresses, ports, an enumerated action and
+          an ACL path, all cheap for a custom NDJSON filter rule to reason
+          about, with only the L7 URL unbounded and percent-encoded. Cap and
+          normalise that URL low-side, drop _raw on this route first since the
+          extracted fields are the whole record, and sample allow traffic
+          before the guard destination rather than after. Persistent Queue
+          backpressure and per-hour count reconciliation still apply, but a
+          sampled stream needs the sampling ratio carried in the envelope or
+          the reconciliation will read as constant loss.
+      direct:
+        parse_location: low
+        cribl: >
+          This is where the volume decision belongs: sample or aggregate allow
+          records near the source and pass discard and reject records through
+          whole, because an ACL entry logging at Packet on a busy Network
+          Access resource can outproduce every other BIG-IP feed combined.
+          Parse the positional tail with the URL element optional so L4
+          matches do not fall through, split the acl_name@session:index token
+          into its three parts, and enrich with the session-id to username
+          lookup already maintained for the network-access dataset so a denial
+          arrives attributed. Length-cap the URL, which is the one
+          attacker-influenced value on the record.
+        elastic: >
+          Land in logs-f5_bigip.apm_acl and settle the action-to-outcome
+          direction once, matching the choice made on f5-bigip-asm's act
+          field, so a discarded packet does not read as a successful
+          mitigation in one dataset and a failed request in another. Map
+          f5.apm.acl.entry_index and f5.apm.session.id as keyword, set
+          event.type from the action (allowed versus denied) in an ingest
+          processor, and keep rule.name on the ACL name with rule.id
+          explicitly unset - the entry index identifies a line within the ACL,
+          not the same object the name describes.

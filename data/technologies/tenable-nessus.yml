@@ -1,0 +1,1263 @@
+id: tenable-nessus
+name: Tenable Nessus (ACAS)
+vendor: Tenable
+versions: Tenable Security Center 6.3 - 6.8, Nessus scanner 10.x
+draft: true
+references:
+- https://docs.tenable.com/security-center/api/index.htm
+- https://docs.tenable.com/security-center/api/System.htm
+- https://docs.tenable.com/security-center/api/Scan-Result.htm
+- https://docs.tenable.com/security-center/Content/SystemLogs.htm
+- https://www.elastic.co/docs/reference/integrations/tenable_sc
+- https://github.com/elastic/integrations/tree/main/packages/tenable_sc
+- https://pytenable.readthedocs.io/en/stable/api/sc/analysis.html
+datasets:
+- id: vulnerability
+  name: Vulnerability findings
+  description: >
+    Per-host, per-plugin findings returned by the Security Center analysis
+    endpoint (POST /rest/analysis, type=vuln, tool=vulndetails) against the
+    cumulative repositories. One document per asset + plugin + port
+    combination, carrying the plugin identity, severity and CVSS scoring, CVE
+    list, asset identity, first/last seen, remediation text, and the raw
+    plugin output. This is the primary ACAS feed a CSOC consumes: Nessus
+    scanners run the credentialed checks, but Security Center - not the
+    individual scanner - is the SIEM-facing system, and it is polled over REST
+    rather than pushing syslog. Compliance/audit-file results (SCAP, STIG
+    benchmarks) ride this same feed, distinguished by the plugin family and
+    checkType.
+  event_categories:
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        The collector polls the Security Center REST API on a schedule. On the
+        guarded path Security Center sits in the scanned enclave, so the pull
+        is initiated low-side and the results are relayed through the guard.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-tenable_sc.vulnerability
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        The collector polls the Security Center REST API on a schedule and
+        delivers the pulled results straight to Elastic with no guard hop.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-tenable_sc.vulnerability
+  formats:
+  - format: api-pull
+    parsing:
+      mechanism: elastic-integration
+      artifact: Tenable Security Center (tenable_sc) integration, vulnerability data stream
+      notes: >
+        The Elastic tenable_sc integration polls the analysis endpoint and
+        already lands the camelCase API fields under the
+        tenable_sc.vulnerability.* namespace plus a partial ECS
+        vulnerability.* mapping. vulnerability.scanner.vendor is set as a
+        constant ("Tenable") by the pipeline rather than coming off any vendor
+        field. Note this feed is state, not events: each poll re-emits the
+        current cumulative finding set, so dedup on plugin id + host + port is
+        required before it is safe to alert on.
+    fields:
+    - vendor: pluginID
+      type: integer
+      description: numeric identifier of the Nessus plugin that produced the finding
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.vulnerability.plugin_id
+      notes: >
+        the real dedup and reporting key in ACAS (POA&M rollups are keyed on
+        plugin id); ECS vulnerability.id is reserved for the CVE, so the
+        plugin id has no ECS home in 9.4. Not threat.indicator.id (new GA in
+        9.4): that field models an id issued by a threat-intel provider for an
+        indicator document, whereas this is detection-content identity.
+    - vendor: pluginName
+      type: string
+      description: >-
+        short title of the plugin/check that fired, e.g. "MS17-010 SMBv1
+        Remote Code Execution"
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.vulnerability.plugin_name
+    - vendor: family.name
+      type: string
+      description: >-
+        plugin family the check belongs to (Windows, Red Hat Local Security
+        Checks, Policy Compliance, ...)
+      ecs: vulnerability.category
+      status: mapped
+    - vendor: severity.name
+      type: enum
+      description: Tenable severity label for the finding - Info, Low, Medium, High, Critical
+      ecs: vulnerability.severity
+      status: mapped
+    - vendor: severity.id
+      type: integer
+      description: numeric severity code, 0 (Info) through 4 (Critical)
+      ecs: event.severity
+      status: partial
+      transform: >
+        Tenable's 0-4 scale is not the ECS numeric severity convention and is
+        not comparable to the 1-5 scales other sources in this pipeline emit;
+        needs a lookup to the site-wide severity scale before it can drive a
+        shared alert threshold
+    - vendor: cve
+      type: string
+      description: CVE identifiers associated with the plugin
+      ecs: vulnerability.id
+      status: partial
+      transform: >
+        returned as a single comma-delimited string holding zero or more CVE
+        IDs; must be split into an array. Compliance/audit-file checks and
+        many local-config plugins carry no CVE at all, so vulnerability.id is
+        empty for a large slice of the feed and triage has to fall back to the
+        plugin id.
+    - vendor: baseScore
+      type: float
+      description: CVSSv2 base score for the plugin
+      ecs: vulnerability.score.base
+      status: partial
+      notes: >
+        collides with cvssV3BaseScore - both target the single ECS
+        vulnerability.score.base field; the pipeline must pick one per
+        deployment and set vulnerability.score.version to match, or the two
+        scoring generations silently overwrite each other
+    - vendor: cvssV3BaseScore
+      type: float
+      description: CVSSv3 base score for the plugin
+      ecs: vulnerability.score.base
+      status: partial
+      notes: >
+        preferred source for vulnerability.score.base on modern content; same
+        single-slot collision with baseScore described above
+    - vendor: vprScore
+      type: float
+      description: Tenable Vulnerability Priority Rating, a 0-10 threat-informed priority score
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.vulnerability.vpr_score
+      notes: >
+        Tenable-proprietary prioritization score; distinct from CVSS and with
+        no ECS equivalent, but it is what remediation tasking is actually
+        driven from
+    - vendor: ip
+      type: ip
+      description: IP address of the asset the finding was detected on
+      ecs: host.ip
+      status: mapped
+      notes: >
+        the whole scanned-asset block (ip, dnsName, macAddress,
+        operatingSystem) stays on host.*. ECS 9.4's GA host.target.* reuse is
+        arguable for a scanned host, but the Elastic tenable_sc integration
+        populates host.* on this data stream and a finding record contains no
+        second host competing for it, so remapping would only fork this map
+        from the shipped pipeline.
+    - vendor: dnsName
+      type: string
+      description: resolved DNS name / FQDN of the scanned asset
+      ecs: host.hostname
+      status: mapped
+    - vendor: macAddress
+      type: mac
+      description: MAC address of the scanned asset
+      ecs: host.mac
+      status: partial
+      transform: >
+        Tenable emits lowercase colon-separated MACs and may return several
+        newline-separated addresses for a multi-homed host; ECS requires
+        uppercase hyphen-separated values, and multi-value cases need
+        splitting
+    - vendor: operatingSystem
+      type: string
+      description: OS fingerprint of the scanned asset as determined by the scanner
+      ecs: host.os.full
+      status: mapped
+    - vendor: port
+      type: port
+      description: port on the asset the check was performed against
+      ecs: destination.port
+      status: partial
+      notes: >
+        the scanned service port; ECS has no "scanner target port", so
+        destination.port is the closest fit. A value of 0 means a host-level
+        rather than service-level check, which must not be indexed as a real
+        port.
+    - vendor: protocol
+      type: string
+      description: transport protocol the check used to reach the port (tcp, udp, icmp)
+      ecs: network.transport
+      status: mapped
+    - vendor: firstSeen
+      type: timestamp
+      description: time a scan first identified this finding on this asset
+      ecs: event.start
+      status: partial
+      transform: >
+        epoch seconds as a string, must be converted to a date; it means
+        "first detection across all scans", not the start of this particular
+        event, so treat event.start here as finding age
+    - vendor: lastSeen
+      type: timestamp
+      description: time a scan most recently identified this finding on this asset
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        epoch seconds as a string; because the pull is a snapshot of
+        cumulative state, lastSeen - not the API poll time - is the honest
+        event timestamp, otherwise every finding appears new on every poll
+    - vendor: solution
+      type: string
+      description: remediation guidance text supplied by the plugin
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.vulnerability.solution
+      notes: free-text remediation instructions; no ECS field exists for it
+    - vendor: pluginText
+      type: string
+      description: plugin output - the evidence the check produced on this specific host
+      ecs: message
+      status: partial
+      notes: >
+        multi-KB free text that routinely contains installed package versions,
+        file paths, and registry contents; the largest single-field volume
+        driver in this feed and the item most likely to need truncation or
+        content inspection on the guarded crossing
+    - vendor: stigSeverity
+      type: enum
+      description: DISA STIG severity category assigned to the finding (I, II, III)
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.vulnerability.stig_severity
+      notes: >
+        CAT I/II/III is the category DoD POA&M and compliance reporting is
+        actually built on; no ECS equivalent, so it must be preserved as a
+        custom field
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Run the REST collector on the Security Center side of the guard (the
+          poll must be initiated there) and emit one thin-envelope JSON object
+          per finding - {_dataId, @timestamp from lastSeen, host, _raw} - with
+          pluginText truncated to a bounded ASCII length so the multi-KB
+          plugin output stops driving crossing volume. Schema-validate every
+          event with C.Schema(...).validate immediately before the guard
+          destination, dead-letter the failures low-side, and run the guard
+          destination on a persistent queue rather than Block.
+        elastic: >
+          Route _dataId into logs-tenable_sc.vulnerability so the shipped
+          tenable_sc ingest pipeline does the extraction, then add an @custom
+          pipeline for the fixes this feed needs: split the comma-delimited
+          cve string into an array, choose CVSSv3 or CVSSv2 for
+          vulnerability.score.base per deployment and stamp
+          vulnerability.score.version to match, normalize MACs to
+          uppercase-hyphen form (splitting multi-homed values), suppress
+          destination.port when the check is host-level (port 0), and run
+          severity.id through a Tenable-specific 0-4 lookup that is NOT shared
+          with the system-log table. Extend the custom-namespace index
+          template for plugin_id, plugin_name, vpr_score, solution and
+          stig_severity, and dedup on plugin id + host + port before anything
+          alerts on this state feed.
+        relay: >
+          Only the envelope crosses, but pluginText inside _raw is the
+          content-filter problem - unbounded free text carrying file paths,
+          registry contents and package versions - so bound and
+          ASCII-normalize it low-side to keep the custom NDJSON filter rules
+          simple. Nothing here is CEF today (it is REST/JSON), so no CEF
+          conversion is needed; treat the crossing as at-most-once and
+          reconcile finding counts per (dataset, hour) between sides, since a
+          silently dropped batch looks identical to remediated findings.
+      direct:
+        parse_location: hybrid
+        cribl: >
+          Run the REST collector against the Security Center REST API and emit
+          one thin-envelope JSON object per finding - {_dataId, @timestamp
+          from lastSeen, host, _raw} - routing it straight to the Elastic side
+          for extraction. pluginText is the multi-KB plugin output that drives
+          this feed's volume, so truncate it to a bounded ASCII length to keep
+          index size in check even though there is no crossing to certify
+          here.
+        elastic: >
+          Route _dataId into logs-tenable_sc.vulnerability so the shipped
+          tenable_sc ingest pipeline does the extraction, then add an @custom
+          pipeline for the fixes this feed needs: split the comma-delimited
+          cve string into an array, choose CVSSv3 or CVSSv2 for
+          vulnerability.score.base per deployment and stamp
+          vulnerability.score.version to match, normalize MACs to
+          uppercase-hyphen form (splitting multi-homed values), suppress
+          destination.port when the check is host-level (port 0), and run
+          severity.id through a Tenable-specific 0-4 lookup that is NOT shared
+          with the system-log table. Extend the custom-namespace index
+          template for plugin_id, plugin_name, vpr_score, solution and
+          stig_severity, and dedup on plugin id + host + port before anything
+          alerts on this state feed.
+  - format: xml-file
+    enable: >
+      Export a completed scan as .nessus from Security Center (Scan Results >
+      select a result > Export > Export as Nessus), or take the scanner's
+      native NessusClientData_v2 output directly. The document is
+      <NessusClientData_v2> wrapping a <Policy> section and a <Report>
+      section; findings live under Report > ReportHost. Each ReportHost
+      carries a name attribute (the scanned IP or FQDN) and a <HostProperties>
+      block of <tag name="..."> entries (host-ip, host-fqdn, mac-address,
+      operating-system, netbios-name, HOST_START, HOST_END), followed by one
+      <ReportItem> per finding. ReportItem attributes are port, svc_name,
+      protocol, severity (integer 0-4), pluginID, pluginName and pluginFamily;
+      child tags carry the plugin detail (risk_factor, synopsis, description,
+      solution, plugin_output, see_also, one <cve> tag per CVE, bid, xref, the
+      cvss_* scoring tags, exploit_available and the plugin/patch/vuln date
+      tags). Compliance and audit-file checks (SCAP/STIG) ride the same
+      ReportItem shape with added cm:compliance-* tags, exactly as they ride
+      the API feed. Unlike the Security Center API record this file has no
+      vprScore, no firstSeen/lastSeen and no repository - it is the raw scan
+      artifact, not Security Center's cumulative state.
+    references:
+    - >-
+      https://docs.tenable.com/quick-reference/nessus-file-format/Nessus-File-Format.pdf
+    - https://developer.tenable.com/docs/export-file-formats
+    - https://docs.tenable.com/security-center/Content/ExportVulnerabilityData.htm
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        custom .nessus (NessusClientData_v2) XML reshape pipeline landing a
+        custom logs-tenable_sc.vulnerability-shaped stream
+      notes: >
+        The stock Elastic tenable_sc integration polls the analysis API and
+        parses only the camelCase JSON it returns; it has no branch for the
+        .nessus tag vocabulary, so a .nessus feed must be decoded and remapped
+        upstream rather than dropped onto the integration pipeline. An XML
+        parse (Cribl XmlToObject or an Elastic XML processor) rebuilds the
+        ReportHost/ReportItem tree, then each ReportItem is flattened to one
+        document per finding and mapped tag-by-tag to ECS - a different
+        mapping table than the API feed because the tag names differ
+        (risk_factor not severity.name, svc_name is new, cvss_base_score not
+        baseScore, plugin_output not pluginText, repeated <cve> elements not a
+        comma string). Dedup on pluginID + host + port as with the API feed.
+        Because .nessus omits Security Center's vprScore and cumulative
+        first/last-seen, remediation-priority and finding-age enrichment that
+        the API feed carries natively must be recovered elsewhere or accepted
+        as absent.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Decode the .nessus XML on the edge worker group and never let raw
+          XML reach the guard - its unbounded element nesting and attribute
+          surface is far harder for a content filter to certify than a
+          fixed-shape NDJSON envelope, the same ruling as any XML crossing.
+          Emit one thin JSON object per ReportItem - {_dataId, @timestamp from
+          HOST_END, host, _raw} - with plugin_output truncated to a bounded
+          ASCII length before it leaves the low side, since (exactly as with
+          the API feed's pluginText) it is the multi-KB free-text field
+          carrying file paths, package versions and registry contents that
+          drives crossing volume and content risk. Schema-validate each event
+          with C.Schema(...).validate immediately before the guard
+          destination, dead-letter failures low-side, and run the guard
+          destination on a persistent queue rather than Block.
+        elastic: >
+          There is no integration data stream that ingests .nessus, so stand
+          up a custom index template and ingest pipeline that mirrors the
+          logs-tenable_sc.vulnerability field set the API feed lands
+          (plugin_id, plugin_name, family, host.*, severity, cve, score) so
+          the two collection paths stay query-compatible, and set
+          vulnerability.scanner.vendor to the constant "Tenable" as the stock
+          pipeline does. Choose cvss_base_score (CVSSv2) or the modern
+          cvss3_base_score for vulnerability.score.base per deployment and
+          stamp vulnerability.score.version to match, collect the repeated
+          <cve> tags into the vulnerability.id array, run severity 0-4 through
+          the Tenable-specific lookup (the same one the API feed uses, NOT the
+          system-log table), suppress destination.port on port 0 host-level
+          checks, and dedup on plugin id + host + port. Backfill vpr_score
+          from the API feed if both paths exist, since .nessus cannot supply
+          it.
+        relay: >
+          Only the bounded NDJSON envelope crosses; the content-filter problem
+          is plugin_output inside _raw, so bound and ASCII-normalize it
+          low-side and keep the allow-listed key set flat so the custom NDJSON
+          filter rules stay simple. Nothing here is CEF - it is XML decoded to
+          JSON before the guard - so no CEF conversion applies. Treat the
+          crossing as at-most-once and reconcile finding counts per (dataset,
+          hour) across the guard, since a silently dropped batch is
+          indistinguishable from remediated findings; prefer exporting to a
+          .nessus file plus a Filesystem collector over a live socket for its
+          replay story on a one-way path.
+      direct:
+        parse_location: low
+        cribl: >
+          High side with no guard: still decode the XML before mapping, but
+          prefer the Security Center REST pull where it is reachable - the API
+          feed carries vprScore and cumulative first/last-seen that the
+          point-in-time .nessus file cannot, so .nessus is the right source
+          only for air-gapped or import-driven collection. Where .nessus is
+          the only feed, XmlToObject in Cribl or an Elastic ingest XML
+          processor rebuilds the tree and the same tag-to-ECS mapping applies.
+        elastic: >
+          Stand up the custom index template and ingest pipeline that mirrors
+          the logs-tenable_sc.vulnerability field set (plugin_id, plugin_name,
+          family, host.*, severity, cve, score) so the collection paths stay
+          query-compatible, and set vulnerability.scanner.vendor to the
+          constant "Tenable". Choose one CVSS generation for
+          vulnerability.score.base and stamp vulnerability.score.version to
+          match, collect the repeated <cve> tags into the vulnerability.id
+          array, apply the Tenable-specific 0-4 severity lookup, and reconcile
+          against the API feed where both exist so vpr_score and finding age
+          are not silently lost on .nessus-only assets.
+    fields:
+    - vendor: ReportHost@name
+      type: string
+      description: >-
+        scanned-asset identifier on the ReportHost element - the IP or FQDN
+        the finding was recorded against
+      ecs: host.name
+      status: mapped
+    - vendor: HostProperties/host-ip
+      type: ip
+      description: IP address of the scanned asset
+      ecs: host.ip
+      status: mapped
+    - vendor: HostProperties/host-fqdn
+      type: string
+      description: resolved FQDN of the scanned asset
+      ecs: host.hostname
+      status: mapped
+    - vendor: HostProperties/mac-address
+      type: mac
+      description: MAC address of the scanned asset
+      ecs: host.mac
+      status: partial
+      transform: >
+        emitted lowercase colon-separated as an HostProperties <tag>; ECS
+        requires uppercase hyphen-separated, and a multi-homed host may carry
+        several newline-separated addresses that need splitting - the same
+        normalization the API feed's macAddress needs
+    - vendor: HostProperties/operating-system
+      type: string
+      description: OS fingerprint the scanner determined for the asset
+      ecs: host.os.full
+      status: mapped
+    - vendor: HostProperties/netbios-name
+      type: string
+      description: NetBIOS name of the scanned asset when discovered
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.vulnerability.netbios_name
+      notes: >-
+        host-fqdn already holds host.hostname, so the NetBIOS name has no
+        distinct ECS home and is preserved as custom
+    - vendor: HostProperties/HOST_START
+      type: timestamp
+      description: time the scan began testing this host
+      ecs: event.start
+      status: partial
+      transform: >
+        a human date string like "Wed Mar 09 22:48:10 2011" (not epoch), must
+        be parsed; it is the per-host scan start, NOT the API feed's firstSeen
+        cumulative "first detection ever", so it is not interchangeable with
+        the api-pull event.start semantics
+    - vendor: HostProperties/HOST_END
+      type: timestamp
+      description: time the scan finished testing this host
+      ecs: event.end
+      status: partial
+      transform: >
+        same human date-string parse as HOST_START; because .nessus has no
+        lastSeen field, HOST_END is the honest @timestamp anchor for the
+        finding on this run
+    - vendor: ReportItem@pluginID
+      type: integer
+      description: numeric identifier of the Nessus plugin that produced the finding
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.vulnerability.plugin_id
+      notes: >
+        the real dedup and POA&M rollup key, as on the API feed; ECS
+        vulnerability.id is reserved for the CVE, so the plugin id has no ECS
+        home
+    - vendor: ReportItem@pluginName
+      type: string
+      description: short title of the plugin/check that fired
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.vulnerability.plugin_name
+    - vendor: ReportItem@pluginFamily
+      type: string
+      description: plugin family the check belongs to (Windows, Policy Compliance, ...)
+      ecs: vulnerability.category
+      status: mapped
+    - vendor: ReportItem@severity
+      type: integer
+      description: numeric severity code, 0 informational through 4 critical
+      ecs: event.severity
+      status: partial
+      transform: >
+        the .nessus 0-4 integer, same scale and same non-ECS-convention
+        problem as the API feed's severity.id; needs the site-wide severity
+        lookup before it can drive a shared alert threshold, and the Tenable
+        table must NOT be shared with the reverse-ordered system-log severity
+        codes
+    - vendor: ReportItem@port
+      type: port
+      description: port on the asset the check was performed against
+      ecs: destination.port
+      status: partial
+      notes: >
+        a value of 0 means a host-level rather than service-level check and
+        must not be indexed as a real port, identical to the API feed
+    - vendor: ReportItem@svc_name
+      type: string
+      description: service the scanner identified on the port (cifs, www, general, ...)
+      ecs: service.name
+      status: mapped
+      notes: >
+        a scanner-report field with no equivalent in the analysis API's tabled
+        fields - format-specific detail gained by taking .nessus
+    - vendor: ReportItem@protocol
+      type: string
+      description: transport the check used to reach the port (tcp, udp, icmp)
+      ecs: network.transport
+      status: mapped
+    - vendor: risk_factor
+      type: enum
+      description: qualitative risk label for the finding - None, Low, Medium, High, Critical
+      ecs: vulnerability.severity
+      status: mapped
+      notes: >
+        the .nessus qualitative label, the analogue of the API feed's
+        severity.name; None is used for informational findings, so it pairs
+        with severity=0
+    - vendor: description
+      type: string
+      description: full text description of the vulnerability
+      ecs: vulnerability.description
+      status: mapped
+    - vendor: synopsis
+      type: string
+      description: one-line summary of the plugin or vulnerability
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.vulnerability.synopsis
+      notes: >-
+        brief summary distinct from the full description;
+        vulnerability.description holds the long form, so the synopsis is
+        preserved as custom
+    - vendor: solution
+      type: string
+      description: remediation guidance text supplied by the plugin
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.vulnerability.solution
+      notes: >-
+        free-text remediation instructions; no ECS field exists for it, as on
+        the API feed
+    - vendor: plugin_output
+      type: string
+      description: 'the plugin''s evidence output on this specific host'
+      ecs: message
+      status: partial
+      notes: >
+        the .nessus equivalent of the API feed's pluginText - multi-KB free
+        text routinely carrying installed package versions, file paths and
+        registry contents; the largest single-field volume driver and the item
+        most likely to need truncation or content inspection on the guarded
+        crossing
+    - vendor: see_also
+      type: string
+      description: external reference URLs with more information on the vulnerability
+      ecs: vulnerability.reference
+      status: mapped
+      notes: >-
+        one or more <see_also> tags; concatenate or array them into
+        vulnerability.reference
+    - vendor: cve
+      type: string
+      description: CVE identifier(s) associated with the plugin
+      ecs: vulnerability.id
+      status: partial
+      transform: >
+        emitted as zero or more repeated <cve> child tags, one CVE per tag -
+        collect the elements into an array, which is a DIFFERENT transform
+        than the API feed's single comma-delimited cve string.
+        Compliance/audit-file and many local-config checks carry no <cve> at
+        all, so vulnerability.id is empty for a large slice of findings and
+        triage falls back to the plugin id
+    - vendor: bid
+      type: string
+      description: Bugtraq ID (BID) reference for the vulnerability
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.vulnerability.bid
+      notes: >-
+        legacy Bugtraq identifier; see_also already occupies
+        vulnerability.reference, so bid is preserved as custom
+    - vendor: xref
+      type: string
+      description: external cross-reference(s) such as OSVDB, Secunia or MS advisory
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.vulnerability.xref
+      notes: >-
+        one or more <xref> tags of the form SOURCE:ID; kept as a custom array
+        alongside cve and bid
+    - vendor: cvss_base_score
+      type: float
+      description: CVSSv2 base score for the plugin
+      ecs: vulnerability.score.base
+      status: partial
+      notes: >
+        CVSSv2 base; modern content also emits cvss3_base_score, which
+        collides with this on the single ECS vulnerability.score.base slot
+        exactly as baseScore and cvssV3BaseScore collide on the API feed -
+        pick one generation per deployment and set vulnerability.score.version
+        to match. cvss_vector, cvss_temporal_score and cvss_temporal_vector
+        are also emitted and, having no ECS home, belong in the custom
+        namespace
+    - vendor: cvss_vector
+      type: string
+      description: CVSSv2 base vector string (CVSS2#AV:N/AC:M/...)
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.vulnerability.cvss_vector
+      notes: >-
+        no ECS field models a CVSS vector string; the cvss3_vector and
+        cvss_temporal_vector siblings share this custom namespace
+    - vendor: exploit_available
+      type: boolean
+      description: whether a public exploit exists for the vulnerability
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.vulnerability.exploit_available
+      notes: >
+        paired with exploit_framework_metasploit / _canvas / _core and
+        exploitability_ease, none of which have ECS homes; useful
+        prioritization signal preserved as custom
+    - vendor: plugin_type
+      type: enum
+      description: general type of the plugin check - local or remote
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.vulnerability.plugin_type
+      notes: >
+        local indicates a credentialed check - the ACAS credentialed-scan
+        coverage signal - versus a remote network check; no ECS equivalent
+    - vendor: vuln_publication_date
+      type: timestamp
+      description: date the vulnerability was publicly published
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.vulnerability.vuln_publication_date
+      notes: >
+        one of several .nessus date tags (plugin_publication_date,
+        plugin_modification_date, patch_publication_date) that share this
+        custom date namespace; none map to event.* since they describe the
+        plugin/CVE lifecycle, not this scan event
+    - vendor: cm:compliance-result
+      type: enum
+      description: verdict of an audit-file compliance check - PASSED, FAILED, WARNING
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.vulnerability.compliance.result
+      notes: >
+        present only on SCAP/STIG audit-file ReportItems (pluginFamily "Policy
+        Compliance"); this is how compliance findings ride the same format,
+        matching the api-pull feed's note. Do NOT overload event.outcome with
+        it - a FAILED compliance check is a control finding, not a pipeline
+        error
+    - vendor: cm:compliance-check-name
+      type: string
+      description: name of the compliance benchmark item, e.g. "2.5 Syslog Logging"
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.vulnerability.compliance.check_name
+      notes: >
+        the cm:compliance-audit-file, cm:compliance-check-id,
+        cm:compliance-info and cm:compliance-actual-value tags share this
+        compliance custom namespace and carry the STIG/CAT reporting detail
+  - format: csv-file
+    enable: >
+      In Security Center, Analysis > Vulnerabilities, open the Export
+      drop-down and choose Export as CSV; select or clear the column
+      check-boxes to choose which fields appear. The resulting CSV carries the
+      human display labels of the chosen Vulnerability Detail List columns
+      (Plugin ID, Plugin Name, Family, Severity, IP Address, DNS Name, MAC
+      Address, Port, Protocol, CVE, CVSS scores, VPR, First Seen, Last Seen,
+      Synopsis, Description, Solution, Plugin Text), a different label
+      vocabulary from both the API camelCase and the .nessus tags. The exact
+      header strings depend on the columns the operator selects and are not
+      published as a fixed reference.
+    references:
+    - https://docs.tenable.com/security-center/Content/ExportVulnerabilityData.htm
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        custom Security Center vulnerability-CSV parse pipeline landing the
+        logs-tenable_sc.vulnerability-shaped stream
+      notes: >
+        A DSV/CSV parse keyed off the header row, mapping the selected
+        display-label columns to the same ECS targets the API feed uses.
+        Because the column set is operator-selected the pipeline must key on
+        header names rather than fixed positions and tolerate a missing
+        column, and it should be treated as a manual/ad-hoc export path rather
+        than a streaming feed. No sourced column-name reference is available,
+        so the field table is left empty pending a real export sample.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Parse the CSV low-side into the same ECS shape the .nessus and API
+          paths land, keying on the header row so a differently-selected
+          column set still maps correctly, and bound the Plugin Text column
+          which is the same free-text volume/content risk as plugin_output.
+          Schema-validate before the guard and dead-letter mismatches; this is
+          a manual export, so also stamp provenance so ad-hoc CSV loads are
+          distinguishable from the scheduled feed during reconciliation.
+        elastic: >
+          Route into the same custom logs-tenable_sc.vulnerability template as
+          the other collection paths so all three stay query-compatible, and
+          dedup on plugin id + host + port. Because the export can include VPR
+          and First/Last Seen (which .nessus lacks), prefer the CSV over
+          .nessus when Security Center enrichment must survive an offline
+          transfer.
+        relay: >
+          Convert to a bounded, allow-listed NDJSON envelope before the guard
+          - never cross raw CSV whose column set varies per export - and cap
+          the Plugin Text column. Treat as at-most-once and reconcile counts,
+          noting that an ad-hoc CSV load is an operator action, not a
+          continuous feed, so per-hour reconciliation must account for its
+          burstiness.
+      direct:
+        parse_location: low
+        cribl: >
+          High side with no guard: parse the CSV at the collector keyed on its
+          header row, but prefer the REST pull for continuous collection - CSV
+          export is the right path for offline or air-gapped transfer of
+          Security Center's enriched view, not for streaming.
+        elastic: >
+          Route into the same custom logs-tenable_sc.vulnerability template as
+          the other collection paths so all three stay query-compatible, and
+          dedup on plugin id + host + port.
+    fields_omitted: >
+      The CSV header is whichever Vulnerability Detail List columns the
+      operator ticks in the Export dialog, rendered as human display labels
+      rather than a fixed vendor column set, and Tenable publishes no
+      reference for those label strings; the underlying attributes are the
+      vulnerability data the api-pull entry inventories, in a third label
+      vocabulary.
+    fields: []
+- id: scan-result
+  name: Scan result activity
+  description: >
+    Per-scan-run records from GET /rest/scanResult - which scan ran, who
+    initiated it, against how many IPs, whether it completed, and how long it
+    took. Used by the CSOC to confirm scan coverage and to distinguish "no
+    findings" from "the scan never ran", and to explain scanner-generated
+    traffic spikes seen in network telemetry.
+  event_categories:
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same scheduled REST poll as the vulnerability feed, sharing the
+        collector and enclave placement with the findings pull.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-tenable_sc.scan_result
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Same scheduled REST poll as the vulnerability feed, sharing the
+        collector with the findings pull; it delivers straight to Elastic with
+        no guard hop.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-tenable_sc.scan_result
+  formats:
+  - format: api-pull
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Tenable Security Center scanResult pipeline
+      notes: >
+        The Elastic tenable_sc integration only ships asset, plugin, and
+        vulnerability data streams - there is no scan-result data stream - so
+        this feed needs a hand-built Cribl pipeline and a custom data stream.
+    fields:
+    - vendor: id
+      type: integer
+      description: unique identifier of the scan result record
+      ecs: event.id
+      status: mapped
+    - vendor: name
+      type: string
+      description: name of the scan result, normally inherited from the scan definition
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.scan_result.name
+    - vendor: status
+      type: enum
+      description: state of the scan run (Completed, Running, Error, Partial, Paused)
+      ecs: event.outcome
+      status: partial
+      transform: >
+        five-value vendor vocabulary collapsed to ECS success/failure/unknown;
+        Partial is genuinely ambiguous (the scan produced results but did not
+        finish) and should map to unknown rather than success, or coverage
+        gaps get hidden
+    - vendor: initiator.username
+      type: string
+      description: Security Center user account that launched the scan run
+      ecs: user.name
+      status: mapped
+      notes: scheduled scans report the owning account rather than a human operator
+    - vendor: owner.username
+      type: string
+      description: Security Center user account that owns the scan result
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.scan_result.owner
+      notes: kept separate from user.name so the initiator remains unambiguous
+    - vendor: totalIPs
+      type: long
+      description: 'number of IP addresses in the scan''s target scope'
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.scan_result.total_ips
+    - vendor: scannedIPs
+      type: long
+      description: number of IP addresses actually scanned in this run
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.scan_result.scanned_ips
+      notes: >
+        scannedIPs well below totalIPs is the usual signal of a coverage gap
+        (unreachable subnet, credential failure); no ECS equivalent
+    - vendor: startTime
+      type: timestamp
+      description: time the scan run began
+      ecs: event.start
+      status: partial
+      transform: epoch seconds as a string, must be converted to a date
+    - vendor: finishTime
+      type: timestamp
+      description: time the scan run completed
+      ecs: event.end
+      status: partial
+      transform: >
+        epoch seconds as a string; also used as @timestamp for this dataset so
+        runs land at completion time, and is empty while a scan is still
+        running
+    - vendor: scanDuration
+      type: integer
+      description: elapsed run time of the scan in seconds
+      ecs: event.duration
+      status: partial
+      transform: seconds must be multiplied out to nanoseconds for ECS event.duration
+    - vendor: errorDetails
+      type: string
+      description: error text explaining why the scan run failed or was incomplete
+      ecs: error.message
+      status: mapped
+    - vendor: repository.name
+      type: string
+      description: Security Center repository the scan results were imported into
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.scan_result.repository_name
+    - vendor: importStatus
+      type: enum
+      description: state of the post-scan import of results into the repository
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.scan_result.import_status
+      notes: >
+        a scan can complete while its import fails, which produces silently
+        missing findings; worth alerting on separately from status
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Build the full ECS-shaped JSON low-side in the hand-built scanResult
+          pipeline: convert the epoch-second startTime and finishTime to
+          dates, use finishTime as @timestamp while leaving it unset for
+          still-running scans, multiply scanDuration out to nanoseconds for
+          event.duration, and collapse the five-value status vocabulary to
+          event.outcome with Partial deliberately landing on unknown. Bound
+          errorDetails, keep nesting at two levels with short ASCII keys, then
+          schema-validate with dead-lettering before a persistent-queue guard
+          destination.
+        elastic: >
+          There is no tenable_sc scan_result data stream, so stand up a custom
+          index template and ingest pipeline for logs-tenable_sc.scan_result
+          covering name, owner, total_ips, scanned_ips, repository_name and
+          import_status, with the pipeline acting only as a validator for what
+          Cribl already shaped. Add detections for the two coverage-gap
+          signals the vendor fields expose but ECS does not: import_status
+          failing on an otherwise Completed run, and scanned_ips falling well
+          short of total_ips.
+        relay: >
+          Full ECS JSON crosses here because no integration exists to parse
+          the raw form high-side, and the payload is small and well-bounded
+          once errorDetails is capped - the one free-text field that could
+          carry scanner stack traces or unicode. Keep the key set allowlisted
+          and flat so the custom guard filter can validate it cheaply, and
+          reconcile per-hour scan-run counts across the guard, since a dropped
+          run is indistinguishable from a scan that never executed.
+      direct:
+        parse_location: low
+        cribl: >
+          Build the full ECS-shaped JSON in the hand-built scanResult pipeline
+          at the collector: convert the epoch-second startTime and finishTime
+          to dates, use finishTime as @timestamp while leaving it unset for
+          still-running scans, multiply scanDuration out to nanoseconds for
+          event.duration, and collapse the five-value status vocabulary to
+          event.outcome with Partial deliberately landing on unknown. Bound
+          errorDetails and keep nesting at two levels with short ASCII keys so
+          the record stays clean before it lands on the Elastic side.
+        elastic: >
+          There is no tenable_sc scan_result data stream, so stand up a custom
+          index template and ingest pipeline for logs-tenable_sc.scan_result
+          covering name, owner, total_ips, scanned_ips, repository_name and
+          import_status, with the pipeline acting only as a validator for what
+          Cribl already shaped. Add detections for the two coverage-gap
+          signals the vendor fields expose but ECS does not: import_status
+          failing on an otherwise Completed run, and scanned_ips falling well
+          short of total_ips.
+- id: system-log
+  name: Security Center system log
+  description: >
+    Security Center's own user-activity and audit trail, retrieved via POST
+    /rest/system/logs - console and API logons, permission and configuration
+    changes, and scheduled-job outcomes. This is the feed that answers "who
+    changed the scan policy" and "who logged into ACAS", as opposed to what
+    the scanners found.
+  event_categories:
+  - authentication
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Polled from the same REST collector as the other two datasets.
+        Security Center can alternatively relay these entries to a syslog
+        host, in which case the syslog-raw format below applies and the first
+        hop stays on an edge worker group.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-tenable_sc.system_log
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Polled from the same REST collector as the other two datasets,
+        delivering straight to Elastic with no guard hop. Security Center can
+        alternatively relay these entries to a syslog host, in which case the
+        syslog-raw format below applies and the first hop stays on an edge
+        worker group.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-tenable_sc.system_log
+  formats:
+  - format: api-pull
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom Tenable Security Center system-log pipeline
+      notes: >
+        No Elastic integration data stream covers the Security Center audit
+        log, and the interesting detail (who, from where, success or failure)
+        lives inside the free-text message, so this needs a hand-built regex
+        pipeline rather than a field rename.
+    fields:
+    - vendor: date
+      type: timestamp
+      description: time the log entry was recorded, rendered like "Thu, 24 Jun 2021 12-26-50 -0400"
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        RFC-2822-style string with a numeric offset in the CSV export and
+        epoch seconds in the JSON response, depending on retrieval mode; both
+        forms must be normalized to UTC
+    - vendor: initiator
+      type: string
+      description: Security Center user account that performed the action
+      ecs: user.name
+      status: mapped
+      notes: >
+        scheduled and internal jobs populate this with a job/system identity
+        rather than a human account
+    - vendor: module
+      type: string
+      description: >-
+        Security Center subsystem that emitted the entry (auth, scan,
+        expireAcceptedRisk, ...)
+      ecs: event.provider
+      status: mapped
+    - vendor: severity.name
+      type: enum
+      description: entry severity - INFO, WARNING, or CRITICAL
+      ecs: event.severity
+      status: partial
+      transform: >
+        three string levels (severity.id 0/1/2) need a lookup to the numeric
+        ECS severity scale; note the ordering is the reverse of the
+        vulnerability dataset's 0-4 codes, so a single shared lookup table
+        will be wrong for one of them
+    - vendor: organization.name
+      type: string
+      description: Security Center organization the entry belongs to
+      ecs: organization.name
+      status: mapped
+    - vendor: message
+      type: string
+      description: >
+        parsed human-readable text of the entry, e.g. Successful login for
+        'admin' from 192.168.37.145 (authentication type tns)
+      ecs: message
+      status: partial
+      notes: >
+        carries the fields the authentication profile actually needs - client
+        IP, auth type, and success/failure - as free text; the pipeline must
+        regex them out into source.ip, event.action, and event.outcome, none
+        of which exist as discrete vendor fields
+    - vendor: rawLog
+      type: string
+      description: unparsed original log line as stored by Security Center
+      ecs: event.original
+      status: mapped
+    - vendor: source
+      type: string
+      description: originating component within Security Center that generated the entry
+      ecs: null
+      status: unmapped
+      custom: tenable_sc.system_log.source
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Normalize both retrieval forms of date - the RFC-2822 string with a
+          numeric offset from the CSV export and epoch seconds from the JSON
+          response - to UTC, then regex source.ip, event.action and
+          event.outcome out of the free-text message, since the authentication
+          profile needs all three and none exist as discrete vendor fields.
+          Keep rawLog as event.original, mask any credential or token material
+          the message text exposes before it leaves the low side, and bound
+          the message length; apply this dataset's own INFO/WARNING/CRITICAL
+          severity lookup rather than the vulnerability table, whose ordering
+          runs the other way.
+        elastic: >
+          Stand up a custom index template and ingest pipeline for
+          logs-tenable_sc.system_log carrying tenable_sc.system_log.source,
+          with the pipeline defaulting event.outcome to unknown whenever the
+          low-side regex found no verdict so failed parses are visible rather
+          than silently counted as successes. Derive event.category
+          authentication vs configuration from the module value so the audit
+          trail lands in both profiles correctly, and keep the numeric
+          severity mapping in a lookup separate from the vulnerability
+          dataset's.
+        relay: >
+          Full ECS JSON crosses, which also means the free-text message - the
+          highest content-filter risk in this technology - is parsed and
+          length-bounded before the guard rather than being inspected raw,
+          with control characters and non-ASCII stripped so the custom NDJSON
+          filter rules stay simple. Carry event.original across until the
+          regex is proven against real console, API and scheduled-job entries,
+          then reassess; if the deployment switches Security Center to syslog
+          relay instead of the REST poll, the parsing still belongs low-side
+          and the first hop stays on an edge worker group.
+      direct:
+        parse_location: low
+        cribl: >
+          Normalize both retrieval forms of date - the RFC-2822 string with a
+          numeric offset from the CSV export and epoch seconds from the JSON
+          response - to UTC, then regex source.ip, event.action and
+          event.outcome out of the free-text message, since the authentication
+          profile needs all three and none exist as discrete vendor fields.
+          Keep rawLog as event.original, mask any credential or token material
+          the message text exposes, and bound the message length; apply this
+          dataset's own INFO/WARNING/CRITICAL severity lookup rather than the
+          vulnerability table, whose ordering runs the other way.
+        elastic: >
+          Stand up a custom index template and ingest pipeline for
+          logs-tenable_sc.system_log carrying tenable_sc.system_log.source,
+          with the pipeline defaulting event.outcome to unknown whenever the
+          collector-side regex found no verdict so failed parses are visible
+          rather than silently counted as successes. Derive event.category
+          authentication vs configuration from the module value so the audit
+          trail lands in both profiles correctly, and keep the numeric
+          severity mapping in a lookup separate from the vulnerability
+          dataset's.
+  - format: syslog-raw
+    enable: >
+      In Security Center, Configuration > Miscellaneous Settings > Syslog, set
+      Enable Forwarding on and choose a Facility and a minimum Severity
+      (Informational, Warning or Critical) to send administrative log events
+      to the LOCAL syslog service; relay them onward to a remote collector
+      with the appliance's own rsyslog/syslog-ng forwarding. The emitted line
+      is a standard RFC-3164 syslog message whose PRI encodes the chosen
+      facility and the mapped severity, followed by the same administrative
+      message text the /rest/system/logs feed returns (console/API logons,
+      config changes, scheduled-job outcomes). Note two limits: this forwards
+      the ADMINISTRATIVE log only, so organization-level audit entries still
+      need the REST poll; and the Syslog settings are not available in Tenable
+      Enclave Security.
+    references:
+    - https://docs.tenable.com/security-center/Content/ConfigurationSettings.htm
+    - https://docs.tenable.com/security-center/Content/SystemLogs.htm
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        custom Tenable Security Center syslog system-log pipeline landing
+        logs-tenable_sc.system_log
+      notes: >
+        As with the API system-log feed, the interesting detail (who, from
+        where, success or failure) lives inside the free-text message, so this
+        needs a hand-built regex pipeline, not a field rename - there is no
+        Elastic integration data stream for the Security Center audit log. The
+        syslog envelope does add a parsed PRI, so log.syslog.facility.name and
+        the syslog severity come for free, but the SC module/initiator context
+        that the JSON API exposes as discrete fields is only present here as
+        text and must be regexed out. The @timestamp is the syslog
+        receive/line time rather than the API's epoch field, and this path
+        covers administrative events only.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Parse the syslog line on the edge worker group: lift the PRI into
+          log.syslog.facility.name and the syslog severity, then regex
+          source.ip, event.action and event.outcome out of the free-text
+          message exactly as the API feed's pipeline does, since the
+          authentication profile needs all three and none exist as discrete
+          tokens here. Keep the original line as event.original, mask any
+          credential or token material the text exposes before it leaves the
+          low side, bound the message length, and apply this dataset's own
+          INFO/WARNING/CRITICAL severity lookup rather than the vulnerability
+          table, whose 0-4 ordering runs the other way.
+        elastic: >
+          Land into the same custom logs-tenable_sc.system_log template the
+          API feed uses so both collection paths are query-compatible, default
+          event.outcome to unknown whenever the low-side regex found no
+          verdict so failed parses stay visible, and derive event.category
+          authentication vs configuration from the module text. Keep the
+          numeric severity mapping in a lookup separate from the vulnerability
+          dataset's, and flag that this path lacks the organization-level
+          entries the REST poll carries so coverage is not assumed complete.
+        relay: >
+          The free-text message is the highest content-filter risk in this
+          technology, so parse and length-bound it before the guard and strip
+          control characters and non-ASCII so the custom NDJSON filter rules
+          stay simple - do not cross raw syslog text. Carry event.original
+          across until the regex is proven against real console, API and
+          scheduled-job lines, then reassess. Because this forwards
+          administrative events only, reconcile against the API feed's
+          organization-level counts rather than assuming syslog volume
+          represents the whole audit trail.
+      direct:
+        parse_location: low
+        cribl: >
+          High side with no guard: the same PRI-plus-regex parse applies, and
+          without a boundary the choice between this syslog relay and the REST
+          poll is operational - the poll captures organization-level audit
+          entries this forwarder omits, so prefer the API where the full audit
+          trail is required and use syslog where a push relay to the local
+          syslog service is simpler to operate.
+        elastic: >
+          Land into the same custom logs-tenable_sc.system_log template the
+          API feed uses so both collection paths are query-compatible, derive
+          event.category authentication vs configuration from the module text,
+          keep the numeric severity mapping in a lookup separate from the
+          vulnerability dataset's, and default event.outcome to unknown on an
+          unparsed verdict.
+    fields:
+    - vendor: syslog PRI (facility)
+      type: integer
+      description: syslog facility encoded in the message PRI, from the SC Syslog Facility setting
+      ecs: log.syslog.facility.name
+      status: mapped
+      notes: operator-chosen facility; derive the name from the numeric PRI facility
+    - vendor: syslog PRI (severity)
+      type: enum
+      description: >-
+        syslog severity encoded in the PRI, mapped from the SC
+        Informational/Warning/Critical level
+      ecs: event.severity
+      status: partial
+      transform: >
+        Security Center's three administrative levels are mapped into the
+        syslog severity; normalize to the site numeric severity scale with
+        this dataset's own lookup - not the vulnerability 0-4 table, whose
+        ordering is reversed - and note log.syslog.severity.name can hold the
+        raw syslog level alongside it
+    - vendor: syslog timestamp
+      type: timestamp
+      description: RFC-3164 timestamp on the forwarded line
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        the syslog line time, distinct from the API feed's epoch-seconds date
+        field; RFC-3164 omits the year, so stamp the receive year and
+        normalize to UTC
+    - vendor: syslog hostname
+      type: string
+      description: hostname field of the syslog line - the Security Center appliance
+      ecs: host.name
+      status: mapped
+      notes: >-
+        identifies the SC appliance that emitted the administrative event, not
+        a scanned asset
+    - vendor: message
+      type: string
+      description: >
+        administrative log message text, e.g. a login success/failure with the
+        client IP and authentication type
+      ecs: message
+      status: partial
+      notes: >
+        same free-text payload as the API feed's message field, carrying the
+        client IP, auth type and success/failure the authentication profile
+        needs; the pipeline must regex them into source.ip, event.action and
+        event.outcome, none of which arrive as discrete tokens over syslog

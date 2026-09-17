@@ -1,0 +1,1988 @@
+id: linux-syslog
+name: Linux syslog / journald
+vendor: Linux
+versions: >-
+  RHEL 8, RHEL 9 (rsyslog 8.x, systemd-journald 239/252, OpenSSH 8.x, sudo
+  1.9.x, cronie 1.5.x)
+draft: true
+references:
+- https://www.elastic.co/docs/reference/integrations/system
+- >-
+  https://github.com/elastic/integrations/blob/main/packages/system/data_stream/auth/elasticsearch/ingest_pipeline/message.yml
+- >-
+  https://github.com/elastic/integrations/blob/main/packages/system/data_stream/auth/fields/fields.yml
+- >-
+  https://github.com/elastic/integrations/blob/main/packages/system/data_stream/syslog/elasticsearch/ingest_pipeline/default.yml
+- https://github.com/cronie-crond/cronie/blob/master/src/misc.c
+- https://man7.org/linux/man-pages/man5/rsyslog.conf.5.html
+- https://man7.org/linux/man-pages/man8/sshd.8.html
+datasets:
+- id: auth
+  name: Authentication log (/var/log/secure)
+  description: >
+    Everything written to the authpriv facility on a RHEL-family server: sshd
+    accept/fail/invalid-user lines, sudo command records, su, and the pam_unix
+    / pam_faillock session and authentication-failure messages that sit
+    underneath all of them. This is the highest-value Linux dataset a SOC
+    ingests — it is where interactive access, credential attacks, and
+    privilege escalation are visible. Deliberately distinct from the
+    linux-auditd map: auditd carries kernel syscall records, this carries the
+    userland daemons' own free-text messages, and the two frequently describe
+    the same login from different sides.
+  event_categories:
+  - authentication
+  - iam
+  - process
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        rsyslog on each server forwards authpriv.* over TCP/6514 (or relays
+        through a site rsyslog concentrator) to a Cribl syslog source. The
+        fields a content policy will constrain are the unbounded free-text
+        ones — sudo COMMAND strings and the SSH key signature — which should
+        be length-capped edge-side before crossing. All three datasets in this
+        file share one Cribl syslog source and are split by facility.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-system.auth
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        rsyslog on each server forwards authpriv.* over TCP/6514 (or relays
+        through a site rsyslog concentrator) to a Cribl syslog source, which
+        forwards straight to Elastic with no guard hop. All three datasets in
+        this file share one Cribl syslog source and are split by facility.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-system.auth
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: elastic-integration
+      artifact: System integration (system), data stream logs-system.auth
+      notes: >
+        The stock pipeline strips the syslog header, then runs a fixed set of
+        grok patterns against the message body for sshd, sudo, useradd/
+        groupadd, gpasswd/usermod/userdel, pam_unix, pam_faillock and
+        unix_chkpwd. Anything not matching one of those templates keeps only
+        header fields and message — notably sssd, polkitd, and vendor PAM
+        modules (smart-card / PIV stacks) are NOT parsed, which matters on a
+        CAC-authenticated estate. A Cribl pipeline in front is the right place
+        to drop the high-volume "session opened/closed for user root" cron
+        churn before it reaches this integration.
+    fields:
+    - vendor: PRI
+      type: integer
+      description: >-
+        RFC 3164 priority value in the leading angle brackets, encoding
+        facility and severity
+      ecs: log.syslog.priority
+      status: mapped
+      transform: >
+        facility = PRI / 8 (10 = authpriv, which is what selects this dataset)
+        and severity = PRI mod 8; both halves must be derived into
+        log.syslog.facility.code and log.syslog.severity.code because the
+        composite number on its own is not filterable.
+    - vendor: timestamp
+      type: timestamp
+      description: Syslog header timestamp of the auth event
+      ecs: '@timestamp'
+      status: partial
+      notes: >
+        RFC 3164 prints "MMM  d HH:mm:ss" with NO year and NO timezone. The
+        date processor guesses the current year and falls back to UTC unless
+        the shipper supplied event.timezone — on a multi-timezone estate
+        relayed through Cribl that metadata is usually absent, so events can
+        land hours off. Force RSYSLOG_SyslogProtocol23Format (RFC 5424, full
+        ISO 8601 with offset) on the senders if you can.
+    - vendor: hostname
+      type: string
+      description: Short host name the originating server writes into the syslog header
+      ecs: host.hostname
+      status: partial
+      notes: >
+        the grok sets host.hostname and appends it to related.hosts, but never
+        sets host.name — that normally comes from Elastic Agent metadata a
+        Cribl-relayed syslog stream does not carry. Populate host.name in
+        Cribl from the source connection or these events will not join to any
+        other host-keyed dataset.
+    - vendor: program
+      type: string
+      description: Process tag before the colon in the syslog header
+      ecs: process.name
+      status: mapped
+      notes: >
+        sshd, sudo, su, crond, systemd-logind, unix_chkpwd, useradd, usermod,
+        userdel, groupadd, gpasswd. This is the routing key for every
+        downstream grok in the pipeline and the field to scope a detection by;
+        it is the closest thing this dataset has to an event.code.
+    - vendor: pid
+      type: integer
+      description: Process id printed in square brackets after the program tag
+      ecs: process.pid
+      status: mapped
+      notes: >
+        the only join key between the several lines one login produces (sshd
+        "Accepted publickey", the pam_unix "session opened", and the matching
+        "session closed" minutes or hours later all share it).
+    - vendor: message
+      type: string
+      description: Free-text remainder after the tag, from which every field below is grokked
+      ecs: message
+      status: mapped
+      notes: >-
+        the untouched line is also copied to event.original before parsing, so
+        a failed grok is still recoverable
+    - vendor: Accepted | Failed | Invalid (sshd result verb)
+      type: enum
+      description: Leading verb of an sshd authentication line
+      ecs: event.outcome
+      status: partial
+      transform: >
+        Accepted -> success, Failed/Invalid -> failure, via a painless script.
+        The raw verb is kept at system.auth.ssh.event. Note event.action is
+        set to the constant "ssh_login" for all three, so event.action does
+        NOT distinguish a successful login from a brute force — the outcome
+        field is doing all the work, and it is also written by the unrelated
+        pam_unix "authentication failure" rule, so scope detections by
+        process.name.
+    - vendor: publickey | password | keyboard-interactive (sshd method)
+      type: enum
+      description: Authentication method sshd accepted or rejected
+      ecs: null
+      status: unmapped
+      custom: system.auth.ssh.method
+      notes: >
+        ECS has no authentication-method concept anywhere in the schema. This
+        is load-bearing on a hardened estate — "did anyone successfully
+        authenticate with a password rather than a key or a PIV certificate"
+        is a standard control check and this custom field is the only place
+        the answer lives.
+    - vendor: user (sshd)
+      type: string
+      description: Account name the SSH client offered
+      ecs: user.name
+      status: partial
+      notes: >
+        the grok strips the literal "invalid user " prefix, so a "Failed
+        password for invalid user admin" line yields user.name=admin with
+        nothing marking the account as nonexistent — that survives only in
+        system.auth.ssh.event=Invalid. A detection that treats user.name as a
+        real principal will manufacture phantom accounts from scanner traffic.
+    - vendor: from <host> (sshd source)
+      type: ip
+      description: Client address on an sshd authentication line
+      ecs: source.ip
+      status: partial
+      transform: >
+        grokked as source.address with an IPORHOST pattern, then converted to
+        source.ip. If sshd is configured with UseDNS yes the token is a
+        hostname, the conversion fails, and the value is written to
+        source.domain instead — leaving source.ip null on exactly the hosts
+        that resolve. Confirm UseDNS is off before keying alerts on source.ip.
+    - vendor: port <n> (sshd source port)
+      type: port
+      description: Ephemeral client port of the SSH connection
+      ecs: source.port
+      status: mapped
+      notes: >-
+        needed to pair a Failed line with the sshd disconnect/session line
+        that follows it from a NAT-shared client address
+    - vendor: 'ssh2: <keytype> SHA256:<fingerprint>'
+      type: string
+      description: Public key type and fingerprint accepted on a publickey login
+      ecs: null
+      status: unmapped
+      custom: system.auth.ssh.signature
+      notes: >
+        ECS has no key-fingerprint namespace (the hash.* set is for file and
+        process hashes). This is the only record of WHICH credential
+        authorised a login, so key-revocation and shared-key investigations
+        depend entirely on this custom field.
+    - vendor: rhost= (PAM)
+      type: ip
+      description: Remote host on a pam_unix key=value authentication line
+      ecs: source.ip
+      status: partial
+      notes: >
+        renamed to source.address then converted, same hostname caveat as the
+        sshd token above. Empty on console, su, and cron-invoked PAM stacks —
+        for those there is no source address at all, so an "authentication
+        failure from unknown source" rule will fire on ordinary local activity
+        unless it excludes empty rhost.
+    - vendor: user= (PAM)
+      type: string
+      description: Account named on a pam_unix authentication-failure line
+      ecs: user.name
+      status: partial
+      notes: >
+        pam_unix prints "logname= uid= euid= tty= ruser= rhost= user=" and the
+        stock pipeline extracts ONLY rhost= and user=. uid/euid (the numeric
+        identity that actually attempted the operation), ruser, and tty= are
+        dropped on the floor — add a kv step in Cribl if you need them,
+        because ECS user.id will otherwise be empty across the whole PAM half
+        of this dataset.
+    - vendor: TTY= (sudo)
+      type: string
+      description: Controlling terminal the sudo command was invoked from
+      ecs: null
+      status: unmapped
+      custom: system.auth.sudo.tty
+      notes: >
+        ECS process.tty is an object holding char_device major/minor numbers,
+        not a device name, so the string "pts/0" has no ECS home. A value of
+        "unknown" means the invocation had no terminal — a good proxy for
+        scripted or remotely-injected sudo.
+    - vendor: PWD= (sudo)
+      type: string
+      description: Working directory sudo was invoked from
+      ecs: process.working_directory
+      status: partial
+      notes: >
+        the stock integration leaves it at system.auth.sudo.pwd and never
+        populates process.working_directory; a copy step is needed before any
+        cross-technology query on working directory will see Linux sudo.
+    - vendor: USER= (sudo)
+      type: string
+      description: Target account sudo switched to
+      ecs: user.effective.name
+      status: mapped
+      transform: >
+        converted from system.auth.sudo.user into user.effective.name and
+        appended to related.user; user.name stays the invoking human. Almost
+        always "root", so the interesting signal is the rare line where it is
+        a service account instead.
+    - vendor: COMMAND= (sudo)
+      type: string
+      description: Full command line executed under sudo
+      ecs: process.command_line
+      status: partial
+      notes: >
+        stock keeps it only at system.auth.sudo.command and leaves
+        process.command_line empty — copy it if you want Linux sudo to reach
+        the same command-line detections as Windows and Sysmon. Two caveats:
+        the pipeline sets event.category=process and event.type=start for
+        these lines even though sudo logs INTENT (the command may still fail
+        to execute), and the string is unbounded free text, making it the
+        field most likely to need capping before a guard hop.
+    - vendor: <sudo error clause> (user NOT in sudoers / N incorrect password attempts)
+      type: string
+      description: Optional error phrase sudo prints before the TTY= token when it refuses
+      ecs: event.reason
+      status: partial
+      notes: >
+        MAJOR GAP — the pipeline captures this at system.auth.sudo.error but
+        never sets event.outcome=failure from it. A refused sudo is therefore
+        indistinguishable from a successful one on event.outcome alone; every
+        sudo-abuse detection must test this field directly.
+    - vendor: session opened | session closed (pam_unix)
+      type: string
+      description: PAM session lifecycle phrase and its "for user X by Y(uid=N)" actors
+      ecs: event.action
+      status: mapped
+      transform: >
+        "session opened" -> event.action=logged-on, "session closed" ->
+        logged-off. The "by <user>(uid=N)" actor becomes user.name and
+        user.id; the "for user <x>" target becomes user.effective.name. On
+        cron-invoked sessions the actor half is empty "by (uid=0)", which is
+        the single largest source of null-principal events in this dataset.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Stamp the year and an event.timezone onto the yearless RFC 3164
+          header at the point of ingest and set host.name (plus host.ip) from
+          the syslog source connection — neither can be recovered downstream
+          once the stream has left the enclave, and without host.name these
+          events join to nothing else. Suppress the cron-invoked pam_unix
+          "session opened/closed for user root" churn low-side, and length-cap
+          the two unbounded free-text tokens the route notes call out — the
+          sudo COMMAND string and the SSH key signature — before either
+          destination. Run the destination on Persistent Queue backpressure,
+          never Block, and push senders toward RSYSLOG_SyslogProtocol23Format
+          so the header carries a real offset.
+        elastic: >
+          The System integration's logs-system.auth pipeline stays the parser;
+          layer a logs-system.auth@custom pipeline that closes the documented
+          gaps: derive event.outcome=failure from system.auth.sudo.error
+          (today a refused sudo is indistinguishable from a successful one),
+          copy system.auth.sudo.command into process.command_line and sudo.pwd
+          into process.working_directory, and kv-extract the
+          uid=/euid=/ruser=/tty= tokens the stock pipeline discards so user.id
+          is populated across the PAM half. Add grok branches for the daemons
+          stock does not match — sssd, polkitd, and vendor PIV/smart-card PAM
+          modules — and mark system.auth.ssh.event=Invalid onto the event so
+          scanner-invented accounts are not treated as real principals. Map
+          system.auth.ssh.method, system.auth.ssh.signature and
+          system.auth.sudo.tty as keywords in the custom namespace, since all
+          three are unmapped and detection-relevant.
+        relay: >
+          Low-side instances cross the guard: the thin {_dataId, @timestamp,
+          host, _raw} envelope crosses rather than a full ECS record — a
+          mature Elastic integration already exists, so the guard only needs
+          to see one stable shape. The content-filter friction is precisely
+          what the route notes flag: sudo COMMAND lines and the SSH key
+          signature are unbounded operator- and attacker-influenced text, so
+          cap their length and strip non-ASCII low-side to keep a custom
+          NDJSON filter a simple shape check, then validate with
+          C.Schema(...).validate immediately before the guard destination with
+          a dead-letter route for failures. Treat the crossing as at-most-once
+          and reconcile low- vs high-side counts per (dataset, hour); carry
+          _raw until the integration parser is proven, since this is the
+          highest-forensic-value Linux stream.
+      direct:
+        parse_location: hybrid
+        cribl: >
+          Stamp the year and an event.timezone onto the yearless RFC 3164
+          header at the point of ingest and set host.name (plus host.ip) from
+          the syslog source connection — neither can be recovered downstream
+          once the stream has left the source host, and without host.name
+          these events join to nothing else. Suppress the cron-invoked
+          pam_unix "session opened/closed for user root" churn at ingest, and
+          length-cap the two unbounded free-text tokens the route notes call
+          out — the sudo COMMAND string and the SSH key signature — before the
+          Elastic destination. Run the destination on Persistent Queue
+          backpressure, never Block, and push senders toward
+          RSYSLOG_SyslogProtocol23Format so the header carries a real offset.
+        elastic: >
+          The System integration's logs-system.auth pipeline stays the parser;
+          layer a logs-system.auth@custom pipeline that closes the documented
+          gaps: derive event.outcome=failure from system.auth.sudo.error
+          (today a refused sudo is indistinguishable from a successful one),
+          copy system.auth.sudo.command into process.command_line and sudo.pwd
+          into process.working_directory, and kv-extract the
+          uid=/euid=/ruser=/tty= tokens the stock pipeline discards so user.id
+          is populated across the PAM half. Add grok branches for the daemons
+          stock does not match — sssd, polkitd, and vendor PIV/smart-card PAM
+          modules — and mark system.auth.ssh.event=Invalid onto the event so
+          scanner-invented accounts are not treated as real principals. Map
+          system.auth.ssh.method, system.auth.ssh.signature and
+          system.auth.sudo.tty as keywords in the custom namespace, since all
+          three are unmapped and detection-relevant.
+  - format: json
+    enable: >
+      Define a JSON template and bind it on the authpriv forwarding action.
+      Modern config: `template(name="authJSON" type="list") {
+      property(name="timereported" dateFormat="rfc3339" format="jsonf"
+      outname="@timestamp") property(name="hostname" format="jsonf")
+      property(name="fromhost-ip" format="jsonf")
+      property(name="syslogfacility" format="jsonf")
+      property(name="syslogseverity" format="jsonf")
+      property(name="programname" format="jsonf") property(name="procid"
+      format="jsonf") property(name="msg" format="jsonf")
+      property(name="rawmsg" format="jsonf") }` then select the facility and
+      forward with `authpriv.* action(type="omfwd" target="<cribl>"
+      port="6514" protocol="tcp" template="authJSON")`. The
+      `dateFormat="rfc3339"` option is the point of the exercise - it emits a
+      full ISO 8601 timestamp with year and timezone offset, removing the RFC
+      3164 guess. Legacy senders can use the equivalent `$template` string
+      with the `:::date-rfc3339` and `:::json` property modifiers.
+    references:
+    - https://docs.rsyslog.com/doc/configuration/templates.html
+    - https://docs.rsyslog.com/doc/configuration/properties.html
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        custom rsyslog-JSON envelope reshaper feeding the System integration
+        (logs-system.auth)
+      notes: >
+        Cribl Extract JSON parses the envelope and maps the typed fields; the
+        `msg` value is then handed to the SAME logs-system.auth grok the
+        syslog-raw feed uses, because the JSON template restructures only the
+        header. Net effect: the yearless-timestamp and missing-host.ip
+        workarounds the deployed pipeline needs are gone, but the sshd/sudo/
+        useradd/pam_unix/pam_faillock body parsing is byte-for-byte the same
+        work. Point the reshaper at the existing integration rather than
+        re-implementing the grok.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Parse the JSON envelope low-side and let the typed fields do what
+          the syslog-raw feed synthesises by hand: take @timestamp straight
+          from the rfc3339 property instead of stamping year/timezone, and set
+          host.ip from fromhost-ip when the sender is the origin. Still
+          length-cap the two unbounded free-text tokens the route flags - the
+          sudo COMMAND string and the SSH key signature - before the crossing,
+          because they ride inside `msg` untouched. Suppress the cron-invoked
+          pam_unix "session opened/closed for user root" churn here as before,
+          and run the destination on Persistent Queue, never Block.
+        elastic: >
+          The logs-system.auth pipeline stays the body parser; keep every
+          logs-system.auth@custom fix the deployed map prescribes (derive
+          event.outcome from system.auth.sudo.error, copy sudo.command into
+          process.command_line, kv-extract the uid/euid/ruser/tty tokens, add
+          sssd/polkitd/PIV grok branches). The only change on the JSON path is
+          that the date processor and the host.ip enrichment become no-ops -
+          validate that @timestamp and host.ip arrive already populated and
+          stop the custom pipeline from overwriting them.
+        relay: >
+          Cross the JSON record as NDJSON behind the plan-of-record Cribl HTTP
+          destination; the envelope is already the stable, shallow shape the
+          guard wants, so a custom NDJSON filter can enforce a clean shape
+          check. The content-filter friction is unchanged from the syslog-raw
+          feed - the sudo COMMAND lines and SSH key signature inside `msg` are
+          the operator- and attacker-influenced text - so cap their length and
+          strip non-ASCII low-side, validate with C.Schema(...).validate
+          immediately before the guard destination with a dead-letter route,
+          and treat the crossing as at-most-once with per-(dataset, hour)
+          count reconciliation.
+      direct:
+        parse_location: hybrid
+        cribl: >
+          High-side instances skip the guard: parse the JSON envelope in the
+          core worker group, map @timestamp and host.ip from the typed
+          properties, and forward `msg` to the integration. There is no
+          body-parsing advantage over syslog-raw here - adopt the JSON
+          template purely to fix the timestamp and host.ip fidelity, and only
+          where you control the rsyslog config on the senders.
+        elastic: >
+          The logs-system.auth pipeline stays the body parser; keep every
+          logs-system.auth@custom fix the deployed map prescribes (derive
+          event.outcome from system.auth.sudo.error, copy sudo.command into
+          process.command_line, kv-extract the uid/euid/ruser/tty tokens, add
+          sssd/polkitd/PIV grok branches). The JSON envelope changes nothing
+          downstream of the grok; the date processor and host.ip enrichment
+          become no-ops, so validate that @timestamp and host.ip arrive
+          already populated. Confirm the reshaper does not double-emit
+          host.name (the JSON carries hostname, Cribl still owns host.name
+          from the source connection) so the two do not diverge.
+    fields:
+    - vendor: timereported
+      type: timestamp
+      description: >-
+        rsyslog property - the timestamp the record reported, emitted through
+        the date-rfc3339 modifier as full ISO 8601 with offset
+      ecs: '@timestamp'
+      status: mapped
+      transform: >
+        template with `dateFormat="rfc3339"` (or `:::date-rfc3339`) so the
+        JSON carries year and timezone. This is the whole reason to move auth
+        to a JSON template: the RFC 3164 yearless, timezone-less header that
+        forces the deployed pipeline to guess is replaced by an unambiguous
+        value.
+    - vendor: hostname
+      type: string
+      description: rsyslog property - the host that generated the message
+      ecs: host.hostname
+      status: mapped
+    - vendor: fromhost-ip
+      type: ip
+      description: rsyslog property - IP address of the sending host from the TCP connection
+      ecs: host.ip
+      status: partial
+      notes: >
+        finally supplies host.ip, which the deployed map has to synthesise in
+        Cribl. Caveat: if the record traversed a site rsyslog concentrator
+        this is the RELAY's address, not the origin's, so keep it
+        authoritative only on direct-forwarding senders and otherwise defer to
+        Cribl's source-connection enrichment. This is the LOG HOST's address,
+        distinct from the sshd "from" client address that stays inside msg.
+    - vendor: syslogfacility
+      type: integer
+      description: rsyslog property - numeric facility code, emitted as a decimal
+      ecs: log.syslog.facility.code
+      status: mapped
+      notes: >-
+        authpriv (10) is what selects this dataset; broken out as a number so
+        no PRI/8 derivation is needed downstream
+    - vendor: syslogseverity
+      type: integer
+      description: rsyslog property - numeric severity, emitted as a decimal
+      ecs: log.syslog.severity.code
+      status: partial
+      notes: >-
+        the inverted 0=emerg..7=debug scale still applies, so reuse the
+        severity lookup rather than thresholding the raw value
+    - vendor: programname
+      type: string
+      description: rsyslog property - the program that sent the message (tag without the pid)
+      ecs: process.name
+      status: mapped
+      notes: >-
+        sshd, sudo, su, crond, systemd-logind, unix_chkpwd,
+        useradd/usermod/userdel/groupadd/gpasswd - the routing key for every
+        downstream grok, cleanly separated from the pid by the template
+    - vendor: procid
+      type: integer
+      description: >-
+        rsyslog property - the process id (RFC5424 PROCID, filled from the
+        syslogtag on RFC3164 input)
+      ecs: process.pid
+      status: partial
+      notes: >
+        the join key between the several lines one login produces; prints the
+        literal "-" when absent, so guard against it before writing an
+        integer.
+    - vendor: msg
+      type: string
+      description: rsyslog property - the free-text message body
+      ecs: message
+      status: mapped
+      notes: >
+        STILL the unparsed sshd/sudo/pam line - the JSON template restructures
+        the envelope only, so every field the deployed map groks out of the
+        body (Accepted/Failed verb, user, source, sudo COMMAND/TTY/PWD, pam
+        rhost/user) needs the identical grok on this path. This is the honest
+        ceiling of the JSON format for auth.
+    - vendor: rawmsg
+      type: string
+      description: rsyslog property - the complete original message as received
+      ecs: event.original
+      status: mapped
+      notes: >-
+        the pre-parse copy, so a failed body grok is still recoverable exactly
+        as on the syslog-raw feed
+    - vendor: app-name
+      type: string
+      description: rsyslog property - the RFC5424 APP-NAME field
+      ecs: log.syslog.appname
+      status: mapped
+      notes: >-
+        only distinct from programname when the upstream sender is genuinely
+        RFC5424; otherwise it mirrors it
+    - vendor: msgid
+      type: string
+      description: rsyslog property - the RFC5424 MSGID field
+      ecs: event.code
+      status: partial
+      notes: >-
+        authpriv daemons emit "-" here almost universally, so event.code stays
+        empty on this path just as on the syslog-raw feed
+  - format: journald
+    enable: >
+      Ensure a persistent journal (`Storage=persistent` in
+      /etc/systemd/journald.conf; RHEL 8/9 default is auto). Read it as JSON
+      with `journalctl -o json` (one object per line), `-o json-seq` (RFC 7464
+      record-separator framing) or `-o export` (the binary-safe Journal Export
+      Format); restrict volume with `--output-fields=`. Split THIS dataset off
+      by the authpriv facility with a journald match, e.g. `journalctl
+      SYSLOG_FACILITY=10 -o json` or an Elastic Agent journald input with
+      `include_matches: [ "SYSLOG_FACILITY=10" ]`. For transport off-host
+      without rsyslog, use systemd-journal-upload
+      (`URL=https://<remote>:19532` to a systemd-journal-remote, streaming the
+      Export Format) or query systemd-journal-gatewayd on :19531 with `Accept:
+      application/json`.
+    references:
+    - https://man7.org/linux/man-pages/man7/systemd.journal-fields.7.html
+    - https://man7.org/linux/man-pages/man1/journalctl.1.html
+    - https://www.elastic.co/docs/reference/beats/filebeat/filebeat-input-journald
+    - https://man7.org/linux/man-pages/man8/systemd-journal-upload.8.html
+    - https://man7.org/linux/man-pages/man8/systemd-journal-gatewayd.8.html
+    parsing:
+      mechanism: elastic-integration
+      artifact: >-
+        Elastic Agent journald input (System integration), then
+        logs-system.auth body grok
+      notes: >
+        The journald input calls journalctl and maps the trusted envelope: the
+        underscore-prefixed fields land in the journald.* namespace (_PID ->
+        journald.pid, _COMM -> journald.process.name) with a parallel set
+        going to ECS (_HOSTNAME -> host.hostname, _MACHINE_ID -> host.id,
+        PRIORITY -> log.syslog.priority, SYSLOG_FACILITY ->
+        log.syslog.facility.code, SYSLOG_IDENTIFIER -> log.syslog.appname),
+        and MESSAGE -> message. It does NOT grok the sshd/sudo/pam sentence,
+        so the same logs-system.auth body parsing must run on `message`
+        afterwards. The value added over syslog-raw is entirely provenance:
+        the attested _AUDIT_LOGINUID / _UID / _COMM / _EXE / _SELINUX_CONTEXT
+        that the free-text line never carried.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Read the journal low-side (journald input or `journalctl -o json`
+          into a Cribl source), keep the attested fields, and copy
+          _AUDIT_LOGINUID into user.id so the PAM half finally has a principal
+          - this is the single biggest reason to prefer journald for auth.
+          Suppress the same cron-invoked root session churn, cap the sudo
+          COMMAND and SSH signature tokens inside MESSAGE, and carry __CURSOR
+          as the idempotency key for the crossing. Persistent Queue on the
+          destination, never Block.
+        elastic: >
+          Run the logs-system.auth body grok on `message` exactly as the
+          syslog-raw feed does, then layer a logs-system.auth@custom pipeline
+          that puts the attested fields to work: resolve _AUDIT_LOGINUID
+          (user.id) to a name for user.name where the body did not, map
+          _SELINUX_CONTEXT and _AUDIT_SESSION into the custom namespace for
+          auditd correlation, and prefer _COMM over the SYSLOG_IDENTIFIER tag
+          when they disagree because the tag is sender-controlled. Normalise
+          PRIORITY, which is the severity only, off the mislabelled
+          log.syslog.priority the input writes.
+        relay: >
+          Cross JSON built from the journal as NDJSON; the attested envelope
+          is a stable shallow shape ideal for a guard schema check. The
+          content risk is the same MESSAGE free text - cap the sudo COMMAND
+          and key signature and strip non-ASCII low-side - and additionally
+          decide policy on the provenance fields: _CMDLINE and _EXE can
+          disclose internal paths, so length-bound them. Validate with
+          C.Schema(...).validate before the guard with a dead-letter route,
+          key dedup on __CURSOR, and reconcile per-(dataset, hour) counts
+          at-most-once.
+      direct:
+        parse_location: hybrid
+        cribl: >
+          High-side instances read the journal in the core worker group and
+          skip the guard; keep the full attested envelope (no redaction
+          pressure) and still run the auth body grok on MESSAGE. Use
+          include_matches on SYSLOG_FACILITY=10 at the input so cron and
+          daemon traffic never enter this dataset's pipeline.
+        elastic: >
+          Run the logs-system.auth grok, plus the @custom enrichment that
+          copies _AUDIT_LOGINUID to user.id and lifts _SELINUX_CONTEXT / _EXE
+          / _CAP_EFFECTIVE into detections. This is the strictly richer auth
+          path - a hardened, auditd-correlated estate should treat journald as
+          the preferred source and syslog-raw as the fallback.
+    fields:
+    - vendor: __REALTIME_TIMESTAMP
+      type: integer
+      description: >-
+        journal address field - wall-clock time (microseconds since the epoch,
+        UTC) when the entry was received by the journal
+      ecs: '@timestamp'
+      status: mapped
+      transform: >
+        divide to milliseconds/seconds for @timestamp. Absolute and
+        unambiguous - the RFC 3164 year/timezone guess that dominates the
+        deployed auth map's caveats simply does not exist on this path.
+    - vendor: MESSAGE
+      type: string
+      description: journal user field - the human-readable message string
+      ecs: message
+      status: mapped
+      notes: >-
+        still the unparsed sshd/sudo/pam sentence; the auth body grok is
+        byte-for-byte unchanged from the syslog-raw feed
+    - vendor: _AUDIT_LOGINUID
+      type: string
+      description: >-
+        journal trusted field - the login UID the kernel audit subsystem ties
+        to the originating session
+      ecs: user.id
+      status: partial
+      notes: >
+        the real human principal, stable across su and sudo, kernel-maintained
+        so the daemon cannot misreport it - this is the field that closes the
+        "user.id empty across the PAM half" gap the deployed map flags.
+        Numeric, so name resolution is a downstream join; it is also the join
+        key to the matching linux-auditd records.
+    - vendor: _UID
+      type: string
+      description: journal trusted field - effective UID of the process that logged the entry
+      ecs: null
+      status: unmapped
+      custom: linux.journald.uid
+      notes: >
+        the daemon's own euid (usually 0 for sshd/sudo), i.e. process
+        provenance, NOT the authenticating principal - kept deliberately
+        distinct from _AUDIT_LOGINUID so a detection does not treat
+        root-the-daemon as the actor.
+    - vendor: _COMM
+      type: string
+      description: journal trusted field - the name of the process the entry originates from
+      ecs: process.name
+      status: mapped
+      notes: >
+        kernel-attested short name (sshd, sudo, su, unix_chkpwd), so it cannot
+        be forged by the log line the way the SYSLOG_IDENTIFIER tag can;
+        prefer it over the tag when the two disagree.
+    - vendor: _EXE
+      type: string
+      description: journal trusted field - the executable path of the originating process
+      ecs: process.executable
+      status: mapped
+      notes: >-
+        the full on-disk binary path, absent entirely from syslog-raw; lets a
+        detection pin the exact binary that authenticated
+    - vendor: _CMDLINE
+      type: string
+      description: journal trusted field - the command line of the originating process
+      ecs: process.command_line
+      status: partial
+      notes: >
+        this is the LOGGING process's own argv (e.g. "sshd: root [priv]"), NOT
+        the sudo COMMAND= target - that still lives in MESSAGE. Do not
+        conflate them: mapping this to process.command_line is convenient but
+        a sudo-command detection must read the body, not this field.
+    - vendor: _PID
+      type: integer
+      description: journal trusted field - the process number of the originating process
+      ecs: process.pid
+      status: mapped
+      notes: >-
+        kernel-attested, unlike the client-supplied SYSLOG_PID, so it is a
+        trustworthy join key across the lines of one login
+    - vendor: _AUDIT_SESSION
+      type: string
+      description: >-
+        journal trusted field - the audit session id of the process as
+        maintained by kernel audit
+      ecs: null
+      status: unmapped
+      custom: linux.journald.audit_session
+      notes: >-
+        the join key that ties this journal entry to the matching linux-auditd
+        records for the same login - a correlation syslog-raw cannot make
+    - vendor: _SELINUX_CONTEXT
+      type: string
+      description: >-
+        journal trusted field - the SELinux security context (label) of the
+        originating process
+      ecs: null
+      status: unmapped
+      custom: linux.journald.selinux_context
+      notes: >-
+        load-bearing on the CAC/PIV hardened, SELinux-enforcing estate the
+        deployed map flags, and available nowhere in syslog-raw
+    - vendor: _SYSTEMD_UNIT
+      type: string
+      description: journal trusted field - the systemd unit the entry originates from
+      ecs: service.name
+      status: partial
+      notes: >
+        sshd.service for the daemon, or the per-login session-N.scope for an
+        interactive session - treat a non-.service value as a session marker
+        rather than a service name.
+    - vendor: _CAP_EFFECTIVE
+      type: string
+      description: >-
+        journal trusted field - the effective capability set of the
+        originating process, as a hex mask
+      ecs: null
+      status: unmapped
+      custom: linux.journald.cap_effective
+      notes: >-
+        a privilege posture / escalation signal on the logging process with no
+        syslog equivalent
+    - vendor: PRIORITY
+      type: integer
+      description: >-
+        journal user field - a priority value 0-7 (the syslog severity) as a
+        decimal string
+      ecs: log.syslog.severity.code
+      status: partial
+      notes: >
+        this is the SEVERITY only, not the composite priority; the Elastic
+        journald input maps it to log.syslog.priority, which is arguably
+        mislabelled since the facility half is carried separately in
+        SYSLOG_FACILITY - normalise into log.syslog.severity.code, and the
+        inverted 0=emerg scale still applies.
+    - vendor: SYSLOG_FACILITY
+      type: integer
+      description: journal user field - the syslog facility as a decimal string
+      ecs: log.syslog.facility.code
+      status: mapped
+      notes: >-
+        authpriv (10) selects this dataset; already broken out as a number,
+        and the field the journald match filters on
+    - vendor: SYSLOG_IDENTIFIER
+      type: string
+      description: journal user field - the syslog identifier (tag) the logging program set
+      ecs: log.syslog.appname
+      status: mapped
+      notes: >-
+        the sender-set tag (sshd/sudo/su); _COMM is the kernel-attested
+        counterpart, so prefer _COMM for trust-sensitive routing
+    - vendor: _HOSTNAME
+      type: string
+      description: journal trusted field - the hostname of the originating host
+      ecs: host.hostname
+      status: mapped
+    - vendor: _MACHINE_ID
+      type: string
+      description: journal trusted field - the stable 128-bit machine id of the originating host
+      ecs: host.id
+      status: mapped
+      notes: >-
+        a durable host key syslog-raw never carries; the Elastic journald
+        input maps host.id from it, giving cross-dataset host correlation
+        without Agent metadata
+    - vendor: MESSAGE_ID
+      type: string
+      description: >-
+        journal user field - a 128-bit message identifier for recognising
+        certain message types
+      ecs: event.code
+      status: partial
+      notes: >-
+        systemd's catalog UUID, set by systemd units but NOT by sshd/sudo/pam,
+        so empty for most of this dataset - do not build auth detections on it
+    - vendor: __CURSOR
+      type: string
+      description: >-
+        journal address field - an opaque text token uniquely describing the
+        position of the entry
+      ecs: null
+      status: unmapped
+      custom: linux.journald.cursor
+      notes: >-
+        unique per entry, so it is the natural dedup/idempotency key across
+        the guard crossing and the reader's resume pointer
+- id: cron
+  name: cron and crond activity
+  description: >
+    Scheduled-job execution and crontab administration from the cron facility:
+    CROND job start (CMD), job output (CMDOUT), completion (CMDEND), crontab
+    reloads, and the crontab(1) BEGIN EDIT / REPLACE / DELETE records. Modest
+    volume, but it is where persistence lives — a new or edited crontab is one
+    of the most common Linux persistence mechanisms and it is visible here
+    before it is visible anywhere else.
+  event_categories:
+  - process
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same rsyslog forwarder and Cribl syslog source as the auth dataset,
+        split out by the cron facility. CMDOUT lines relay arbitrary job
+        stdout/stderr and are the least predictable content in the whole file,
+        so they are the obvious candidate for edge-side dropping rather than
+        guard inspection.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-system.syslog
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Same rsyslog forwarder and Cribl syslog source as the auth dataset,
+        split out by the cron facility, forwarding straight to Elastic with no
+        guard hop. CMDOUT lines relay arbitrary job stdout/stderr and are the
+        least predictable content in the whole file, so they are the obvious
+        candidate for dropping at ingest.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-system.syslog
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom cronie pipeline
+      notes: >
+        Deliberately NOT elastic-integration. Cron lines do land in
+        logs-system.syslog via the System integration, but that data stream's
+        pipeline extracts only the syslog header — it has no grok for cronie's
+        "(user) EVENT (detail)" body, so user, action, and command all stay
+        buried inside the message string. A small Cribl pipeline applying
+        `^\((?<user>[^)]+)\) (?<event>[A-Z ]+) \((?<detail>.*)\)$` ahead of
+        the Elastic destination is what makes this dataset queryable. Revisit
+        if Elastic adds a cron parse upstream.
+    fields:
+    - vendor: program
+      type: string
+      description: Syslog tag identifying which cron component emitted the line
+      ecs: process.name
+      status: mapped
+      notes: >
+        CROND (a forked job runner), crond (the daemon itself), crontab (the
+        user-facing editor), anacron, and the run-parts(<dir>) form. The
+        distinction matters: crontab lines are administrative changes, CROND
+        lines are executions.
+    - vendor: pid
+      type: integer
+      description: Process id printed in square brackets after the tag
+      ecs: process.pid
+      status: mapped
+      notes: >-
+        the only key linking a CMD line to its later CMDOUT and CMDEND lines;
+        cronie emits no job id
+    - vendor: hostname
+      type: string
+      description: Short host name from the syslog header
+      ecs: host.hostname
+      status: partial
+      notes: >-
+        same host.name gap as the auth dataset — set it in Cribl from the
+        source connection
+    - vendor: timestamp
+      type: timestamp
+      description: Syslog header timestamp of the cron event
+      ecs: '@timestamp'
+      status: partial
+      notes: same yearless, timezone-less RFC 3164 header caveat as the auth dataset
+    - vendor: (<username>) (first parenthesised slot)
+      type: string
+      description: Account the log line is attributed to
+      ecs: user.name
+      status: partial
+      notes: >
+        one slot with two meanings — on CROND lines it is the account the job
+        RUNS AS, on crontab(1) lines it is the REAL invoking user while the
+        account being modified sits in the detail slot instead. Do not treat
+        it as a single identity concept. The literal string "CRON" appears
+        here for daemon-level messages and is not a user at all.
+    - vendor: <EVENT> (uppercase action token)
+      type: enum
+      description: Action keyword cronie writes between the two parenthesised slots
+      ecs: event.action
+      status: partial
+      transform: >
+        CMD, CMDOUT, CMDEND, MAIL, RELOAD, STARTUP, INFO, ORPHAN, UNSAFE,
+        AUTH, LIST, DELETE, REPLACE, BEGIN EDIT, END EDIT. Lowercase and
+        hyphenate for ECS. Note the two-word tokens break any naive whitespace
+        split. There is no vendor outcome token anywhere in this dataset — see
+        the severity field below.
+    - vendor: (<detail>) (second parenthesised slot)
+      type: string
+      description: Event-specific payload, most often the command line being run
+      ecs: process.command_line
+      status: partial
+      notes: >
+        only a command line when the event token is CMD or CMDEND. For RELOAD
+        it is a crontab path (/var/spool/cron/<user>), for BEGIN EDIT / END
+        EDIT / REPLACE / DELETE / LIST it is the target username, for INFO it
+        is daemon prose. Mapping the whole slot to process.command_line is a
+        convenience for reusing command-line detections; a parser must branch
+        on the event token first or it will index usernames as commands.
+    - vendor: CMDOUT detail
+      type: string
+      description: A single line of stdout or stderr relayed from a running job
+      ecs: message
+      status: partial
+      notes: >
+        cronie emits one syslog event PER LINE of job output, so a chatty job
+        multiplies into hundreds of events sharing only a pid. This is the
+        volume risk in the dataset and the usual first Cribl drop rule; it is
+        also where secrets accidentally leak from job output into the SIEM.
+    - vendor: '<strerror text> after '': '''
+      type: string
+      description: errno string cronie appends when the operation failed
+      ecs: error.message
+      status: mapped
+      notes: >-
+        present only when cronie logged with a non-zero errno; its presence is
+        itself the failure signal
+    - vendor: PRI
+      type: integer
+      description: RFC 3164 priority value encoding the cron facility and the severity
+      ecs: log.syslog.severity.code
+      status: partial
+      transform: >
+        severity = PRI mod 8. This is the ONLY outcome signal in the dataset:
+        cronie logs everything at LOG_INFO (6) and drops to LOG_ERR (3) purely
+        when errno was set. event.outcome must be derived from this plus the
+        presence of the errno tail — there is no success/failure word to read.
+    - vendor: run-parts(<dir>)
+      type: string
+      description: Tag variant that embeds the cron.daily/cron.hourly directory in the program name
+      ecs: null
+      status: unmapped
+      custom: linux.cron.run_parts_dir
+      notes: >
+        the header grok assigns the entire "run-parts(/etc/cron.daily)" string
+        to process.name, which fragments process.name into one distinct value
+        per directory and breaks aggregation by program. Split the
+        parenthesised path out into this custom field and normalise
+        process.name back to "run-parts".
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Build the whole ECS record in the custom cronie pipeline: branch on
+          the uppercase event token BEFORE mapping the second parenthesised
+          slot, so the target usernames on BEGIN EDIT / END EDIT / REPLACE /
+          DELETE / LIST are not indexed as process.command_line, and handle
+          the two-word tokens that break a naive whitespace split. Derive
+          event.outcome low-side from severity (PRI mod 8) plus the presence
+          of the errno tail — there is no success or failure word anywhere in
+          this dataset — and split run-parts(<dir>) into
+          linux.cron.run_parts_dir with process.name normalised back to
+          "run-parts" so aggregation by program works. Stamp year/timezone on
+          the header, set host.name from the source connection, put the CMDOUT
+          drop-or-sample rule here (one event per output line is both the
+          volume risk and the secret-leak path), and use Persistent Queue
+          backpressure on the destination.
+        elastic: >
+          No integration owns cronie's grammar, so the high side should only
+          receive and store: send the pre-shaped records into
+          logs-system.syslog and keep any logs-system.syslog@custom logic to
+          invariant guards, not re-parsing. Add custom-namespace
+          index-template mappings for linux.cron.run_parts_dir and the cron
+          user/event/detail fields as keywords, and confirm the lowercased,
+          hyphenated event.action values produced low-side survive the stock
+          header pipeline untouched.
+        relay: >
+          With no integration to parse cronie, this dataset crosses as full
+          ECS-shaped JSON (envelope keys unchanged) rather than a thin
+          envelope, which also lets the guard make field-aware decisions
+          instead of inspecting raw job text. CMDOUT is the content-filter
+          problem — arbitrary job stdout/stderr with no predictable grammar —
+          so drop or aggressively sample it low-side rather than expecting a
+          custom LUA filter to adjudicate it, and cap detail-slot length, keep
+          nesting at two levels with short ASCII keys. Validate with
+          C.Schema(...).validate before the guard destination with a
+          dead-letter route, treat the crossing as at-most-once, and reconcile
+          per-(dataset, hour) counts because a lost crontab REPLACE is a lost
+          persistence signal.
+      direct:
+        parse_location: low
+        cribl: >
+          Build the whole ECS record in the custom cronie pipeline: branch on
+          the uppercase event token BEFORE mapping the second parenthesised
+          slot, so the target usernames on BEGIN EDIT / END EDIT / REPLACE /
+          DELETE / LIST are not indexed as process.command_line, and handle
+          the two-word tokens that break a naive whitespace split. Derive
+          event.outcome from severity (PRI mod 8) plus the presence of the
+          errno tail — there is no success or failure word anywhere in this
+          dataset — and split run-parts(<dir>) into linux.cron.run_parts_dir
+          with process.name normalised back to "run-parts" so aggregation by
+          program works. Stamp year/timezone on the header, set host.name from
+          the source connection, put the CMDOUT drop-or-sample rule here (one
+          event per output line is both the volume risk and the secret-leak
+          path), and use Persistent Queue backpressure on the destination.
+        elastic: >
+          No integration owns cronie's grammar, so the high side should only
+          receive and store: send the pre-shaped records into
+          logs-system.syslog and keep any logs-system.syslog@custom logic to
+          invariant guards, not re-parsing. Add custom-namespace
+          index-template mappings for linux.cron.run_parts_dir and the cron
+          user/event/detail fields as keywords, and confirm the lowercased,
+          hyphenated event.action values built in Cribl survive the stock
+          header pipeline untouched.
+  - format: json
+    enable: >
+      Reuse the JSON template pattern but select the cron facility on the
+      forwarding action: `cron.* action(type="omfwd" target="<cribl>"
+      port="6514" protocol="tcp" template="cronJSON")`, where cronJSON is a
+      `template(name="cronJSON" type="list")` emitting timereported (with
+      `dateFormat="rfc3339"`), hostname, syslogfacility, syslogseverity,
+      programname, procid, msg and rawmsg as jsonf properties. The severity
+      property matters here: it is the only outcome signal cronie gives, so it
+      must survive into the JSON.
+    references:
+    - https://docs.rsyslog.com/doc/configuration/templates.html
+    - https://docs.rsyslog.com/doc/configuration/properties.html
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom cronie pipeline, fed by a JSON-envelope extract
+      notes: >
+        Cribl Extract JSON supplies the typed envelope; the custom cronie
+        regex `^\((?<user>[^)]+)\) (?<event>[A-Z ]+) \((?<detail>.*)\)$` then
+        runs on `msg` exactly as on the syslog-raw feed, because no
+        integration parses cronie's grammar and the JSON template does not
+        touch the body. The only improvement is that the year/timezone
+        stamping and PRI/8 severity math the deployed pipeline performs become
+        unnecessary - severity and an ISO 8601 timestamp arrive typed.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Build the whole ECS record low-side as the deployed map prescribes -
+          branch on the uppercase event token before mapping the second
+          parenthesised slot, split run-parts(<dir>) into
+          linux.cron.run_parts_dir, handle the two-word BEGIN EDIT / END EDIT
+          tokens - but take @timestamp and log.syslog.severity.code straight
+          from the JSON envelope instead of deriving them. Derive
+          event.outcome from the typed severity plus the errno tail (still no
+          success/failure word), and put the CMDOUT drop-or-sample rule here
+          since one event per output line is both the volume risk and the
+          secret-leak path.
+        elastic: >
+          No integration owns cronie, so the high side only receives and
+          stores: send the pre-shaped records into logs-system.syslog and keep
+          logs-system.syslog@custom to invariant guards, not re-parsing. The
+          JSON path changes nothing here except that the timestamp and
+          severity are already correct on arrival - confirm the stock header
+          pipeline does not overwrite them.
+        relay: >
+          Cross full ECS-shaped JSON (the envelope is already JSON, so the
+          guard can make field-aware decisions rather than inspecting raw job
+          text). CMDOUT remains the content problem - arbitrary job
+          stdout/stderr - so drop or aggressively sample it low-side, cap the
+          detail slot length and keep nesting shallow with ASCII keys.
+          Validate with C.Schema(...).validate before the guard with a
+          dead-letter route, at-most-once, and reconcile counts because a lost
+          crontab REPLACE is a lost persistence signal.
+      direct:
+        parse_location: low
+        cribl: >
+          High-side instances build the same cronie ECS record in the core
+          worker group and forward to Elastic directly. Adopt the JSON
+          template only for the timestamp/severity fidelity; the cronie body
+          parse is identical work either way, and CMDOUT sampling is still the
+          first rule to add.
+        elastic: >
+          Receive and store into logs-system.syslog with custom-namespace
+          mappings for linux.cron.run_parts_dir and the cron user/event/detail
+          keywords, as on the syslog-raw feed. Confirm the lowercased,
+          hyphenated event.action values built in Cribl survive the stock
+          header pipeline untouched.
+    fields:
+    - vendor: timereported
+      type: timestamp
+      description: rsyslog property - the reported timestamp, templated as RFC 3339 with offset
+      ecs: '@timestamp'
+      status: mapped
+      transform: >-
+        emit with `dateFormat="rfc3339"`; removes the yearless RFC 3164 header
+        caveat the deployed cron map shares with auth
+    - vendor: syslogseverity
+      type: integer
+      description: rsyslog property - numeric severity, decimal
+      ecs: log.syslog.severity.code
+      status: partial
+      notes: >
+        the ONLY outcome signal in cronie - LOG_INFO (6) normally, LOG_ERR (3)
+        when errno was set - so it must reach the pipeline; event.outcome is
+        derived from it plus the errno tail, never from a success/failure
+        word.
+    - vendor: programname
+      type: string
+      description: rsyslog property - the cron component that emitted the line
+      ecs: process.name
+      status: mapped
+      notes: >
+        CROND (job runner), crond (daemon), crontab (editor), anacron; cleanly
+        split from the pid by the template. The run-parts(<dir>) form still
+        lands whole here and needs splitting into linux.cron.run_parts_dir as
+        on the syslog-raw feed.
+    - vendor: procid
+      type: integer
+      description: rsyslog property - process id (from the syslogtag on RFC3164 input)
+      ecs: process.pid
+      status: partial
+      notes: >-
+        the only key linking a CMD line to its later CMDOUT and CMDEND lines;
+        guard against the literal "-"
+    - vendor: hostname
+      type: string
+      description: rsyslog property - originating host
+      ecs: host.hostname
+      status: mapped
+    - vendor: msg
+      type: string
+      description: rsyslog property - the free-text cron body
+      ecs: message
+      status: mapped
+      notes: >
+        STILL the unparsed "(user) EVENT (detail)" string - the custom cronie
+        regex runs on this exactly as on syslog-raw; the JSON template gives
+        no body structure. CMDOUT job output also arrives whole here, one
+        event per line, and is the volume/secret-leak risk to sample.
+    - vendor: rawmsg
+      type: string
+      description: rsyslog property - complete original message
+      ecs: event.original
+      status: mapped
+  - format: journald
+    enable: >
+      Read the journal as JSON (`journalctl -o json` / `-o export` / `-o
+      json-seq`) and split this dataset by the cron facility with a match:
+      `journalctl SYSLOG_FACILITY=9 -o json`, or an Elastic Agent journald
+      input with `include_matches: [ "SYSLOG_FACILITY=9" ]` (cron is facility
+      9). The same off-host transports apply - systemd-journal-upload's Export
+      Format to a systemd-journal-remote, or systemd-journal-gatewayd on
+      :19531 with `Accept: application/json`. Use `--output-fields=` to drop
+      the noisy CMDOUT payload envelope where a job is chatty.
+    references:
+    - https://man7.org/linux/man-pages/man7/systemd.journal-fields.7.html
+    - https://man7.org/linux/man-pages/man1/journalctl.1.html
+    - https://www.elastic.co/docs/reference/beats/filebeat/filebeat-input-journald
+    parsing:
+      mechanism: elastic-integration
+      artifact: Elastic Agent journald input, then the custom cronie body parse
+      notes: >
+        The journald input maps the attested envelope (to journald.* and ECS)
+        and MESSAGE -> message; no integration parses cronie, so the same
+        "(user) EVENT (detail)" regex must run on `message` afterwards. The
+        value over syslog-raw is identity: _AUDIT_LOGINUID gives the real
+        invoking human on crontab administrative events, disambiguating
+        cronie's overloaded first parenthesised slot, and _COMM attests
+        daemon-vs-runner where the syslog tag could be spoofed.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Read the journal low-side, run the cronie regex on MESSAGE, and use
+          _AUDIT_LOGINUID as user.id on BEGIN EDIT / END EDIT / REPLACE /
+          DELETE events so the person who changed a crontab is named rather
+          than inferred from the ambiguous first slot. Keep the CMDOUT
+          drop-or-sample rule here, carry __CURSOR for idempotency, and derive
+          event.outcome from PRIORITY (severity) plus the errno tail as
+          before. Persistent Queue, never Block.
+        elastic: >
+          Receive and store into logs-system.syslog; keep the high side to
+          invariant guards, not re-parsing. Add custom-namespace mappings for
+          the cron user/event/detail keywords and linux.cron.run_parts_dir,
+          and lift _AUDIT_SESSION / _SYSTEMD_UNIT into the custom namespace so
+          a crontab edit can be tied to the interactive session that made it.
+        relay: >
+          Cross full ECS-shaped JSON built from the journal; the attested
+          envelope lets the guard reason over fields, not raw job text. CMDOUT
+          is still the content problem - drop or sample low-side - and
+          _CMDLINE / _EXE can leak paths, so length-bound them. Validate with
+          C.Schema(...).validate before the guard with a dead-letter route,
+          dedup on __CURSOR, at-most-once with per-(dataset, hour)
+          reconciliation since a lost REPLACE is a lost persistence signal.
+      direct:
+        parse_location: low
+        cribl: >
+          High-side instances read the journal in the core worker group, run
+          the cronie parse on MESSAGE and forward to Elastic; keep the full
+          attested envelope. include_matches on SYSLOG_FACILITY=9 at the input
+          keeps auth and daemon traffic out of this pipeline.
+        elastic: >
+          Store into logs-system.syslog with the cron custom-namespace
+          mappings; the journald path's advantage is purely the resolved
+          identity fields, so wire _AUDIT_LOGINUID into user.id and treat
+          journald as the preferred cron source on an auditd-correlated host.
+    fields:
+    - vendor: __REALTIME_TIMESTAMP
+      type: integer
+      description: >-
+        journal address field - wall-clock receipt time in microseconds since
+        the epoch, UTC
+      ecs: '@timestamp'
+      status: mapped
+      transform: >-
+        absolute UTC; removes the yearless/timezone-less RFC 3164 caveat the
+        deployed cron map shares
+    - vendor: MESSAGE
+      type: string
+      description: journal user field - the human-readable cron message
+      ecs: message
+      status: mapped
+      notes: >-
+        still the unparsed "(user) EVENT (detail)" string; the custom cronie
+        regex runs on it unchanged, and CMDOUT still arrives one event per
+        job-output line
+    - vendor: _AUDIT_LOGINUID
+      type: string
+      description: journal trusted field - login UID the kernel ties to the session
+      ecs: user.id
+      status: partial
+      notes: >
+        on crontab(1) administrative events this names the REAL invoking
+        human, resolving cronie's overloaded first parenthesised slot (which
+        on those lines is the account being modified, not the actor). Numeric,
+        so name resolution is a downstream join.
+    - vendor: _COMM
+      type: string
+      description: journal trusted field - the originating process name
+      ecs: process.name
+      status: mapped
+      notes: >-
+        kernel-attested crond/CROND/crontab/anacron, distinguishing the daemon
+        from the job runner reliably where the syslog tag could be forged
+    - vendor: _PID
+      type: integer
+      description: journal trusted field - originating process id
+      ecs: process.pid
+      status: mapped
+      notes: >-
+        attested join key linking a CMD line to its CMDOUT/CMDEND lines, more
+        trustworthy than the client-supplied SYSLOG_PID
+    - vendor: _SYSTEMD_UNIT
+      type: string
+      description: journal trusted field - the systemd unit the entry originates from
+      ecs: service.name
+      status: partial
+      notes: >-
+        crond.service for scheduled runs, or the user's session scope for an
+        interactive crontab edit - a useful daemon-vs-interactive
+        discriminator
+    - vendor: _AUDIT_SESSION
+      type: string
+      description: journal trusted field - kernel audit session id
+      ecs: null
+      status: unmapped
+      custom: linux.journald.audit_session
+      notes: >-
+        ties a crontab edit to the interactive login session that made it,
+        correlating with linux-auditd
+    - vendor: PRIORITY
+      type: integer
+      description: journal user field - priority value 0-7 (the syslog severity)
+      ecs: log.syslog.severity.code
+      status: partial
+      notes: >-
+        the only outcome signal in cronie (LOG_ERR 3 vs LOG_INFO 6); the input
+        mislabels it as log.syslog.priority, so normalise, and the inverted
+        scale applies
+    - vendor: SYSLOG_FACILITY
+      type: integer
+      description: journal user field - syslog facility, decimal
+      ecs: log.syslog.facility.code
+      status: mapped
+      notes: cron is facility 9; the field the journald match filters this dataset on
+    - vendor: SYSLOG_IDENTIFIER
+      type: string
+      description: journal user field - the syslog tag the cron component set
+      ecs: log.syslog.appname
+      status: mapped
+      notes: >-
+        CROND/crond/crontab/anacron; _COMM is the attested counterpart to
+        prefer for trust-sensitive routing
+    - vendor: _HOSTNAME
+      type: string
+      description: journal trusted field - originating hostname
+      ecs: host.hostname
+      status: mapped
+    - vendor: _MACHINE_ID
+      type: string
+      description: journal trusted field - stable 128-bit machine id
+      ecs: host.id
+      status: mapped
+      notes: durable host key for cross-dataset correlation without Agent metadata
+    - vendor: __CURSOR
+      type: string
+      description: journal address field - opaque unique position token
+      ecs: null
+      status: unmapped
+      custom: linux.journald.cursor
+      notes: >-
+        dedup/idempotency key across the crossing and the reader resume
+        pointer; a lost persistence event is worst-case here, so idempotent
+        replay matters
+- id: syslog
+  name: System and daemon messages
+  description: >
+    The catch-all remainder — kernel ring-buffer messages, systemd unit
+    start/stop, NetworkManager, chronyd, sssd, dnf/yum transactions, and
+    anything else a daemon writes to a non-authpriv, non-cron facility.
+    Individually low value, collectively the context a SOC needs to explain
+    what a host was doing around an alert, and the place service tampering (a
+    unit disabled, a security agent stopped) shows up.
+  event_categories:
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same Cribl syslog source as the other two datasets, carrying
+        everything the facility filters did not claim. This is the dataset a
+        guard content policy will find hardest to allow-list, because the
+        message body is arbitrary daemon text with no fixed grammar, so expect
+        either aggressive facility-level filtering edge-side or a decision to
+        leave this dataset out of the cross-domain flow entirely.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-system.syslog
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Same Cribl syslog source as the other two datasets, carrying
+        everything the facility filters did not claim, forwarding straight to
+        Elastic with no guard hop. The message body is arbitrary daemon text
+        with no fixed grammar, so a facility-level allow-list is the volume
+        control point for this catch-all.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-system.syslog
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: elastic-integration
+      artifact: System integration (system), data stream logs-system.syslog
+      notes: >
+        The syslog data stream's pipeline is header-only: four grok patterns
+        that peel off timestamp, hostname, process name and pid, then leave
+        the entire remainder in system.syslog.message. There is no per-daemon
+        parsing at all, by design. Any structure the CSOC wants out of systemd
+        or sssd messages has to come from a Cribl pipeline or a custom ingest
+        pipeline layered on top.
+    fields:
+    - vendor: PRI
+      type: integer
+      description: RFC 3164 priority value in the leading angle brackets
+      ecs: log.syslog.priority
+      status: mapped
+      transform: >-
+        derive facility (PRI / 8) and severity (PRI mod 8) into
+        log.syslog.facility.code and log.syslog.severity.code
+    - vendor: facility
+      type: enum
+      description: Syslog facility the message was emitted on
+      ecs: log.syslog.facility.name
+      status: partial
+      notes: >
+        not printed as its own token — it must be derived from PRI. It is
+        nonetheless the single most important field in this file, because
+        facility is what splits the three datasets: authpriv (10) is the auth
+        dataset, cron (9, or 15 on some builds) is the cron dataset, and
+        daemon/kern/local0-7 land here. Get the derivation wrong and the
+        datasets bleed into each other.
+    - vendor: severity
+      type: enum
+      description: Syslog severity of the message
+      ecs: log.syslog.severity.name
+      status: partial
+      notes: >
+        the System integration never populates ECS event.severity for this
+        data stream, so thresholds must read log.syslog.severity.code, where
+        0=emerg and 7=debug — LOWER is worse, the inverse of the ECS
+        convention most other technologies in this catalog follow. Do not
+        write a cross-technology severity rule without normalising.
+    - vendor: timestamp
+      type: timestamp
+      description: Syslog header timestamp of the message
+      ecs: '@timestamp'
+      status: partial
+      notes: >-
+        same yearless, timezone-less RFC 3164 caveat as the other datasets;
+        the ISO8601 fallback pattern only fires when senders use RFC 5424
+    - vendor: hostname
+      type: string
+      description: Short host name written into the syslog header
+      ecs: host.hostname
+      status: partial
+      notes: >
+        the grok sets host.hostname only. host.name, host.id and host.ip all
+        come from Elastic Agent metadata that a Cribl-relayed syslog stream
+        does not have, so cross-dataset host correlation depends on Cribl
+        enriching from the source connection.
+    - vendor: program
+      type: string
+      description: Process tag before the colon, identifying the emitting daemon
+      ecs: process.name
+      status: mapped
+      notes: >
+        systemd, kernel, NetworkManager, dbus-daemon, chronyd, sssd, dnf,
+        rsyslogd. With no message-body parsing this is the only structured
+        dimension the dataset has, so nearly every useful query over it starts
+        by filtering on process.name.
+    - vendor: pid
+      type: integer
+      description: Process id in square brackets after the tag
+      ecs: process.pid
+      status: mapped
+      notes: >-
+        absent on kernel lines and on many systemd-emitted messages, so it
+        cannot be relied on as a join key here
+    - vendor: message
+      type: string
+      description: Everything after the tag — unparsed daemon free text
+      ecs: message
+      status: mapped
+      notes: >
+        grokked into system.syslog.message and renamed to message. This holds
+        the whole payload: "Started/Stopped <unit>", kernel driver text, dnf
+        transaction lines. Detections over this dataset are substring matches
+        against this field, which is why they are brittle and need re-testing
+        on every OS minor release.
+    - vendor: '[ <seconds>.<microseconds> ] (kernel timestamp)'
+      type: string
+      description: Monotonic uptime prefix the kernel prepends to ring-buffer lines
+      ecs: null
+      status: unmapped
+      custom: linux.syslog.kernel_timestamp
+      notes: >
+        seconds since boot, not a wall-clock time, so it cannot feed
+        @timestamp. Worth extracting anyway — it is the only way to order
+        kernel events that share a one-second syslog timestamp, and a sudden
+        reset to near zero marks an unlogged reboot.
+    - vendor: APP-NAME (RFC 5424)
+      type: string
+      description: Application name field when senders use the RFC 5424 header instead of RFC 3164
+      ecs: log.syslog.appname
+      status: mapped
+      notes: >
+        present only if rsyslog is configured with
+        RSYSLOG_SyslogProtocol23Format. The pipeline copies it into
+        process.name when the 3164 grok did not already set one, so a mixed
+        estate produces the same logical value in two different fields.
+    - vendor: MSGID (RFC 5424)
+      type: string
+      description: Message identifier slot of the RFC 5424 header
+      ecs: event.code
+      status: partial
+      notes: >
+        systemd carries stable MESSAGE_ID UUIDs over the journald path, but
+        the plain-syslog path almost always prints "-" here. event.code is
+        therefore empty for the large majority of RHEL syslog traffic — unlike
+        the Windows map, this dataset has no event-id dimension to build
+        detections on.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Derive facility and severity from PRI low-side and route on them —
+          that derivation is what separates the three datasets in this file,
+          and getting it wrong bleeds authpriv and cron traffic in here. Make
+          the facility and process.name allow-list the volume control point
+          for this catch-all stream rather than forwarding everything, stamp
+          year and timezone on the yearless header, and set host.name/host.ip
+          from the source connection since no Agent metadata accompanies a
+          relayed syslog stream. Extract the kernel's monotonic [sec.usec]
+          prefix into linux.syslog.kernel_timestamp near the source, and run
+          the destination on Persistent Queue backpressure.
+        elastic: >
+          The System integration's header-only logs-system.syslog pipeline is
+          the parser; add a logs-system.syslog@custom pipeline that normalises
+          the inverted syslog severity (0=emerg .. 7=debug) into ECS
+          event.severity through an explicit lookup, so cross-technology
+          threshold rules stop firing backwards on this dataset. Reconcile the
+          mixed-estate duplication where RFC 5424 senders land the program
+          name in log.syslog.appname while RFC 3164 senders land it in
+          process.name, and drop the literal "-" MSGID instead of writing it
+          to event.code. Map linux.syslog.kernel_timestamp in the custom
+          namespace, and note that with no body parsing every detection here
+          is a substring match on message and needs re-testing each OS minor
+          release.
+        relay: >
+          Cross the thin {_dataId, @timestamp, host, _raw} envelope so the
+          integration still does the header parse, but accept that this is the
+          hardest dataset in the file to allow-list: the body is arbitrary
+          daemon text with no fixed grammar, so a custom NDJSON guard filter
+          can only realistically enforce shape, not content. Do the real
+          filtering low-side — allow-list facilities and process.name,
+          length-cap _raw, strip non-ASCII — then validate with
+          C.Schema(...).validate before the guard destination with a
+          dead-letter route and at-most-once count reconciliation. Expect the
+          legitimate outcome of that conversation with the guard owner to be a
+          sharply reduced facility set, or this dataset being left out of the
+          cross-domain flow entirely.
+      direct:
+        parse_location: hybrid
+        cribl: >
+          Derive facility and severity from PRI and route on them — that
+          derivation is what separates the three datasets in this file, and
+          getting it wrong bleeds authpriv and cron traffic in here. Make the
+          facility and process.name allow-list the volume control point for
+          this catch-all stream rather than forwarding everything, stamp year
+          and timezone on the yearless header, and set host.name/host.ip from
+          the source connection since no Agent metadata accompanies a relayed
+          syslog stream. Extract the kernel's monotonic [sec.usec] prefix into
+          linux.syslog.kernel_timestamp near the source, and run the
+          destination on Persistent Queue backpressure.
+        elastic: >
+          The System integration's header-only logs-system.syslog pipeline is
+          the parser; add a logs-system.syslog@custom pipeline that normalises
+          the inverted syslog severity (0=emerg .. 7=debug) into ECS
+          event.severity through an explicit lookup, so cross-technology
+          threshold rules stop firing backwards on this dataset. Reconcile the
+          mixed-estate duplication where RFC 5424 senders land the program
+          name in log.syslog.appname while RFC 3164 senders land it in
+          process.name, and drop the literal "-" MSGID instead of writing it
+          to event.code. Map linux.syslog.kernel_timestamp in the custom
+          namespace, and note that with no body parsing every detection here
+          is a substring match on message and needs re-testing each OS minor
+          release.
+  - format: json
+    enable: >
+      Emit the remaining facilities through a JSON template on their
+      forwarding action, e.g. `*.* ;authpriv,cron.none action(type="omfwd"
+      target="<cribl>" port="6514" protocol="tcp" template="sysJSON")`, where
+      sysJSON is a `template(name="sysJSON" type="list")` carrying
+      timereported (with `dateFormat="rfc3339"`), hostname, fromhost-ip,
+      syslogfacility, syslogfacility-text, syslogseverity,
+      syslogseverity-text, programname, procid, app-name, msgid, msg and
+      rawmsg as jsonf properties. Emitting facility and severity as their own
+      typed fields is the main gain, since it is what separates this catch-all
+      from the auth and cron streams.
+    references:
+    - https://docs.rsyslog.com/doc/configuration/templates.html
+    - https://docs.rsyslog.com/doc/configuration/properties.html
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        custom rsyslog-JSON envelope reshaper feeding the System integration
+        (logs-system.syslog)
+      notes: >
+        Cribl Extract JSON maps the typed envelope; the logs-system.syslog
+        pipeline is header-only by design, so `msg` stays in
+        system.syslog.message / message exactly as on the syslog-raw feed -
+        there is no per-daemon body parsing to gain or lose. What the JSON
+        envelope fixes is upstream of that: facility and severity are numbers
+        rather than a PRI to divide, and app-name/msgid are separated for the
+        RFC5424 senders, ending the mixed-estate duplication where the program
+        name lands in appname for one sender and process.name for another.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Route on the typed syslogfacility and syslogseverity rather than
+          deriving them from PRI - getting that derivation wrong is what
+          bleeds authpriv and cron into this catch-all, and the JSON template
+          removes the derivation entirely. Make facility and programname the
+          volume-control allow-list here rather than forwarding everything,
+          take @timestamp and host.ip from the typed properties, and run
+          Persistent Queue backpressure on the destination.
+        elastic: >
+          The header-only logs-system.syslog pipeline stays the parser; keep
+          the logs-system.syslog@custom fixes the deployed map prescribes -
+          normalise the inverted severity into event.severity through a
+          lookup, drop the literal "-" MSGID instead of writing event.code -
+          but note the JSON path already reconciles the
+          appname-vs-process.name split at source, so the custom pipeline's
+          dedup logic for that can be simplified. Body detections are still
+          substring matches on message and need re-testing each OS minor
+          release.
+        relay: >
+          Cross the JSON envelope as NDJSON; this is still the hardest dataset
+          to allow-list because the body is arbitrary daemon text with no
+          fixed grammar, so the guard filter can realistically enforce only
+          shape. Do the real filtering low-side - allow-list facilities and
+          programname, length-cap msg, strip non-ASCII - then validate with
+          C.Schema(...).validate before the guard with a dead-letter route and
+          at-most-once reconciliation. Expect the guard conversation to end in
+          a sharply reduced facility set or this dataset being left off the
+          crossing.
+      direct:
+        parse_location: hybrid
+        cribl: >
+          High-side instances route on the typed facility/severity in the core
+          worker group and forward to Elastic. The JSON template's value here
+          is entirely the reliable facility split and the timestamp/host.ip
+          fidelity; the body stays unparsed by design, so no body grok is
+          added.
+        elastic: >
+          The header-only logs-system.syslog pipeline stays the parser, plus
+          the severity-normalisation and MSGID-drop @custom logic. Confirm the
+          reshaper's facility/severity numbers agree with what the header
+          pipeline expects so a threshold rule does not fire backwards on the
+          inverted scale.
+    fields:
+    - vendor: timereported
+      type: timestamp
+      description: rsyslog property - reported timestamp, templated as RFC 3339 with offset
+      ecs: '@timestamp'
+      status: mapped
+      transform: >-
+        emit with `dateFormat="rfc3339"`; the ISO 8601 fallback the deployed
+        map relies on only fires for RFC5424 senders, whereas the template
+        makes it universal
+    - vendor: syslogfacility
+      type: integer
+      description: rsyslog property - numeric facility, decimal
+      ecs: log.syslog.facility.code
+      status: mapped
+      notes: >
+        the single most important field in this dataset - it is what splits
+        the three datasets - now emitted as a typed number so the error-prone
+        PRI/8 derivation is gone. daemon/kern/local0-7 land here; authpriv
+        (10) and cron (9) are routed away.
+    - vendor: syslogfacility-text
+      type: string
+      description: rsyslog property - facility name in text
+      ecs: log.syslog.facility.name
+      status: mapped
+    - vendor: syslogseverity
+      type: integer
+      description: rsyslog property - numeric severity, decimal
+      ecs: log.syslog.severity.code
+      status: partial
+      notes: >-
+        still the inverted 0=emerg..7=debug scale, so normalise into
+        event.severity through the lookup before any cross-technology
+        threshold - the JSON typing does not fix the inversion, only the
+        derivation
+    - vendor: syslogseverity-text
+      type: string
+      description: rsyslog property - severity name in text
+      ecs: log.syslog.severity.name
+      status: mapped
+    - vendor: programname
+      type: string
+      description: rsyslog property - the emitting daemon (tag without pid)
+      ecs: process.name
+      status: mapped
+      notes: >-
+        systemd, kernel, NetworkManager, chronyd, sssd, dnf, rsyslogd; with no
+        body parsing this is the only structured dimension, so most queries
+        filter on it
+    - vendor: procid
+      type: integer
+      description: rsyslog property - process id
+      ecs: process.pid
+      status: partial
+      notes: >-
+        absent on kernel and many systemd lines (prints "-"), so it cannot be
+        relied on as a join key here
+    - vendor: msg
+      type: string
+      description: rsyslog property - the unparsed daemon free text
+      ecs: message
+      status: mapped
+      notes: >
+        the whole payload - "Started/Stopped <unit>", kernel driver text, dnf
+        transaction lines - left unparsed by design. Detections are substring
+        matches against this field and are brittle across OS minor releases,
+        the same as on the syslog-raw feed.
+    - vendor: rawmsg
+      type: string
+      description: rsyslog property - complete original message
+      ecs: event.original
+      status: mapped
+    - vendor: app-name
+      type: string
+      description: rsyslog property - the RFC5424 APP-NAME
+      ecs: log.syslog.appname
+      status: mapped
+      notes: >
+        on this mixed estate the JSON template ends the duplication the
+        deployed map flags - the program name no longer lands in appname for
+        RFC5424 senders and process.name for RFC3164 senders on different
+        records; both are emitted explicitly.
+    - vendor: msgid
+      type: string
+      description: rsyslog property - the RFC5424 MSGID
+      ecs: event.code
+      status: partial
+      notes: >-
+        the plain-syslog path almost always prints "-", so event.code stays
+        empty for the majority of this traffic; drop the "-" rather than
+        writing it
+  - format: journald
+    enable: >
+      Read the journal as JSON (`journalctl -o json` / `-o export` / `-o
+      json-seq`) taking everything the auth and cron matches did not claim -
+      exclude those facilities with `journalctl + SYSLOG_FACILITY=<n>` unions
+      or an Elastic Agent journald input whose include_matches enumerate the
+      daemon/kern/local facilities (or match on `_TRANSPORT=kernel` /
+      `_SYSTEMD_UNIT=` to pull unit-scoped messages directly). The systemd
+      catalog MESSAGE_ID is populated on this path, so keep it. Off-host
+      transport is systemd-journal-upload's Export Format to a
+      systemd-journal-remote, or systemd-journal-gatewayd on :19531 with
+      `Accept: application/json` / `text/event-stream`.
+    references:
+    - https://man7.org/linux/man-pages/man7/systemd.journal-fields.7.html
+    - https://man7.org/linux/man-pages/man1/journalctl.1.html
+    - https://www.elastic.co/docs/reference/beats/filebeat/filebeat-input-journald
+    - https://man7.org/linux/man-pages/man8/systemd-journal-gatewayd.8.html
+    parsing:
+      mechanism: elastic-integration
+      artifact: Elastic Agent journald input (System integration), logs-system.syslog
+      notes: >
+        The journald input maps the attested envelope and MESSAGE -> message;
+        the logs-system.syslog pipeline stays header-only by design. The
+        difference from syslog-raw is structure the journal carries natively:
+        _SYSTEMD_UNIT names the unit for systemd/NetworkManager/chronyd/sssd
+        messages without any body grok (the "which unit was disabled/stopped"
+        question the dataset exists for), MESSAGE_ID supplies stable catalog
+        UUIDs as an event-id dimension plain syslog does not have, and
+        __MONOTONIC_TIMESTAMP / _BOOT_ID provide the kernel-ordering and
+        reboot-detection the deployed map extracts by regex into
+        linux.syslog.kernel_timestamp.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Filter this catch-all low-side on _SYSTEMD_UNIT and facility rather
+          than forwarding everything - the attested unit is the precise
+          volume-control key. Take __MONOTONIC_TIMESTAMP as
+          linux.journald.monotonic_timestamp instead of regex-extracting the
+          kernel's [sec.usec] prefix, watch _BOOT_ID for the authoritative
+          reboot marker, carry MESSAGE_ID as event.code where present, and run
+          Persistent Queue backpressure. host.ip/host.name still come from the
+          attested _HOSTNAME/_MACHINE_ID plus the source connection.
+        elastic: >
+          The header-only logs-system.syslog pipeline stays the parser; the
+          logs-system.syslog@custom pipeline normalises the inverted severity
+          into event.severity and now also promotes MESSAGE_ID to event.code
+          (genuinely populated on this path, unlike the plain-syslog "-"). Map
+          _SYSTEMD_UNIT into service.name so service-tampering queries work
+          without body parsing, and map __MONOTONIC_TIMESTAMP / _TRANSPORT
+          into the custom namespace. Body detections are still substring
+          matches on message.
+        relay: >
+          Cross the attested JSON envelope; it is still the hardest dataset to
+          allow-list because the body is arbitrary daemon text, but the guard
+          can at least gate on _SYSTEMD_UNIT / facility / _TRANSPORT rather
+          than raw text. Do the real filtering low-side - allow-list units and
+          facilities, length-cap message, strip non-ASCII - validate with
+          C.Schema(...).validate before the guard with a dead-letter route,
+          dedup on __CURSOR, at-most-once. Expect the guard outcome to be a
+          reduced unit/ facility set or this dataset left off the crossing
+          entirely.
+      direct:
+        parse_location: hybrid
+        cribl: >
+          High-side instances read the journal in the core worker group and
+          filter on _SYSTEMD_UNIT/facility; keep the full attested envelope
+          and the native MESSAGE_ID / __MONOTONIC_TIMESTAMP / _BOOT_ID fields.
+          No body grok is added - the dataset is header-plus-provenance by
+          design.
+        elastic: >
+          The header-only logs-system.syslog pipeline stays the parser, plus
+          the @custom severity normalisation and the MESSAGE_ID -> event.code
+          promotion. On a systemd estate this path is strictly richer than
+          syslog-raw for the catch-all - service.name and an event-id
+          dimension for free - so prefer journald where the collector can read
+          the journal.
+    fields:
+    - vendor: __REALTIME_TIMESTAMP
+      type: integer
+      description: >-
+        journal address field - wall-clock receipt time, microseconds since
+        the epoch, UTC
+      ecs: '@timestamp'
+      status: mapped
+      transform: >-
+        absolute UTC; removes the yearless RFC 3164 caveat, and unlike the
+        syslog-raw feed the ISO 8601 value is not conditional on RFC5424
+        senders
+    - vendor: MESSAGE
+      type: string
+      description: journal user field - the unparsed daemon free text
+      ecs: message
+      status: mapped
+      notes: >
+        Started/Stopped <unit>, kernel driver text, dnf lines - left unparsed
+        by design; detections are brittle substring matches needing re-test
+        each OS minor release.
+    - vendor: _SYSTEMD_UNIT
+      type: string
+      description: journal trusted field - the systemd unit the entry originates from
+      ecs: service.name
+      status: partial
+      notes: >
+        natively names the unit for systemd/NetworkManager/chronyd/sssd
+        messages, so the "which unit was disabled or stopped" question the
+        dataset exists for is answerable WITHOUT body parsing - the single
+        strongest reason to prefer journald for the catch-all. Scope/slice
+        units also appear, so treat a non-.service value accordingly.
+    - vendor: MESSAGE_ID
+      type: string
+      description: journal user field - a 128-bit systemd catalog message identifier
+      ecs: event.code
+      status: partial
+      notes: >
+        systemd emits stable catalog UUIDs over the journald path (unit
+        started/stopped, etc.), giving this dataset the event-id dimension the
+        deployed map explicitly says plain syslog lacks - the plain-syslog
+        MSGID is "-". Present only for systemd-originated messages, empty for
+        generic daemon text.
+    - vendor: PRIORITY
+      type: integer
+      description: journal user field - priority value 0-7 (the syslog severity)
+      ecs: log.syslog.severity.code
+      status: partial
+      notes: >-
+        severity only; the input mislabels it log.syslog.priority, so
+        normalise, and the inverted 0=emerg scale must be lookup-normalised
+        before any cross-technology threshold
+    - vendor: SYSLOG_FACILITY
+      type: integer
+      description: journal user field - syslog facility, decimal
+      ecs: log.syslog.facility.code
+      status: mapped
+      notes: >-
+        emitted as a number, so the facility split that separates the three
+        datasets is done natively rather than by PRI/8 derivation
+    - vendor: _COMM
+      type: string
+      description: journal trusted field - originating process name
+      ecs: process.name
+      status: mapped
+      notes: >-
+        kernel-attested daemon name (systemd, NetworkManager, chronyd, sssd,
+        dnf), the primary structured dimension with no body parsing
+    - vendor: _EXE
+      type: string
+      description: journal trusted field - originating executable path
+      ecs: process.executable
+      status: mapped
+      notes: >-
+        the on-disk binary path, absent from syslog-raw; useful for pinning
+        which daemon build emitted a message
+    - vendor: _PID
+      type: integer
+      description: journal trusted field - originating process id
+      ecs: process.pid
+      status: mapped
+      notes: >-
+        attested, present even on many systemd-emitted lines where SYSLOG_PID
+        would be absent
+    - vendor: _TRANSPORT
+      type: string
+      description: >-
+        journal trusted field - how the entry was received by the journal
+        (kernel, syslog, stdout, audit, journal)
+      ecs: null
+      status: unmapped
+      custom: linux.journald.transport
+      notes: >-
+        separates a genuine kernel ring-buffer line (_TRANSPORT=kernel) from
+        one relayed in over syslog - a provenance distinction syslog-raw
+        collapses
+    - vendor: __MONOTONIC_TIMESTAMP
+      type: integer
+      description: >-
+        journal address field - monotonic since-boot time in microseconds when
+        the entry was received
+      ecs: null
+      status: unmapped
+      custom: linux.journald.monotonic_timestamp
+      notes: >
+        replaces the regex-extracted kernel [sec.usec] prefix the deployed map
+        lifts into linux.syslog.kernel_timestamp - the journal provides it
+        natively and typed; it orders entries sharing a wall-clock
+        microsecond.
+    - vendor: _BOOT_ID
+      type: string
+      description: >-
+        journal trusted field - the kernel boot id for the boot the message
+        was generated in
+      ecs: null
+      status: unmapped
+      custom: linux.journald.boot_id
+      notes: >-
+        an authoritative reboot marker - a change in _BOOT_ID is a cleaner
+        "the host rebooted" signal than watching the kernel monotonic counter
+        reset to near zero
+    - vendor: _HOSTNAME
+      type: string
+      description: journal trusted field - originating hostname
+      ecs: host.hostname
+      status: mapped
+    - vendor: _MACHINE_ID
+      type: string
+      description: journal trusted field - stable 128-bit machine id
+      ecs: host.id
+      status: mapped
+      notes: >-
+        durable host key the header-only syslog feed never carries; the
+        journald input maps host.id from it
+    - vendor: __CURSOR
+      type: string
+      description: journal address field - opaque unique position token
+      ecs: null
+      status: unmapped
+      custom: linux.journald.cursor
+      notes: dedup/idempotency key across the crossing and the reader resume pointer

@@ -1,0 +1,1917 @@
+id: defender-endpoint
+name: Microsoft Defender for Endpoint
+vendor: Microsoft
+versions: >-
+  Defender for Endpoint API v1.0, Defender XDR streaming API (Event Hub), GCC
+  / GCC High / DoD tenants
+draft: true
+references:
+- https://learn.microsoft.com/en-us/defender-endpoint/api/alerts
+- https://learn.microsoft.com/en-us/defender-endpoint/gov
+- https://learn.microsoft.com/en-us/defender-xdr/streaming-api-event-hub
+- >-
+  https://learn.microsoft.com/en-us/defender-xdr/advanced-hunting-deviceprocessevents-table
+- >-
+  https://learn.microsoft.com/en-us/defender-xdr/advanced-hunting-devicenetworkevents-table
+- https://www.elastic.co/docs/reference/integrations/microsoft_defender_endpoint
+- https://www.elastic.co/docs/reference/integrations/m365_defender
+datasets:
+- id: alerts
+  name: Defender for Endpoint alerts
+  description: >
+    EDR detections retrieved as JSON from the Defender for Endpoint Alert API
+    (/api/alerts) — in a US Government tenant that is
+    api-gcc.securitycenter.microsoft.us for GCC and
+    api-gov.securitycenter.microsoft.us for GCC High/DoD, with tokens from
+    login.microsoftonline.us rather than the commercial endpoints. Each alert
+    carries detection metadata (title, category, severity, detectionSource,
+    MITRE technique ids) plus an `evidence` array of heterogeneous entities —
+    File, Process, User, Ip, Url, Registry — each of which repeats the same
+    key set with the irrelevant members null. This is the primary CSOC feed;
+    the same alerts are also reachable via the Graph security alerts_v2
+    endpoint if the org standardises on Graph.
+  event_categories:
+  - malware
+  - process
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        A Cribl REST Collector polls the gov Alert API on a schedule and
+        checkpoints on lastUpdateTime. The alerts originate in the Microsoft
+        government cloud, so the collector sits wherever outbound Azure Gov
+        access is permitted — the low-side enclave on the guarded path.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-microsoft_defender_endpoint.log
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        A Cribl REST Collector polls the gov Alert API on a schedule and
+        checkpoints on lastUpdateTime. The alerts originate in the Microsoft
+        government cloud, so the collector sits wherever outbound Azure Gov
+        access is permitted.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-microsoft_defender_endpoint.log
+  formats:
+  - format: api-pull
+    parsing:
+      mechanism: elastic-integration
+      artifact: Microsoft Defender for Endpoint integration (alert/log data stream)
+      notes: >
+        The stock integration pulls the Alert API directly and parses in its
+        own ingest pipeline. Coverage is honestly partial: severity is scored,
+        evidence entities are flattened onto file./process./url. fields, but
+        mitreTechniques is never mapped and `category` is appended to
+        threat.technique.name even though its values are tactic names.
+    fields:
+    - vendor: id
+      type: string
+      description: unique alert identifier assigned by the service
+      ecs: event.id
+      status: mapped
+    - vendor: title
+      type: string
+      description: human-readable name of the detection that fired
+      ecs: rule.name
+      status: partial
+      notes: >
+        the detection name and detectorId describe the same object, so
+        rule.name/rule.id is the correct home; the stock integration instead
+        copies title into `message`, leaving rule.name empty
+    - vendor: description
+      type: string
+      description: prose explanation of the detected behaviour
+      ecs: rule.description
+      status: mapped
+    - vendor: severity
+      type: enum
+      description: alert severity - UnSpecified, Informational, Low, Medium, High
+      ecs: event.severity
+      status: partial
+      transform: >
+        the integration script converts the string enum to ECS's numeric scale
+        (Low=21, Medium=47, High=73, Critical=99) but maps Informational to 21
+        as well, so Informational and Low become indistinguishable after
+        ingest
+    - vendor: category
+      type: string
+      description: detection category, e.g. Execution, DefenseEvasion, CommandAndControl
+      ecs: event.action
+      status: partial
+      notes: >
+        values are MITRE ATT&CK tactic names, so threat.tactic.name is the
+        semantically correct target; the stock pipeline copies category to
+        event.action AND appends it to threat.technique.name, which is wrong
+    - vendor: mitreTechniques
+      type: string
+      description: >-
+        array of MITRE ATT&CK technique identifiers attributed to the alert
+        (T1064, T1085, ...)
+      ecs: threat.technique.id
+      status: partial
+      notes: >
+        array of technique ids that maps cleanly to threat.technique.id, but
+        the stock integration does not map it at all - it survives only inside
+        microsoft.defender_endpoint.*
+    - vendor: detectionSource
+      type: string
+      description: >-
+        component that raised the alert (WindowsDefenderAtp,
+        WindowsDefenderAv, CustomDetection, ...)
+      ecs: observer.name
+      status: mapped
+    - vendor: detectorId
+      type: string
+      description: GUID of the detector logic that triggered the alert
+      ecs: rule.id
+      status: mapped
+    - vendor: incidentId
+      type: long
+      description: numeric id of the Defender XDR incident this alert was correlated into
+      ecs: null
+      status: unmapped
+      custom: microsoft.defender_endpoint.incidentId
+      notes: >-
+        incident grouping key; no ECS equivalent, and the CSOC needs it to
+        pivot from alert to incident
+    - vendor: status
+      type: enum
+      description: workflow state of the alert - Unknown, New, InProgress, Resolved
+      ecs: null
+      status: unmapped
+      custom: microsoft.defender_endpoint.status
+      notes: >-
+        analyst workflow state, not an event outcome; deliberately not mapped
+        to event.outcome
+    - vendor: computerDnsName
+      type: string
+      description: fully qualified name of the device the alert fired on
+      ecs: host.name
+      status: mapped
+    - vendor: machineId
+      type: string
+      description: service-assigned unique identifier of the device entity
+      ecs: host.id
+      status: partial
+      notes: >
+        stable per-device id; the stock integration routes it to
+        cloud.instance.id, which is a poor fit for on-prem endpoints and
+        should be re-pointed at host.id high-side
+    - vendor: alertCreationTime
+      type: timestamp
+      description: UTC time the alert was created by the service
+      ecs: event.created
+      status: mapped
+    - vendor: firstEventTime
+      type: timestamp
+      description: first occurrence of the triggering event on the device
+      ecs: event.start
+      status: mapped
+    - vendor: lastEventTime
+      type: timestamp
+      description: last occurrence of the triggering event on the device
+      ecs: event.end
+      status: mapped
+    - vendor: relatedUser.userName
+      type: string
+      description: account name of the user associated with the alert
+      ecs: user.name
+      status: mapped
+    - vendor: evidence[].entityType
+      type: enum
+      description: >-
+        kind of entity the evidence element describes - File, Process, User,
+        Ip, Url, Registry
+      ecs: null
+      status: unmapped
+      custom: microsoft.defender_endpoint.evidence.entityType
+      notes: >-
+        discriminator that says which of the shared evidence keys are
+        meaningful on a given element
+    - vendor: evidence[].sha256
+      type: string
+      description: SHA-256 of the file or process image in the evidence element
+      ecs: file.hash.sha256
+      status: partial
+      notes: >
+        evidence is an array of mixed entity types, so the hash must be
+        selected from the File/Process element rather than taken from the
+        first array member; multi-file alerts lose the extra hashes
+    - vendor: evidence[].filePath
+      type: string
+      description: directory containing the file in the evidence element
+      ecs: file.path
+      status: partial
+      notes: >
+        the vendor splits directory (filePath) from name (fileName), so
+        file.path is only a full path after the two are joined
+    - vendor: evidence[].processCommandLine
+      type: string
+      description: command line of the process in the evidence element
+      ecs: process.command_line
+      status: partial
+      notes: >-
+        same evidence-array selection problem; only the Process-type element
+        carries a command line
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Keep the core worker group a pass-through for this route — the Alert
+          API already emits one stable JSON schema, so low-side extraction
+          buys nothing. Confine low-side work to the gov endpoint and token
+          configuration (api-gcc / api-gov plus login.microsoftonline.us),
+          lastUpdateTime checkpointing with de-duplication on alert id so
+          re-polled updates do not multiply documents, and Persistent Queue
+          backpressure on the Elastic destination. Carry _raw end to end:
+          alert volume is low and the full evidence array is the forensic
+          artifact.
+        elastic: >
+          Run the stock Microsoft Defender for Endpoint integration pipeline
+          and layer a logs-microsoft_defender_endpoint.log@custom pipeline
+          that fixes three documented mis-routings: move `category` off
+          threat.technique.name onto threat.tactic.name, populate
+          threat.technique.id from the mitreTechniques array the stock
+          pipeline drops, and copy `title` to rule.name with detectorId as
+          rule.id so detections are groupable by name instead of only readable
+          in `message`. Re-point machineId at host.id rather than
+          cloud.instance.id, widen the severity script so Informational does
+          not collapse into Low at 21, and derive event.outcome from
+          classification/determination once analysts set it. Add keyword
+          index-template mappings for microsoft.defender_endpoint.incidentId,
+          .status and .evidence.entityType.
+        relay: >
+          Low-side instances cross the guard: NDJSON crosses — never CEF — but
+          the alert document has to be reshaped low-side first: the `evidence`
+          array of objects exceeds the two-level nesting constraint, so
+          explode it into one flat record per evidence entity keyed by alert
+          id, or pin the primary entity and carry the rest as a bounded,
+          allowlisted key set. The specific content-filter friction is the
+          `description` field, which is multi-sentence analyst prose running
+          to kilobytes and carrying unicode — cap and flag it low-side rather
+          than letting a custom LUA rule decide. Treat the crossing as
+          at-most-once and reconcile low- and high-side alert-id counts per
+          hour, since a re-poll cannot repair a drop the high side never saw.
+      direct:
+        parse_location: high
+        cribl: >
+          The Alert API already emits one stable JSON schema, so no field
+          extraction is needed on this route — the collector's work is the gov
+          endpoint and token configuration (api-gcc / api-gov plus
+          login.microsoftonline.us), lastUpdateTime checkpointing with
+          de-duplication on alert id so re-polled updates do not multiply
+          documents, and Persistent Queue backpressure on the Elastic
+          destination. Carry _raw end to end: alert volume is low and the full
+          evidence array is the forensic artifact.
+        elastic: >
+          Run the stock Microsoft Defender for Endpoint integration pipeline
+          and layer a logs-microsoft_defender_endpoint.log@custom pipeline
+          that fixes three documented mis-routings: move `category` off
+          threat.technique.name onto threat.tactic.name, populate
+          threat.technique.id from the mitreTechniques array the stock
+          pipeline drops, and copy `title` to rule.name with detectorId as
+          rule.id so detections are groupable by name instead of only readable
+          in `message`. Re-point machineId at host.id rather than
+          cloud.instance.id, widen the severity script so Informational does
+          not collapse into Low at 21, and derive event.outcome from
+          classification/determination once analysts set it. Add keyword
+          index-template mappings for microsoft.defender_endpoint.incidentId,
+          .status and .evidence.entityType.
+  - format: json
+    enable: >
+      In the Microsoft Defender portal go to Settings > Microsoft Defender XDR
+      > Streaming API, add a streaming settings resource, and choose the
+      destination: an Event Hub (Event Hubs namespace resource id, optional
+      hub name) or a Storage account (resource id - events land as JSON-line
+      append blobs in per-type containers named insights-logs-<eventtype>, one
+      blob per hour partition). Then select the event types to export and
+      include AlertInfo and AlertEvidence. In a US Government tenant this is
+      the gov Defender portal and the Event Hub / Storage account must live in
+      Azure Government; as with the device tables, streaming is a Defender XDR
+      feature rather than a Defender for Endpoint one, so its availability for
+      the specific GCC / GCC High / DoD tenant type has to be confirmed before
+      this route is committed. Each Event Hub message is an object with a
+      records array; every record wraps the table row in {time, tenantId,
+      category ("AdvancedHunting-AlertEvidence"), properties}, so the same
+      envelope handling as the device tables applies.
+    references:
+    - https://learn.microsoft.com/en-us/defender-xdr/streaming-api
+    - https://learn.microsoft.com/en-us/defender-xdr/streaming-api-event-hub
+    - https://learn.microsoft.com/en-us/defender-xdr/streaming-api-storage
+    - >-
+      https://learn.microsoft.com/en-us/defender-xdr/advanced-hunting-alertevidence-table
+    - https://learn.microsoft.com/en-us/defender-xdr/advanced-hunting-alertinfo-table
+    parsing:
+      mechanism: elastic-integration
+      artifact: Microsoft Defender XDR (m365_defender) integration, event data stream
+      notes: >
+        The m365_defender integration's event data stream ingests the alert
+        tables from the streaming export, landing the columns under
+        m365_defender.event.* and copying a subset to ECS, the same way it
+        handles the device tables. The trade against the Alert API feed is
+        coverage of alert workflow: the streaming AlertEvidence / AlertInfo
+        rows carry the detection and evidence detail but not the api-pull
+        feed's incidentId, status, or the machineId/host identity in the
+        api-pull shape, and Categories arrives as a JSON-array string rather
+        than a scalar. Where the api-pull feed emits one alert with a nested
+        evidence array, this feed emits one flat row per evidence entity keyed
+        by AlertId, which is the shape a downstream consumer wants anyway.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          A Cribl Azure Event Hubs source (blob-storage checkpoint), or an
+          Azure Blob source when the Storage account destination is used,
+          consumes the export low-side because the hub/account lives in Azure
+          Government on the guarded path. Open the envelope here regardless of
+          the parse decision: explode the records array so one AlertEvidence
+          entity becomes one NDJSON line, lift properties to the top level,
+          and keep the record category ("AdvancedHunting- AlertEvidence") as
+          the _dataId route key so the high side selects the alert-table
+          branch. Do no field extraction beyond that. This feed's advantage
+          over the Alert API crossing is that the evidence array is already
+          exploded by the vendor, so the low-side reshape the api-pull relay
+          needs is unnecessary. Run the Elastic destination on Persistent
+          Queue backpressure and gate the guard destination with schema
+          validation plus a dead-letter route.
+        elastic: >
+          Let the m365_defender event data stream parse the row, then add a
+          logs-m365_defender.event@custom pipeline that fixes the alert-table
+          gaps: populate threat.technique.id from AttackTechniques (the stock
+          pipeline does not map it), copy Title to rule.name so detections
+          group by name, parse the Categories JSON-array string and route its
+          tactic-style values to threat.tactic.name, and widen the severity
+          script so Informational does not collapse into Low. Add keyword
+          index-template mappings for the
+          microsoft.defender_endpoint.evidence.* namespace (entity_type, role,
+          direction) so the per-entity evidence pivot the CSOC needs stays
+          aggregatable, and reconcile observer.product from ServiceSource so
+          this streamed alert feed lines up with the Alert API feed for the
+          same tenant.
+        relay: >
+          NDJSON crosses, never CEF - the vendor feed is already JSON. The
+          nesting problem the Alert API relay fights (the evidence array of
+          objects exceeding the two-level constraint) does not exist here
+          because AlertEvidence is pre-flattened to one row per entity, so the
+          crossing shape is a single flat record. The content-filter frictions
+          are the free-text and blob columns: RemoteUrl (unbounded,
+          percent-encoded, often non-ASCII), ProcessCommandLine (encoded
+          payloads), and AdditionalFields (arbitrary per-entity JSON) - cap
+          and key-allowlist those low-side so a custom LUA rule stays simple.
+          Treat the crossing as at-most-once and reconcile low- and high-side
+          row counts per (AlertId, hour); because one alert fans out to many
+          AlertEvidence rows, reconcile on the row count per AlertId, not on a
+          single alert document as the api-pull feed does.
+      direct:
+        parse_location: hybrid
+        cribl: >
+          On a high-side tenant the Event Hub is reachable without the guard:
+          consume the hub, explode the records array to one NDJSON line per
+          AlertEvidence entity, keep the record category
+          ("AdvancedHunting-AlertEvidence") as the route key, and hand _raw to
+          Elastic. No length-capping or dead-letter discipline is required.
+          The decision that matters is deduplication against the Alert API
+          feed if both are collected for the same tenant - key on AlertId so
+          the streamed evidence rows and the api-pull alert document are
+          recognized as the same detection rather than double-counted.
+        elastic: >
+          Let the m365_defender event data stream parse the row, then add a
+          logs-m365_defender.event@custom pipeline that fixes the alert-table
+          gaps: populate threat.technique.id from AttackTechniques, copy Title
+          to rule.name so detections group by name, parse the Categories
+          JSON-array string and route its tactic-style values to
+          threat.tactic.name, widen the severity script so Informational does
+          not collapse into Low, add keyword index-template mappings for the
+          microsoft.defender_endpoint.evidence.* namespace (entity_type, role,
+          direction), and reconcile observer.product from ServiceSource so
+          this streamed alert feed lines up with the Alert API feed for the
+          same tenant. Because there is no boundary, retain AdditionalFields
+          and the full evidence row set for hunting rather than stripping
+          them, and treat this feed as complementary to the Alert API feed:
+          the streaming rows carry richer per-entity evidence (EvidenceRole,
+          EvidenceDirection, registry and cloud-resource entities) while the
+          Alert API feed still carries the incident correlation and workflow
+          status this feed omits.
+    fields:
+    - vendor: Timestamp
+      type: timestamp
+      description: date and time when the alert evidence row was recorded
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: AlertId
+      type: string
+      description: unique identifier of the alert the evidence belongs to
+      ecs: event.id
+      status: mapped
+      notes: >
+        denormalized onto every evidence row, so it is both the alert identity
+        and the join/reconciliation key that groups the exploded entity rows
+        back into one alert
+    - vendor: Title
+      type: string
+      description: title of the alert
+      ecs: rule.name
+      status: partial
+      notes: >-
+        the detection name; the stock integration leaves rule.name empty and
+        carries the title in message, as on the Alert API feed
+    - vendor: Categories
+      type: string
+      description: list of categories the alert belongs to, in JSON array format
+      ecs: event.action
+      status: partial
+      notes: >
+        a serialized JSON array here rather than the scalar the Alert API feed
+        emits; its values are MITRE ATT&CK tactic names, so it must be parsed
+        and routed to threat.tactic.name, not only copied to event.action
+    - vendor: AttackTechniques
+      type: string
+      description: MITRE ATT&CK techniques associated with the activity that triggered the alert
+      ecs: threat.technique.id
+      status: partial
+      notes: >-
+        maps cleanly to threat.technique.id but the stock integration does not
+        map it, so it survives only in the custom namespace
+    - vendor: ServiceSource
+      type: string
+      description: >-
+        product or service that provided the alert information (Microsoft
+        Defender for Endpoint, for Office 365, ...)
+      ecs: observer.product
+      status: mapped
+    - vendor: DetectionSource
+      type: string
+      description: detection technology or sensor that identified the activity
+      ecs: observer.name
+      status: mapped
+    - vendor: EntityType
+      type: string
+      description: >-
+        type of object the evidence row describes - a file, process, device,
+        user, IP, URL, or registry entity
+      ecs: null
+      status: unmapped
+      custom: microsoft.defender_endpoint.evidence.entity_type
+      notes: >-
+        the discriminator that says which of the shared evidence columns are
+        meaningful on a given row, replacing the api-pull feed's
+        evidence[].entityType
+    - vendor: EvidenceRole
+      type: string
+      description: >-
+        how the entity is involved in the alert - whether it is impacted or is
+        merely related
+      ecs: null
+      status: unmapped
+      custom: microsoft.defender_endpoint.evidence.role
+      notes: >-
+        not present on the Alert API feed; lets a detection separate the
+        entity acted upon from context entities
+    - vendor: EvidenceDirection
+      type: string
+      description: whether the entity is the source or the destination of a network connection
+      ecs: null
+      status: unmapped
+      custom: microsoft.defender_endpoint.evidence.direction
+      notes: >-
+        the signal that decides whether RemoteIP/LocalIP on this row is the
+        source or destination endpoint
+    - vendor: FileName
+      type: string
+      description: name of the file the recorded action was applied to
+      ecs: file.name
+      status: mapped
+    - vendor: FolderPath
+      type: string
+      description: folder containing the file the recorded action was applied to
+      ecs: file.directory
+      status: partial
+      notes: the directory only; join with FileName to populate file.path
+    - vendor: SHA1
+      type: string
+      description: SHA-1 of the file the recorded action was applied to
+      ecs: file.hash.sha1
+      status: mapped
+    - vendor: SHA256
+      type: string
+      description: SHA-256 of the file the recorded action was applied to
+      ecs: file.hash.sha256
+      status: partial
+      notes: >-
+        documented as usually not populated - Microsoft directs consumers to
+        SHA1, so SHA-256-keyed correlation will silently miss
+    - vendor: FileSize
+      type: long
+      description: size of the file in bytes
+      ecs: file.size
+      status: mapped
+    - vendor: ThreatFamily
+      type: string
+      description: >-
+        malware family the suspicious or malicious file or process has been
+        classified under
+      ecs: null
+      status: unmapped
+      custom: microsoft.defender_endpoint.evidence.threat_family
+      notes: >-
+        no ECS home for malware family; a useful grouping key the Alert API
+        feed does not surface at the evidence level
+    - vendor: RemoteIP
+      type: string
+      description: IP address that was being connected to
+      ecs: destination.ip
+      status: partial
+      notes: >-
+        EvidenceDirection decides whether this is the destination or, on
+        inbound evidence, the source
+    - vendor: RemoteUrl
+      type: string
+      description: URL or fully qualified domain name that was being connected to
+      ecs: url.full
+      status: partial
+      notes: >-
+        a single column holding either a full URL or a bare FQDN; the FQDN
+        case belongs in destination.domain, so it needs a shape test before
+        landing in url.full
+    - vendor: AccountName
+      type: string
+      description: user name of the account entity
+      ecs: user.name
+      status: mapped
+    - vendor: AccountDomain
+      type: string
+      description: domain of the account entity
+      ecs: user.domain
+      status: mapped
+    - vendor: AccountSid
+      type: string
+      description: security identifier (SID) of the account entity
+      ecs: user.id
+      status: mapped
+    - vendor: AccountUpn
+      type: string
+      description: user principal name (UPN) of the account entity
+      ecs: null
+      status: unmapped
+      custom: microsoft.defender_endpoint.evidence.account_upn
+      notes: >-
+        UPN form (user@domain), distinct from the SID in user.id and the bare
+        name in user.name; normalize before joining the active-directory
+        account names
+    - vendor: AccountObjectId
+      type: string
+      description: unique identifier of the account in Microsoft Entra ID
+      ecs: null
+      status: unmapped
+      custom: microsoft.defender_endpoint.evidence.account_object_id
+      notes: the Entra object GUID, an identity handle rather than a sign-in name
+    - vendor: DeviceId
+      type: string
+      description: unique identifier of the device entity in the service
+      ecs: host.id
+      status: mapped
+    - vendor: DeviceName
+      type: string
+      description: fully qualified domain name of the device entity
+      ecs: host.name
+      status: mapped
+    - vendor: LocalIP
+      type: string
+      description: IP address assigned to the local device used during communication
+      ecs: source.ip
+      status: partial
+      notes: >-
+        the source on outbound evidence; EvidenceDirection inverts this on
+        inbound rows, as with the device network table
+    - vendor: NetworkMessageId
+      type: string
+      description: unique identifier for the email, generated by Office 365
+      ecs: null
+      status: unmapped
+      custom: microsoft.defender_endpoint.evidence.network_message_id
+      notes: >-
+        populated only on Defender for Office 365 alert evidence; the internal
+        O365 message id, not an RFC 5322 Message-ID
+    - vendor: EmailSubject
+      type: string
+      description: subject of the email entity
+      ecs: email.subject
+      status: mapped
+      notes: populated only on Defender for Office 365 alert evidence
+    - vendor: Application
+      type: string
+      description: application that performed the recorded action
+      ecs: null
+      status: unmapped
+      custom: microsoft.defender_endpoint.evidence.application
+    - vendor: ApplicationId
+      type: int
+      description: unique identifier for the application
+      ecs: null
+      status: unmapped
+      custom: microsoft.defender_endpoint.evidence.application_id
+    - vendor: OAuthApplicationId
+      type: string
+      description: unique identifier of the third-party OAuth application
+      ecs: null
+      status: unmapped
+      custom: microsoft.defender_endpoint.evidence.oauth_application_id
+    - vendor: ProcessCommandLine
+      type: string
+      description: command line used to create the process entity
+      ecs: process.command_line
+      status: mapped
+    - vendor: RegistryKey
+      type: string
+      description: registry key the recorded action was applied to
+      ecs: registry.key
+      status: mapped
+    - vendor: RegistryValueName
+      type: string
+      description: name of the registry value the recorded action was applied to
+      ecs: registry.value
+      status: mapped
+    - vendor: RegistryValueData
+      type: string
+      description: data of the registry value the recorded action was applied to
+      ecs: registry.data.strings
+      status: partial
+      transform: >-
+        ECS registry.data.strings is an array, so the scalar value has to be
+        wrapped in a single-element array on ingest
+    - vendor: AdditionalFields
+      type: string
+      description: additional information about the entity or event, as a JSON string
+      ecs: null
+      status: unmapped
+      custom: microsoft.defender_endpoint.evidence.additional_fields
+      notes: >-
+        key set varies by entity type; parse and add an explicit
+        index-template mapping to avoid dynamic-mapping field explosion
+    - vendor: Severity
+      type: enum
+      description: potential impact of the alert - high, medium, or low
+      ecs: event.severity
+      status: partial
+      transform: >-
+        string enum that needs conversion to the ECS numeric severity scale,
+        and Informational must stay distinct from Low
+    - vendor: CloudResource
+      type: string
+      description: cloud resource name
+      ecs: null
+      status: unmapped
+      custom: microsoft.defender_endpoint.evidence.cloud_resource
+      notes: populated on cloud-resource evidence rows only
+    - vendor: CloudPlatform
+      type: string
+      description: >-
+        cloud platform the resource belongs to - Azure, Amazon Web Services,
+        or Google Cloud Platform
+      ecs: cloud.provider
+      status: partial
+      transform: map the vendor labels to the ECS cloud.provider vocabulary (azure / aws / gcp)
+    - vendor: ResourceType
+      type: string
+      description: type of cloud resource
+      ecs: null
+      status: unmapped
+      custom: microsoft.defender_endpoint.evidence.resource_type
+    - vendor: ResourceID
+      type: string
+      description: unique identifier of the cloud resource accessed
+      ecs: null
+      status: unmapped
+      custom: microsoft.defender_endpoint.evidence.resource_id
+    - vendor: SubscriptionId
+      type: string
+      description: unique identifier of the cloud service subscription
+      ecs: cloud.account.id
+      status: partial
+      notes: >-
+        populated only on cloud-resource evidence rows; the Azure subscription
+        that owns the resource
+- id: device-process-events
+  name: DeviceProcessEvents (streaming)
+  description: >
+    Raw process-creation telemetry from the advanced hunting
+    DeviceProcessEvents table, exported by the Defender XDR streaming API to
+    an Azure Event Hub. Each Event Hub message is an object with a `records`
+    array; every record wraps the hunting row in {time, tenantId, category,
+    properties}, where category is the table name prefixed "AdvancedHunting-".
+    This is one representative member of a large family — DeviceNetworkEvents,
+    DeviceLogonEvents, DeviceFileEvents, DeviceRegistryEvents,
+    DeviceImageLoadEvents and DeviceEvents share the same envelope and the
+    same Initiating*/created-entity column convention, so a pipeline built for
+    this table generalises to the rest.
+  event_categories:
+  - process
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        A Cribl Azure Event Hubs source consumes the streaming export with a
+        blob-storage checkpoint; the Event Hub lives in Azure Government, so
+        the consumer runs low-side on the guarded path. Note the streaming API
+        is a Defender XDR feature, not a Defender for Endpoint one, so gov
+        availability must be confirmed for the specific tenant type before
+        this route is committed.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-m365_defender.event
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        A Cribl Azure Event Hubs source consumes the streaming export with a
+        blob-storage checkpoint; the Event Hub lives in Azure Government, so
+        the consumer sits wherever outbound Azure Gov access is permitted.
+        Note the streaming API is a Defender XDR feature, not a Defender for
+        Endpoint one, so gov availability must be confirmed for the specific
+        tenant type before this route is committed.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-m365_defender.event
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: Microsoft Defender XDR (m365_defender) integration, event data stream
+      notes: >
+        The integration's pipeline_device branch handles the device tables: it
+        lands every column under m365_defender.event.* and then copies a
+        subset to ECS, mapping the created process to process.* and the
+        Initiating* columns to process.parent.*. ProcessUniqueId, ReportId and
+        the integrity/elevation columns stop at the custom namespace.
+    fields:
+    - vendor: Timestamp
+      type: timestamp
+      description: UTC time the event was recorded on the device
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: DeviceName
+      type: string
+      description: fully qualified domain name of the reporting device
+      ecs: host.name
+      status: mapped
+    - vendor: DeviceId
+      type: string
+      description: service-assigned unique identifier for the device
+      ecs: host.id
+      status: mapped
+    - vendor: ActionType
+      type: string
+      description: activity that generated the row, e.g. ProcessCreated, OpenProcessApiCall
+      ecs: event.action
+      status: mapped
+      transform: >
+        ActionType is copied to event.action verbatim and also drives the
+        integration's event.category/event.type assignment; the authoritative
+        value list is the in-portal schema reference, not the public docs
+    - vendor: FileName
+      type: string
+      description: name of the image file of the newly created process
+      ecs: process.name
+      status: mapped
+    - vendor: FolderPath
+      type: string
+      description: folder containing the image file of the newly created process
+      ecs: process.executable
+      status: partial
+      notes: >
+        documented as the containing folder, and the Elastic pipeline copies
+        it straight to process.executable; whether that yields a full image
+        path depends on the sensor populating it with the filename appended,
+        so join FolderPath with FileName rather than relying on it
+    - vendor: ProcessCommandLine
+      type: string
+      description: command line the new process was launched with
+      ecs: process.command_line
+      status: mapped
+    - vendor: ProcessId
+      type: long
+      description: operating-system process id of the newly created process
+      ecs: process.pid
+      status: mapped
+    - vendor: ProcessCreationTime
+      type: timestamp
+      description: UTC time the new process was created
+      ecs: process.start
+      status: mapped
+    - vendor: ProcessUniqueId
+      type: string
+      description: unique identifier of the process, equal to the Windows Process Start Key
+      ecs: process.entity_id
+      status: partial
+      notes: >
+        the correct source for a PID-reuse-safe process identity, but the
+        stock integration leaves it in the custom namespace and never
+        populates process.entity_id
+    - vendor: SHA1
+      type: string
+      description: SHA-1 of the image file of the newly created process
+      ecs: process.hash.sha1
+      status: mapped
+    - vendor: SHA256
+      type: string
+      description: SHA-256 of the image file of the newly created process
+      ecs: process.hash.sha256
+      status: partial
+      notes: >
+        documented as usually not populated on this table - Microsoft directs
+        consumers to SHA1, so SHA-256-keyed correlation rules will silently
+        miss
+    - vendor: AccountName
+      type: string
+      description: user name of the account the new process runs as
+      ecs: user.name
+      status: mapped
+    - vendor: AccountSid
+      type: string
+      description: Windows security identifier of the account the new process runs as
+      ecs: user.id
+      status: mapped
+    - vendor: InitiatingProcessFileName
+      type: string
+      description: name of the process that created this process
+      ecs: process.parent.name
+      status: mapped
+    - vendor: InitiatingProcessCommandLine
+      type: string
+      description: command line of the process that created this process
+      ecs: process.parent.command_line
+      status: mapped
+    - vendor: InitiatingProcessId
+      type: long
+      description: process id of the process that created this process
+      ecs: process.parent.pid
+      status: mapped
+    - vendor: InitiatingProcessFolderPath
+      type: string
+      description: folder containing the image of the process that created this process
+      ecs: process.parent.executable
+      status: mapped
+    - vendor: ReportId
+      type: long
+      description: >-
+        repeating counter that identifies the event, unique only with
+        DeviceName and Timestamp
+      ecs: null
+      status: unmapped
+      custom: m365_defender.event.report_id
+      notes: >
+        not globally unique on its own; it is the de-duplication and
+        low-side/high-side reconciliation key when combined with DeviceName
+        and Timestamp
+    - vendor: AdditionalFields
+      type: string
+      description: per-ActionType extra properties carried as a JSON string
+      ecs: null
+      status: unmapped
+      custom: m365_defender.event.additional_fields
+      notes: >
+        key set varies by ActionType, so it needs parsing plus an explicit
+        index-template mapping to avoid dynamic-mapping field explosion
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          The Event Hub envelope has to be opened low-side regardless of the
+          parse decision: explode the `records` array so one hunting row
+          becomes one NDJSON line, lift `properties` to the top level, and
+          keep the record's `category` value as the _dataId route key so the
+          high side can select the per-table branch. Do no field extraction
+          beyond that. Run the Elastic destination on Persistent Queue
+          backpressure, gate any guard destination with C.Schema(...).validate
+          plus a dead-letter route, and shape volume here with ActionType
+          filters rather than by trimming columns.
+        elastic: >
+          Let the m365_defender integration's pipeline_device branch do the
+          field extraction, then add a logs-m365_defender.event@custom
+          pipeline that closes the gaps this table exposes: populate
+          process.entity_id from ProcessUniqueId (the Process Start Key) so
+          process trees survive PID reuse, and derive process.executable by
+          joining FolderPath with FileName instead of trusting FolderPath to
+          already contain the image name. Prefer SHA1 over SHA256 in
+          correlation rules because SHA256 is documented as usually
+          unpopulated on this table, and add explicit index-template mappings
+          for m365_defender.event.report_id and the parsed AdditionalFields
+          object so dynamic mapping does not explode on its per-ActionType key
+          set.
+        relay: >
+          A thin envelope crosses (mode A): {_dataId, @timestamp, host, _raw}
+          with _raw holding the single-line JSON properties object, because
+          the Elastic integration is a good parser and the guard should see
+          one stable shape rather than the union of every device table. Two
+          real content-filter frictions: ProcessCommandLine is unbounded free
+          text that routinely carries encoded PowerShell payloads and
+          non-ASCII, and AdditionalFields is an arbitrary nested JSON blob
+          whose keys vary by ActionType - both should be length-capped and
+          key-allowlisted low-side so a custom LUA filter can stay simple.
+          Nothing CEF-shaped is involved; the vendor feed is already JSON. The
+          crossing is at-most-once, so reconcile low- and high-side counts per
+          (DeviceId, hour) using ReportId with DeviceName and Timestamp as the
+          uniqueness triple.
+      direct:
+        parse_location: hybrid
+        cribl: >
+          The Event Hub envelope has to be opened regardless of the parse
+          decision: explode the `records` array so one hunting row becomes one
+          NDJSON line, lift `properties` to the top level, and keep the
+          record's `category` value as the _dataId route key so the pipeline
+          can select the per-table branch. Do no field extraction beyond that.
+          Run the Elastic destination on Persistent Queue backpressure, and
+          shape volume with ActionType filters rather than by trimming
+          columns.
+        elastic: >
+          Let the m365_defender integration's pipeline_device branch do the
+          field extraction, then add a logs-m365_defender.event@custom
+          pipeline that closes the gaps this table exposes: populate
+          process.entity_id from ProcessUniqueId (the Process Start Key) so
+          process trees survive PID reuse, and derive process.executable by
+          joining FolderPath with FileName instead of trusting FolderPath to
+          already contain the image name. Prefer SHA1 over SHA256 in
+          correlation rules because SHA256 is documented as usually
+          unpopulated on this table, and add explicit index-template mappings
+          for m365_defender.event.report_id and the parsed AdditionalFields
+          object so dynamic mapping does not explode on its per-ActionType key
+          set.
+  - format: api-pull
+    enable: >
+      Register an Entra app with the ThreatHunting.Read.All application (or
+      delegated) permission and POST a KQL query to
+      https://graph.microsoft.com/v1.0/security/runHuntingQuery with a body
+      {"Query":"DeviceProcessEvents | where ...","Timespan":"P1D"}; the
+      Timespan (ISO-8601, default 30 days) bounds the look-back. For a US
+      Government tenant use the Graph national-cloud host (graph.microsoft.us)
+      with tokens from login.microsoftonline.us. The response is a
+      huntingQueryResults object: a schema array of {name,type} column
+      descriptors and a results array of row objects. To collect continuously,
+      page by Timestamp and de-duplicate on ReportId with DeviceName and
+      Timestamp, since the API is a point-in-time query rather than a stream.
+      Honor the documented quotas (Graph advanced hunting is rate- and
+      CPU-limited; the legacy MDE endpoint capped at 45 calls/min, 1500/hour,
+      100,000 rows and 50 MB per request).
+    references:
+    - https://learn.microsoft.com/en-us/graph/api/security-security-runhuntingquery
+    - https://learn.microsoft.com/en-us/defender-endpoint/api/run-advanced-query-api
+    - >-
+      https://learn.microsoft.com/en-us/defender-xdr/advanced-hunting-deviceprocessevents-table
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        custom advanced-hunting pull pipeline (Cribl REST Collector) feeding
+        the m365_defender event data stream
+      notes: >
+        The runHuntingQuery envelope is not the Event Hub records envelope the
+        m365_defender integration expects, so a Cribl REST Collector polls the
+        API and a pipeline unwraps the results array into one NDJSON row per
+        record before handing it on. Once unwrapped the row columns are
+        byte-for-byte the DeviceProcessEvents schema, so the integration's
+        pipeline_device branch parses them exactly as it parses the streamed
+        feed. The operational trade is completeness and latency: the query API
+        returns at most 100,000 rows per call over a 30-day window under a
+        tenant CPU/time quota, so it is a gap-fill or low-volume-tenant path,
+        not a replacement for the real-time stream on a high-volume endpoint
+        estate.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          A Cribl REST Collector runs the KQL query low-side (the tenant is in
+          Azure Government on the guarded path), checkpoints on the maximum
+          Timestamp seen, and unwraps the results array into one NDJSON line
+          per row; keep a fixed _dataId of the table name so the high side
+          selects the pipeline_device branch. Do the volume work in the query
+          itself - project only the needed columns and filter ActionType
+          server-side - because the API bills CPU and caps rows, unlike the
+          stream where filtering happens in the worker. Run the Elastic
+          destination on Persistent Queue backpressure and gate the guard
+          destination with schema validation and a dead-letter route.
+        elastic: >
+          Reuse the m365_defender pipeline_device branch, then add the same
+          logs-m365_defender.event@custom fixes the streamed feed needs:
+          populate process.entity_id from ProcessUniqueId so process trees
+          survive PID reuse, join FolderPath with FileName for
+          process.executable, and prefer SHA1 over SHA256 in correlation rules
+          because SHA256 is usually unpopulated. Because the pull can return
+          the same row across overlapping windows, enforce a fingerprint on
+          (DeviceName, Timestamp, ReportId) at ingest so re-queried rows do
+          not multiply documents.
+        relay: >
+          A thin envelope crosses (mode A): {_dataId, @timestamp, host, _raw}
+          with _raw the single-line JSON row, identical to the streamed
+          device-table crossing so the guard sees one device-table schema
+          regardless of whether the row arrived by push or by pull. The same
+          two content-filter frictions apply: ProcessCommandLine is unbounded
+          free text carrying encoded PowerShell and non-ASCII, and
+          AdditionalFields is arbitrary nested JSON - length-cap and
+          key-allowlist both low-side. The crossing is at-most-once; reconcile
+          per (DeviceId, hour) on the (DeviceName, Timestamp, ReportId)
+          uniqueness triple, and expect the pull feed to lag the stream
+          because of query latency and the 30-day retention horizon.
+      direct:
+        parse_location: hybrid
+        cribl: >
+          On a high-side tenant reachable without the guard, a Cribl REST
+          Collector runs the KQL query, checkpoints on the maximum Timestamp
+          seen, and unwraps the results array into one NDJSON line per row
+          with a fixed table _dataId; no length-capping or dead-letter
+          discipline is required. The decision that matters is scheduling
+          against quota: stagger queries and keep the projected column set
+          tight so a backfill does not exhaust the tenant's hourly CPU
+          allowance and starve the alert pull that shares it.
+        elastic: >
+          Reuse the m365_defender pipeline_device branch, then add the same
+          logs-m365_defender.event@custom fixes the streamed feed needs:
+          populate process.entity_id from ProcessUniqueId so process trees
+          survive PID reuse, join FolderPath with FileName for
+          process.executable, and prefer SHA1 over SHA256 in correlation rules
+          because SHA256 is usually unpopulated. Because the pull can return
+          the same row across overlapping windows, fingerprint on (DeviceName,
+          Timestamp, ReportId) at ingest so re-queried rows do not multiply
+          documents. With no boundary, retain AdditionalFields and the
+          version-info and integrity/elevation columns for hunting; treat this
+          pull path as a backfill companion to the stream - it can recover the
+          last 30 days after a stream outage, which the Event Hub consumer
+          cannot once its checkpoint has lapsed past the hub retention.
+    fields:
+    - vendor: Timestamp
+      type: timestamp
+      description: date and time when the event was recorded on the device
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: DeviceId
+      type: string
+      description: service-assigned unique identifier for the device
+      ecs: host.id
+      status: mapped
+    - vendor: DeviceName
+      type: string
+      description: fully qualified domain name of the reporting device
+      ecs: host.name
+      status: mapped
+    - vendor: ActionType
+      type: string
+      description: type of activity that triggered the event, e.g. ProcessCreated
+      ecs: event.action
+      status: mapped
+      transform: >-
+        copied to event.action and drives the integration's
+        event.category/type; the authoritative value list is the in-portal
+        schema reference
+    - vendor: FileName
+      type: string
+      description: name of the image file of the newly created process
+      ecs: process.name
+      status: mapped
+    - vendor: FolderPath
+      type: string
+      description: folder containing the image file of the newly created process
+      ecs: process.executable
+      status: partial
+      notes: >-
+        documented as the containing folder; join with FileName rather than
+        relying on it to already contain the image name
+    - vendor: SHA1
+      type: string
+      description: SHA-1 of the image file of the newly created process
+      ecs: process.hash.sha1
+      status: mapped
+    - vendor: SHA256
+      type: string
+      description: SHA-256 of the image file of the newly created process
+      ecs: process.hash.sha256
+      status: partial
+      notes: documented as usually not populated - use SHA1
+    - vendor: MD5
+      type: string
+      description: MD5 hash of the image file of the newly created process
+      ecs: process.hash.md5
+      status: mapped
+    - vendor: FileSize
+      type: long
+      description: size of the image file in bytes
+      ecs: file.size
+      status: mapped
+    - vendor: ProcessId
+      type: long
+      description: process id of the newly created process
+      ecs: process.pid
+      status: mapped
+    - vendor: ProcessCommandLine
+      type: string
+      description: command line the new process was launched with
+      ecs: process.command_line
+      status: mapped
+    - vendor: ProcessIntegrityLevel
+      type: string
+      description: integrity level Windows assigned to the newly created process
+      ecs: null
+      status: unmapped
+      custom: m365_defender.event.process_integrity_level
+      notes: >-
+        a privilege signal the json streaming subset omits;
+        low-integrity-to-high transitions are directly alertable
+    - vendor: ProcessTokenElevation
+      type: string
+      description: >-
+        type of token elevation applied to the new process -
+        TokenElevationTypeLimited, TokenElevationTypeDefault,
+        TokenElevationTypeFull
+      ecs: null
+      status: unmapped
+      custom: m365_defender.event.process_token_elevation
+      notes: >-
+        the UAC elevation discriminator; a Full elevation on a non-admin
+        account is a privilege-escalation signal
+    - vendor: ProcessCreationTime
+      type: timestamp
+      description: UTC time the new process was created
+      ecs: process.start
+      status: mapped
+    - vendor: ProcessUniqueId
+      type: string
+      description: unique identifier of the process, equal to the Windows Process Start Key
+      ecs: process.entity_id
+      status: partial
+      notes: >-
+        the PID-reuse-safe process identity; the stock integration leaves it
+        in the custom namespace and never populates process.entity_id
+    - vendor: AccountName
+      type: string
+      description: user name of the account the new process runs as
+      ecs: user.name
+      status: mapped
+    - vendor: AccountDomain
+      type: string
+      description: domain of the account the new process runs as
+      ecs: user.domain
+      status: mapped
+    - vendor: AccountSid
+      type: string
+      description: Windows security identifier of the account the new process runs as
+      ecs: user.id
+      status: mapped
+    - vendor: AccountUpn
+      type: string
+      description: user principal name of the account the new process runs as
+      ecs: null
+      status: unmapped
+      custom: m365_defender.event.account_upn
+      notes: UPN form; distinct from the SID in user.id and the bare name in user.name
+    - vendor: AccountObjectId
+      type: string
+      description: Microsoft Entra object id of the account the new process runs as
+      ecs: null
+      status: unmapped
+      custom: m365_defender.event.account_object_id
+    - vendor: LogonId
+      type: long
+      description: >-
+        identifier for the logon session, unique on the same device only
+        between restarts
+      ecs: null
+      status: unmapped
+      custom: m365_defender.event.logon_id
+      notes: the session join key back to DeviceLogonEvents; not globally unique
+    - vendor: InitiatingProcessFileName
+      type: string
+      description: name of the process that created this process
+      ecs: process.parent.name
+      status: mapped
+    - vendor: InitiatingProcessCommandLine
+      type: string
+      description: command line of the process that created this process
+      ecs: process.parent.command_line
+      status: mapped
+    - vendor: InitiatingProcessId
+      type: long
+      description: process id of the process that created this process
+      ecs: process.parent.pid
+      status: mapped
+    - vendor: InitiatingProcessFolderPath
+      type: string
+      description: folder containing the image of the process that created this process
+      ecs: process.parent.executable
+      status: mapped
+    - vendor: InitiatingProcessSHA1
+      type: string
+      description: SHA-1 of the image of the process that created this process
+      ecs: process.parent.hash.sha1
+      status: mapped
+    - vendor: InitiatingProcessCreationTime
+      type: timestamp
+      description: UTC time the creating process was started
+      ecs: process.parent.start
+      status: mapped
+    - vendor: InitiatingProcessUniqueId
+      type: string
+      description: >-
+        unique identifier of the creating process, equal to its Windows
+        Process Start Key
+      ecs: process.parent.entity_id
+      status: partial
+      notes: the PID-reuse-safe parent identity; not populated by the stock integration
+    - vendor: InitiatingProcessParentId
+      type: long
+      description: >-
+        process id of the parent of the creating process (the grandparent of
+        the new process)
+      ecs: null
+      status: unmapped
+      custom: m365_defender.event.initiating_process_parent_id
+      notes: >-
+        ECS process.parent has no parent of its own, so the grandparent PID
+        has no standard home; needed to reconstruct the full ancestry chain
+    - vendor: InitiatingProcessParentFileName
+      type: string
+      description: name of the parent of the creating process
+      ecs: null
+      status: unmapped
+      custom: m365_defender.event.initiating_process_parent_file_name
+      notes: >-
+        the grandparent image name, same ancestry-chain rationale as
+        InitiatingProcessParentId
+    - vendor: InitiatingProcessAccountName
+      type: string
+      description: user name of the account that ran the creating process
+      ecs: null
+      status: unmapped
+      custom: m365_defender.event.initiating_process_account_name
+      notes: >-
+        kept custom to avoid colliding with the created-process account in
+        user.name; the two accounts differ across a runas or service launch
+    - vendor: InitiatingProcessSignatureStatus
+      type: string
+      description: signature status of the image of the creating process
+      ecs: null
+      status: unmapped
+      custom: m365_defender.event.initiating_process_signature_status
+      notes: >-
+        an Unsigned status on a system-path parent is a tampering signal the
+        json subset omits
+    - vendor: InitiatingProcessSignerType
+      type: string
+      description: type of file signer of the image of the creating process
+      ecs: null
+      status: unmapped
+      custom: m365_defender.event.initiating_process_signer_type
+    - vendor: IsInitiatingProcessRemoteSession
+      type: boolean
+      description: whether the creating process ran under a remote desktop (RDP) session
+      ecs: null
+      status: unmapped
+      custom: m365_defender.event.is_initiating_process_remote_session
+      notes: >-
+        pairs with InitiatingProcessRemoteSessionIP to flag process activity
+        launched over RDP
+    - vendor: InitiatingProcessRemoteSessionIP
+      type: string
+      description: >-
+        IP address of the remote device from which the creating process's RDP
+        session was initiated
+      ecs: null
+      status: unmapped
+      custom: m365_defender.event.initiating_process_remote_session_ip
+      notes: >-
+        kept custom rather than source.ip because it is the RDP origin of the
+        actor, not a network endpoint of this event
+    - vendor: ReportId
+      type: long
+      description: >-
+        repeating counter that identifies the event, unique only with
+        DeviceName and Timestamp
+      ecs: null
+      status: unmapped
+      custom: m365_defender.event.report_id
+      notes: >-
+        the de-duplication and low-side/high-side reconciliation key when
+        combined with DeviceName and Timestamp
+    - vendor: AdditionalFields
+      type: string
+      description: additional per-ActionType properties carried as a JSON string
+      ecs: null
+      status: unmapped
+      custom: m365_defender.event.additional_fields
+      notes: >-
+        key set varies by ActionType; parse and add an explicit index-template
+        mapping to avoid dynamic-mapping field explosion
+- id: device-network-events
+  name: DeviceNetworkEvents (streaming)
+  description: >
+    Endpoint network-connection telemetry from the advanced hunting
+    DeviceNetworkEvents table, exported over the same Event Hub streaming
+    route as DeviceProcessEvents. Rows record connection attempts, accepted
+    inbound connections and listening sockets, always attributed to the
+    initiating process; on Linux and macOS sensors DNS lookup detail also
+    arrives here inside AdditionalFields. This is the highest-volume device
+    table by a wide margin and is the natural first place to shape volume.
+  event_categories:
+  - network
+  - process
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same Azure Event Hubs source and blob checkpoint as
+        DeviceProcessEvents, either sharing one hub or using the per-table hub
+        option of the streaming API.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-m365_defender.event
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Same Azure Event Hubs source and blob checkpoint as
+        DeviceProcessEvents, either sharing one hub or using the per-table hub
+        option of the streaming API.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-m365_defender.event
+  formats:
+  - format: json
+    parsing:
+      mechanism: elastic-integration
+      artifact: Microsoft Defender XDR (m365_defender) integration, event data stream
+      notes: >
+        Handled by the same pipeline_device branch. Note the column-role
+        inversion against the process table: here the Initiating* columns
+        describe the process that made the connection and are copied to
+        process.*, not process.parent.*, so a single query cannot treat
+        InitiatingProcess* consistently across the two datasets.
+    fields:
+    - vendor: Timestamp
+      type: timestamp
+      description: UTC time the connection event was recorded on the device
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: DeviceName
+      type: string
+      description: fully qualified domain name of the reporting device
+      ecs: host.name
+      status: mapped
+    - vendor: DeviceId
+      type: string
+      description: service-assigned unique identifier for the device
+      ecs: host.id
+      status: mapped
+    - vendor: ActionType
+      type: string
+      description: >-
+        connection activity that generated the row, e.g. ConnectionSuccess,
+        ConnectionFailed, InboundConnectionAccepted,
+        ListeningConnectionCreated
+      ecs: event.action
+      status: mapped
+      transform: >
+        copied to event.action verbatim; it is also the only signal for
+        connection direction, so it must drive both network.direction and
+        which of LocalIP/RemoteIP becomes source versus destination
+    - vendor: LocalIP
+      type: ip
+      description: IP address on the reporting device used for the communication
+      ecs: source.ip
+      status: partial
+      notes: >
+        only the source on outbound ActionTypes; on InboundConnectionAccepted
+        the local address is the destination, so the assignment is
+        ActionType-dependent rather than fixed
+    - vendor: LocalPort
+      type: integer
+      description: TCP/UDP port on the reporting device used for the communication
+      ecs: source.port
+      status: partial
+      notes: same ActionType-dependent inversion as LocalIP
+    - vendor: RemoteIP
+      type: ip
+      description: IP address of the peer the device communicated with
+      ecs: destination.ip
+      status: partial
+      notes: >-
+        becomes source.ip on inbound ActionTypes; the Elastic pipeline
+        branches on ActionType to decide
+    - vendor: RemotePort
+      type: integer
+      description: TCP/UDP port on the peer used for the communication
+      ecs: destination.port
+      status: partial
+      notes: same ActionType-dependent inversion as RemoteIP
+    - vendor: RemoteUrl
+      type: string
+      description: URL or fully qualified domain name that was being connected to
+      ecs: url.full
+      status: partial
+      notes: >
+        a single column holding either a full URL or a bare FQDN; the FQDN
+        case belongs in destination.domain, so it needs a shape test before it
+        lands in url.full
+    - vendor: Protocol
+      type: string
+      description: transport protocol used for the communication (Tcp, Udp, Icmp)
+      ecs: network.transport
+      status: mapped
+      transform: >-
+        vendor casing (Tcp/Udp) is lowercased to satisfy the ECS
+        network.transport convention
+    - vendor: LocalIPType
+      type: string
+      description: >-
+        address class of the local IP - Public, Private, Reserved, Loopback,
+        Teredo, FourToSixMapping, Broadcast
+      ecs: null
+      status: unmapped
+      custom: m365_defender.event.local_ip_type
+      notes: >-
+        no ECS equivalent; the practical use is low-side noise suppression of
+        loopback and link-local rows
+    - vendor: RemoteIPType
+      type: string
+      description: address class of the remote IP, same value set as LocalIPType
+      ecs: null
+      status: unmapped
+      custom: m365_defender.event.remote_ip_type
+      notes: >-
+        cheap internal-versus-external discriminator that the CSOC uses in
+        place of a CIDR lookup
+    - vendor: InitiatingProcessFileName
+      type: string
+      description: name of the process that made or accepted the connection
+      ecs: process.name
+      status: mapped
+      notes: >-
+        on this table the Initiating* columns are the acting process and map
+        to process.*, unlike DeviceProcessEvents where they map to
+        process.parent.*
+    - vendor: InitiatingProcessCommandLine
+      type: string
+      description: command line of the process that made or accepted the connection
+      ecs: process.command_line
+      status: mapped
+    - vendor: InitiatingProcessId
+      type: long
+      description: process id of the process that made or accepted the connection
+      ecs: process.pid
+      status: mapped
+    - vendor: InitiatingProcessFolderPath
+      type: string
+      description: folder containing the image of the process that made or accepted the connection
+      ecs: process.executable
+      status: mapped
+    - vendor: InitiatingProcessSHA1
+      type: string
+      description: SHA-1 of the image of the process that made or accepted the connection
+      ecs: process.hash.sha1
+      status: mapped
+    - vendor: InitiatingProcessAccountName
+      type: string
+      description: user name of the account that ran the connecting process
+      ecs: user.name
+      status: mapped
+    - vendor: InitiatingProcessAccountSid
+      type: string
+      description: Windows security identifier of the account that ran the connecting process
+      ecs: user.id
+      status: mapped
+    - vendor: AdditionalFields
+      type: string
+      description: per-ActionType extra properties carried as a JSON string
+      ecs: null
+      status: unmapped
+      custom: m365_defender.event.additional_fields
+      notes: >
+        carries DNS query, qtype, rcode and answer detail on Linux and macOS
+        sensors; those members are the only route to dns.question.name for
+        this dataset and need parsing before any DNS detection can use them
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Explode the Event Hub `records` array into one NDJSON line per row
+          and keep the record `category` as the _dataId route key, exactly as
+          for the process table, with no low-side field extraction. Do the
+          volume work here rather than at Elastic: suppress loopback and
+          link-local rows using LocalIPType/RemoteIPType, and drop or sample
+          the high-cardinality ActionType values the CSOC has no detection
+          for. Run the Elastic destination on Persistent Queue backpressure
+          and gate any guard destination with schema validation plus a
+          dead-letter route.
+        elastic: >
+          The m365_defender pipeline_device branch parses this table; add a
+          logs-m365_defender.event@custom pipeline that asserts the
+          direction-dependent endpoint assignment is right - RemoteIP must
+          become source.ip on inbound ActionTypes and destination.ip on
+          outbound ones - and sets network.direction explicitly so analysts
+          are not inferring it from ActionType strings. Split RemoteUrl into
+          url.full versus destination.domain based on whether it is a URL or a
+          bare FQDN, and parse AdditionalFields into the dns.* fields for
+          Linux and macOS DNS rows. Map m365_defender.event.local_ip_type and
+          .remote_ip_type as keyword in the index template so the
+          noise-suppression filters that run low-side stay auditable
+          high-side.
+        relay: >
+          Thin envelope (mode A) crosses, same shape as the process table, so
+          the guard sees one schema for the whole device-table family rather
+          than one per table. This is the dataset where the _raw carry policy
+          should be relaxed first: volume is the highest of the three and
+          per-connection forensic value the lowest, so drop _raw here before
+          touching alerts or process events. The content-filter friction is
+          RemoteUrl, which is unbounded, percent-encoded and frequently
+          non-ASCII - cap it low-side. No CEF is involved. At-most-once
+          crossing means reconciling counts per (DeviceId, hour); expect the
+          reconciliation tolerance here to be wider than on the other datasets
+          because low-side sampling is deliberate.
+      direct:
+        parse_location: hybrid
+        cribl: >
+          Explode the Event Hub `records` array into one NDJSON line per row
+          and keep the record `category` as the _dataId route key, exactly as
+          for the process table, with no field extraction beyond that. Do the
+          volume work here rather than at Elastic: suppress loopback and
+          link-local rows using LocalIPType/RemoteIPType, and drop or sample
+          the high-cardinality ActionType values the CSOC has no detection
+          for. Run the Elastic destination on Persistent Queue backpressure.
+        elastic: >
+          The m365_defender pipeline_device branch parses this table; add a
+          logs-m365_defender.event@custom pipeline that asserts the
+          direction-dependent endpoint assignment is right - RemoteIP must
+          become source.ip on inbound ActionTypes and destination.ip on
+          outbound ones - and sets network.direction explicitly so analysts
+          are not inferring it from ActionType strings. Split RemoteUrl into
+          url.full versus destination.domain based on whether it is a URL or a
+          bare FQDN, and parse AdditionalFields into the dns.* fields for
+          Linux and macOS DNS rows. Map m365_defender.event.local_ip_type and
+          .remote_ip_type as keyword in the index template so the collector's
+          noise-suppression filtering stays auditable at Elastic.
+  - format: api-pull
+    enable: >
+      POST a KQL query over DeviceNetworkEvents to
+      https://graph.microsoft.com/v1.0/security/runHuntingQuery with a bounded
+      Timespan, using an Entra app that holds ThreatHunting.Read.All; for a US
+      Government tenant use the graph.microsoft.us national-cloud host with
+      login.microsoftonline.us tokens. The response is a huntingQueryResults
+      object with a schema array and a results array of rows. Because this
+      table is the highest-volume one, shape the query hard server-side -
+      project only the needed columns, filter noisy ActionTypes, and suppress
+      loopback/link-local rows with LocalIPType/RemoteIPType in the KQL itself
+      - to stay inside the 100,000 row and CPU/time quotas. Page by Timestamp
+      and de-duplicate on ReportId with DeviceName and Timestamp.
+    references:
+    - https://learn.microsoft.com/en-us/graph/api/security-security-runhuntingquery
+    - https://learn.microsoft.com/en-us/defender-endpoint/api/run-advanced-query-api
+    - >-
+      https://learn.microsoft.com/en-us/defender-xdr/advanced-hunting-devicenetworkevents-table
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        custom advanced-hunting pull pipeline (Cribl REST Collector) feeding
+        the m365_defender event data stream
+      notes: >
+        As with the process table, a Cribl REST Collector polls the query API
+        and a pipeline unwraps the results array into one NDJSON row per
+        record; the unwrapped columns are the DeviceNetworkEvents schema, so
+        the m365_defender pipeline_device branch parses them unchanged. The
+        same column-role inversion against the process table holds: here the
+        Initiating* columns are the acting process and map to process.*, not
+        process.parent.*. The volume economics make this a scoped-query path
+        only - a full pull of this table would exhaust the tenant CPU quota
+        long before it matched the stream.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          The REST Collector runs the scoped KQL low-side (Azure Government,
+          guarded path), checkpoints on the maximum Timestamp, and unwraps the
+          results array to one NDJSON line per row with a fixed table _dataId.
+          Push the volume work into the query itself -
+          LocalIPType/RemoteIPType suppression and ActionType sampling belong
+          in the KQL because the API caps rows and bills CPU. Run the Elastic
+          destination on Persistent Queue backpressure and gate the guard
+          destination with schema validation and a dead-letter route.
+        elastic: >
+          Reuse the m365_defender pipeline_device branch, then add the
+          logs-m365_defender.event@custom fixes this table needs: assert the
+          direction-dependent endpoint assignment (RemoteIP becomes source.ip
+          on inbound ActionTypes and destination.ip on outbound ones), set
+          network.direction explicitly, split RemoteUrl into url.full versus
+          destination.domain on a shape test, and parse AdditionalFields into
+          dns.* on Linux/macOS DNS rows. Fingerprint on (DeviceName,
+          Timestamp, ReportId) so rows returned across overlapping query
+          windows do not multiply documents.
+        relay: >
+          A thin envelope crosses (mode A), the same device-table schema the
+          streamed feed presents, so the guard sees one shape whether a row
+          arrived by push or pull. RemoteUrl is the content-filter friction -
+          unbounded, percent-encoded, frequently non-ASCII - cap it low-side.
+          As on the stream, this is the dataset where _raw carry should be
+          relaxed first: per-connection forensic value is low and volume is
+          high. The crossing is at-most-once; reconcile per (DeviceId, hour)
+          on (DeviceName, Timestamp, ReportId), with a wider tolerance than
+          the other datasets because the low-side KQL sampling is deliberate.
+      direct:
+        parse_location: hybrid
+        cribl: >
+          On a high-side tenant without the guard, a Cribl REST Collector runs
+          the scoped KQL, checkpoints on the maximum Timestamp, and unwraps
+          the results array to one NDJSON line per row with a fixed table
+          _dataId; no capping or dead-letter discipline is required. The
+          governing decision is quota: this table cannot be pulled in full, so
+          define the query to a bounded ActionType and IP scope and accept
+          that the pull covers a slice of the traffic the stream would carry
+          whole.
+        elastic: >
+          Reuse the m365_defender pipeline_device branch, then add the
+          logs-m365_defender.event@custom fixes this table needs: assert the
+          direction-dependent endpoint assignment (RemoteIP becomes source.ip
+          on inbound ActionTypes and destination.ip on outbound ones), set
+          network.direction explicitly, split RemoteUrl into url.full versus
+          destination.domain on a shape test, and parse AdditionalFields into
+          dns.* on Linux/macOS DNS rows. Fingerprint on (DeviceName,
+          Timestamp, ReportId) so rows returned across overlapping query
+          windows do not multiply documents. With no boundary, retain
+          AdditionalFields for the DNS detail it carries on Linux and macOS
+          sensors; treat the pull strictly as a 30-day backfill for a scoped
+          question, since the stream is the only feed that keeps up with this
+          table's volume in steady state.
+    fields:
+    - vendor: Timestamp
+      type: timestamp
+      description: UTC time the connection event was recorded on the device
+      ecs: '@timestamp'
+      status: mapped
+    - vendor: DeviceId
+      type: string
+      description: service-assigned unique identifier for the device
+      ecs: host.id
+      status: mapped
+    - vendor: DeviceName
+      type: string
+      description: fully qualified domain name of the reporting device
+      ecs: host.name
+      status: mapped
+    - vendor: ActionType
+      type: string
+      description: >-
+        connection activity that generated the row, e.g. ConnectionSuccess,
+        InboundConnectionAccepted, ListeningConnectionCreated
+      ecs: event.action
+      status: mapped
+      transform: >-
+        copied to event.action and the only signal for connection direction,
+        so it must drive network.direction and the source/destination
+        assignment
+    - vendor: RemoteIP
+      type: string
+      description: IP address that was being connected to
+      ecs: destination.ip
+      status: partial
+      notes: becomes source.ip on inbound ActionTypes; branch on ActionType to decide
+    - vendor: RemotePort
+      type: integer
+      description: TCP/UDP port on the peer used for the communication
+      ecs: destination.port
+      status: partial
+      notes: same ActionType-dependent inversion as RemoteIP
+    - vendor: RemoteUrl
+      type: string
+      description: URL or fully qualified domain name that was being connected to
+      ecs: url.full
+      status: partial
+      notes: >-
+        a single column holding either a full URL or a bare FQDN; the FQDN
+        case belongs in destination.domain, so it needs a shape test
+    - vendor: LocalIP
+      type: string
+      description: source IP, or the IP address where the communication came from
+      ecs: source.ip
+      status: partial
+      notes: >-
+        only the source on outbound ActionTypes; on inbound the local address
+        is the destination
+    - vendor: LocalPort
+      type: integer
+      description: TCP/UDP port on the reporting device used for the communication
+      ecs: source.port
+      status: partial
+      notes: same ActionType-dependent inversion as LocalIP
+    - vendor: Protocol
+      type: string
+      description: transport protocol used for the communication
+      ecs: network.transport
+      status: partial
+      transform: >-
+        vendor casing (Tcp/Udp) is lowercased to satisfy the ECS
+        network.transport convention
+    - vendor: LocalIPType
+      type: string
+      description: >-
+        address class of the local IP - Public, Private, Reserved, Loopback,
+        Teredo, FourToSixMapping, Broadcast
+      ecs: null
+      status: unmapped
+      custom: m365_defender.event.local_ip_type
+      notes: >-
+        no ECS equivalent; used for query-side noise suppression of loopback
+        and link-local rows
+    - vendor: RemoteIPType
+      type: string
+      description: address class of the remote IP, same value set as LocalIPType
+      ecs: null
+      status: unmapped
+      custom: m365_defender.event.remote_ip_type
+      notes: cheap internal-versus-external discriminator used in place of a CIDR lookup
+    - vendor: InitiatingProcessFileName
+      type: string
+      description: name of the process that made or accepted the connection
+      ecs: process.name
+      status: mapped
+      notes: >-
+        on this table the Initiating* columns are the acting process and map
+        to process.*, unlike DeviceProcessEvents where they map to
+        process.parent.*
+    - vendor: InitiatingProcessCommandLine
+      type: string
+      description: command line of the process that made or accepted the connection
+      ecs: process.command_line
+      status: mapped
+    - vendor: InitiatingProcessId
+      type: long
+      description: process id of the process that made or accepted the connection
+      ecs: process.pid
+      status: mapped
+    - vendor: InitiatingProcessFolderPath
+      type: string
+      description: folder containing the image of the connecting process
+      ecs: process.executable
+      status: mapped
+    - vendor: InitiatingProcessSHA1
+      type: string
+      description: SHA-1 of the image of the connecting process
+      ecs: process.hash.sha1
+      status: mapped
+    - vendor: InitiatingProcessSHA256
+      type: string
+      description: SHA-256 of the image of the connecting process
+      ecs: process.hash.sha256
+      status: partial
+      notes: documented as usually not populated - use SHA1
+    - vendor: InitiatingProcessMD5
+      type: string
+      description: MD5 hash of the image of the connecting process
+      ecs: process.hash.md5
+      status: mapped
+    - vendor: InitiatingProcessCreationTime
+      type: timestamp
+      description: UTC time the connecting process was started
+      ecs: process.start
+      status: mapped
+    - vendor: InitiatingProcessUniqueId
+      type: string
+      description: >-
+        unique identifier of the connecting process, equal to its Windows
+        Process Start Key
+      ecs: process.entity_id
+      status: partial
+      notes: the PID-reuse-safe process identity; not populated by the stock integration
+    - vendor: InitiatingProcessParentFileName
+      type: string
+      description: name of the parent of the connecting process
+      ecs: process.parent.name
+      status: mapped
+    - vendor: InitiatingProcessParentId
+      type: long
+      description: process id of the parent of the connecting process
+      ecs: process.parent.pid
+      status: mapped
+    - vendor: InitiatingProcessParentCreationTime
+      type: timestamp
+      description: UTC time the parent of the connecting process was started
+      ecs: process.parent.start
+      status: mapped
+    - vendor: InitiatingProcessAccountName
+      type: string
+      description: user name of the account that ran the connecting process
+      ecs: user.name
+      status: mapped
+    - vendor: InitiatingProcessAccountDomain
+      type: string
+      description: domain of the account that ran the connecting process
+      ecs: user.domain
+      status: mapped
+    - vendor: InitiatingProcessAccountSid
+      type: string
+      description: Windows security identifier of the account that ran the connecting process
+      ecs: user.id
+      status: mapped
+    - vendor: InitiatingProcessAccountUpn
+      type: string
+      description: user principal name of the account that ran the connecting process
+      ecs: null
+      status: unmapped
+      custom: m365_defender.event.account_upn
+      notes: UPN form, distinct from the SID in user.id and the bare name in user.name
+    - vendor: InitiatingProcessAccountObjectId
+      type: string
+      description: Microsoft Entra object id of the account that ran the connecting process
+      ecs: null
+      status: unmapped
+      custom: m365_defender.event.account_object_id
+    - vendor: InitiatingProcessIntegrityLevel
+      type: string
+      description: integrity level of the connecting process
+      ecs: null
+      status: unmapped
+      custom: m365_defender.event.initiating_process_integrity_level
+      notes: a privilege signal the json streaming subset omits
+    - vendor: InitiatingProcessTokenElevation
+      type: string
+      description: UAC token-elevation type applied to the connecting process
+      ecs: null
+      status: unmapped
+      custom: m365_defender.event.initiating_process_token_elevation
+    - vendor: IsInitiatingProcessRemoteSession
+      type: boolean
+      description: whether the connecting process ran under a remote desktop (RDP) session
+      ecs: null
+      status: unmapped
+      custom: m365_defender.event.is_initiating_process_remote_session
+      notes: >-
+        pairs with InitiatingProcessRemoteSessionIP to flag network activity
+        driven from an RDP session
+    - vendor: InitiatingProcessRemoteSessionIP
+      type: string
+      description: >-
+        IP address of the remote device from which the connecting process's
+        RDP session was initiated
+      ecs: null
+      status: unmapped
+      custom: m365_defender.event.initiating_process_remote_session_ip
+      notes: >-
+        the RDP origin of the actor, kept custom rather than source.ip which
+        is this connection's local endpoint
+    - vendor: ReportId
+      type: long
+      description: >-
+        repeating counter that identifies the event, unique only with
+        DeviceName and Timestamp
+      ecs: null
+      status: unmapped
+      custom: m365_defender.event.report_id
+      notes: >-
+        the de-duplication and reconciliation key when combined with
+        DeviceName and Timestamp
+    - vendor: AdditionalFields
+      type: string
+      description: additional per-ActionType properties carried as a JSON string
+      ecs: null
+      status: unmapped
+      custom: m365_defender.event.additional_fields
+      notes: >-
+        carries DNS query, qtype, rcode and answer detail on Linux and macOS
+        sensors - the only route to dns.question.name for this dataset

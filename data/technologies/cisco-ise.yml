@@ -1,0 +1,2447 @@
+id: cisco-ise
+name: Cisco ISE
+vendor: Cisco
+versions: ISE 3.1, 3.2, 3.3, 3.4
+draft: true
+references:
+- >-
+  https://www.cisco.com/c/en/us/td/docs/security/ise/syslog/Cisco_ISE_Syslogs/m_SyslogsList.html
+- >-
+  https://www.cisco.com/c/en/us/support/docs/security/identity-services-engine/222223-configure-external-syslog-server-on-ise.html
+- https://www.elastic.co/docs/reference/integrations/cisco_ise
+- >-
+  https://github.com/elastic/integrations/blob/main/packages/cisco_ise/data_stream/log/fields/fields.yml
+- >-
+  https://github.com/elastic/integrations/blob/main/packages/cisco_ise/data_stream/log/elasticsearch/ingest_pipeline/pipeline_passed_authentications.yml
+- >-
+  https://github.com/elastic/integrations/tree/main/packages/cisco_ise/data_stream/log/_dev/test/pipeline
+datasets:
+- id: passed-authentications
+  name: Passed authentications
+  description: >
+    CISE_Passed_Authentications logging category — successful RADIUS (802.1X,
+    MAB, VPN) and guest/portal authentications, message codes 5200
+    (Authentication succeeded), 5231 (Guest Authentication Passed), 5233
+    (TrustSec data download), and neighbours. Every ISE remote-target message
+    is a positional header — priority, timestamp, hostname, CISE_<category>,
+    message id, total segments, segment number, code, severity — followed by a
+    comma-separated attribute=value payload, so the payload is key/value but
+    the framing is not. Attributes repeat (Step=, NetworkDeviceGroups=,
+    cisco-av-pair=) and a single logical event can be split across several
+    segments that must be reassembled by message id before any field is
+    trustworthy.
+  event_categories:
+  - authentication
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Receives syslog over UDP/514 (TCP where the deployment allows it) from
+        the ISE remote logging targets configured per logging category — the
+        one syslog listener shared by all four datasets in this file. The
+        multi-segment reassembly below MUST happen before the crossing — a
+        guard that reorders or drops a segment leaves an unparseable
+        half-event on the Elastic side. Also raise the ISE syslog collector
+        "maximum length" from the 1024-byte default to 8192, or long
+        authentication messages arrive truncated mid-attribute.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cisco_ise.log
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Receives syslog over UDP/514 (TCP where the deployment allows it) from
+        the ISE remote logging targets configured per logging category — the
+        one syslog listener shared by all four datasets in this file.
+        Reassemble the multi-segment messages by message id before parsing,
+        and raise the ISE syslog collector "maximum length" from the 1024-byte
+        default to 8192, or long authentication messages arrive truncated
+        mid-attribute.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cisco_ise.log
+  formats:
+  - format: syslog-kv
+    parsing:
+      mechanism: elastic-integration
+      artifact: Cisco ISE integration (cisco_ise), data stream logs-cisco_ise.log
+      notes: >
+        The integration's default pipeline groks the positional header, then
+        branches on cisco_ise.log.category.name to a per-category sub-pipeline
+        (pipeline_passed_authentications, pipeline_failed_attempts,
+        pipeline_tacacs_accounting,
+        pipeline_administrative_and_operational_audit, ...). ALL categories
+        land in the single logs-cisco_ise.log data stream, so the four
+        datasets in this file are a logical split (filter on
+        cisco_ise.log.category.name or event.code), not a routing split.
+        Unmapped attributes survive as cisco_ise.log.log_details.*.
+        CISE_RADIUS_Accounting (codes 3000/3001/3002 — start/stop/interim,
+        Acct-Session-Id, Framed-IP-Address, Acct-Input-Octets) rides the same
+        listener and is the obvious fifth dataset for IP-to-user attribution;
+        it is not mapped here yet.
+    fields:
+    - vendor: MessageCode
+      type: integer
+      description: >-
+        Five-digit ISE message code carried positionally in the header (5200 =
+        Authentication succeeded)
+      ecs: event.code
+      status: mapped
+    - vendor: MessageText
+      type: string
+      description: >-
+        Message description following the code, e.g. "Passed-Authentication:
+        Authentication succeeded"
+      ecs: event.action
+      status: partial
+      transform: >
+        the pipeline groks the token before the first colon
+        (Passed-Authentication, Guest, TrustSec-Data-Download) into
+        event.action and keeps the remainder as message; event.outcome is set
+        to success for the whole category rather than from any vendor
+        attribute, so a CSOC rule must not look for an outcome column.
+    - vendor: UserName
+      type: string
+      description: >-
+        Identity presented for authentication — a username for 802.1X/portal,
+        the endpoint MAC for MAB
+      ecs: user.name
+      status: mapped
+    - vendor: User-Name
+      type: string
+      description: Raw RADIUS User-Name attribute as received from the network access device
+      ecs: user.name
+      status: partial
+      notes: >
+        duplicates UserName on most messages; the pipeline prefers UserName
+        and falls back to User-Name, so both must be checked when back-filling
+        identity on older data.
+    - vendor: Device IP Address
+      type: ip
+      description: >-
+        Address of the network access device (switch, WLC, VPN headend) that
+        sent the RADIUS request
+      ecs: client.ip
+      status: mapped
+      notes: >
+        client.* on the RADIUS datasets is wholly the network access device —
+        it is the RADIUS client that sends the Access-Request to ISE — and
+        never the authenticating endpoint, whose MAC lands in source.mac.
+        Vendor attribute name contains spaces — key/value extraction has to
+        split on ", " and the first "=", not on whitespace.
+    - vendor: NAS-IP-Address
+      type: ip
+      description: RADIUS NAS-IP-Address attribute — the NAD address as the NAD reports it
+      ecs: null
+      custom: cisco_ise.log.nas.ip
+      status: partial
+      notes: >
+        usually equals Device IP Address but differs behind NAT or on
+        multi-homed WLCs; kept custom and copied to related.ip rather than
+        overloading source.ip.
+    - vendor: DestinationIPAddress
+      type: ip
+      description: ISE Policy Service Node address that received the RADIUS request
+      ecs: destination.ip
+      status: mapped
+    - vendor: DestinationPort
+      type: port
+      description: RADIUS authentication port on the PSN (1812 or legacy 1645)
+      ecs: destination.port
+      status: mapped
+    - vendor: EndPointMACAddress
+      type: mac
+      description: MAC address of the authenticating endpoint as resolved by ISE
+      ecs: source.mac
+      status: partial
+      transform: >-
+        ISE emits dash-separated upper case (92-09-00-00-00-01); normalize to
+        ECS colon-separated form
+      notes: >
+        the endpoint and the network access device are two different machines,
+        so they get two different ECS entities: client.* is the NAD that
+        speaks RADIUS to ISE (client.ip, client.port) and the endpoint seeking
+        access is the source, which puts its MAC on source.mac. host.* is
+        deliberately not used for the endpoint here — host.hostname already
+        carries the ISE node on the database format of this dataset, and the
+        NAD-name enrichment would fill host.name, so host.* would be no less a
+        chimera than client.* was. The stock cisco_ise integration writes this
+        attribute to client.mac, mixing NAD transport and endpoint identity in
+        one object, so an @custom pipeline moves the value to source.mac and
+        clears client.mac. The catalog's other NAC map maps its endpoint MAC
+        the same way (forescout-counteract nac-event srcMAC).
+    - vendor: Calling-Station-ID
+      type: string
+      description: RADIUS Calling-Station-ID — the endpoint identifier presented by the NAD
+      ecs: null
+      custom: cisco_ise.log.calling_station.id
+      status: partial
+      notes: >
+        normally the endpoint MAC (dash or colon separated depending on NAD
+        vendor) but an IP address for VPN sessions; needs a type-sniffing
+        transform before it can feed source.mac (the MAC branch, the same home
+        as EndPointMACAddress) or source.ip (the VPN branch). Both branches
+        describe the endpoint, so neither may land in client.*, which is the
+        network access device on this dataset.
+    - vendor: AuthenticationMethod
+      type: enum
+      description: How the identity was proven (Lookup, PAP_ASCII, MSCHAPV2, x509_PKI, ...)
+      ecs: null
+      custom: cisco_ise.log.authentication.method
+      status: unmapped
+      notes: >
+        ECS has no authentication-method field; x509_PKI vs PAP_ASCII is
+        exactly the distinction a PIV/CAC-enforcement alert needs, so this
+        custom field is load-bearing for a US government SOC.
+    - vendor: AuthenticationIdentityStore
+      type: string
+      description: >-
+        Identity store that answered the authentication (Internal Users,
+        Internal Endpoints, an AD join point)
+      ecs: null
+      custom: cisco_ise.log.authentication.identity_store
+      status: unmapped
+    - vendor: IdentityGroup
+      type: string
+      description: User or endpoint identity group the authenticated identity resolved to
+      ecs: null
+      custom: cisco_ise.log.identity.group
+      status: unmapped
+      notes: >
+        values are colon-delimited paths ("Endpoint Identity
+        Groups:Profiled:Windows11-Workstation"); ECS group.name is the nearest
+        field but it means a user group, not an endpoint group.
+    - vendor: SelectedAuthorizationProfiles
+      type: string
+      description: Authorization result applied to the session (dACL, VLAN, SGT profile name)
+      ecs: null
+      custom: cisco_ise.log.selected.authorization.profiles
+      status: unmapped
+      notes: >-
+        the actual access granted — the highest-value field in the message and
+        it has no ECS home
+    - vendor: AuthorizationPolicyMatchedRule
+      type: string
+      description: Name of the authorization policy rule that matched
+      ecs: rule.name
+      status: partial
+      notes: >
+        three matched-rule attributes compete for the single rule.name slot
+        (AuthorizationPolicyMatchedRule, IdentityPolicyMatchedRule,
+        AllowedProtocolMatchedRule); the Elastic integration keeps all three
+        custom, so mapping one to rule.name is a local decision that must be
+        documented.
+    - vendor: PostureAssessmentStatus
+      type: enum
+      description: >-
+        Posture compliance result for the endpoint (Compliant, NonCompliant,
+        NotApplicable)
+      ecs: null
+      custom: cisco_ise.log.posture.assessment.status
+      status: unmapped
+      notes: >-
+        ECS has no posture/compliance concept; needed for any "non-compliant
+        endpoint got network access" rule
+    - vendor: NetworkDeviceName
+      type: string
+      description: ISE object name of the network access device the endpoint authenticated through
+      ecs: null
+      custom: cisco_ise.log.network.device.name
+      status: partial
+      notes: >
+        the authentication alerting profile expects host.name and no ISE
+        message fills it: the syslog header hostname is the ISE node, and this
+        value is the NAD, which belongs to the client entity alongside
+        client.ip and client.port rather than to host.*. Enrich it to
+        client.domain and accept that host.name is empty on every ISE
+        authentication event — that gap is real and is better stated than
+        closed by putting a third machine into host.*. The GA ECS 9.4
+        host.target.* fieldset is deliberately NOT used here: on a RADIUS
+        authentication the NAD is the authenticator the endpoint connects
+        through, not a host the identity is acting upon, so host.target.name
+        applies only on the TACACS+ accounting dataset.
+    - vendor: AcsSessionID
+      type: string
+      description: ISE-assigned session identifier, e.g. "cisco-ise-host/435083133/126"
+      ecs: null
+      custom: cisco_ise.log.acs.session.id
+      status: unmapped
+      notes: >
+        ECS 9.4 still has no session-id field, so this and CPMSessionID (the
+        identifier the NAD and pxGrid use) both stay custom even though
+        session stitching across passed-auth, accounting, and CoA events
+        depends on them.
+    - vendor: Protocol
+      type: enum
+      description: AAA protocol carrying the request (Radius or Tacacs)
+      ecs: network.protocol
+      status: mapped
+      transform: lowercased to satisfy the ECS convention (Radius -> radius)
+    - vendor: Step
+      type: string
+      description: >-
+        Numeric policy/protocol flow step code, emitted once per step in the
+        authentication flow
+      ecs: null
+      custom: cisco_ise.log.step
+      status: partial
+      notes: >
+        repeats 5-30 times in one message; a naive key/value parser keeps only
+        the last occurrence. Must be collected into an array, and the step
+        codes need the ISE message catalogue to be readable.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Reassemble multi-segment messages by message id and re-emit one
+          event before anything else touches the payload, and raise the ISE
+          syslog collector maximum length from 1024 to 8192 so long
+          authentication messages are not truncated mid-attribute. Add a
+          NetworkDeviceName-to-site/owner lookup at the collecting worker
+          group (it is cheapest near the source and feeds the host.name
+          enrichment below), and hold this category as the one to sample if
+          volume reduction is ever needed.
+        elastic: >
+          Field extraction stays with the stock cisco_ise integration
+          (pipeline_passed_authentications); add an @custom pipeline that
+          fills client.domain from cisco_ise.log.network.device.name (the NAD
+          is the client entity on this feed, so its name must not land on
+          host.name), gathers the repeated Step= occurrences into an array
+          instead of keeping only the last, type-sniffs Calling-Station-ID
+          into source.mac or source.ip, and moves EndPointMACAddress off the
+          integration's client.mac into source.mac in colon form so client.*
+          stays wholly the network access device and the endpoint identity
+          sits on the host entity. Extend the custom namespace mappings for
+          the decision-grade unmapped attributes (authentication.method,
+          selected.authorization.profiles, posture.assessment.status,
+          identity.group, acs.session.id), pick and document one matched-rule
+          attribute for rule.name, and note in the detection content that
+          event.outcome here is a property of the logging category, not of any
+          vendor attribute.
+        relay: >
+          Low-side instances cross the guard, and that route is hybrid: a thin
+          {_dataId, @timestamp, host, _raw} NDJSON envelope with reassembly
+          already completed low-side, because an at-most-once crossing that
+          drops one segment leaves an unparseable half-event that no high-side
+          pipeline can repair. Use Persistent Queue backpressure on the guard
+          destination, disable compression, and reconcile low-side and
+          high-side counts per (dataset, hour) since there is no return
+          channel. Bound the carried _raw and strip non-ASCII before the
+          crossing — reassembled authentication messages routinely run to
+          several kilobytes and the NDJSON content filter is custom work, so
+          keep the shape it must inspect simple; if this ever moves to
+          parse-low, Step= must be emitted as an array rather than duplicate
+          JSON keys.
+      direct:
+        parse_location: high
+        cribl: >
+          Reassemble multi-segment messages by message id and re-emit one
+          event before anything else touches the payload, and raise the ISE
+          syslog collector maximum length from 1024 to 8192 so long
+          authentication messages are not truncated mid-attribute. Add a
+          NetworkDeviceName-to-site/owner lookup at the collecting worker
+          group (it is cheapest near the source and feeds the host.name
+          enrichment below), and hold this category as the one to sample if
+          volume reduction is ever needed.
+        elastic: >
+          Field extraction stays with the stock cisco_ise integration
+          (pipeline_passed_authentications); add an @custom pipeline that
+          fills client.domain from cisco_ise.log.network.device.name (the NAD
+          is the client entity on this feed, so its name must not land on
+          host.name), gathers the repeated Step= occurrences into an array
+          instead of keeping only the last, type-sniffs Calling-Station-ID
+          into source.mac or source.ip, and moves EndPointMACAddress off the
+          integration's client.mac into source.mac in colon form so client.*
+          stays wholly the network access device and the endpoint identity
+          sits on the host entity. Extend the custom namespace mappings for
+          the decision-grade unmapped attributes (authentication.method,
+          selected.authorization.profiles, posture.assessment.status,
+          identity.group, acs.session.id), pick and document one matched-rule
+          attribute for rule.name, and note in the detection content that
+          event.outcome here is a property of the logging category, not of any
+          vendor attribute.
+  - format: jdbc-sql
+    enable: >
+      Enable ISE Data Connect from Administration > System > Settings > Data
+      Connect: toggle it ON and set the dataconnect account password (it
+      expires on a configurable interval and must be rotated before it lapses
+      or the pull stops). ISE opens a TLS-only Oracle listener on TCP/2484 on
+      the primary MnT node (and the secondary MnT if deployed); a collector
+      connects as user "dataconnect" with the ISE-presented server certificate
+      trusted, then SELECTs from the read-only views. Passed authentications
+      come from the per-record view RADIUS_AUTHENTICATIONS filtered on PASSED
+      = 1 (the view also carries failed rows, split out on the failed-attempts
+      dataset). Poll on a durable high-water mark - the monotonic ID column or
+      TIMESTAMP / TIMESTAMP_TIMEZONE - so a restart neither gaps nor re-reads,
+      since the collector, not ISE, owns the read cursor. A lighter
+      alternative for spot lookups on this dataset is the Monitoring REST API
+      AuthStatus call
+      (/admin/API/mnt/AuthStatus/MACAddress/<mac>/<seconds>/<count>/All
+      returning <passed>, <authentication_method>, <user_name>,
+      <acs_timestamp>, <message_code>, <execution_steps>, <identity_store>,
+      <audit_session_id> as XML), but it is a per-endpoint troubleshooting
+      query and does not replace the Data Connect bulk view.
+    references:
+    - https://developer.cisco.com/docs/dataconnect/guides/
+    - https://developer.cisco.com/docs/dataconnect/database-views/
+    - >-
+      https://www.cisco.com/c/en/us/td/docs/security/ise/3-3/admin_guide/b_ise_admin_3_3/b_ISE_admin_33_maintain_monitor.html
+    - >-
+      https://developer.cisco.com/docs/identity-services-engine/latest/using-api-calls-for-troubleshooting/
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        custom Cribl Database Collector + SQL-row-to-cisco_ise.log pipeline
+        (no stock cisco_ise JDBC input)
+      notes: >
+        The stock Elastic cisco_ise integration ingests only the syslog form;
+        it has no JDBC/SQL input and no ingest pipeline keyed to Data Connect
+        column names, so a hand-built Cribl Database Collector must SELECT the
+        view and a pipeline must rename the upper-case columns into the
+        cisco_ise.log.* namespace and ECS. The rows are already structured (no
+        positional-header grok, no comma key/value split, no multi-segment
+        reassembly), which is the whole appeal, but the view is materially
+        thinner than the syslog payload: there is no Step array beyond
+        EXECUTION_STEPS, no repeated cisco-av-pair, no NetworkDeviceGroups
+        path list, and CALLING_STATION_ID is the only endpoint identifier (the
+        view has no separate EndPointMACAddress column), so MAC normalization
+        must run off CALLING_STATION_ID here.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          The Database Collector has to live low-side because it needs JDBC
+          reach to the low-side MnT node on 2484, so run the SELECT and the
+          column-to-cisco_ise.log rename at the low-side worker group and
+          cross a shaped record rather than a raw row. Set the poll watermark
+          on ID (or TIMESTAMP_TIMEZONE, which carries the offset) and persist
+          it durably; add the NetworkDeviceName/DEVICE_NAME-to- site/owner
+          lookup here exactly as on the syslog feed. Because the MnT store
+          already reassembled every multi-segment message, the 8192-byte
+          collector-length and message-id reassembly cautions that dominate
+          the syslog path simply do not apply to this feed - that is the
+          strongest operational argument for it on the low side.
+        elastic: >
+          Point a logs-cisco_ise.log@custom ingest pipeline at the Data
+          Connect column names since none of the stock RADIUS grok fires on
+          these rows: copy SYSLOG_MESSAGE_CODE to event.code, map PASSED to
+          event.outcome (this view carries an explicit outcome column, so
+          outcome is a real field here rather than a property of the routing
+          category as on syslog), fold AUTHORIZATION_RULE into rule.name,
+          type-sniff CALLING_STATION_ID into source.mac or source.ip (the
+          endpoint entity - client.* here is the NAD from NAS_IP_ADDRESS), and
+          lift the decision-grade columns AUTHENTICATION_METHOD,
+          AUTHORIZATION_PROFILES, POSTURE_STATUS, IDENTITY_GROUP and
+          SECURITY_GROUP into the custom namespace. Fill host.name from
+          DEVICE_NAME if the NAD enrichment is adopted, and convert
+          RESPONSE_TIME (milliseconds) to event.duration nanoseconds.
+        relay: >
+          This crossing is a pull re-emitted as NDJSON, not a syslog stream,
+          so the low-side shape is one already-structured JSON row per event -
+          friendlier to an allowlisted-key content filter than reassembled
+          multi-kilobyte syslog. The free-text exposure is small on passed
+          authentications (no OpenSSL/EAP error text on this side of the
+          outcome split), so cap AUTHORIZATION_PROFILES and the
+          ATTRIBUTES-style columns and cross a thin {_dataId, @timestamp,
+          host, _raw} envelope. There is no return channel and no per-message
+          ack, so reconcile low-side and high-side by the contiguous ID range
+          pulled per (dataset, hour) - the monotonic ID makes gap detection
+          exact, which the syslog feed cannot offer. Keep the dataconnect
+          password rotation on a calendar because a lapsed credential silently
+          stops the feed with no crossing error.
+      direct:
+        parse_location: low
+        cribl: >
+          For a high-side ISE whose MnT node and Elastic stack sit on the same
+          side, run the Database Collector and the full column-to-ECS shaping
+          in one low pass with no crossing discipline. The decision that
+          matters is whether to adopt Data Connect at all over the syslog
+          feed: it wins where multi-segment reassembly and 1024-byte
+          truncation are hurting the syslog path, and loses where the
+          syslog-only attributes (the repeated Step array, cisco-av- pair) are
+          needed, so run it alongside syslog only if the reassembly pain
+          outweighs the attribute loss.
+        elastic: >
+          Point a logs-cisco_ise.log@custom ingest pipeline at the Data
+          Connect column names since none of the stock RADIUS grok fires on
+          these rows: copy SYSLOG_MESSAGE_CODE to event.code, map PASSED to
+          event.outcome (this view carries an explicit outcome column, so
+          outcome is a real field here rather than a property of the routing
+          category as on syslog), fold AUTHORIZATION_RULE into rule.name,
+          type-sniff CALLING_STATION_ID into source.mac or source.ip (the
+          endpoint entity - client.* here is the NAD from NAS_IP_ADDRESS), and
+          lift AUTHENTICATION_METHOD, AUTHORIZATION_PROFILES, POSTURE_STATUS,
+          IDENTITY_GROUP and SECURITY_GROUP into the custom namespace. Fill
+          host.name from DEVICE_NAME if the NAD enrichment is adopted, and
+          convert RESPONSE_TIME (milliseconds) to event.duration nanoseconds.
+          Because Data Connect and syslog can both be indexed for the same
+          events, set a distinguishing event.provider (or observer input tag)
+          so the leaner Data Connect rows are separable from the richer syslog
+          rows in the shared data stream, and standardize event.duration on
+          nanoseconds so response-time analytics line up across the two feeds.
+    fields:
+    - vendor: TIMESTAMP
+      type: date
+      description: Event time as stored in the MnT database
+      ecs: '@timestamp'
+      status: partial
+      notes: prefer TIMESTAMP_TIMEZONE, which carries the UTC offset the bare TIMESTAMP omits
+    - vendor: TIMESTAMP_TIMEZONE
+      type: string
+      description: 'Event time with the ISE node''s timezone offset'
+      ecs: '@timestamp'
+      status: partial
+      notes: >-
+        the offset-bearing form; use it to set @timestamp rather than the
+        naive TIMESTAMP column
+    - vendor: ID
+      type: string
+      description: Data Connect surrogate row identifier, monotonic per view
+      ecs: null
+      custom: cisco_ise.log.record.id
+      status: unmapped
+      notes: >-
+        the pull watermark and the count-reconciliation key; a database row
+        id, not the syslog message id
+    - vendor: ISE_NODE
+      type: string
+      description: Hostname of the ISE PSN/MnT node that recorded the authentication
+      ecs: host.hostname
+      status: mapped
+    - vendor: SYSLOG_MESSAGE_CODE
+      type: integer
+      description: >-
+        Five-digit ISE message code, identical to the syslog header code (5200
+        Authentication succeeded)
+      ecs: event.code
+      status: mapped
+    - vendor: USERNAME
+      type: string
+      description: Identity that authenticated - username for 802.1X/portal, endpoint MAC for MAB
+      ecs: user.name
+      status: mapped
+    - vendor: USER_TYPE
+      type: string
+      description: ISE classification of the identity (User, Endpoint)
+      ecs: null
+      custom: cisco_ise.log.user.type
+      status: unmapped
+    - vendor: CALLING_STATION_ID
+      type: string
+      description: >-
+        Endpoint identifier presented by the NAD, normally the MAC but an IP
+        for VPN sessions
+      ecs: null
+      custom: cisco_ise.log.calling_station.id
+      status: partial
+      notes: >
+        the only endpoint identifier this view carries (there is no
+        EndPointMACAddress column), so the MAC-or-IP type sniff that feeds
+        source.mac/source.ip must run off this column; both branches describe
+        the endpoint and neither may land in client.*, which is the NAD on
+        this dataset
+    - vendor: ORIG_CALLING_STATION_ID
+      type: string
+      description: Calling-Station-ID as originally received before ISE normalization
+      ecs: null
+      custom: cisco_ise.log.orig_calling_station.id
+      status: unmapped
+    - vendor: FRAMED_IP_ADDRESS
+      type: ip
+      description: IP address assigned to the authenticating endpoint
+      ecs: null
+      custom: cisco_ise.log.framed.ip
+      status: partial
+      notes: >-
+        the endpoint's own address, not the NAD's; copy to related.ip rather
+        than overloading source.ip, which VPN Calling-Station-ID may also
+        claim
+    - vendor: NAS_IP_ADDRESS
+      type: ip
+      description: >-
+        Address of the network access device (switch, WLC, VPN headend) that
+        relayed the request
+      ecs: client.ip
+      status: mapped
+      notes: >
+        this view collapses the syslog feed's separate Device IP Address and
+        NAS-IP-Address into one NAS_IP_ADDRESS column; it is the NAD address
+        and maps to client.ip as on the syslog path, where client.* describes
+        the network access device wholly and the authenticating endpoint sits
+        on the host entity
+    - vendor: NAS_PORT_ID
+      type: string
+      description: Physical/logical NAD port the endpoint connected on (GigabitEthernet1/0/5, etc.)
+      ecs: null
+      custom: cisco_ise.log.nas.port_id
+      status: unmapped
+    - vendor: NAS_PORT_TYPE
+      type: string
+      description: RADIUS NAS-Port-Type (Ethernet, Wireless-802.11, Virtual)
+      ecs: null
+      custom: cisco_ise.log.nas.port_type
+      status: unmapped
+    - vendor: NAS_IPV6_ADDRESS
+      type: ip
+      description: IPv6 address of the NAD where the NAD is dual-stacked
+      ecs: null
+      custom: cisco_ise.log.nas.ipv6
+      status: unmapped
+    - vendor: FRAMED_IPV6_ADDRESS
+      type: ip
+      description: IPv6 address assigned to the endpoint
+      ecs: null
+      custom: cisco_ise.log.framed.ipv6
+      status: unmapped
+    - vendor: IDENTITY_STORE
+      type: string
+      description: >-
+        Identity store that answered the authentication (Internal Users, an AD
+        join point)
+      ecs: null
+      custom: cisco_ise.log.authentication.identity_store
+      status: unmapped
+    - vendor: IDENTITY_GROUP
+      type: string
+      description: User or endpoint identity group the identity resolved to
+      ecs: null
+      custom: cisco_ise.log.identity.group
+      status: unmapped
+      notes: >-
+        colon-delimited path values; ECS group.name means a user group, not an
+        endpoint group, so this is kept custom
+    - vendor: AUDIT_SESSION_ID
+      type: string
+      description: Session identifier the NAD and pxGrid share (the CPMSessionID)
+      ecs: null
+      custom: cisco_ise.log.audit_session.id
+      status: partial
+      notes: >-
+        the cross-event stitching key to accounting and CoA records; ECS 9.4
+        still has no session-id field, so it stays custom
+    - vendor: AUTHENTICATION_METHOD
+      type: string
+      description: How the identity was proven (PAP_ASCII, MSCHAPV2, x509_PKI, Lookup)
+      ecs: null
+      custom: cisco_ise.log.authentication.method
+      status: unmapped
+      notes: >-
+        x509_PKI vs PAP_ASCII is exactly the PIV/CAC-enforcement distinction a
+        government SOC alerts on; ECS has no authentication-method field
+    - vendor: AUTHENTICATION_PROTOCOL
+      type: string
+      description: EAP/inner protocol carrying the credential (EAP-TLS, PEAP, PAP)
+      ecs: null
+      custom: cisco_ise.log.authentication.protocol
+      status: unmapped
+      notes: a protocol NAME, not radius/tacacs; never fold into network.protocol
+    - vendor: SERVICE_TYPE
+      type: string
+      description: RADIUS Service-Type of the request (Framed, Call-Check for MAB, Login)
+      ecs: null
+      custom: cisco_ise.log.service_type
+      status: unmapped
+    - vendor: ACCESS_SERVICE
+      type: string
+      description: Allowed-protocols/access service the request was matched against
+      ecs: null
+      custom: cisco_ise.log.access_service
+      status: unmapped
+    - vendor: DEVICE_NAME
+      type: string
+      description: ISE object name of the NAD the endpoint authenticated through
+      ecs: null
+      custom: cisco_ise.log.network.device.name
+      status: partial
+      notes: >
+        the same host.name gap as the syslog feed - nothing in the record
+        fills host.name (ISE_NODE becomes host.hostname), so either enrich
+        host.name from this value or accept host.name empty; on a RADIUS
+        authentication the NAD is the authenticator, not a host.target
+    - vendor: DEVICE_TYPE
+      type: string
+      description: Device-Type NDG path of the NAD
+      ecs: null
+      custom: cisco_ise.log.network.device.type
+      status: unmapped
+    - vendor: LOCATION
+      type: string
+      description: Location NDG path of the NAD
+      ecs: null
+      custom: cisco_ise.log.network.device.location
+      status: unmapped
+    - vendor: AUTHORIZATION_PROFILES
+      type: string
+      description: Authorization result applied to the session (dACL, VLAN, SGT profile name)
+      ecs: null
+      custom: cisco_ise.log.selected.authorization.profiles
+      status: unmapped
+      notes: >-
+        the actual access granted - the highest-value field in the record and
+        it has no ECS home
+    - vendor: AUTHORIZATION_RULE
+      type: string
+      description: Name of the authorization policy rule that matched
+      ecs: rule.name
+      status: partial
+      notes: >
+        the view exposes only the authorization rule here (POLICY_SET_NAME is
+        separate), so unlike the syslog feed's three competing matched- rule
+        attributes there is one clean candidate for rule.name
+    - vendor: POLICY_SET_NAME
+      type: string
+      description: Policy set that evaluated the request
+      ecs: null
+      custom: cisco_ise.log.policy_set.name
+      status: unmapped
+    - vendor: POSTURE_STATUS
+      type: string
+      description: >-
+        Posture compliance result for the endpoint (Compliant, NonCompliant,
+        NotApplicable)
+      ecs: null
+      custom: cisco_ise.log.posture.assessment.status
+      status: unmapped
+      notes: >-
+        needed for any "non-compliant endpoint got network access" rule; ECS
+        has no posture concept
+    - vendor: SECURITY_GROUP
+      type: string
+      description: TrustSec Security Group (SGT) assigned to the session
+      ecs: null
+      custom: cisco_ise.log.security_group
+      status: unmapped
+    - vendor: ENDPOINT_PROFILE
+      type: string
+      description: ISE-profiled device type of the endpoint (Windows11-Workstation, Apple-Device)
+      ecs: null
+      custom: cisco_ise.log.endpoint.profile
+      status: unmapped
+    - vendor: MDM_SERVER_NAME
+      type: string
+      description: MDM server that vouched for the endpoint, where MDM integration is in use
+      ecs: null
+      custom: cisco_ise.log.mdm.server.name
+      status: unmapped
+    - vendor: CREDENTIAL_CHECK
+      type: string
+      description: Credential-validation method result recorded for the authentication
+      ecs: null
+      custom: cisco_ise.log.credential_check
+      status: unmapped
+    - vendor: FAILURE_REASON
+      type: string
+      description: Failure code and text; empty on passed rows
+      ecs: event.reason
+      status: partial
+      notes: populated only on FAILED rows (see the failed-attempts dataset); null here
+    - vendor: RESPONSE_TIME
+      type: integer
+      description: Milliseconds ISE took to process the authentication
+      ecs: event.duration
+      status: partial
+      transform: >-
+        ISE reports milliseconds; multiply by 1,000,000 for the ECS
+        event.duration nanosecond convention
+    - vendor: PASSED
+      type: boolean
+      description: Flag set when the authentication succeeded
+      ecs: event.outcome
+      status: partial
+      transform: >
+        PASSED = 1 folds to event.outcome success; unlike the syslog
+        CISE_Passed_Authentications category, where outcome is a property of
+        the routing category, this view carries an explicit per-record outcome
+        column (PASSED and its FAILED counterpart)
+    - vendor: FAILED
+      type: boolean
+      description: >-
+        Flag set when the authentication failed; the passed-authentications
+        pull filters PASSED = 1 so this is 0 here
+      ecs: null
+      custom: cisco_ise.log.failed_flag
+      status: unmapped
+    - vendor: EXECUTION_STEPS
+      type: string
+      description: Ordered policy/protocol step codes for the authentication flow
+      ecs: null
+      custom: cisco_ise.log.step
+      status: partial
+      notes: >-
+        the Data Connect equivalent of the repeated syslog Step= attribute,
+        delivered as one column; the step codes still need the ISE message
+        catalogue to be readable
+    - vendor: CHECKSUM
+      type: string
+      description: Row hash ISE uses for de-duplication
+      ecs: null
+      custom: cisco_ise.log.checksum
+      status: unmapped
+- id: failed-attempts
+  name: Failed attempts
+  description: >
+    CISE_Failed_Attempts logging category — rejected and dropped AAA requests:
+    5400 (Authentication failed), 5405 (RADIUS Request dropped), 5411
+    (Supplicant stopped responding), 5418 (Guest Authentication Failed), plus
+    the EAP/TLS handshake failures. Shares the passed-authentication attribute
+    vocabulary and adds the failure diagnostics; this is the brute-force,
+    rogue-endpoint, and certificate-failure dataset.
+  event_categories:
+  - authentication
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same listener as the passed-authentication dataset. Failure messages
+        carry the largest free-text payloads on this source
+        (OpenSSLErrorMessage, OpenSSLErrorStack, DetailedInfo) and are what a
+        content inspection allow-list will actually have to constrain on the
+        crossing.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cisco_ise.log
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Same listener as the passed-authentication dataset. Failure messages
+        carry the largest free-text payloads on this source
+        (OpenSSLErrorMessage, OpenSSLErrorStack, DetailedInfo), the fields the
+        parsing pipeline drops or truncates unless certificate troubleshooting
+        needs them.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cisco_ise.log
+  formats:
+  - format: syslog-kv
+    parsing:
+      mechanism: elastic-integration
+      artifact: Cisco ISE integration (cisco_ise), data stream logs-cisco_ise.log
+      notes: >
+        Handled by pipeline_failed_attempts, selected on
+        cisco_ise.log.category.name == 'CISE_Failed_Attempts'. The pipeline
+        sets event.outcome: failure for the whole category, so outcome is a
+        property of the routing category rather than of any attribute in the
+        payload.
+    fields:
+    - vendor: MessageCode
+      type: integer
+      description: >-
+        Five-digit message code identifying the failure class (5400, 5405,
+        5411, 5418, ...)
+      ecs: event.code
+      status: mapped
+    - vendor: MessageText
+      type: string
+      description: 'Message description, e.g. "Failed-Attempt: RADIUS Request dropped"'
+      ecs: event.action
+      status: partial
+      transform: >-
+        token before the first colon becomes event.action; event.outcome is
+        forced to failure for the whole category
+    - vendor: FailureReason
+      type: string
+      description: >-
+        Numeric failure code plus its text, e.g. "11036 The
+        Message-Authenticator RADIUS attribute is invalid"
+      ecs: event.reason
+      status: partial
+      transform: >
+        split the leading numeric code from the sentence — alerting wants to
+        pivot on the code (22056 unknown subject, 12309 PEAP handshake failed,
+        24408 wrong password) and dashboards want the text; the Elastic
+        integration keeps the whole string in cisco_ise.log.failure.reason.
+    - vendor: UserName
+      type: string
+      description: >-
+        Identity that failed to authenticate (may be the literal "INVALID" on
+        portal failures)
+      ecs: user.name
+      status: mapped
+    - vendor: EndPointMACAddress
+      type: mac
+      description: MAC of the endpoint whose authentication failed
+      ecs: source.mac
+      status: partial
+      transform: dash-separated upper case in the payload; normalize to ECS colon form
+      notes: >
+        the endpoint and the network access device are two different machines,
+        so they get two different ECS entities: client.* is the NAD that
+        speaks RADIUS to ISE (client.ip, client.port) and the endpoint seeking
+        access is the source, which puts its MAC on source.mac. host.* is
+        deliberately not used for the endpoint here — host.hostname already
+        carries the ISE node on the database format of this dataset, and the
+        NAD-name enrichment would fill host.name, so host.* would be no less a
+        chimera than client.* was. The stock cisco_ise integration writes this
+        attribute to client.mac, mixing NAD transport and endpoint identity in
+        one object, so an @custom pipeline moves the value to source.mac and
+        clears client.mac. The catalog's other NAC map maps its endpoint MAC
+        the same way (forescout-counteract nac-event srcMAC).
+    - vendor: Calling-Station-ID
+      type: string
+      description: >-
+        Endpoint identifier as presented by the NAD, MAC or IP depending on
+        access method
+      ecs: null
+      custom: cisco_ise.log.calling_station.id
+      status: partial
+      notes: >
+        same MAC-or-IP ambiguity as on the passed-authentication dataset; the
+        type sniff feeds source.mac or source.ip, both endpoint fields, never
+        client.*, which is the NAD here
+    - vendor: Device IP Address
+      type: ip
+      description: Address of the network access device that relayed the failed request
+      ecs: client.ip
+      status: mapped
+      notes: >
+        client.* on the RADIUS datasets is wholly the network access device —
+        the RADIUS client that sent the Access-Request to ISE — and never the
+        endpoint whose authentication failed, whose MAC lands in source.mac
+    - vendor: Device Port
+      type: port
+      description: Source UDP port the NAD used for the RADIUS request
+      ecs: client.port
+      status: mapped
+      notes: >
+        the NAD's RADIUS source port, so it pairs with client.ip on the
+        network access device and not with the endpoint identity in source.mac
+    - vendor: DestinationIPAddress
+      type: ip
+      description: ISE PSN that rejected or dropped the request
+      ecs: destination.ip
+      status: mapped
+    - vendor: NAS-IP-Address
+      type: ip
+      description: NAS-IP-Address attribute from the RADIUS request
+      ecs: null
+      custom: cisco_ise.log.nas.ip
+      status: partial
+      notes: kept custom and copied to related.ip; see the passed-authentication dataset
+    - vendor: AuthenticationMethod
+      type: enum
+      description: Method attempted (PAP_ASCII, MSCHAPV2, x509_PKI, Lookup, ...)
+      ecs: null
+      custom: cisco_ise.log.authentication.method
+      status: unmapped
+    - vendor: EapTunnel
+      type: enum
+      description: Outer EAP tunnel type negotiated (PEAP, EAP-FAST, TEAP)
+      ecs: null
+      custom: cisco_ise.log.eap.tunnel
+      status: unmapped
+    - vendor: EapAuthentication
+      type: enum
+      description: Inner EAP method used for the identity check (EAP-TLS, EAP-MSCHAPv2, ...)
+      ecs: null
+      custom: cisco_ise.log.eap.authentication
+      status: unmapped
+    - vendor: OpenSSLErrorMessage
+      type: string
+      description: Raw OpenSSL error text when the TLS/EAP-TLS handshake is what failed
+      ecs: null
+      custom: cisco_ise.log.openssl.error.message
+      status: unmapped
+      notes: >
+        multi-line free text containing embedded commas, colons, and quotes —
+        the single worst field for comma-split key/value parsers and for guard
+        content inspection; drop it at Cribl unless certificate
+        troubleshooting needs it.
+    - vendor: DetailedInfo
+      type: string
+      description: Supplementary explanation of the failure aimed at an operator
+      ecs: null
+      custom: cisco_ise.log.detailed_info
+      status: unmapped
+    - vendor: TotalFailedAttempts
+      type: integer
+      description: >-
+        Running count of consecutive failures ISE has recorded for this
+        identity/endpoint
+      ecs: null
+      custom: cisco_ise.log.total.failed_attempts
+      status: unmapped
+      notes: >-
+        lets a brute-force rule fire on a vendor-computed counter instead of a
+        windowed count; no ECS equivalent
+    - vendor: NetworkDeviceName
+      type: string
+      description: ISE object name of the NAD the failed attempt came through
+      ecs: null
+      custom: cisco_ise.log.network.device.name
+      status: partial
+      notes: same host.name gap as the passed-authentication dataset
+    - vendor: Protocol
+      type: enum
+      description: AAA protocol of the failed request (Radius or Tacacs)
+      ecs: network.protocol
+      status: mapped
+      transform: lowercased
+    - vendor: AcsSessionID
+      type: string
+      description: >-
+        ISE session identifier for correlating the failure with diagnostics
+        and accounting records
+      ecs: null
+      custom: cisco_ise.log.acs.session.id
+      status: unmapped
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Drop OpenSSLErrorMessage and OpenSSLErrorStack and truncate
+          DetailedInfo in the low-side pipeline unless certificate
+          troubleshooting is actively running — multi-line free text with
+          embedded commas, colons, and quotes is the worst input both for
+          downstream key/value extraction and for any content inspection. The
+          same multi-segment reassembly and 8192-byte collector length as the
+          passed-authentication dataset apply here, and this category must be
+          excluded from volume-reduction sampling because failure bursts are
+          the signal.
+        elastic: >
+          pipeline_failed_attempts sets event.outcome: failure for the whole
+          category; add an @custom pipeline that splits FailureReason into a
+          numeric code and its sentence so alerting pivots on the code (22056,
+          12309, 24408) while dashboards keep the text, fills client.domain
+          from cisco_ise.log.network.device.name (the NAD is the client entity
+          here, so its name must not land on host.name), and copies
+          NAS-IP-Address into related.ip. Add custom-namespace mappings for
+          eap.tunnel, eap.authentication, authentication.method and
+          total.failed_attempts so brute-force and PIV/CAC-enforcement rules
+          can key on the vendor-computed counter and the method rather than a
+          windowed count.
+        relay: >
+          This is the dataset that decides the guard content filter: on the
+          low-side crossing the allow-list has to cope with the largest
+          free-text payloads on the feed, so drop the OpenSSL fields and cap
+          DetailedInfo low-side before the crossing rather than asking a
+          custom NDJSON filter to reason about them. Cross as a thin {_dataId,
+          @timestamp, host, _raw} NDJSON envelope with reassembly done
+          low-side, Persistent Queue backpressure on the guard destination,
+          and per-(dataset, hour) count reconciliation as the only drop
+          detection.
+      direct:
+        parse_location: high
+        cribl: >
+          Drop OpenSSLErrorMessage and OpenSSLErrorStack and truncate
+          DetailedInfo in the collecting pipeline unless certificate
+          troubleshooting is actively running — multi-line free text with
+          embedded commas, colons, and quotes is the worst input for
+          downstream key/value extraction. The same multi-segment reassembly
+          and 8192-byte collector length as the passed-authentication dataset
+          apply here, and this category must be excluded from volume-reduction
+          sampling because failure bursts are the signal.
+        elastic: >
+          pipeline_failed_attempts sets event.outcome: failure for the whole
+          category; add an @custom pipeline that splits FailureReason into a
+          numeric code and its sentence so alerting pivots on the code (22056,
+          12309, 24408) while dashboards keep the text, fills client.domain
+          from cisco_ise.log.network.device.name (the NAD is the client entity
+          here, so its name must not land on host.name), and copies
+          NAS-IP-Address into related.ip. Add custom-namespace mappings for
+          eap.tunnel, eap.authentication, authentication.method and
+          total.failed_attempts so brute-force and PIV/CAC-enforcement rules
+          can key on the vendor-computed counter and the method rather than a
+          windowed count.
+  - format: jdbc-sql
+    enable: >
+      Same Data Connect connection as the passed-authentications dataset
+      (Administration > System > Settings > Data Connect, dataconnect user,
+      TLS TCP/2484 to the MnT node). Failed attempts are the SAME
+      RADIUS_AUTHENTICATIONS view filtered on FAILED = 1; the column set is
+      identical to the passed-authentications entry, so only the failure-
+      bearing and identity columns are detailed below and the shared
+      identity/NAD columns (ISE_NODE, USERNAME, CALLING_STATION_ID,
+      NAS_IP_ADDRESS, DEVICE_NAME, IDENTITY_STORE, AUDIT_SESSION_ID, and the
+      rest) carry over unchanged from that dataset. The Monitoring REST API
+      AuthStatus call also returns failed rows (<failed>, <failure_reason>,
+      <authentication_method>) for a given MAC/user and is the lighter spot-
+      check surface, but the same one-format-per-dataset collision applies, so
+      Data Connect is the documented alternate.
+    references:
+    - https://developer.cisco.com/docs/dataconnect/database-views/
+    - https://developer.cisco.com/docs/dataconnect/guides/
+    - >-
+      https://www.cisco.com/c/en/us/td/docs/security/ise/3-3/admin_guide/b_ise_admin_3_3/b_ISE_admin_33_maintain_monitor.html
+    - >-
+      https://developer.cisco.com/docs/identity-services-engine/latest/using-api-calls-for-troubleshooting/
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        custom Cribl Database Collector + SQL-row-to-cisco_ise.log pipeline
+        (no stock cisco_ise JDBC input)
+      notes: >
+        The single most important honesty on this dataset: Data Connect's
+        RADIUS_AUTHENTICATIONS view is markedly LOSSIER than the syslog
+        CISE_Failed_Attempts payload for failure diagnostics. The view carries
+        FAILURE_REASON (code + text), AUTHENTICATION_METHOD,
+        AUTHENTICATION_PROTOCOL and CREDENTIAL_CHECK, but it has NO
+        OpenSSLErrorMessage/Stack, NO EapTunnel/EapAuthentication columns, NO
+        DetailedInfo, and NO TotalFailedAttempts counter - so brute-force
+        rules that key on the vendor-computed counter and certificate- failure
+        triage on the OpenSSL text cannot be built from this feed and must
+        stay on syslog. What the feed buys in return is that the worst
+        free-text fields the syslog crossing has to constrain are simply
+        absent, which makes it the cleaner feed to cross a guard.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Run the Database Collector low-side against the MnT node, SELECT
+          RADIUS_AUTHENTICATIONS WHERE FAILED = 1 on an ID watermark, and
+          shape columns to cisco_ise.log at the edge. Because the OpenSSL and
+          DetailedInfo free-text the syslog feed truncates here does not exist
+          in the view, none of the syslog low-side field-dropping is needed -
+          but exclude this pull from any volume sampling, since failure bursts
+          are the signal, and reconcile by ID range because a dropped
+          brute-force window is exactly what this dataset exists to catch.
+        elastic: >
+          A logs-cisco_ise.log@custom pipeline must split FAILURE_REASON into
+          its leading numeric code and sentence so alerting pivots on the code
+          (22056 unknown subject, 12309 PEAP handshake failed, 24408 wrong
+          password) while dashboards keep the text, map FAILED to
+          event.outcome failure, copy NAS_IP_ADDRESS into related.ip, and lift
+          AUTHENTICATION_METHOD and AUTHENTICATION_PROTOCOL into the custom
+          namespace for PIV/CAC-enforcement rules. Note in the detection
+          content that this feed cannot supply
+          cisco_ise.log.total.failed_attempts, so any brute-force rule built
+          on Data Connect must fall back to a windowed count.
+        relay: >
+          This is the cleanest ISE dataset to cross precisely because the
+          lossy view has already discarded the OpenSSL/DetailedInfo free text
+          that makes the syslog failed-attempts crossing hard - the content
+          filter sees a compact structured row of enum-ish columns plus one
+          FAILURE_REASON string to cap. Cross a thin {_dataId, @timestamp,
+          host, _raw} NDJSON envelope with the FAILED filter applied low-side,
+          Persistent Queue backpressure on the guard destination, compression
+          disabled, and per-(dataset, hour) ID-range reconciliation as the
+          only drop detection, which is exact here because ID is monotonic.
+      direct:
+        parse_location: low
+        cribl: >
+          Same-side deployments run the SELECT and full ECS shaping in one low
+          pass. The adoption call is sharper on this dataset than on passed
+          authentications: the missing EapTunnel, OpenSSL and
+          TotalFailedAttempts columns mean certificate-failure triage and
+          counter-based brute-force detection must remain on the syslog feed,
+          so Data Connect is a supplement for reassembly-clean failure
+          analytics, not a replacement for the diagnostic-rich syslog path.
+        elastic: >
+          A logs-cisco_ise.log@custom pipeline must split FAILURE_REASON into
+          its leading numeric code and sentence so alerting pivots on the code
+          (22056 unknown subject, 12309 PEAP handshake failed, 24408 wrong
+          password) while dashboards keep the text, map FAILED to
+          event.outcome failure, copy NAS_IP_ADDRESS into related.ip, and lift
+          AUTHENTICATION_METHOD and AUTHENTICATION_PROTOCOL into the custom
+          namespace for PIV/CAC-enforcement rules. Tag event.provider so these
+          leaner failure rows are separable from syslog CISE_Failed_Attempts
+          events in the shared data stream, and document that this feed cannot
+          supply cisco_ise.log.total.failed_attempts and that the
+          certificate/EAP failure detail lives only on the syslog feed, so any
+          brute-force rule falls back to a windowed count and analysts pivot
+          to syslog for handshake triage.
+    fields:
+    - vendor: SYSLOG_MESSAGE_CODE
+      type: integer
+      description: >-
+        Message code of the failure class (5400 Authentication failed, 5405
+        RADIUS Request dropped, 5411, 5418)
+      ecs: event.code
+      status: mapped
+    - vendor: FAILED
+      type: boolean
+      description: Flag set when the authentication failed
+      ecs: event.outcome
+      status: partial
+      transform: >-
+        FAILED = 1 folds to event.outcome failure; this view carries an
+        explicit outcome column, unlike the syslog category where outcome is
+        fixed by the routing category
+    - vendor: FAILURE_REASON
+      type: string
+      description: >-
+        Numeric failure code plus its text, e.g. "11036 The
+        Message-Authenticator RADIUS attribute is invalid"
+      ecs: event.reason
+      status: partial
+      transform: >
+        split the leading numeric code from the sentence so alerting pivots on
+        the code (22056, 12309, 24408) and dashboards keep the text; this is
+        the failure signal, populated on FAILED rows where it is empty on
+        passed rows
+    - vendor: USERNAME
+      type: string
+      description: >-
+        Identity that failed to authenticate (may be the literal INVALID on
+        portal failures)
+      ecs: user.name
+      status: mapped
+    - vendor: CALLING_STATION_ID
+      type: string
+      description: Endpoint identifier presented by the NAD, MAC or IP depending on access method
+      ecs: null
+      custom: cisco_ise.log.calling_station.id
+      status: partial
+      notes: >-
+        same MAC-or-IP ambiguity as on the passed-authentications dataset, and
+        again the only endpoint identifier in the view; the type sniff feeds
+        source.mac or source.ip, both endpoint fields, never client.*, which
+        is the NAD from NAS_IP_ADDRESS
+    - vendor: NAS_IP_ADDRESS
+      type: ip
+      description: Address of the NAD that relayed the failed request
+      ecs: client.ip
+      status: mapped
+      notes: >-
+        copy to related.ip as well; the view collapses Device IP Address and
+        NAS-IP-Address into this one column, and client.* describes that
+        network access device wholly — the endpoint sits on the host entity
+    - vendor: AUTHENTICATION_METHOD
+      type: string
+      description: Method attempted (PAP_ASCII, MSCHAPV2, x509_PKI, Lookup)
+      ecs: null
+      custom: cisco_ise.log.authentication.method
+      status: unmapped
+      notes: >-
+        the method on a failed attempt is the PIV/CAC-enforcement and
+        weak-method signal; no ECS field models it
+    - vendor: AUTHENTICATION_PROTOCOL
+      type: string
+      description: EAP/inner protocol that failed (EAP-TLS, PEAP, PAP)
+      ecs: null
+      custom: cisco_ise.log.authentication.protocol
+      status: unmapped
+      notes: >-
+        the nearest Data Connect column to the syslog
+        EapTunnel/EapAuthentication pair, but coarser - it is the negotiated
+        protocol, not the separate outer-tunnel and inner-method breakdown
+    - vendor: CREDENTIAL_CHECK
+      type: string
+      description: Credential-validation result recorded for the failed attempt
+      ecs: null
+      custom: cisco_ise.log.credential_check
+      status: unmapped
+    - vendor: IDENTITY_STORE
+      type: string
+      description: Identity store consulted for the failed authentication
+      ecs: null
+      custom: cisco_ise.log.authentication.identity_store
+      status: unmapped
+    - vendor: AUDIT_SESSION_ID
+      type: string
+      description: CPMSessionID for correlating the failure with diagnostics and accounting
+      ecs: null
+      custom: cisco_ise.log.audit_session.id
+      status: partial
+      notes: session-stitching key; ECS has no session-id field
+    - vendor: DEVICE_NAME
+      type: string
+      description: ISE object name of the NAD the failed attempt came through
+      ecs: null
+      custom: cisco_ise.log.network.device.name
+      status: partial
+      notes: same host.name gap as the passed-authentications dataset
+    - vendor: EXECUTION_STEPS
+      type: string
+      description: Ordered policy/protocol step codes up to the point of failure
+      ecs: null
+      custom: cisco_ise.log.step
+      status: partial
+      notes: >-
+        useful for locating where in the flow the failure occurred; step codes
+        need the ISE message catalogue
+    - vendor: TIMESTAMP_TIMEZONE
+      type: string
+      description: 'Failure time with the ISE node''s timezone offset'
+      ecs: '@timestamp'
+      status: partial
+      notes: offset-bearing form; prefer over the naive TIMESTAMP column
+    - vendor: ID
+      type: string
+      description: Monotonic Data Connect row id - the pull watermark and reconciliation key
+      ecs: null
+      custom: cisco_ise.log.record.id
+      status: unmapped
+- id: tacacs-accounting
+  name: TACACS+ accounting
+  description: >
+    CISE_TACACS_Accounting logging category — device administration records
+    from ISE's TACACS+ service: 3300 (Accounting with Command), 3301
+    (Accounting START), 3302 (Accounting STOP). Every privileged command an
+    administrator runs on a switch, router, or firewall appears here, which
+    makes it the network-device command audit trail for the CSOC.
+  event_categories:
+  - configuration
+  - authentication
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same listener as the RADIUS datasets. Note that TACACS accounting is
+        the category most often truncated by the default 1024-byte syslog
+        collector limit — CmdSet plus the repeated AVPair attributes routinely
+        exceed it, and a truncated command is worse than no command for audit
+        purposes.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cisco_ise.log
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Same listener as the RADIUS datasets. Note that TACACS accounting is
+        the category most often truncated by the default 1024-byte syslog
+        collector limit — CmdSet plus the repeated AVPair attributes routinely
+        exceed it, and a truncated command is worse than no command for audit
+        purposes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cisco_ise.log
+  formats:
+  - format: syslog-kv
+    parsing:
+      mechanism: elastic-integration
+      artifact: Cisco ISE integration (cisco_ise), data stream logs-cisco_ise.log
+      notes: >
+        Handled by pipeline_tacacs_accounting. It sets event.category
+        statically for the category and derives event.action from the token
+        before the colon in the message description; command text is left in
+        cisco_ise.log.cmdset untouched.
+    fields:
+    - vendor: MessageCode
+      type: integer
+      description: Message code — 3300 accounting with command, 3301 START, 3302 STOP
+      ecs: event.code
+      status: mapped
+    - vendor: CmdSet
+      type: string
+      description: The command the administrator executed on the network device
+      ecs: null
+      custom: cisco_ise.log.cmdset
+      status: partial
+      notes: >
+        wrapped as "[ CmdAV=show mac-address-table <cr> ]" and must be
+        unwrapped before it is searchable. process.command_line is the nearest
+        ECS field but is semantically wrong — the command runs on the managed
+        network device, not on ISE or on any host in the event — so the
+        configuration alerting profile has no clean field to key
+        command-content rules on.
+    - vendor: User
+      type: string
+      description: Administrator account that authenticated to the network device
+      ecs: user.name
+      status: mapped
+    - vendor: Device IP Address
+      type: ip
+      description: Address of the network device the administrator was logged into
+      ecs: client.ip
+      status: mapped
+      notes: >
+        client.ip is what the integration sets, but on this dataset the
+        address belongs to the administered device — the GA ECS 9.4
+        host.target.ip is the semantically truer home and should be populated
+        alongside client.ip if the local host.target.name enrichment on
+        NetworkDeviceName is adopted.
+    - vendor: NetworkDeviceName
+      type: string
+      description: ISE object name of the administered network device
+      ecs: host.target.name
+      custom: cisco_ise.log.network.device.name
+      status: partial
+      notes: >
+        this is the host the command actually ran on. ECS 9.4 promotes
+        host.target.* to GA and that is the correct home here: the
+        administered device is the host being acted upon, not the host
+        emitting the log (the ISE node, which lands in host.hostname). The
+        Elastic integration still writes only
+        cisco_ise.log.network.device.name, so populating host.target.name is a
+        local enrichment; host.name stays empty on this dataset by design
+        rather than by omission.
+    - vendor: Remote-Address
+      type: string
+      description: >-
+        Address the administrator's session originated from, as reported by
+        the network device
+      ecs: destination.address
+      status: partial
+      notes: >
+        the Elastic integration puts this in destination.address, which
+        inverts the intuitive sense — for a CSOC this is the analyst's source
+        address. Any "admin logged in from an unexpected network" rule has to
+        read destination.address, or the value has to be copied to source.ip
+        locally.
+    - vendor: Privilege-Level
+      type: integer
+      description: TACACS+ privilege level in effect for the command (0-15)
+      ecs: null
+      custom: cisco_ise.log.privilege.level
+      status: unmapped
+      notes: >-
+        level 15 command execution is the privilege-escalation signal; ECS has
+        no privilege-level field
+    - vendor: Authen-Method
+      type: enum
+      description: >-
+        Authentication method the device used for the session (TacacsPlus,
+        Enable, Local, ...)
+      ecs: null
+      custom: cisco_ise.log.authen_method
+      status: unmapped
+    - vendor: Type
+      type: enum
+      description: TACACS+ request type — Authentication, Authorization, or Accounting
+      ecs: null
+      custom: cisco_ise.log.type
+      status: unmapped
+    - vendor: Service
+      type: enum
+      description: TACACS+ service for the session (Login, Enable, ...)
+      ecs: null
+      custom: cisco_ise.log.service.name
+      status: unmapped
+      notes: >
+        the Elastic integration parks this in cisco_ise.log.service.name; ECS
+        service.name means the service producing the log, so mapping it there
+        would be wrong.
+    - vendor: Port
+      type: string
+      description: Line or tty on the network device the session occupied (tty2, vty0, ...)
+      ecs: null
+      custom: cisco_ise.log.port
+      status: unmapped
+      notes: >-
+        a string device line, not a TCP/UDP port — never map to
+        destination.port despite the name
+    - vendor: AcctRequest-Flags
+      type: enum
+      description: Accounting record phase — Start, Stop, or Watchdog
+      ecs: event.action
+      status: partial
+      transform: >
+        lower-cased into event.action so start/stop pair up; the integration
+        keeps it as cisco_ise.log.acct.request.flags and instead derives
+        event.action from the message description text.
+    - vendor: Response
+      type: string
+      description: TACACS+ reply block, e.g. "{AcctReply-Status=Success; }"
+      ecs: event.outcome
+      status: partial
+      transform: >
+        the only outcome signal in the record — AcctReply-Status has to be
+        extracted from the braces and folded to success/failure; there is no
+        dedicated result attribute.
+    - vendor: AVPair
+      type: string
+      description: >-
+        Repeated TACACS+ attribute-value pairs (task_id, timezone, start_time,
+        stop_time, elapsed_time, priv-lvl, disc-cause)
+      ecs: null
+      custom: cisco_ise.log.avpair
+      status: partial
+      notes: >
+        appears many times per message with different sub-keys; must be
+        collected and re-split on its own "=" before elapsed_time (session
+        duration) or start_time/stop_time (epoch seconds) can be used.
+    - vendor: AcsSessionID
+      type: string
+      description: >-
+        ISE session identifier tying the accounting record to the matching
+        TACACS authentication
+      ecs: null
+      custom: cisco_ise.log.acs.session.id
+      status: unmapped
+    - vendor: NetworkDeviceGroups
+      type: string
+      description: >-
+        Hierarchical NDG membership of the device (Location, Device Type,
+        IPSEC), repeated once per group
+      ecs: null
+      custom: cisco_ise.log.network.device.groups
+      status: unmapped
+      notes: >-
+        values are "#"-delimited paths such as "Location#All Locations#EMEA"
+        and the key repeats within one message
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Raising the syslog collector maximum length from 1024 to 8192 is the
+          highest-priority item on this dataset — CmdSet plus the repeated
+          AVPair attributes routinely exceed the default and a truncated
+          command is worse than no command for audit — alongside the same
+          message-id reassembly used by the RADIUS categories. Keep _raw
+          end-to-end and exempt this category from sampling or field-dropping
+          rules, and add the NetworkDeviceName-to-owner/site lookup near the
+          source so the administered-device enrichment is available
+          downstream.
+        elastic: >
+          pipeline_tacacs_accounting leaves the command wrapped, so an @custom
+          pipeline must unwrap "[ CmdAV=... ]" into a searchable command
+          field, gather the repeated AVPair and NetworkDeviceGroups keys into
+          arrays and re-split AVPair on its own "=" to recover elapsed_time,
+          start_time/stop_time and priv-lvl, and derive event.outcome by
+          extracting AcctReply-Status from the Response braces. Populate
+          host.target.name and host.target.ip from NetworkDeviceName and
+          Device IP Address, copy Remote-Address into source.ip (the
+          integration's destination.address inverts the analyst's sense), and
+          map privilege.level, authen_method and cmdset in the custom
+          namespace so level-15 command-execution rules have real fields.
+        relay: >
+          Low-side device-admin PSNs cross the guard with a thin {_dataId,
+          @timestamp, host, _raw} NDJSON envelope with reassembly completed
+          low-side, Persistent Queue backpressure, compression disabled, and
+          per-(dataset, hour) reconciliation instead of acknowledgements.
+          Command text is exactly the content a filter will want to inspect,
+          so bound the record length after reassembly and keep the envelope
+          keys short and ASCII — the NDJSON filter is custom work — and if
+          this ever becomes a parse-low route, AVPair and NetworkDeviceGroups
+          must be emitted as arrays because the crossing JSON may not carry
+          duplicate keys.
+      direct:
+        parse_location: high
+        cribl: >
+          Raising the syslog collector maximum length from 1024 to 8192 is the
+          highest-priority item on this dataset — CmdSet plus the repeated
+          AVPair attributes routinely exceed the default and a truncated
+          command is worse than no command for audit — alongside the same
+          message-id reassembly used by the RADIUS categories. Keep _raw
+          end-to-end and exempt this category from sampling or field-dropping
+          rules, and add the NetworkDeviceName-to-owner/site lookup near the
+          source so the administered-device enrichment is available
+          downstream.
+        elastic: >
+          pipeline_tacacs_accounting leaves the command wrapped, so an @custom
+          pipeline must unwrap "[ CmdAV=... ]" into a searchable command
+          field, gather the repeated AVPair and NetworkDeviceGroups keys into
+          arrays and re-split AVPair on its own "=" to recover elapsed_time,
+          start_time/stop_time and priv-lvl, and derive event.outcome by
+          extracting AcctReply-Status from the Response braces. Populate
+          host.target.name and host.target.ip from NetworkDeviceName and
+          Device IP Address, copy Remote-Address into source.ip (the
+          integration's destination.address inverts the analyst's sense), and
+          map privilege.level, authen_method and cmdset in the custom
+          namespace so level-15 command-execution rules have real fields.
+  - format: jdbc-sql
+    enable: >
+      Same Data Connect connection (Administration > System > Settings > Data
+      Connect, dataconnect user, TLS TCP/2484 to the MnT node). TACACS+
+      device-administration records come from the TACACS_ACCOUNTING view,
+      which the vendor documents as holding the last two days of accounting
+      rows for query performance - so a Data Connect pull of this dataset must
+      run frequently enough (a short poll interval on the ID/ GENERATED_TIME
+      watermark) that no row ages out of the view before it is collected,
+      unlike the RADIUS views. The Monitoring REST API does NOT cover TACACS
+      accounting, so Data Connect is the only structured- pull alternate for
+      this dataset.
+    references:
+    - https://developer.cisco.com/docs/dataconnect/database-views/
+    - https://developer.cisco.com/docs/dataconnect/guides/
+    - >-
+      https://www.cisco.com/c/en/us/td/docs/security/ise/3-3/admin_guide/b_ise_admin_3_3/b_ISE_admin_33_maintain_monitor.html
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        custom Cribl Database Collector + SQL-row-to-cisco_ise.log pipeline
+        (no stock cisco_ise JDBC input)
+      notes: >
+        The clear win of this view over the syslog feed is that COMMAND and
+        COMMAND_ARGS arrive as SEPARATE, already-unwrapped columns - the
+        syslog feed's "[ CmdAV=show run <cr> ]" wrapping that has to be
+        unwrapped before the command is searchable does not occur here, and
+        STATUS gives an explicit outcome instead of parsing AcctReply-Status
+        out of a Response brace. It is also reassembly-clean, which matters
+        most on this category since TACACS accounting is the syslog feed's
+        most-truncated dataset. The tradeoff is that the repeated per-record
+        attribute detail (task_id, timezone, start_time/stop_time,
+        elapsed_time, priv-lvl) is collapsed into the single ATTRIBUTES column
+        and must be re-split there, and the two-day retention window of the
+        view makes a durable, fast poll cadence mandatory.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Run the Database Collector low-side with a short poll interval so
+          nothing ages out of the two-day view before it is read, watermark on
+          ID or GENERATED_TIME, and shape columns at the edge. The 8192- byte
+          collector-length worry that dominates the syslog TACACS path is
+          irrelevant here because the MnT store already holds the full command
+          untruncated - the standout reason to prefer this feed for the
+          command audit trail. Add the DEVICE_NAME-to-owner/site lookup near
+          the source so administered-device enrichment is available
+          downstream.
+        elastic: >
+          A logs-cisco_ise.log@custom pipeline should keep COMMAND and
+          COMMAND_ARGS as a searchable command pair (no unwrap needed),
+          re-split ATTRIBUTES on its own delimiters to recover elapsed_time,
+          start_time/stop_time and priv-lvl, map STATUS to event.outcome
+          directly, and populate host.target.name/host.target.ip from
+          DEVICE_NAME/DEVICE_IP because on device administration the NAD is
+          the host the command acts upon. Copy REMOTE_ADDRESS to source.ip
+          (the view, like the integration, records it as the administrator's
+          origin under an inverted sense), and map
+          AUTHENTICATION_PRIVILEGE_LEVEL and AUTHENTICATION_METHOD into the
+          custom namespace for level-15 command-execution rules.
+        relay: >
+          Command text is the content a guard filter most wants to inspect,
+          and this feed presents it cleanly in COMMAND/COMMAND_ARGS rather
+          than wrapped in an AVPair blob - shape those to short ASCII keys and
+          cap ATTRIBUTES before crossing a thin {_dataId, @timestamp, host,
+          _raw} NDJSON envelope. Because the command is already complete in
+          the MnT store, there is no risk of crossing a truncated command (the
+          syslog feed's worst failure mode on this category). Persistent Queue
+          backpressure, compression disabled, and per-(dataset, hour) ID-range
+          reconciliation stand in for the absent return channel.
+      direct:
+        parse_location: low
+        cribl: >
+          Same-side deployments shape TACACS_ACCOUNTING to ECS in one low
+          pass. This dataset is the strongest case for adopting Data Connect
+          over syslog: it removes both the truncation risk and the CmdAV
+          unwrap, giving a cleaner command audit trail, and the only loss is
+          the flattening of the repeated AVPair detail into one ATTRIBUTES
+          column, which the pipeline re-splits.
+        elastic: >
+          A logs-cisco_ise.log@custom pipeline should keep COMMAND and
+          COMMAND_ARGS as a searchable command pair (no unwrap needed),
+          re-split ATTRIBUTES on its own delimiters to recover elapsed_time,
+          start_time/stop_time and priv-lvl, map STATUS to event.outcome
+          directly, and populate host.target.name/host.target.ip from
+          DEVICE_NAME/DEVICE_IP because on device administration the NAD is
+          the host the command acts upon. Copy REMOTE_ADDRESS to source.ip
+          (the view records it as the administrator's origin under an inverted
+          sense), and map AUTHENTICATION_PRIVILEGE_LEVEL and
+          AUTHENTICATION_METHOD into the custom namespace for level-15
+          command-execution rules. Tag event.provider so Data Connect command
+          records are separable from any syslog CISE_TACACS_Accounting events
+          in the shared data stream, and standardize the re-split ATTRIBUTES
+          sub-keys (elapsed_time, priv-lvl) so session-duration and privilege
+          analytics match across both feeds.
+    fields:
+    - vendor: GENERATED_TIME
+      type: date
+      description: Time the accounting event was generated on ISE
+      ecs: '@timestamp'
+      status: mapped
+      notes: the event time; LOGGED_TIME is the later MnT receipt time
+    - vendor: LOGGED_TIME
+      type: date
+      description: Time ISE MnT recorded the accounting row
+      ecs: null
+      custom: cisco_ise.log.logged_time
+      status: unmapped
+    - vendor: ID
+      type: string
+      description: Monotonic Data Connect row id - pull watermark and reconciliation key
+      ecs: null
+      custom: cisco_ise.log.record.id
+      status: unmapped
+    - vendor: MESSAGE_CODE
+      type: integer
+      description: Accounting message code (3300 accounting with command, 3301 START, 3302 STOP)
+      ecs: event.code
+      status: mapped
+    - vendor: MESSAGE_TEXT
+      type: string
+      description: Message description of the accounting event
+      ecs: event.action
+      status: partial
+      transform: token before the first colon becomes event.action
+    - vendor: USERNAME
+      type: string
+      description: Administrator account that authenticated to the network device
+      ecs: user.name
+      status: mapped
+    - vendor: COMMAND
+      type: string
+      description: The command the administrator executed on the network device
+      ecs: null
+      custom: cisco_ise.log.cmdset
+      status: partial
+      notes: >
+        delivered already unwrapped (no "[ CmdAV=... ]" wrapper the syslog
+        feed carries); process.command_line is the nearest ECS field but is
+        semantically wrong because the command runs on the managed device, not
+        on ISE or on any host in the event
+    - vendor: COMMAND_ARGS
+      type: string
+      description: Arguments to the executed command, delivered as a column separate from COMMAND
+      ecs: null
+      custom: cisco_ise.log.command_args
+      status: partial
+      notes: >-
+        the syslog feed folds these into the wrapped CmdSet; here they are
+        pre-split, so no CmdAV parse is needed
+    - vendor: DEVICE_NAME
+      type: string
+      description: ISE object name of the administered network device
+      ecs: host.target.name
+      custom: cisco_ise.log.network.device.name
+      status: partial
+      notes: >
+        this is the host the command actually ran on; ECS 9.4 host.target.* is
+        the correct home. The value also stays in the custom namespace to
+        match the syslog feed; host.name stays empty on this dataset by design
+    - vendor: DEVICE_IP
+      type: ip
+      description: Address of the network device the administrator was logged into
+      ecs: client.ip
+      status: mapped
+      notes: >-
+        also populate host.target.ip - on device administration the address
+        belongs to the administered device, not to a network client
+    - vendor: DEVICE_IPV6
+      type: ip
+      description: IPv6 address of the administered device where dual-stacked
+      ecs: null
+      custom: cisco_ise.log.network.device.ipv6
+      status: unmapped
+    - vendor: DEVICE_PORT
+      type: string
+      description: Line or tty on the network device the session occupied (tty2, vty0)
+      ecs: null
+      custom: cisco_ise.log.port
+      status: unmapped
+      notes: >-
+        a string device line, not a TCP/UDP port - never map to
+        destination.port despite the name
+    - vendor: DEVICE_GROUPS
+      type: string
+      description: Hierarchical NDG membership of the device (Location, Device Type)
+      ecs: null
+      custom: cisco_ise.log.network.device.groups
+      status: unmapped
+      notes: >-
+        #-delimited path values; the syslog feed repeats the key per group,
+        the view collapses them into one column
+    - vendor: DEVICE_TYPE
+      type: string
+      description: Device-Type NDG path of the administered device
+      ecs: null
+      custom: cisco_ise.log.network.device.type
+      status: unmapped
+    - vendor: LOCATION
+      type: string
+      description: Location NDG path of the administered device
+      ecs: null
+      custom: cisco_ise.log.network.device.location
+      status: unmapped
+    - vendor: REMOTE_ADDRESS
+      type: string
+      description: 'Address the administrator''s session originated from, as reported by the device'
+      ecs: destination.address
+      status: partial
+      notes: >
+        recorded under the same inverted sense as the syslog feed - for a CSOC
+        this is the analyst's source address, so an "admin logged in from an
+        unexpected network" rule must read destination.address or the value
+        must be copied to source.ip locally
+    - vendor: AUTHENTICATION_PRIVILEGE_LEVEL
+      type: integer
+      description: TACACS+ privilege level in effect for the command (0-15)
+      ecs: null
+      custom: cisco_ise.log.privilege.level
+      status: unmapped
+      notes: >-
+        level 15 command execution is the privilege-escalation signal; ECS has
+        no privilege-level field
+    - vendor: AUTHENTICATION_METHOD
+      type: string
+      description: >-
+        Authentication method the device used for the session (TacacsPlus,
+        Enable, Local)
+      ecs: null
+      custom: cisco_ise.log.authen_method
+      status: unmapped
+    - vendor: AUTHENTICATION_SERVICE
+      type: string
+      description: TACACS+ service for the session (Login, Enable)
+      ecs: null
+      custom: cisco_ise.log.service.name
+      status: unmapped
+      notes: >-
+        ECS service.name means the service producing the log, so mapping this
+        device-session service there would be wrong
+    - vendor: AUTHENTICATION_TYPE
+      type: string
+      description: TACACS+ request type - Authentication, Authorization, or Accounting
+      ecs: null
+      custom: cisco_ise.log.type
+      status: unmapped
+    - vendor: ACCOUNTING_TYPE
+      type: string
+      description: Accounting record phase - Start, Stop, or Watchdog
+      ecs: event.action
+      status: partial
+      transform: >-
+        lower-cased into event.action so start/stop pair up; also kept custom
+        as cisco_ise.log.acct.request.flags
+    - vendor: STATUS
+      type: string
+      description: Outcome of the accounting request as recorded by ISE
+      ecs: event.outcome
+      status: partial
+      notes: >
+        an explicit outcome column - a real advantage over the syslog feed,
+        where outcome has to be extracted from the AcctReply-Status inside a
+        Response brace; fold to success/failure
+    - vendor: FAILURE_REASON
+      type: string
+      description: Failure code and text where the accounting request was rejected
+      ecs: event.reason
+      status: partial
+      notes: usually empty on accepted accounting records
+    - vendor: ATTRIBUTES
+      type: string
+      description: >-
+        Blob of the record's TACACS+ attribute-value pairs (task_id, timezone,
+        start_time, stop_time, elapsed_time, priv-lvl)
+      ecs: null
+      custom: cisco_ise.log.avpair
+      status: partial
+      notes: >
+        the view collapses the repeated syslog AVPair attributes into this one
+        column; re-split on its own delimiters before elapsed_time (session
+        duration) or start_time/stop_time can be used
+    - vendor: EXECUTION_STEPS
+      type: string
+      description: Ordered policy/protocol step codes for the accounting request
+      ecs: null
+      custom: cisco_ise.log.step
+      status: partial
+      notes: step codes need the ISE message catalogue to be readable
+    - vendor: SESSION_KEY
+      type: string
+      description: >-
+        ISE session identifier tying the accounting record to the matching
+        TACACS authentication
+      ecs: null
+      custom: cisco_ise.log.acs.session.id
+      status: partial
+      notes: session-stitching key; ECS has no session-id field
+    - vendor: IDENTITY_GROUP
+      type: string
+      description: Identity group of the administrator account
+      ecs: null
+      custom: cisco_ise.log.identity.group
+      status: unmapped
+    - vendor: ISE_NODE
+      type: string
+      description: ISE node that recorded the accounting event
+      ecs: host.hostname
+      status: mapped
+    - vendor: EVENT
+      type: string
+      description: Event/message class of the accounting record
+      ecs: null
+      custom: cisco_ise.log.event
+      status: unmapped
+    - vendor: EPOCH_TIME
+      type: integer
+      description: Event time as epoch seconds
+      ecs: null
+      custom: cisco_ise.log.epoch_time
+      status: unmapped
+- id: administrative-audit
+  name: Administrative and operational audit
+  description: >
+    CISE_Administrative_and_Operational_Audit logging category — who did what
+    to ISE itself: administrator GUI/CLI/SSH logins (51000 failed, 51001
+    succeeded, 51002 logged off, 51020/51021 bad user or password, 60080/60115
+    SSH CLI login), configuration changes (52000 added, 52001 changed, 52002
+    deleted), and operational events such as backups and process restarts.
+    Compromise of an ISE admin account is a network-wide access-control
+    compromise, so this small, low-volume category is disproportionately
+    important.
+  event_categories:
+  - authentication
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same listener as the other three datasets. Volume here is tiny
+        relative to the authentication categories, so this dataset should be
+        exempted from any Cribl sampling or volume-reduction rule written for
+        CISE_Passed_Authentications.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cisco_ise.log
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Same listener as the other three datasets. Volume here is tiny
+        relative to the authentication categories, so this dataset should be
+        exempted from any Cribl sampling or volume-reduction rule written for
+        CISE_Passed_Authentications.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-cisco_ise.log
+  formats:
+  - format: syslog-kv
+    parsing:
+      mechanism: elastic-integration
+      artifact: Cisco ISE integration (cisco_ise), data stream logs-cisco_ise.log
+      notes: >
+        pipeline_administrative_and_operational_audit uses a set of
+        alternative grok patterns rather than generic key/value extraction,
+        because the payload shape differs per message code and the free-text
+        tail contains escaped commas. AdminName is written to client.user.name
+        and only copied to user.name when user.name is still empty — a rule
+        keyed solely on user.name will miss admin events parsed by older
+        pipeline versions.
+    fields:
+    - vendor: MessageCode
+      type: integer
+      description: >-
+        Message code identifying the administrative event (51001 login
+        success, 51000 login failure, 52001 config changed, ...)
+      ecs: event.code
+      status: mapped
+      notes: >
+        the practical source of event.outcome for this dataset — 51001 means
+        success and 51000/51020/51021 mean failure; there is no outcome
+        attribute in the payload.
+    - vendor: MessageText
+      type: string
+      description: >-
+        Message description, e.g. "Administrator-Login: Administrator
+        authentication succeeded"
+      ecs: event.action
+      status: partial
+      transform: >-
+        token before the first colon (Administrator-Login,
+        Configuration-Changes, System-Management) becomes event.action
+    - vendor: AdminName
+      type: string
+      description: ISE administrator account that performed the action
+      ecs: user.name
+      status: partial
+      notes: >
+        written to client.user.name first and copied to user.name only when
+        user.name is empty; if the value is user@domain it is split into
+        client.user.name and client.user.domain, so the copied user.name loses
+        the domain.
+    - vendor: AdminIPAddress
+      type: ip
+      description: Address the administrator connected from
+      ecs: client.ip
+      status: partial
+      notes: >
+        the authentication and configuration alerting profiles both require
+        source.ip; this lands in client.ip instead, so "admin login from an
+        unusual address" rules must read client.ip or the value must be copied
+        to source.ip locally.
+    - vendor: AdminInterface
+      type: enum
+      description: Interface used for the administrative session (GUI, CLI, API)
+      ecs: null
+      custom: cisco_ise.log.admin.interface
+      status: unmapped
+      notes: >-
+        distinguishing API from GUI activity is the cheapest automation-abuse
+        signal on this source; no ECS equivalent
+    - vendor: AdminSession
+      type: string
+      description: Administrative session identifier (e.g. AdminGUI_Session)
+      ecs: null
+      custom: cisco_ise.log.admin.session
+      status: unmapped
+    - vendor: OperationMessageText
+      type: string
+      description: Free-text description of the operation and why it succeeded or failed
+      ecs: message
+      status: partial
+      notes: >
+        contains backslash-escaped commas ("invalid user or password\, or
+        account is disabled/locked") which break comma-split key/value
+        extraction — this is why the category is grokked per message code
+        instead of parsed generically.
+    - vendor: ConfigChangeData
+      type: string
+      description: The configuration delta applied by a 52000/52001/52002 event
+      ecs: null
+      custom: cisco_ise.log.config_change.data
+      status: partial
+      notes: >
+        the audit substance of a change event and the largest free-text field
+        in the category; carries no consistent structure, and if this source
+        crosses the guard it is the field a content inspection allow-list has
+        to reason about.
+    - vendor: ObjectType
+      type: string
+      description: >-
+        Class of ISE object that was added, changed, or deleted (e.g. Network
+        Device, Authorization Profile)
+      ecs: null
+      custom: cisco_ise.log.object.type
+      status: unmapped
+    - vendor: ObjectName
+      type: string
+      description: Name of the specific ISE object that changed
+      ecs: null
+      custom: cisco_ise.log.object.name
+      status: unmapped
+      notes: >
+        together with ObjectType this is the natural user.target.name / "what
+        was acted on" pair the iam-style rules want, but ECS has no generic
+        changed-object field.
+    - vendor: ObjectInternalID
+      type: string
+      description: Internal ISE identifier of the changed object
+      ecs: null
+      custom: cisco_ise.log.object.internal.id
+      status: unmapped
+    - vendor: Component
+      type: string
+      description: ISE subsystem that raised the event
+      ecs: null
+      custom: cisco_ise.log.component
+      status: unmapped
+    - vendor: FailureFlag
+      type: boolean
+      description: Set on some operational messages to indicate the operation failed
+      ecs: event.outcome
+      status: partial
+      transform: >
+        boolean folded to failure/success, but it is absent from most messages
+        — MessageCode remains the reliable outcome source.
+    - vendor: LogSeverityLevel
+      type: enum
+      description: ISE-assigned severity of the logging event (NOTICE, WARN, ERROR, ...)
+      ecs: log.level
+      status: partial
+      notes: >
+        a vendor-supplied text severity, so log.level is its home; the
+        NOTICE/WARN/ERROR vocabulary is not the syslog text-severity
+        vocabulary and log.syslog.severity.name is owned by the PRI decode in
+        the header, which is the consistent severity source for the whole
+        category. Partial because the attribute is only present on the
+        logging-configuration messages, not on administrator logins, so
+        log.level is empty on most of the category. The stock cisco_ise
+        integration renames this attribute onto log.syslog.severity.name,
+        mixing the two vocabularies in one field, so the @custom pipeline has
+        to undo that rename and set log.level instead.
+    - vendor: ConfigVersionId
+      type: integer
+      description: ISE configuration version counter at the time of the event
+      ecs: null
+      custom: cisco_ise.log.config_version.id
+      status: unmapped
+      notes: >-
+        monotonic per deployment; useful for ordering change events that share
+        a timestamp
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Explicitly exempt this category from every sampling, truncation, or
+          field-dropping rule written for CISE_Passed_Authentications — the
+          volume is trivial and an ISE admin compromise is a network-wide
+          access-control compromise — and keep _raw end-to-end for forensic
+          replay. Apply the same 8192-byte collector length and message-id
+          reassembly, and add a low-side mask for any credential-shaped text
+          appearing in OperationMessageText or ConfigChangeData.
+        elastic: >
+          pipeline_administrative_and_operational_audit groks per message
+          code; add an @custom pipeline that derives event.outcome from
+          MessageCode (51001 success, 51000/51020/51021 failure) because
+          FailureFlag is absent from most messages, copies AdminName into
+          user.name unconditionally and with the domain intact rather than
+          only when user.name is empty, and copies AdminIPAddress into
+          source.ip so the authentication and configuration alerting profiles
+          get the field they require. Map admin.interface, admin.session,
+          object.type, object.name and config_change.data in the custom
+          namespace, and undo the integration's rename of LogSeverityLevel
+          onto log.syslog.severity.name: put that vendor text severity in
+          log.level and leave log.syslog.severity.name to the header PRI
+          decode, which is the one severity present on every message in the
+          category since LogSeverityLevel appears only on the
+          logging-configuration messages.
+        relay: >
+          ConfigChangeData is the unbounded free-text field a guard content
+          filter would have to reason about on this dataset, so cap or hash it
+          low-side before the crossing and keep the full value on the low side
+          for audit rather than trying to express it in a custom NDJSON filter
+          rule. Otherwise the standard low-side shape applies: thin {_dataId,
+          @timestamp, host, _raw} envelope, Persistent Queue backpressure,
+          compression disabled, and per-(dataset, hour) count reconciliation —
+          this category is small enough that any count mismatch is a real,
+          investigable drop.
+      direct:
+        parse_location: high
+        cribl: >
+          Explicitly exempt this category from every sampling, truncation, or
+          field-dropping rule written for CISE_Passed_Authentications — the
+          volume is trivial and an ISE admin compromise is a network-wide
+          access-control compromise — and keep _raw end-to-end for forensic
+          replay. Apply the same 8192-byte collector length and message-id
+          reassembly, and add a mask for any credential-shaped text appearing
+          in OperationMessageText or ConfigChangeData.
+        elastic: >
+          pipeline_administrative_and_operational_audit groks per message
+          code; add an @custom pipeline that derives event.outcome from
+          MessageCode (51001 success, 51000/51020/51021 failure) because
+          FailureFlag is absent from most messages, copies AdminName into
+          user.name unconditionally and with the domain intact rather than
+          only when user.name is empty, and copies AdminIPAddress into
+          source.ip so the authentication and configuration alerting profiles
+          get the field they require. Map admin.interface, admin.session,
+          object.type, object.name and config_change.data in the custom
+          namespace, and undo the integration's rename of LogSeverityLevel
+          onto log.syslog.severity.name: put that vendor text severity in
+          log.level and leave log.syslog.severity.name to the header PRI
+          decode, which is the one severity present on every message in the
+          category since LogSeverityLevel appears only on the
+          logging-configuration messages.
+  - format: jdbc-sql
+    enable: >
+      Same Data Connect connection (Administration > System > Settings > Data
+      Connect, dataconnect user, TLS TCP/2484 to the MnT node). This category
+      spans TWO Data Connect views: ADMINISTRATOR_LOGINS for ISE admin
+      GUI/CLI/SSH logins (the 51000/51001/51002 login events) and
+      CHANGE_CONFIGURATION_AUDIT for configuration changes (the 52000/52001/
+      52002 add/change/delete events, with MODIFIED_PROPERTIES carrying the
+      delta). A pull of this dataset SELECTs both views on their ID/TIMESTAMP
+      watermarks and unions them under the CISE_Administrative_and_
+      Operational_Audit logical dataset. The Monitoring REST API does not
+      cover admin audit, so Data Connect is the only structured-pull
+      alternate. The column list below tags each field with its source view.
+    references:
+    - https://developer.cisco.com/docs/dataconnect/database-views/
+    - https://developer.cisco.com/docs/dataconnect/guides/
+    - >-
+      https://www.cisco.com/c/en/us/td/docs/security/ise/3-3/admin_guide/b_ise_admin_3_3/b_ISE_admin_33_maintain_monitor.html
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        custom Cribl Database Collector + SQL-row-to-cisco_ise.log pipeline
+        unioning ADMINISTRATOR_LOGINS and CHANGE_CONFIGURATION_AUDIT
+      notes: >
+        Two views must be pulled and unioned: ADMINISTRATOR_LOGINS gives the
+        admin authentication events (ADMIN_NAME, IP_ADDRESS, INTERFACE,
+        ADMIN_SESSION, EVENT, EVENT_DETAILS) with no message-code column, so
+        event.outcome for a login must be derived from EVENT/EVENT_DETAILS
+        rather than a code; CHANGE_CONFIGURATION_AUDIT gives the config-
+        change events with MESSAGE_CODE, OBJECT_NAME/OBJECT_TYPE,
+        REQUESTED_OPERATION, MODIFIED_PROPERTIES and FAILURE_FLAG. Because the
+        config view already isolates MODIFIED_PROPERTIES as a column, the
+        comma-escaping that forces per-message-code grok on the syslog feed
+        (OperationMessageText with backslash-escaped commas) is largely
+        avoided. This is a low-volume, high-value category, so keep _raw for
+        forensic replay on both views.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          Pull both views low-side on ID watermarks and union them, tagging
+          each row with its source view so the pipeline can branch. Exempt
+          this pull from every sampling or field-dropping rule - the volume is
+          trivial and an ISE admin compromise is a network-wide access-
+          control compromise - and keep _raw end-to-end. Add a low-side mask
+          for any credential-shaped text in EVENT_DETAILS or
+          MODIFIED_PROPERTIES before it is shaped or crossed.
+        elastic: >
+          A logs-cisco_ise.log@custom pipeline should derive event.outcome
+          from MESSAGE_CODE on config rows (52001 success paths) and from
+          EVENT/EVENT_DETAILS on login rows where no code exists, copy
+          ADMIN_NAME into user.name with the domain intact, copy IP_ADDRESS
+          into source.ip so the authentication and configuration alerting
+          profiles get the field they require, and map OBJECT_NAME/
+          OBJECT_TYPE toward the user.target.name "what was acted on" pair.
+          Keep MODIFIED_PROPERTIES as the config-change delta in the custom
+          namespace and prefer the row TIMESTAMP over any node-local clock.
+        relay: >
+          MODIFIED_PROPERTIES and OPERATION_MESSAGE_TEXT/EVENT_DETAILS are the
+          unbounded free-text a guard content filter would have to reason
+          about, so cap or hash them low-side before the crossing and keep the
+          full value low-side for audit rather than expressing it in a custom
+          NDJSON filter rule. Otherwise the standard shape applies: a thin
+          {_dataId, @timestamp, host, _raw} envelope per unioned row,
+          Persistent Queue backpressure, compression disabled, and per-
+          (dataset, hour) ID-range reconciliation - and because this category
+          is small, any count mismatch is a real, investigable drop.
+      direct:
+        parse_location: low
+        cribl: >
+          Same-side deployments pull and shape both views in one low pass.
+          Data Connect is attractive here because CHANGE_CONFIGURATION_AUDIT
+          isolates MODIFIED_PROPERTIES and OBJECT_NAME/OBJECT_TYPE as clean
+          columns, avoiding the per-message-code grok the escaped-comma syslog
+          payload forces - so the config-change audit is more structured from
+          this feed than from syslog.
+        elastic: >
+          A logs-cisco_ise.log@custom pipeline should derive event.outcome
+          from MESSAGE_CODE on config rows (52001 success paths) and from
+          EVENT/EVENT_DETAILS on login rows where no code exists, copy
+          ADMIN_NAME into user.name with the domain intact, copy IP_ADDRESS
+          into source.ip so the authentication and configuration alerting
+          profiles get the field they require, and map OBJECT_NAME/OBJECT_TYPE
+          toward the user.target.name "what was acted on" pair. Keep
+          MODIFIED_PROPERTIES as the config-change delta in the custom
+          namespace and prefer the row TIMESTAMP over any node-local clock.
+          Tag event.provider so Data Connect admin-audit rows are separable
+          from syslog CISE_Administrative_and_Operational_Audit events, and
+          standardize the OBJECT_TYPE/OBJECT_NAME pair so change-tracking
+          rules key on the same fields regardless of feed.
+    fields:
+    - vendor: TIMESTAMP
+      type: date
+      description: Time of the admin login or configuration change (both views)
+      ecs: '@timestamp'
+      status: mapped
+      notes: >-
+        CHANGE_CONFIGURATION_AUDIT also carries TIMESTAMP_TIMEZONE with the
+        offset; prefer it there
+    - vendor: ISE_NODE
+      type: string
+      description: ISE node the administrative event occurred on (both views)
+      ecs: host.hostname
+      status: mapped
+    - vendor: ADMIN_NAME
+      type: string
+      description: ISE administrator account that logged in or made the change (both views)
+      ecs: user.name
+      status: partial
+      notes: >
+        if the value is user@domain, split the domain into user.domain rather
+        than losing it; the syslog feed writes AdminName to client.user.name
+        first, so back-filled data may need both checked
+    - vendor: IP_ADDRESS
+      type: ip
+      description: Address the administrator connected from (ADMINISTRATOR_LOGINS)
+      ecs: client.ip
+      status: partial
+      notes: >-
+        the alerting profiles require source.ip; this lands in client.ip, so
+        "admin login from an unusual address" rules must read client.ip or the
+        value must be copied to source.ip locally
+    - vendor: IPV6_ADDRESS
+      type: ip
+      description: IPv6 address the administrator connected from (ADMINISTRATOR_LOGINS)
+      ecs: null
+      custom: cisco_ise.log.admin.ipv6
+      status: unmapped
+    - vendor: INTERFACE
+      type: string
+      description: Interface used for the administrative session - GUI, CLI, API (both views)
+      ecs: null
+      custom: cisco_ise.log.admin.interface
+      status: unmapped
+      notes: >-
+        distinguishing API from GUI activity is the cheapest automation-abuse
+        signal on this source; no ECS equivalent
+    - vendor: ADMIN_SESSION
+      type: string
+      description: Administrative session identifier, e.g. AdminGUI_Session (ADMINISTRATOR_LOGINS)
+      ecs: null
+      custom: cisco_ise.log.admin.session
+      status: unmapped
+    - vendor: EVENT
+      type: string
+      description: Event/message class of the administrative event (both views)
+      ecs: event.action
+      status: partial
+      transform: >-
+        the login/operation class token becomes event.action
+        (Administrator-Login, Configuration-Changes)
+    - vendor: EVENT_DETAILS
+      type: string
+      description: >-
+        Free-text detail of the login event and why it succeeded or failed
+        (ADMINISTRATOR_LOGINS)
+      ecs: null
+      custom: cisco_ise.log.event.details
+      status: partial
+      notes: >
+        on login rows there is no MESSAGE_CODE column, so event.outcome for a
+        login has to be derived from this text and the EVENT class, not from a
+        code as on the config view
+    - vendor: MESSAGE_CODE
+      type: integer
+      description: >-
+        Message code of the configuration event (52000 added, 52001 changed,
+        52002 deleted; CHANGE_CONFIGURATION_AUDIT)
+      ecs: event.code
+      status: mapped
+      notes: >-
+        the practical outcome source for config rows; ADMINISTRATOR_LOGINS has
+        no code column, so login outcome comes from EVENT/EVENT_DETAILS
+        instead
+    - vendor: REQUESTED_OPERATION
+      type: string
+      description: >-
+        The CRUD operation performed (Create, Update, Delete;
+        CHANGE_CONFIGURATION_AUDIT)
+      ecs: null
+      custom: cisco_ise.log.requested_operation
+      status: unmapped
+      notes: >-
+        the add/change/delete verb; pairs with OBJECT_TYPE/OBJECT_NAME to
+        describe the change
+    - vendor: OBJECT_TYPE
+      type: string
+      description: >-
+        Class of ISE object added, changed, or deleted (Network Device,
+        Authorization Profile; CHANGE_CONFIGURATION_AUDIT)
+      ecs: null
+      custom: cisco_ise.log.object.type
+      status: unmapped
+    - vendor: OBJECT_NAME
+      type: string
+      description: Name of the specific ISE object that changed (CHANGE_CONFIGURATION_AUDIT)
+      ecs: null
+      custom: cisco_ise.log.object.name
+      status: unmapped
+      notes: >-
+        with OBJECT_TYPE this is the natural user.target.name "what was acted
+        on" pair the iam rules want, but ECS has no generic changed-object
+        field
+    - vendor: OBJECT_ID
+      type: string
+      description: Internal ISE identifier of the changed object (CHANGE_CONFIGURATION_AUDIT)
+      ecs: null
+      custom: cisco_ise.log.object.internal.id
+      status: unmapped
+    - vendor: MODIFIED_PROPERTIES
+      type: string
+      description: The configuration delta applied by the change (CHANGE_CONFIGURATION_AUDIT)
+      ecs: null
+      custom: cisco_ise.log.config_change.data
+      status: partial
+      notes: >
+        the audit substance of a change event and the largest free-text field
+        in the category; delivered as its own column here rather than embedded
+        in an escaped-comma message string as on syslog, so it is the field a
+        content-inspection allow-list must reason about if this crosses the
+        guard
+    - vendor: OPERATION_MESSAGE_TEXT
+      type: string
+      description: >-
+        Free-text description of the operation and why it succeeded or failed
+        (CHANGE_CONFIGURATION_AUDIT)
+      ecs: message
+      status: partial
+      notes: >-
+        the config-view analogue of the syslog OperationMessageText; carries
+        the human-readable operation summary
+    - vendor: FAILURE_FLAG
+      type: boolean
+      description: Set when the operation failed (CHANGE_CONFIGURATION_AUDIT)
+      ecs: event.outcome
+      status: partial
+      transform: >-
+        boolean folded to failure/success, but MESSAGE_CODE is the more
+        reliable outcome source where the flag is absent
+    - vendor: MESSAGE_CLASS
+      type: string
+      description: Message class/category of the config event (CHANGE_CONFIGURATION_AUDIT)
+      ecs: null
+      custom: cisco_ise.log.message_class
+      status: unmapped
+    - vendor: REQUEST_RESPONSE_TYPE
+      type: string
+      description: Type of the request/response for the operation (CHANGE_CONFIGURATION_AUDIT)
+      ecs: null
+      custom: cisco_ise.log.request_response_type
+      status: unmapped
+    - vendor: DETAILS
+      type: string
+      description: Supplementary detail of the configuration event (CHANGE_CONFIGURATION_AUDIT)
+      ecs: null
+      custom: cisco_ise.log.details
+      status: unmapped
+    - vendor: HOST_ID
+      type: string
+      description: >-
+        Identifier of the host/node the operation applied to
+        (CHANGE_CONFIGURATION_AUDIT)
+      ecs: null
+      custom: cisco_ise.log.host_id
+      status: unmapped
+    - vendor: NAS_IP_ADDRESS
+      type: ip
+      description: Source address recorded on the configuration event (CHANGE_CONFIGURATION_AUDIT)
+      ecs: null
+      custom: cisco_ise.log.admin.nas.ip
+      status: unmapped
+      notes: on this audit view the address is the admin/request origin; copy to related.ip
+    - vendor: APPLIED_TO_ACS_INSTANCE
+      type: string
+      description: >-
+        ISE instance(s) the configuration change was applied to
+        (CHANGE_CONFIGURATION_AUDIT)
+      ecs: null
+      custom: cisco_ise.log.applied_to_instance
+      status: unmapped
+    - vendor: LOCAL_MODE
+      type: string
+      description: Whether the change was made in local mode (CHANGE_CONFIGURATION_AUDIT)
+      ecs: null
+      custom: cisco_ise.log.local_mode
+      status: unmapped
+    - vendor: ID
+      type: string
+      description: >-
+        Monotonic Data Connect row id - pull watermark and reconciliation key
+        (both views)
+      ecs: null
+      custom: cisco_ise.log.record.id
+      status: unmapped

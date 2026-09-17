@@ -1,0 +1,1283 @@
+id: bluecat
+name: BlueCat DDI
+vendor: BlueCat
+versions: Integrity 9.4, 9.5, 9.6 (Address Manager + DNS/DHCP Server)
+draft: true
+references:
+- >-
+  https://docs.bluecatnetworks.com/r/Address-Manager-Administration-Guide/DNS-query-event/9.6.0
+- >-
+  https://docs.bluecatnetworks.com/r/Address-Manager-Administration-Guide/Viewing-DNS/DHCP-Server-logs/9.6.0
+- >-
+  https://docs.bluecatnetworks.com/r/Address-Manager-Administration-Guide/Viewing-Address-Manager-logs/9.6.0
+- >-
+  https://docs.bluecatnetworks.com/r/Address-Manager-Administration-Guide/Viewing-transaction-history/9.6.0
+- >-
+  https://docs.bluecatnetworks.com/r/Address-Manager-Administration-Guide/Viewing-DHCPv4-lease-history/9.6.0
+- >-
+  https://docs.bluecatnetworks.com/r/Address-Manager-Administration-Guide/Retaining-audit-data/9.6.0
+- >-
+  https://docs.bluecatnetworks.com/r/Address-Manager-Administration-Guide/Reference-Event-level-subscriptions/9.6.0
+- https://bind9.readthedocs.io/en/stable/reference.html
+- https://jpmens.net/2011/02/22/bind-querylog-know-your-flags/
+- https://www.logzilla.ai/docs/logzilla-appstore/bluecat-dns
+- >-
+  https://docs.cloud.google.com/chronicle/docs/ingestion/default-parsers/bluecat-ddi
+datasets:
+- id: dns-query
+  name: DNS query log (named querylog)
+  description: >
+    Per-query records written by the ISC BIND `named` instance running on a
+    BlueCat DNS/DHCP Server (BDDS) when the `queries` logging category is
+    enabled, and redirected off-box by the BDDS syslog redirection setting.
+    This is the highest-volume BlueCat dataset and the one a SOC uses for DNS
+    hunting (tunnelling, DGA, beaconing, sinkhole hits). Lines are
+    unstructured BIND text, not key=value.
+  event_categories:
+  - dns
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        The BDDS appliances forward syslog (UDP/TCP 514) straight to the Cribl
+        syslog source, replacing the old ArcSight syslog connector. The
+        low-side crossing needs a destination allow-list here before
+        onboarding, and query volume needs a sampling or aggregation decision
+        at this hop.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-bluecat.dns_query
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        The BDDS appliances forward syslog (UDP/TCP 514) straight to the Cribl
+        syslog source, replacing the old ArcSight syslog connector. Query
+        volume needs a sampling or aggregation decision at this hop.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-bluecat.dns_query
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom BlueCat named querylog pipeline
+      notes: >
+        No Elastic integration and no Cribl pack exists for BlueCat or for raw
+        ISC BIND querylog; extraction is a hand-built regex pipeline over the
+        BIND line grammar (`client @0xHANDLE ip#port (qname): view VIEW:
+        query: QNAME CLASS TYPE FLAGS (dest-ip)`). The Elastic `coredns` and
+        `infoblox_nios` integrations are the closest reference mappings for
+        the ECS side.
+    fields:
+    - vendor: client
+      type: string
+      description: BIND client object identifier printed as a hex pointer, e.g. @0x7fa0d607f200.
+      ecs: null
+      status: unmapped
+      custom: bluecat.bdds.named.client_handle
+      notes: >
+        process-local pointer value, useful only for correlating the query
+        line with its query-errors/rpz follow-up line
+    - vendor: client address
+      type: ip
+      description: IP address of the resolver client that asked the question.
+      ecs: source.ip
+      status: mapped
+      notes: parsed from the `ip#port` token immediately after the client handle
+    - vendor: client port
+      type: port
+      description: Source UDP/TCP port of the querying client.
+      ecs: source.port
+      status: mapped
+    - vendor: view
+      type: string
+      description: BIND view name the query matched.
+      ecs: null
+      status: unmapped
+      custom: bluecat.bdds.named.view
+      notes: >
+        BlueCat deploys one view per "DNS view" object in Address Manager;
+        essential for disambiguating split-horizon answers, no ECS equivalent
+    - vendor: QNAME
+      type: string
+      description: Fully qualified domain name being queried.
+      ecs: dns.question.name
+      status: mapped
+      transform: >
+        BIND prints the name with a trailing dot (`h1.example.com.`); strip
+        the trailing dot and lowercase before indexing, then derive
+        dns.question.registered_domain / top_level_domain / subdomain with a
+        registered-domain processor
+    - vendor: CLASS
+      type: enum
+      description: DNS query class, effectively always IN.
+      ecs: dns.question.class
+      status: mapped
+    - vendor: TYPE
+      type: enum
+      description: DNS record type requested (A, AAAA, PTR, TXT, MX, AXFR, ...).
+      ecs: dns.question.type
+      status: mapped
+    - vendor: 'flag: + / -'
+      type: enum
+      description: Recursion-desired indicator; `+` set, `-` not set.
+      ecs: dns.header_flags
+      status: partial
+      transform: >
+        must be rewritten to the ECS header-flag token RD and appended to the
+        dns.header_flags array rather than stored as the raw character
+    - vendor: 'flag: T'
+      type: boolean
+      description: Present when the query arrived over TCP rather than UDP.
+      ecs: network.transport
+      status: partial
+      transform: >
+        absence means UDP. There is no positive UDP token, so the pipeline
+        must emit network.transport=udp by default — a parser bug here
+        silently mislabels every UDP query
+    - vendor: 'flag: E(n)'
+      type: integer
+      description: EDNS version negotiated for the query, printed as E(0).
+      ecs: null
+      status: unmapped
+      custom: bluecat.bdds.named.edns_version
+      notes: ECS has no EDNS version field
+    - vendor: 'flag: D'
+      type: boolean
+      description: Present when the DNSSEC OK (DO) bit was set on the request.
+      ecs: dns.header_flags
+      status: partial
+      transform: convert to the ECS header-flag token DO and append to dns.header_flags
+    - vendor: 'flag: C'
+      type: boolean
+      description: Present when the checking-disabled (CD) bit was set.
+      ecs: dns.header_flags
+      status: partial
+      transform: convert to the CD header-flag token and append to dns.header_flags
+    - vendor: 'flag: S'
+      type: boolean
+      description: Present when the request carried a TSIG/SIG(0) signature.
+      ecs: null
+      status: unmapped
+      custom: bluecat.bdds.named.signed_request
+      notes: relevant for detecting rogue dynamic-update or zone-transfer clients
+    - vendor: destination address
+      type: ip
+      description: BDDS listening address that received the query, printed in trailing parentheses.
+      ecs: destination.ip
+      status: mapped
+    - vendor: syslog hostname
+      type: string
+      description: BDDS appliance name taken from the syslog header.
+      ecs: observer.hostname
+      status: mapped
+      notes: >-
+        also copy to observer.name so the DNS and DHCP datasets join on the
+        same appliance
+    - vendor: syslog tag
+      type: string
+      description: Emitting daemon name; always `named` for this dataset.
+      ecs: process.name
+      status: mapped
+      notes: >-
+        the discriminator that separates DNS lines from `dhcpd` lines on the
+        same syslog stream
+    - vendor: severity
+      type: enum
+      description: >-
+        BIND channel severity (info, notice, warning, error) when
+        print-severity is enabled.
+      ecs: log.level
+      status: mapped
+    - vendor: category
+      type: enum
+      description: BIND logging category the line was emitted under.
+      ecs: event.dataset
+      status: partial
+      notes: >
+        values include queries, query-errors, security, lame-servers, rpz,
+        update and xfer-out; only `queries` belongs in this dataset, the
+        others share the channel and must be split at the Cribl hop or they
+        pollute the DNS query stream
+    - vendor: rpz rewrite
+      type: string
+      description: >-
+        Response-policy-zone action text, e.g. `rpz QNAME NXDOMAIN rewrite ...
+        via <trigger>.rpz.zone`.
+      ecs: event.action
+      status: partial
+      notes: >
+        emitted on the same channel and the highest-value security record
+        here; needs its own parser branch and a policy-name field that ECS
+        does not define
+    - vendor: raw message
+      type: string
+      description: Unparsed syslog message body retained for reprocessing.
+      ecs: message
+      status: mapped
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Split the shared BIND channel on `category` so only `queries` lines
+          reach this dataset and give rpz rewrites their own branch; the flag
+          blob must emit network.transport=udp by default when `T` is absent
+          and expand +/-, D and C into the dns.header_flags token array rather
+          than storing raw characters. Take the sampling/aggregation decision
+          at this hop, then validate the emitted ECS JSON with
+          C.Schema(...).validate before the destination with a dead-letter
+          route for failures.
+        elastic: >
+          No integration exists, so stand up a custom logs-bluecat.dns_query
+          ingest pipeline that does only the registered_domain /
+          top_level_domain / subdomain derivation from dns.question.name and
+          the observer.hostname to observer.name copy that lets DNS and DHCP
+          join on the appliance. Add a custom-namespace index template mapping
+          bluecat.bdds.named.client_handle, .view, .edns_version and
+          .signed_request as keywords.
+        relay: >
+          Highest-volume feed on this route: cross full ECS-shaped NDJSON
+          (compression off, LF-terminated), use Persistent Queue backpressure
+          on the guard destination, and reconcile low-side vs high-side counts
+          per (dataset, hour) because there is no acknowledgement. Drop _raw
+          here first once the line grammar is proven, and bound QNAME length
+          and non-ASCII/punycode forms low-side so attacker-chosen names do
+          not trip content filtering.
+      direct:
+        parse_location: low
+        cribl: >
+          Split the shared BIND channel on `category` so only `queries` lines
+          reach this dataset and give rpz rewrites their own branch; the flag
+          blob must emit network.transport=udp by default when `T` is absent
+          and expand +/-, D and C into the dns.header_flags token array rather
+          than storing raw characters. Take the sampling/aggregation decision
+          at this hop, then validate the emitted ECS JSON with
+          C.Schema(...).validate before the destination with a dead-letter
+          route for failures.
+        elastic: >
+          No integration exists, so stand up a custom logs-bluecat.dns_query
+          ingest pipeline that does only the registered_domain /
+          top_level_domain / subdomain derivation from dns.question.name and
+          the observer.hostname to observer.name copy that lets DNS and DHCP
+          join on the appliance. Add a custom-namespace index template mapping
+          bluecat.bdds.named.client_handle, .view, .edns_version and
+          .signed_request as keywords.
+- id: dns-activity
+  name: DNS activity (dnstap) event
+  description: >
+    Structured DNS transaction records produced by the BDDS DNS data
+    collection / dnstap feature. Unlike the querylog, these are JSON objects
+    with a documented key schema covering both the question and the answer
+    side (AuthQuery, ClientQuery, ClientResponse, ResolverQuery,
+    ResolverResponse), which makes them the preferred long-term feed where the
+    appliance and the collector can support it.
+  event_categories:
+  - dns
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        dnstap output is delivered as JSON over HTTP/TCP rather than syslog,
+        so it needs a separate Cribl source from the querylog, and the
+        low-side crossing must be agreed with the guard owner for this feed
+        specifically — a JSON-over-HTTP stream has different Everfox HSG
+        inspection constraints than line-oriented syslog.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-bluecat.dns_activity
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        dnstap output is delivered as JSON over HTTP/TCP rather than syslog,
+        so it needs a separate Cribl source from the querylog.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-bluecat.dns_activity
+  formats:
+  - format: json
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom BlueCat dnstap JSON pipeline
+      notes: >
+        JSON parses natively; the work is renaming to ECS and flattening the
+        nested requestData/responseData objects. No vendor pack or Elastic
+        integration exists. Field names below are taken verbatim from
+        BlueCat's documented DNS query event sample.
+    fields:
+    - vendor: messageType
+      type: enum
+      description: >-
+        Direction and role of the DNS transaction (AuthQuery, AuthResponse,
+        ClientQuery, ClientResponse, ResolverQuery, ResolverResponse).
+      ecs: null
+      status: partial
+      custom: bluecat.bdds.dnstap.message_type
+      notes: >
+        drives both dns.type (query vs answer) and network.direction, but
+        neither ECS field captures the auth-vs-resolver distinction, so the
+        raw value is kept alongside the derived ones
+    - vendor: serverId
+      type: string
+      description: Hostname of the BDDS appliance that produced the record.
+      ecs: observer.name
+      status: mapped
+    - vendor: serverVersion
+      type: string
+      description: DNS engine version string, e.g. "BIND 9.16.5".
+      ecs: observer.version
+      status: mapped
+    - vendor: sourceAddress
+      type: ip
+      description: IP address of the querying client (or the upstream peer on Resolver* messages).
+      ecs: source.ip
+      status: mapped
+    - vendor: sourcePort
+      type: port
+      description: Source port of the querying client.
+      ecs: source.port
+      status: mapped
+    - vendor: responseAddress
+      type: ip
+      description: BDDS-side address of the transaction.
+      ecs: destination.ip
+      status: mapped
+      notes: >-
+        on Resolver* messages this is the upstream server, not the
+        client-facing listener
+    - vendor: socketProtocol
+      type: enum
+      description: Transport carrying the DNS message, UDP or TCP.
+      ecs: network.transport
+      status: mapped
+      transform: vendor emits UDP/TCP uppercase; ECS network.transport expects lowercase udp/tcp
+    - vendor: socketFamily
+      type: enum
+      description: Socket address family, INET or INET6.
+      ecs: network.type
+      status: partial
+      transform: INET -> ipv4, INET6 -> ipv6
+    - vendor: requestData.question[].domainName
+      type: string
+      description: Queried domain name from the DNS question section.
+      ecs: dns.question.name
+      status: mapped
+      transform: >-
+        trailing dot present in the vendor value (`h1.example.com.`); strip it
+        and lowercase
+    - vendor: requestData.question[].questionType
+      type: enum
+      description: Record type requested (A, AAAA, TXT, ...).
+      ecs: dns.question.type
+      status: mapped
+    - vendor: requestData.question[].class
+      type: enum
+      description: DNS question class, e.g. IN.
+      ecs: dns.question.class
+      status: mapped
+    - vendor: requestData.rcodeName
+      type: enum
+      description: DNS response code by name (NoError, NXDomain, ServFail, Refused).
+      ecs: dns.response_code
+      status: mapped
+      transform: >
+        vendor spelling is mixed case; ECS convention is the uppercase
+        mnemonic (NOERROR, NXDOMAIN, SERVFAIL, REFUSED)
+    - vendor: requestData.header.id
+      type: integer
+      description: DNS transaction ID from the message header.
+      ecs: dns.id
+      status: mapped
+      transform: numeric in the source, keyword in ECS — cast to string
+    - vendor: requestData.header.opcode
+      type: integer
+      description: Numeric DNS opcode (0=QUERY, 4=NOTIFY, 5=UPDATE).
+      ecs: dns.op_code
+      status: partial
+      transform: needs a lookup to the mnemonic ECS expects
+    - vendor: requestData.header.{aa,ad,cd,ra,rd,tc}
+      type: boolean
+      description: Six individual DNS header flag booleans.
+      ecs: dns.header_flags
+      status: partial
+      transform: >
+        ECS wants a single array of the set flag names (AA, AD, CD, RA, RD,
+        TC), so the pipeline has to collapse the true-valued keys into one
+        array
+    - vendor: responseData.answers[].rData
+      type: string
+      description: Answer record data (address, CNAME target, TXT payload, ...).
+      ecs: dns.answers.data
+      status: mapped
+      notes: >-
+        also feed dns.resolved_ip when recordType is A/AAAA, which is what
+        most detection content pivots on
+    - vendor: responseData.answers[].recordType
+      type: enum
+      description: Record type of the answer.
+      ecs: dns.answers.type
+      status: mapped
+    - vendor: responseData.answers[].ttl
+      type: integer
+      description: Time-to-live of the answer record in seconds.
+      ecs: dns.answers.ttl
+      status: mapped
+    - vendor: time
+      type: timestamp
+      description: >-
+        Event time as an epoch integer, with units declared by the sibling
+        timePrecision key.
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        BlueCat's sample uses "ns" precision (1599780145572110343); it must be
+        divided down to milliseconds — parsing it as epoch_ms throws the event
+        roughly 50 million years into the future
+    - vendor: key
+      type: string
+      description: Per-message UUID assigned by the dnstap collector.
+      ecs: null
+      status: unmapped
+      custom: bluecat.bdds.dnstap.key
+      notes: the join key between the Query and Response halves of one transaction
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          JSON parses natively, so the low-side work is shape: flatten
+          requestData/responseData to nesting depth 2 or less, scale the epoch
+          `time` value by the units the sibling timePrecision key declares
+          (the documented sample is nanoseconds and lands ~50 million years in
+          the future if read as epoch_ms), collapse the six header booleans
+          into one dns.header_flags array, and lowercase socketProtocol.
+          Derive dns.type and network.direction from messageType while keeping
+          the raw value, then schema-validate with a dead-letter route.
+        elastic: >
+          Custom logs-bluecat.dns_activity ingest pipeline: uppercase
+          rcodeName to the ECS mnemonic (NOERROR/NXDOMAIN/SERVFAIL/REFUSED),
+          cast the numeric header id to a keyword dns.id, look opcode up to
+          its mnemonic, map socketFamily INET/INET6 to ipv4/ipv6, and populate
+          dns.resolved_ip from answers whose recordType is A or AAAA since
+          detection content pivots on it. Map bluecat.bdds.dnstap.message_type
+          and .key as keywords in the custom index template — .key joins the
+          Query and Response halves.
+        relay: >
+          A JSON-over-HTTP feed faces different guard inspection constraints
+          than the line-oriented syslog datasets, so settle this route's terms
+          with the guard owner independently rather than inheriting the
+          querylog's. Low-side instances send the flattened ECS NDJSON and
+          never the nested vendor object, and cap TXT/rData answer payloads,
+          which are the unbounded free-text values here.
+      direct:
+        parse_location: low
+        cribl: >
+          JSON parses natively, so the shaping work at the edge is shape:
+          flatten requestData/responseData to nesting depth 2 or less, scale
+          the epoch `time` value by the units the sibling timePrecision key
+          declares (the documented sample is nanoseconds and lands ~50 million
+          years in the future if read as epoch_ms), collapse the six header
+          booleans into one dns.header_flags array, and lowercase
+          socketProtocol. Derive dns.type and network.direction from
+          messageType while keeping the raw value, then schema-validate with a
+          dead-letter route.
+        elastic: >
+          Custom logs-bluecat.dns_activity ingest pipeline: uppercase
+          rcodeName to the ECS mnemonic (NOERROR/NXDOMAIN/SERVFAIL/REFUSED),
+          cast the numeric header id to a keyword dns.id, look opcode up to
+          its mnemonic, map socketFamily INET/INET6 to ipv4/ipv6, and populate
+          dns.resolved_ip from answers whose recordType is A or AAAA since
+          detection content pivots on it. Map bluecat.bdds.dnstap.message_type
+          and .key as keywords in the custom index template — .key joins the
+          Query and Response halves.
+- id: dhcp
+  name: DHCP lease event (dhcpd)
+  description: >
+    ISC DHCPd transaction lines from the BDDS DHCP service, forwarded by
+    syslog redirection. The DORA sequence (DHCPDISCOVER / DHCPOFFER /
+    DHCPREQUEST / DHCPACK) plus NAK, DECLINE, RELEASE, INFORM and EXPIRE. This
+    is the authoritative IP-to-MAC-to-hostname binding record and underpins
+    asset attribution for every other data source.
+  event_categories:
+  - network
+  - configuration
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same syslog stream and same Cribl source as the named querylog — the
+        two are separated by the `dhcpd` vs `named` syslog tag, so this
+        dataset always takes the same crossing as the DNS query feed.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-bluecat.dhcp
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Same syslog stream and same Cribl source as the named querylog — the
+        two are separated by the `dhcpd` vs `named` syslog tag, so this
+        dataset follows the same path as the DNS query feed.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-bluecat.dhcp
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom ISC dhcpd pipeline
+      notes: >
+        Free-text English sentences with a different word order per message
+        type (`DHCPACK on <ip> to <mac> (<host>) via <iface>` vs `DHCPREQUEST
+        for <ip> (<server>) from <mac> (<host>) via <iface>`), so each verb
+        needs its own regex branch. There is no vendor pack; the widely used
+        ISC-dhcpd grok pattern set is the practical starting point.
+    fields:
+    - vendor: message type
+      type: enum
+      description: >-
+        Leading DHCP verb (DHCPDISCOVER, DHCPOFFER, DHCPREQUEST, DHCPACK,
+        DHCPNAK, DHCPDECLINE, DHCPRELEASE, DHCPINFORM, DHCPEXPIRE).
+      ecs: event.action
+      status: mapped
+      transform: >
+        lowercase it for ECS style and set event.outcome=failure for
+        DHCPNAK/DHCPDECLINE, success for DHCPACK
+    - vendor: lease address
+      type: ip
+      description: Address being offered, requested, acknowledged or released.
+      ecs: client.ip
+      status: mapped
+      notes: >
+        parsed from the `on <ip>` / `for <ip>` / `of <ip>` slot. Deliberately
+        client.ip, not source.ip: on a DISCOVER the client has no address yet,
+        so source.ip would be 0.0.0.0
+    - vendor: chaddr
+      type: mac
+      description: Client hardware (MAC) address from the DHCP packet.
+      ecs: client.mac
+      status: mapped
+      transform: >
+        dhcpd prints lowercase colon-separated (00:0c:29:1a:2b:3c); ECS
+        requires uppercase dash-separated (00-0C-29-1A-2B-3C). Skipping this
+        breaks every join against Windows and switch data
+    - vendor: client hostname
+      type: string
+      description: Client-supplied hostname printed in parentheses after the MAC.
+      ecs: host.hostname
+      status: partial
+      notes: >
+        this is the DHCP option 12 / option 81 value and is
+        attacker-controllable; dhcpd substitutes the literal "Hostname
+        Unsuitable for Printing" when it contains non-printable bytes, which
+        must not be indexed as a real hostname
+    - vendor: via <interface>
+      type: string
+      description: BDDS interface the request arrived on, e.g. eth0.
+      ecs: observer.ingress.interface.name
+      status: partial
+      notes: >
+        the `via` token holds EITHER the interface name or the relay agent
+        address (giaddr) depending on whether the request was relayed; the
+        pipeline has to test for an IP and route it to network.forwarded_ip
+        instead
+    - vendor: via <giaddr>
+      type: ip
+      description: Relay agent address form of the `via` token.
+      ecs: network.forwarded_ip
+      status: partial
+      notes: the only field that identifies which subnet/VLAN the request came from
+    - vendor: server identifier
+      type: ip
+      description: DHCP server the client selected, printed in parentheses on DHCPREQUEST lines.
+      ecs: destination.ip
+      status: partial
+      notes: absent on INIT-REBOOT requests
+    - vendor: uid / client identifier
+      type: string
+      description: DHCP option 61 client identifier.
+      ecs: null
+      status: unmapped
+      custom: bluecat.bdds.dhcpd.client_id
+      notes: >-
+        distinct from chaddr and often the only stable identifier for PXE and
+        virtual clients
+    - vendor: Circuit ID
+      type: string
+      description: >-
+        DHCP option 82 sub-option 1, identifying the relay circuit the request
+        came from.
+      ecs: null
+      status: unmapped
+      custom: bluecat.bdds.dhcpd.circuit_id
+      notes: BlueCat surfaces it on lease history; the switch-port-level attribution field
+    - vendor: Remote ID
+      type: string
+      description: DHCP option 82 sub-option 2, identifying the relay agent.
+      ecs: null
+      status: unmapped
+      custom: bluecat.bdds.dhcpd.remote_id
+    - vendor: Vendor Class Identifier
+      type: string
+      description: >-
+        DHCP option 60 vendor class string sent by the client, e.g. MSFT 5.0
+        or PXEClient.
+      ecs: null
+      status: unmapped
+      custom: bluecat.bdds.dhcpd.vendor_class
+      notes: coarse device fingerprint with no ECS home
+    - vendor: Parameter Request List
+      type: string
+      description: DHCP option 55, the ordered list of options the client asked for.
+      ecs: null
+      status: unmapped
+      custom: bluecat.bdds.dhcpd.parameter_request_list
+      notes: a usable OS fingerprint, but ECS has no field for it
+    - vendor: DUID
+      type: string
+      description: DHCPv6 unique identifier used in place of chaddr.
+      ecs: null
+      status: unmapped
+      custom: bluecat.bdds.dhcpd.duid
+      notes: the v6 message set (Solicit/Advertise/Request/Reply) needs its own parser branch
+    - vendor: lease time
+      type: integer
+      description: Lease length in seconds, where dhcpd prints it.
+      ecs: event.duration
+      status: partial
+      transform: ECS event.duration is nanoseconds, so multiply by 1e9
+    - vendor: reason text
+      type: string
+      description: >-
+        Trailing free text explaining a refusal, e.g. "unknown lease" or
+        "wrong network".
+      ecs: event.reason
+      status: partial
+      notes: only present on failure verbs
+    - vendor: syslog hostname
+      type: string
+      description: BDDS appliance that served the lease.
+      ecs: observer.hostname
+      status: mapped
+      notes: also copy to observer.name to match the DNS datasets
+    - vendor: syslog tag
+      type: string
+      description: Emitting daemon name; always `dhcpd` for this dataset.
+      ecs: process.name
+      status: mapped
+      notes: the discriminator against `named` lines on the shared stream
+    - vendor: syslog pid
+      type: integer
+      description: Process ID of the dhcpd daemon from the syslog header.
+      ecs: process.pid
+      status: mapped
+    - vendor: raw message
+      type: string
+      description: Unparsed syslog message body retained for reprocessing.
+      ecs: message
+      status: mapped
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Split the shared stream on the `dhcpd` vs `named` syslog tag, then
+          run one branch per verb plus a separate DHCPv6
+          Solicit/Advertise/Request/Reply branch keyed on DUID instead of
+          chaddr. Normalize chaddr to uppercase dash-separated form at this
+          hop — skipping it breaks every join against Windows and switch data
+          — test the `via` token for an IP so relayed requests land in
+          network.forwarded_ip rather than the interface name, and suppress
+          dhcpd's "Hostname Unsuitable for Printing" placeholder so it is
+          never indexed as a real host.hostname.
+        elastic: >
+          Custom logs-bluecat.dhcp ingest pipeline deriving event.outcome
+          (failure for DHCPNAK/DHCPDECLINE, success for DHCPACK), lowercasing
+          the verb into event.action, and converting the printed lease time
+          from seconds to nanosecond event.duration. The index template has to
+          map the option-60/61/82/55 custom fields —
+          bluecat.bdds.dhcpd.client_id, .circuit_id, .remote_id,
+          .vendor_class, .parameter_request_list and .duid — as keywords, or
+          the switch-port attribution and fingerprinting pivots are
+          unqueryable.
+        relay: >
+          This feed shares its transport with the named querylog, so it takes
+          the same crossing that source does; low-side instances cross full
+          ECS NDJSON with the MAC already normalized so no high-side rewrite
+          is needed. Client-supplied hostnames and option-82 circuit/remote ID
+          strings are attacker-controllable free text — bound and sanitize
+          them low-side before content filtering sees them, and keep _raw
+          across the guard until the per-verb grammars are proven.
+      direct:
+        parse_location: low
+        cribl: >
+          Split the shared stream on the `dhcpd` vs `named` syslog tag, then
+          run one branch per verb plus a separate DHCPv6
+          Solicit/Advertise/Request/Reply branch keyed on DUID instead of
+          chaddr. Normalize chaddr to uppercase dash-separated form at this
+          hop — skipping it breaks every join against Windows and switch data
+          — test the `via` token for an IP so relayed requests land in
+          network.forwarded_ip rather than the interface name, and suppress
+          dhcpd's "Hostname Unsuitable for Printing" placeholder so it is
+          never indexed as a real host.hostname.
+        elastic: >
+          Custom logs-bluecat.dhcp ingest pipeline deriving event.outcome
+          (failure for DHCPNAK/DHCPDECLINE, success for DHCPACK), lowercasing
+          the verb into event.action, and converting the printed lease time
+          from seconds to nanosecond event.duration. The index template has to
+          map the option-60/61/82/55 custom fields —
+          bluecat.bdds.dhcpd.client_id, .circuit_id, .remote_id,
+          .vendor_class, .parameter_request_list and .duid — as keywords, or
+          the switch-port attribution and fingerprinting pivots are
+          unqueryable.
+- id: bam-audit
+  name: Address Manager audit and session events
+  description: >
+    Administrative and session activity from BlueCat Address Manager (BAM) —
+    the IPAM control plane. Covers administrative history (adds, updates and
+    deletes to configurations, zones, records, blocks and networks made
+    through the GUI or the API), session and event history (admin
+    login/logout), and service-level events from the deployment, monitoring
+    and database-maintenance subscriptions.
+  event_categories:
+  - configuration
+  - iam
+  - authentication
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        BAM's own syslog redirection (Configuration > System Settings >
+        Logging > Syslog Servers, UDP/TCP 514 or TLS 6514), separate from the
+        BDDS appliances. Low volume, high value. The management plane is often
+        in a different enclave from the DNS/DHCP data plane, so a given BAM
+        can sit on a different side from the BDDS appliances it manages.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-bluecat.bam_audit
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        BAM's own syslog redirection (Configuration > System Settings >
+        Logging > Syslog Servers, UDP/TCP 514 or TLS 6514), separate from the
+        BDDS appliances. Low volume, high value. The management plane is often
+        in a different enclave from the DNS/DHCP data plane, so a given BAM
+        can sit on a different side from the BDDS appliances it manages.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-bluecat.bam_audit
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom BAM audit pipeline
+      notes: >
+        Syslog carries the operations/session events as free text. The
+        complete administrative history — including the before/after field
+        values — lives in the BAM database and is only fully exposed through
+        the BAM API (transaction history / audit data), so an api-pull
+        companion collector is worth scoping if the CSOC needs field-level
+        change detail rather than just "who changed what object".
+    fields:
+    - vendor: User
+      type: string
+      description: BAM administrator account that performed the transaction.
+      ecs: user.name
+      status: mapped
+    - vendor: Operation
+      type: string
+      description: >-
+        Human-readable description of the recorded transaction, as shown in
+        BAM transaction history.
+      ecs: event.action
+      status: mapped
+    - vendor: Action
+      type: enum
+      description: Per-detail verb inside a transaction (Add, Update, Delete).
+      ecs: event.action
+      status: partial
+      notes: >
+        collides with Operation above — one transaction can contain many
+        Action rows, so a single ECS event.action cannot represent both levels
+        and the detail rows need flattening or a custom field
+    - vendor: Object Type
+      type: enum
+      description: >-
+        Entity class affected (Configuration, View, Zone, HostRecord,
+        IP4Block, IP4Network, DHCPRange, User, UserGroup).
+      ecs: null
+      status: unmapped
+      custom: bluecat.bam.object.type
+      notes: >
+        ECS 9.4 has beta entity.target.type / entity.target.sub_type; adopt
+        when GA. The GA host.target.* reuse added in 9.x is not a fit — a BAM
+        configuration object (even a HostRecord) is not a host
+    - vendor: Object ID
+      type: integer
+      description: BAM-internal numeric entity identifier for the affected object.
+      ecs: null
+      status: unmapped
+      custom: bluecat.bam.object.id
+      notes: >
+        the join key back to the BAM API. entity.target.id is GA in ECS 9.4,
+        but every companion leaf that gives it meaning (entity.target.name /
+        .type / .sub_type) is still beta, so adopting the id alone would index
+        an opaque integer with no type context — keep the custom field and
+        adopt the set when GA
+    - vendor: Object Name
+      type: string
+      description: Name of the affected entity, e.g. the zone or host record.
+      ecs: null
+      status: unmapped
+      custom: bluecat.bam.object.name
+      notes: >
+        often the only human-meaningful identifier in the event. ECS 9.4 has
+        beta entity.target.name; adopt when GA
+    - vendor: Transaction Number
+      type: integer
+      description: >-
+        Unique transaction identifier grouping all detail rows of one
+        administrative change.
+      ecs: null
+      status: unmapped
+      custom: bluecat.bam.transaction.id
+    - vendor: Field Name
+      type: string
+      description: Name of the specific object attribute that changed.
+      ecs: null
+      status: unmapped
+      custom: bluecat.bam.change.field
+    - vendor: Previous State
+      type: string
+      description: Prior value of the changed field.
+      ecs: null
+      status: unmapped
+      custom: bluecat.bam.change.previous_state
+      notes: >-
+        DNS-record-tampering detection depends on this, and it is not present
+        in the syslog form of the event
+    - vendor: Updated State
+      type: string
+      description: New value of the changed field.
+      ecs: null
+      status: unmapped
+      custom: bluecat.bam.change.updated_state
+      notes: same syslog-vs-API caveat as Previous State
+    - vendor: Time
+      type: timestamp
+      description: Date and time the transaction was recorded.
+      ecs: '@timestamp'
+      status: partial
+      notes: >
+        BAM records the transaction time in the appliance's configured time
+        zone; the syslog header time and the event body time can disagree, so
+        pick one deliberately and keep the other as a drift check
+    - vendor: login/logout event
+      type: enum
+      description: >-
+        Session and event history entries — admin sign-in, sign-out, session
+        timeout, failed authentication.
+      ecs: event.action
+      status: partial
+      notes: >
+        these are the authentication-category events in this dataset and need
+        their own parser branch setting event.outcome
+    - vendor: client address
+      type: ip
+      description: Address the administrative session originated from.
+      ecs: source.ip
+      status: partial
+      notes: present on session events, usually absent on API-driven object changes
+    - vendor: event level
+      type: enum
+      description: >-
+        Event level from BAM event subscriptions (Info, Warning, Error,
+        Success, Failed, Invalid).
+      ecs: event.severity
+      status: partial
+      transform: >
+        needs a lookup to ECS's numeric event.severity, and Success/Failed
+        should additionally drive event.outcome
+    - vendor: service
+      type: enum
+      description: >-
+        BAM subsystem that raised the event (Deployment Service, Monitoring
+        Service, Data Check Service, Database Maintenance Service, IP
+        Reconciliation Service, xHA, SSO and OAuth Management Service).
+      ecs: service.name
+      status: mapped
+    - vendor: syslog hostname
+      type: string
+      description: BAM appliance name from the syslog header.
+      ecs: observer.hostname
+      status: mapped
+      notes: distinguishes primary from standby in an xHA pair
+    - vendor: raw message
+      type: string
+      description: Unparsed syslog message body retained for reprocessing.
+      ecs: message
+      status: mapped
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Take this on its own source (BAM syslog redirection, TLS 6514 in
+          preference to UDP/TCP 514) and branch the pipeline into
+          object-change, session/authentication and service-event grammars.
+          Scope the BAM API transaction-history collector at this hop as well:
+          Previous State and Updated State never appear in the syslog form, so
+          without it there are no before/after values for DNS-record-tampering
+          detection. Decide deliberately whether the syslog header time or the
+          body time becomes @timestamp and carry the other as a clock-drift
+          check.
+        elastic: >
+          Custom logs-bluecat.bam_audit ingest pipeline with a lookup from the
+          BAM event level (Info/Warning/Error/Success/Failed/Invalid) to
+          numeric event.severity, plus event.outcome derived from
+          Success/Failed and from the login/logout branch. Map the
+          bluecat.bam.* customs (object.type/.id/.name, transaction.id,
+          change.field/.previous_state/ .updated_state) in the index template,
+          keep the per-detail Action out of event.action so it does not
+          collide with Operation, and revisit entity.target.* once the whole
+          set leaves beta.
+        relay: >
+          Low volume and high value, and the management plane frequently sits
+          in a different enclave from the DNS/DHCP data plane, so establish
+          which side a given BAM sits on independently of the BDDS feeds
+          rather than assuming it matches. Cross full ECS NDJSON, and cap the
+          API-sourced change values — previous/updated state can carry whole
+          record contents — with C.Schema validation immediately before the
+          guard destination.
+      direct:
+        parse_location: low
+        cribl: >
+          Take this on its own source (BAM syslog redirection, TLS 6514 in
+          preference to UDP/TCP 514) and branch the pipeline into
+          object-change, session/authentication and service-event grammars.
+          Scope the BAM API transaction-history collector at this hop as well:
+          Previous State and Updated State never appear in the syslog form, so
+          without it there are no before/after values for DNS-record-tampering
+          detection. Decide deliberately whether the syslog header time or the
+          body time becomes @timestamp and carry the other as a clock-drift
+          check.
+        elastic: >
+          Custom logs-bluecat.bam_audit ingest pipeline with a lookup from the
+          BAM event level (Info/Warning/Error/Success/Failed/Invalid) to
+          numeric event.severity, plus event.outcome derived from
+          Success/Failed and from the login/logout branch. Map the
+          bluecat.bam.* customs (object.type/.id/.name, transaction.id,
+          change.field/.previous_state/ .updated_state) in the index template,
+          keep the per-detail Action out of event.action so it does not
+          collide with Operation, and revisit entity.target.* once the whole
+          set leaves beta.
+  - format: json
+    enable: >
+      Turn on Administration tab > Data Management > Audit Data Settings >
+      Audit Data Export on the BAM appliance. From Address Manager v9.5.0 the
+      export service emits valid JSON and stamps each record with the hostname
+      of the emitting Address Manager server (so a multi-BAM or xHA estate is
+      separable at the collector). Configure one of the four native
+      destinations - a generic HTTP(S) endpoint, a Splunk HTTP Event
+      Collector, a Kafka cluster, or an Elasticsearch server - each with TLS
+      and certificate verification; the service buffers events before export
+      and the BAM UI may report success before the destination handshake
+      completes, so validate delivery from the BAM event log rather than the
+      config dialog. This export carries the administrative audit trail
+      (transaction history, including the per-field Previous/Updated State the
+      syslog form omits) plus the session and service event logs, so it is the
+      path to adopt when the CSOC needs before/after change values rather than
+      only "who changed what object". It is a separate emission from the BDDS
+      DNS/DHCP server syslog - it covers the BAM management plane only.
+    references:
+    - >-
+      https://docs.bluecatnetworks.com/r/Address-Manager-Administration-Guide/Enabling-Audit-Data-Export/9.6.0
+    - >-
+      https://docs.bluecatnetworks.com/r/Address-Manager-Administration-Guide/Enabling-Audit-Data-Export/9.5.0
+    - >-
+      https://docs.bluecatnetworks.com/r/Address-Manager-Administration-Guide/What-s-New-in-Address-Manager-v9.5.0/9.5.0
+    - >-
+      https://docs.bluecatnetworks.com/r/Address-Manager-Administration-Guide/Viewing-transaction-history/9.6.0
+    - >-
+      https://docs.bluecatnetworks.com/r/Address-Manager-Administration-Guide/Reference-Event-level-subscriptions/9.6.0
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom BlueCat BAM audit-data-export JSON pipeline
+      notes: >
+        JSON parses natively, so no line grammar is needed as the syslog form
+        requires; the work is ECS renaming and flattening the per-detail
+        change rows (Action / Field Name / Previous State / Updated State),
+        each transaction carrying many detail rows under one Transaction
+        Number. No Elastic integration and no Cribl pack exists for BlueCat
+        BAM. Terminate the chosen transport with the matching Cribl source - a
+        Cribl HTTP source for the HTTP/Splunk-HEC destination, a Kafka source
+        for the Kafka destination, or (on the direct side) let an Elastic
+        Agent httpjson/http_endpoint input take it. The vendor field names
+        below follow BlueCat's documented audit-data-model display labels, NOT
+        a confirmed export sample: the literal JSON export key names and their
+        casing are unverified and must be checked against real export output
+        on-site before the pipeline field paths are fixed.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Take this on its own Cribl source (HTTP or Kafka, in preference to
+          re-deriving it from syslog) and branch the pipeline into
+          object-change, session/authentication and service-event grammars
+          exactly as the syslog form is branched, but here the change detail
+          arrives structured so no reconstruction is needed. Flatten the
+          per-detail rows to nesting depth two or less, collapse each
+          transaction's detail array while preserving the Transaction Number
+          join key, and decide deliberately whether the record time or the
+          transport-stamped time becomes @timestamp, carrying the other as a
+          clock-drift check. Schema-validate the emitted ECS JSON with
+          C.Schema(...).validate before the guard destination with a
+          dead-letter route for failures.
+        elastic: >
+          Custom logs-bluecat.bam_audit ingest pipeline with a lookup from the
+          BAM event level (Info/Warning/Error/Success/Failed/Invalid) to
+          numeric event.severity, plus event.outcome derived from
+          Success/Failed and from the login/logout branch. Map the
+          bluecat.bam.* customs (object.type/.id/.name,
+          transaction.id/.comment,
+          change.field/.previous_state/.updated_state) as keywords in the
+          custom index template, and keep the per-detail Action out of
+          event.action so it does not collide with the transaction-level
+          Operation. Because Previous/Updated State are present in this form,
+          add a change-diff enrichment the syslog feed cannot support.
+        relay: >
+          Low volume and high value, and the management plane frequently sits
+          in a different enclave from the DNS/DHCP data plane, so establish
+          which side a given BAM sits on independently of the BDDS feeds. The
+          unbounded, content-inspection-relevant values here are Previous
+          State and Updated State - they can carry whole record contents
+          including attacker-influenced hostnames and TXT data - so length-cap
+          and sanitize them low-side and hold the record to a declared nesting
+          depth before the guard destination. Cross full ECS NDJSON, drop the
+          raw vendor object once the mapping is proven, and reconcile low-side
+          vs high-side counts per (dataset, hour) because the crossing is
+          at-most-once with no acknowledgement.
+      direct:
+        parse_location: high
+        cribl: >
+          For a high-side BAM with no guard, terminate the export directly:
+          either a thin Cribl HTTP/Kafka source that passes the JSON through
+          with the vendor object kept as _raw, or skip Cribl and let an
+          Elastic Agent input drain the HTTP/Kafka destination. The only
+          decision that matters is not double-counting against any
+          co-collected syslog-redirection feed for the same BAM - pick one
+          authoritative audit transport per appliance, keying on Transaction
+          Number if both are briefly run in parallel during cutover.
+        elastic: >
+          Custom logs-bluecat.bam_audit ingest pipeline with a lookup from the
+          BAM event level (Info/Warning/Error/Success/Failed/Invalid) to
+          numeric event.severity, plus event.outcome derived from
+          Success/Failed and from the login/logout branch. Map the
+          bluecat.bam.* customs (object.type/.id/.name,
+          transaction.id/.comment,
+          change.field/.previous_state/.updated_state) as keywords in the
+          custom index template, and keep the per-detail Action out of
+          event.action so it does not collide with the transaction-level
+          Operation. Because there is no boundary, retain the full
+          Previous/Updated State values for change-forensics rather than
+          capping them, and treat this JSON export as the authoritative audit
+          feed over the syslog form, which cannot carry the before/after
+          values this one does.
+    fields:
+    - vendor: hostname
+      type: string
+      description: >-
+        Hostname of the Address Manager server emitting the export, added to
+        every JSON record in v9.5.0+.
+      ecs: observer.hostname
+      status: mapped
+      notes: >-
+        also copy to observer.name so the BAM audit feed joins the DNS/DHCP
+        datasets on the same appliance, and it distinguishes primary from
+        standby in an xHA pair
+    - vendor: Operation
+      type: string
+      description: >-
+        Human-readable description of the recorded transaction, as shown in
+        BAM transaction history.
+      ecs: event.action
+      status: mapped
+    - vendor: User
+      type: string
+      description: BAM administrator account that performed the transaction.
+      ecs: user.name
+      status: mapped
+    - vendor: Time
+      type: timestamp
+      description: Date and time the transaction was recorded.
+      ecs: '@timestamp'
+      status: partial
+      notes: >
+        recorded in the appliance's configured time zone; the record time and
+        the transport-stamped delivery time can disagree, so pick one
+        deliberately as @timestamp and keep the other as a drift check
+    - vendor: Transaction Number
+      type: integer
+      description: >-
+        Unique transaction identifier grouping all detail rows of one
+        administrative change.
+      ecs: null
+      status: unmapped
+      custom: bluecat.bam.transaction.id
+    - vendor: Comment
+      type: string
+      description: >-
+        Free-text comment attached to the transaction, shown in the
+        transaction's General section.
+      ecs: null
+      status: unmapped
+      custom: bluecat.bam.transaction.comment
+    - vendor: Action
+      type: enum
+      description: Per-detail verb inside a transaction (Add, Update, Delete).
+      ecs: event.action
+      status: partial
+      notes: >
+        one transaction can contain many Action rows, so it collides with the
+        transaction-level Operation - a single ECS event.action cannot
+        represent both levels, so the detail rows need flattening or a custom
+        field
+    - vendor: Object Type
+      type: enum
+      description: >-
+        Entity class affected (Configuration, View, Zone, HostRecord,
+        IP4Block, IP4Network, DHCPRange, User, UserGroup).
+      ecs: null
+      status: unmapped
+      custom: bluecat.bam.object.type
+      notes: ECS 9.4 has beta entity.target.type / entity.target.sub_type; adopt when GA
+    - vendor: Object ID
+      type: integer
+      description: BAM-internal numeric entity identifier for the affected object.
+      ecs: null
+      status: unmapped
+      custom: bluecat.bam.object.id
+      notes: the join key back to the BAM RESTful v2 API for full object context
+    - vendor: Object Name
+      type: string
+      description: Name of the affected entity, e.g. the zone or host record.
+      ecs: null
+      status: unmapped
+      custom: bluecat.bam.object.name
+      notes: >-
+        often the only human-meaningful identifier in the event; ECS 9.4 has
+        beta entity.target.name, adopt when GA
+    - vendor: Field Name
+      type: string
+      description: Name of the specific object attribute that changed.
+      ecs: null
+      status: unmapped
+      custom: bluecat.bam.change.field
+    - vendor: Previous State
+      type: string
+      description: Prior value of the changed field.
+      ecs: null
+      status: unmapped
+      custom: bluecat.bam.change.previous_state
+      notes: >
+        DNS-record-tampering detection depends on this, and it is the value
+        that IS present in this JSON export but NOT in the syslog redirection
+        form of the event - the reason to adopt this feed
+    - vendor: Updated State
+      type: string
+      description: New value of the changed field.
+      ecs: null
+      status: unmapped
+      custom: bluecat.bam.change.updated_state
+      notes: same present-here-absent-in-syslog property as Previous State
+    - vendor: event level
+      type: enum
+      description: >-
+        Event level from BAM event subscriptions (Info, Warning, Error,
+        Success, Failed, Invalid).
+      ecs: event.severity
+      status: partial
+      transform: >
+        needs a lookup to ECS's numeric event.severity, and Success/Failed
+        should additionally drive event.outcome
+    - vendor: service
+      type: enum
+      description: >-
+        BAM subsystem that raised the event (Deployment Service, Monitoring
+        Service, Data Check Service, Database Maintenance Service, IP
+        Reconciliation Service, xHA, SSO and OAuth Management Service).
+      ecs: service.name
+      status: mapped
+    - vendor: login/logout event
+      type: enum
+      description: >-
+        Session and event history entries - admin sign-in, sign-out, session
+        timeout, failed authentication.
+      ecs: event.action
+      status: partial
+      notes: >-
+        the authentication-category events in this feed; they need their own
+        parser branch setting event.outcome
+    - vendor: client address
+      type: ip
+      description: Address the administrative session originated from.
+      ecs: source.ip
+      status: partial
+      notes: present on session events, usually absent on API-driven object changes

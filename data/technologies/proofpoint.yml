@@ -1,0 +1,1782 @@
+id: proofpoint
+name: Proofpoint Email Security
+vendor: Proofpoint
+versions: PPS 8.x / 8.20 (Protection Server and Proofpoint on Demand), TAP SIEM API v2
+draft: true
+references:
+- https://help.proofpoint.com/Threat_Insight_Dashboard/API_Documentation/SIEM_API
+- >-
+  https://help.proofpoint.com/Threat_Insight_Dashboard/API_Documentation/Forensics_API
+- https://www.elastic.co/docs/reference/integrations/proofpoint_tap
+- https://www.elastic.co/docs/reference/integrations/proofpoint_on_demand
+- >-
+  https://github.com/elastic/integrations/tree/main/packages/proofpoint_on_demand/data_stream/message/fields
+- >-
+  https://github.com/elastic/integrations/tree/main/packages/proofpoint_tap/data_stream/message_blocked/elasticsearch/ingest_pipeline
+- >-
+  https://splunk.github.io/splunk-connect-for-syslog/next-major/sources/vendor/Proofpoint/
+- >-
+  https://docs.cloud.google.com/chronicle/docs/ingestion/parser-list/proofpoint-mail-filter-changelog
+datasets:
+- id: filter-log
+  name: PPS filter log (mail flow)
+  description: >
+    The Protection Server's own mail-flow record: sendmail-derived syslog
+    lines (qid=, from=, to=, relay=, stat=, msgid=, delay=) interleaved with
+    the filter module's structured key/value lines, each tagged with the
+    module that emitted it and the command it was running (mod=session
+    cmd=connect, mod=mail cmd=env_from / cmd=env_rcpt, mod=spam cmd=run,
+    mod=av cmd=run ...), correlated by the session id (s=) and the per-session
+    message number (m=). One message therefore produces many syslog lines that
+    MUST be reassembled into a single event before anything downstream is
+    useful - Splunk Connect for Syslog's pps_filter_log source states the same
+    and defers reassembly to the SIEM. Proofpoint on Demand (the hosted PPS)
+    emits the already assembled record as one JSON object per message over the
+    PoD Log API (WSS), and that JSON schema is the authoritative naming for
+    the verdict and disposition values the on-prem kv lines carry per module;
+    the four fields below written in dotted form (filter.disposition,
+    filter.modules.*, msgParts.sha256) are quoted with their PoD Log API names
+    for that reason.
+  event_categories:
+  - malware
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        The PPS forwards the filter log over syslog (System > Logs and Reports
+        > Log Settings, facility local1) to Cribl; the mail log needs a
+        dedicated port because its sendmail grammar collides with generic
+        sendmail sources. On the low-side crossing, subjects, attachment
+        filenames and rewritten URLs are unbounded adversary-controlled free
+        text and need an explicit content-inspection and length policy, and
+        the multi-line reassembly has to happen BEFORE the crossing.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-proofpoint_on_demand.message
+      notes: >
+        the proofpoint_on_demand integration models the assembled PoD JSON
+        message record; landing the reassembled on-prem event in the same data
+        stream keeps one schema for both deployment styles, but the
+        integration's own ingest pipeline expects the WSS JSON and will not
+        parse the raw syslog kv form
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        The PPS forwards the filter log over syslog (System > Logs and Reports
+        > Log Settings, facility local1) to Cribl; the mail log needs a
+        dedicated port because its sendmail grammar collides with generic
+        sendmail sources. The multi-line reassembly by (s, m) has to happen in
+        Cribl before the assembled event reaches Elastic.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-proofpoint_on_demand.message
+      notes: >
+        the proofpoint_on_demand integration models the assembled PoD JSON
+        message record; landing the reassembled on-prem event in the same data
+        stream keeps one schema for both deployment styles, but the
+        integration's own ingest pipeline expects the WSS JSON and will not
+        parse the raw syslog kv form
+  formats:
+  - format: syslog-kv
+    recommended: true
+    recommended_because: >-
+      the JSON Log API exists only on Proofpoint on Demand; an on-premises
+      Protection Server appliance offers the key-value filter log and nothing
+      else.
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: custom PPS filter-log pipeline
+      notes: >
+        No Elastic integration ingests the on-prem PPS syslog filter log.
+        proofpoint_on_demand covers only the hosted PoD Log API (WSS, data
+        streams audit / mail / message) and proofpoint_tap covers only the TAP
+        SIEM API, so a hand-built Cribl pipeline owns the kv split, the
+        multi-line reassembly by (s, m) and the emit into the
+        proofpoint_on_demand.message document shape.
+    fields:
+    - vendor: mod
+      type: string
+      description: >-
+        PPS filter module that emitted the line (session, mail, spam, av,
+        urldefense, dmarc, sandbox, access)
+      ecs: null
+      status: unmapped
+      custom: proofpoint.pps.filter.module
+      notes: >-
+        identifies which scanning module produced the line and therefore which
+        other keys are present on it
+    - vendor: cmd
+      type: string
+      description: >-
+        command or protocol phase the module was executing (connect,
+        disconnect, env_from, env_rcpt, msg, run)
+      ecs: null
+      status: unmapped
+      custom: proofpoint.pps.filter.command
+      notes: >
+        a processing phase, not a security decision - do not map it to
+        event.action; the decision is carried by the disposition and the final
+        rule, and event.action must be derived from those
+    - vendor: s
+      type: string
+      description: session identifier shared by every line of one inbound SMTP conversation
+      ecs: null
+      status: unmapped
+      custom: proofpoint.pps.session.id
+      transform: >
+        primary reassembly key - all lines carrying the same s value belong to
+        one SMTP connection and must be aggregated before the event is emitted
+    - vendor: m
+      type: string
+      description: >-
+        message number within the session, distinguishing multiple messages
+        sent over one connection
+      ecs: null
+      status: unmapped
+      custom: proofpoint.pps.message.number
+      transform: >
+        secondary reassembly key - (s, m) together identify one message;
+        aggregating on s alone merges unrelated messages from a pipelined
+        connection
+    - vendor: rule
+      type: string
+      description: name of the filter rule that fired on this module pass
+      ecs: rule.name
+      status: mapped
+    - vendor: folder
+      type: string
+      description: >-
+        quarantine folder the message was placed in (Quarantine, Bulk Mail,
+        Audit, custom folders)
+      ecs: null
+      status: unmapped
+      custom: proofpoint.pps.quarantine.folder
+      notes: >-
+        presence of a folder value is the strongest single indicator that the
+        message was not delivered
+    - vendor: ip
+      type: ip
+      description: IP address of the connecting SMTP client, from the mod=session cmd=connect line
+      ecs: source.ip
+      status: mapped
+    - vendor: helo
+      type: string
+      description: FQDN or address literal the peer announced in the HELO/EHLO command
+      ecs: null
+      status: unmapped
+      custom: proofpoint.pps.connection.helo
+      notes: >
+        self-asserted and frequently forged, so it is deliberately not mapped
+        to source.domain, which readers treat as a resolved name
+    - vendor: qid
+      type: string
+      description: sendmail queue identifier for the message on this PPS
+      ecs: email.local_id
+      status: mapped
+    - vendor: from
+      type: string
+      description: envelope sender address from MAIL FROM
+      ecs: email.sender.address
+      status: partial
+      notes: >
+        ECS models no envelope sender distinct from the header sender;
+        email.sender.address is used for the envelope value here to match the
+        convention Elastic's own Proofpoint TAP pipeline follows, with the
+        header From going to email.from.address
+    - vendor: to
+      type: string
+      description: envelope recipient address from RCPT TO
+      ecs: email.to.address
+      status: partial
+      transform: >
+        one line is emitted per recipient; the reassembly step must collect
+        them into the email.to.address array rather than letting the last line
+        win
+    - vendor: hfrom
+      type: string
+      description: >-
+        address parsed from the RFC 5322 From: header, which need not match
+        the envelope sender
+      ecs: email.from.address
+      status: mapped
+    - vendor: msgid
+      type: string
+      description: RFC 5322 Message-ID taken from the message header
+      ecs: email.message_id
+      status: mapped
+      notes: >-
+        some PPS builds emit the same value as hdr_mid on the filter-module
+        line and as msgid on the sendmail line
+    - vendor: relay
+      type: string
+      description: >-
+        peer host and address the message was received from or delivered to,
+        as host [IP]
+      ecs: destination.address
+      status: partial
+      notes: >
+        direction-dependent - on the sender line relay= is the inbound peer
+        (already captured as source.ip) and on the recipient line it is the
+        delivery next hop; only the latter belongs in destination.address, so
+        the pipeline must branch on which line it came from
+    - vendor: stat
+      type: string
+      description: >-
+        sendmail delivery status text for the recipient (Sent, Deferred, User
+        unknown, ...)
+      ecs: event.outcome
+      status: partial
+      transform: >
+        needs a prefix lookup, not a copy - Sent maps to success, Deferred and
+        the bounce texts to failure, and the value must be combined with the
+        filter disposition so a quarantined message is not recorded as a
+        successful delivery
+    - vendor: delay
+      type: string
+      description: total time the message spent in the queue, formatted HH:MM:SS or days+HH:MM:SS
+      ecs: event.duration
+      status: partial
+      transform: >-
+        convert the HH:MM:SS (or d+HH:MM:SS) string to nanoseconds; ECS
+        event.duration is a long in nanoseconds
+    - vendor: filter.disposition
+      type: string
+      description: >-
+        message disposition determined by filterd (PoD Log API name for the
+        value the on-prem lines carry as the final module action)
+      ecs: null
+      status: partial
+      custom: proofpoint.pps.filter.disposition
+      transform: >
+        drives event.action and, together with the sendmail status,
+        event.outcome - accept/deliver are successes, reject/discard/
+        quarantine are failures; leaving it as a raw string means every alert
+        rule re-implements the vocabulary
+    - vendor: filter.modules.av.virus_names
+      type: string
+      description: virus names reported by the antivirus module (PoD Log API name)
+      ecs: null
+      status: unmapped
+      custom: proofpoint.pps.av.virus_names
+      notes: >
+        vendor detection name; no ECS home in 9.4 and deliberately not
+        threat.indicator.* or rule.name, which model a TI-provider indicator
+        and the filter policy rule respectively
+    - vendor: filter.modules.spam.triggered_classifier
+      type: string
+      description: >-
+        the single spam classifier that determined the spam disposition (PoD
+        Log API name)
+      ecs: null
+      status: unmapped
+      custom: proofpoint.pps.spam.triggered_classifier
+      notes: >-
+        the classifier name is the only explanation of a spam verdict the log
+        carries; keep it queryable for false-positive triage
+    - vendor: msgParts.sha256
+      type: string
+      description: SHA-256 of a message part (body or attachment), PoD Log API name
+      ecs: email.attachments.file.hash.sha256
+      status: mapped
+      notes: >
+        the malware alerting profile reads file.hash.sha256, so the attachment
+        hash needs an explicit copy into that field as well; message parts
+        with disposition inline are bodies, not attachments, and should not
+        populate the attachment array
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Own the reassembly on the low side: key a stateful aggregation on
+          the session id and per-session message number, join the sendmail and
+          filter-module lines for one message into a single ECS-shaped record,
+          and emit only on the terminal line so partial messages never reach
+          Elastic. Derive event.outcome once, from the filter disposition and
+          the sendmail status prefix together rather than from either alone,
+          convert the HH:MM:SS delay to nanoseconds, and build the envelope
+          recipient array from the repeated per-recipient lines. Drop or mask
+          the authentication material that appears on rejected-relay lines,
+          cap subject and attachment-name length, and gate the destination
+          with a Schema Library validation plus a dead-letter route, because a
+          hand-built parser with no vendor pack behind it will meet new module
+          keys on every PPS upgrade.
+        elastic: >
+          Land the reassembled documents in logs-proofpoint_on_demand.message
+          and keep the high side to enrichment, not a second parse. Add
+          custom-namespace keyword mappings for the session id, per-session
+          message number, quarantine folder, filter module and filter command
+          so mail-flow triage can pivot on them, map the message size as long,
+          and add a runtime or ingest copy of the attachment SHA-256 into
+          file.hash.sha256 because the malware alerting profile reads that
+          field and the email attachment hash lives under
+          email.attachments.file.hash.sha256. Assert that host.name is
+          populated from the PPS agent identity rather than left empty.
+        relay: >
+          On the low-side crossing, what crosses is full ECS-shaped NDJSON
+          built low-side (envelope mode B), one line per reassembled message -
+          never the raw multi-line syslog, because a crossing that is
+          at-most-once can drop one line of a message group and the high side
+          can never complete it. The friction to settle with the guard owner
+          is the free-text trio - subject, attachment filenames, rewritten URL
+          Defense links - which are kilobyte-scale, unicode-bearing and
+          attacker-controlled; cap and normalize them before the guard
+          destination and hold the JSON to two levels of nesting with short
+          ASCII keys. Reconcile low-side and high-side message counts per
+          (dataset, hour) to detect silent drops.
+      direct:
+        parse_location: low
+        cribl: >
+          Own the reassembly at the collector: key a stateful aggregation on
+          the session id and per-session message number, join the sendmail and
+          filter-module lines for one message into a single ECS-shaped record,
+          and emit only on the terminal line so partial messages never reach
+          Elastic. Derive event.outcome once, from the filter disposition and
+          the sendmail status prefix together rather than from either alone,
+          convert the HH:MM:SS delay to nanoseconds, and build the envelope
+          recipient array from the repeated per-recipient lines. Drop or mask
+          the authentication material that appears on rejected-relay lines and
+          gate the destination with a Schema Library validation plus a
+          dead-letter route, because a hand-built parser with no vendor pack
+          behind it will meet new module keys on every PPS upgrade.
+        elastic: >
+          Land the reassembled documents in logs-proofpoint_on_demand.message
+          and keep the high side to enrichment, not a second parse. Add
+          custom-namespace keyword mappings for the session id, per-session
+          message number, quarantine folder, filter module and filter command
+          so mail-flow triage can pivot on them, map the message size as long,
+          and add a runtime or ingest copy of the attachment SHA-256 into
+          file.hash.sha256 because the malware alerting profile reads that
+          field and the email attachment hash lives under
+          email.attachments.file.hash.sha256. Assert that host.name is
+          populated from the PPS agent identity rather than left empty.
+  - format: json
+    enable: >
+      Available only on Proofpoint on Demand (the Proofpoint-hosted PPS), not
+      on an on-prem appliance. Request Log API / Remote Syslog access from
+      Proofpoint support to obtain the Cluster ID (cid) and an access token,
+      then connect to the PoD Log API WebSocket endpoint
+      (wss://logstream.proofpoint.com/v1/stream?cid=<cid>&type=message&token=<token>)
+      - type=message is the filter (mail-processing) log documented here;
+      type=maillog is the MTA sendmail log. The stream is real-time; a
+      sinceTime/toTime query replays archived hours up to 30 days back in
+      one-hour windows. Consume it with the Elastic Agent proofpoint_on_demand
+      integration (Cluster ID + Access Token) or a Cribl WebSocket source. No
+      appliance log-subscription change is involved - the feed is a property
+      of the hosted service, and it emits one assembled JSON object per
+      message, so the on-prem (s, m) reassembly step does not apply.
+    references:
+    - https://help.proofpoint.com/Threat_Insight_Dashboard/API_Documentation/SIEM_API
+    - https://www.elastic.co/docs/reference/integrations/proofpoint_on_demand
+    - >-
+      https://github.com/elastic/integrations/tree/main/packages/proofpoint_on_demand/data_stream/message/fields
+    - https://docs.cyderes.cloud/files/proofpoint-on-demand-log-api-rev-c.pdf
+    parsing:
+      mechanism: elastic-integration
+      artifact: Proofpoint on Demand integration (message data stream)
+      notes: >
+        The proofpoint_on_demand integration's ingest pipeline renames the
+        dotted JSON into proofpoint_on_demand.message.* and lifts the common
+        values into ECS email.*, source.* and observer.*. Because PoD emits
+        one assembled object per message, none of the stateful (s, m)
+        aggregation the on-prem syslog kv form needs is required here - the
+        integration parses the WSS JSON directly. This is the same data stream
+        the on-prem route reassembles into, so landing PoD traffic here keeps
+        one schema for both deployment styles; the difference is that the
+        hosted feed arrives pre-assembled and the integration pipeline can
+        parse it as-is.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Terminate the WSS stream on a low-side Cribl WebSocket source (the
+          outbound connection to Proofpoint's cloud must originate on the low
+          side; the high side has no egress). Keep the worker thin - PoD
+          delivers a complete object per message, so there is nothing to
+          reassemble - and spend the edge budget on the CDS content policy
+          instead: cap and unicode-normalize the free-text trio
+          (msg.header.subject, msgParts[].detectedName / labeledName, and the
+          extracted msgParts[].urls[].url values), and flatten msgParts and
+          the filter.modules.* tree to a bounded depth before the destination
+          so an arbitrarily deep nested object never reaches the guard. Stamp
+          the PoD cluster id and appliance identity into fields the payload
+          already carries (pps.cid, pps.agent) and run Persistent Queue
+          backpressure so a high-side outage does not consume the 30-day
+          replay window.
+        elastic: >
+          Run the stock proofpoint_on_demand message pipeline and keep the
+          high side to enrichment. Add the one derivation the malware profile
+          needs - copy each msgParts[].sha256 into file.hash.sha256 alongside
+          the ECS email.attachments.file.hash.sha256 the pipeline already
+          sets, restricting the copy to parts whose disposition is an
+          attachment rather than an inline body. Normalize filter.disposition
+          and finalAction into event.action / event.outcome once (accept and
+          deliver are successes; reject, discard and quarantine are failures)
+          so alert rules do not each re-implement the verdict vocabulary,
+          convert filter.durationSecs to nanoseconds for event.duration, and
+          assert observer.name / host.name are populated from pps.agent since
+          downstream alerting requires a host.
+        relay: >
+          What crosses is full ECS-shaped NDJSON built low-side, one line per
+          PoD message object - never the raw multi-frame WebSocket stream. The
+          content-filter friction is the same free-text trio as every other
+          Proofpoint dataset (subject, attachment filenames, extracted URLs),
+          which are kilobyte-scale, unicode-bearing and attacker-controlled;
+          length-cap and normalize them before the guard destination and hold
+          the JSON to two levels of nesting with short ASCII keys after
+          flattening msgParts and filter.modules.*. Reconcile low-side and
+          high-side message counts per (dataset, hour) to detect silent drops,
+          and dedup on guid because a replayed hour and a live frame can both
+          carry the same message.
+      direct:
+        parse_location: high
+        cribl: >
+          High-side appliance with no guard: terminate the WSS stream on a
+          Cribl WebSocket source (or point the Elastic Agent integration
+          straight at PoD) and route with no interposed parsing - the
+          integration owns the field work. The only edge task worth keeping is
+          dedup on guid across the live stream and any archived-hour replay,
+          so overlapping windows do not double-index a message.
+        elastic: >
+          Run the stock proofpoint_on_demand message pipeline and keep the
+          high side to enrichment. Add the one derivation the malware profile
+          needs - copy each msgParts[].sha256 into file.hash.sha256 alongside
+          the ECS email.attachments.file.hash.sha256 the pipeline already
+          sets, restricting the copy to parts whose disposition is an
+          attachment rather than an inline body. Normalize filter.disposition
+          and finalAction into event.action / event.outcome once (accept and
+          deliver are successes; reject, discard and quarantine are failures)
+          so alert rules do not each re-implement the verdict vocabulary,
+          convert filter.durationSecs to nanoseconds for event.duration, and
+          assert observer.name / host.name are populated from pps.agent since
+          downstream alerting requires a host. Prefer this hosted JSON feed
+          over standing up an on-prem syslog kv path where a site runs PoD,
+          since it arrives pre-assembled and parses without a hand-built
+          reassembly pipeline.
+    fields:
+    - vendor: guid
+      type: string
+      description: globally unique identifier PPS assigns to the message object
+      ecs: null
+      status: unmapped
+      custom: proofpoint_on_demand.message.guid
+      notes: >-
+        join key across the PoD message and maillog streams and, via the queue
+        id, to the TAP message and click events; also the natural dedup key
+        for live-plus-replay ingest
+    - vendor: ts
+      type: timestamp
+      description: time PPS finished processing the message
+      ecs: null
+      status: unmapped
+      custom: proofpoint_on_demand.message.ts
+      notes: >-
+        the integration sets @timestamp from this value; kept in the vendor
+        namespace as the authoritative processing time
+    - vendor: connection.ip
+      type: ip
+      description: IP address of the connecting SMTP client
+      ecs: source.ip
+      status: mapped
+    - vendor: connection.host
+      type: string
+      description: resolved hostname of the connecting client, when reverse resolution succeeded
+      ecs: source.domain
+      status: partial
+      notes: >
+        trustworthy only when connection.resolveStatus indicates a successful
+        reverse lookup; gate on resolveStatus before treating it as a resolved
+        name, since an unresolved connection leaves it empty
+    - vendor: connection.helo
+      type: string
+      description: FQDN or address literal the peer announced in HELO/EHLO
+      ecs: null
+      status: unmapped
+      custom: proofpoint_on_demand.message.connection.helo
+      notes: >-
+        self-asserted and frequently forged, so deliberately not mapped to
+        source.domain, which readers treat as a resolved name
+    - vendor: connection.country
+      type: string
+      description: country PPS attributed to the connecting IP
+      ecs: source.geo.country_iso_code
+      status: partial
+      notes: >-
+        a PPS-supplied ISO country code for the connecting IP, not a full geo
+        enrichment; treat as a coarse hint rather than an authoritative geo
+        record
+    - vendor: connection.tls.inbound.version
+      type: string
+      description: TLS protocol version negotiated on the inbound SMTP connection
+      ecs: tls.version
+      status: partial
+      transform: >-
+        strip the vendor "TLSv" prefix to the bare numeric version ECS
+        tls.version expects
+    - vendor: connection.tls.inbound.cipher
+      type: string
+      description: TLS cipher suite negotiated on the inbound connection
+      ecs: tls.cipher
+      status: mapped
+    - vendor: envelope.from
+      type: string
+      description: envelope sender address from MAIL FROM
+      ecs: email.sender.address
+      status: partial
+      notes: >
+        ECS models no envelope sender distinct from the header sender;
+        email.sender.address carries the envelope value to match the
+        convention Elastic's Proofpoint pipelines follow, with the header From
+        going to email.from.address
+    - vendor: envelope.rcpts
+      type: string
+      description: envelope recipient addresses from RCPT TO (array)
+      ecs: email.to.address
+      status: partial
+      transform: >-
+        PoD delivers the full recipient array pre-assembled; write every
+        element into email.to.address rather than letting one win
+    - vendor: msg.header.from
+      type: string
+      description: >-
+        address parsed from the RFC 5322 From: header, which need not match
+        the envelope sender
+      ecs: email.from.address
+      status: mapped
+    - vendor: msg.header.to
+      type: string
+      description: 'RFC 5322 To: header address list'
+      ecs: email.to.address
+      status: partial
+      notes: >-
+        the header To set and the envelope recipient set are different lists;
+        both land in email.to.address, so keep the distinction if BCC-style
+        delivery matters to detection
+    - vendor: msg.header.cc
+      type: string
+      description: 'RFC 5322 Cc: header address list'
+      ecs: email.cc.address
+      status: mapped
+    - vendor: msg.header.subject
+      type: string
+      description: subject line of the message
+      ecs: email.subject
+      status: mapped
+      notes: >-
+        unbounded attacker-controlled free text - the main length and encoding
+        exposure on this dataset for any content-inspection policy
+    - vendor: msg.header.message-id
+      type: string
+      description: RFC 5322 Message-ID from the message header
+      ecs: email.message_id
+      status: mapped
+    - vendor: msg.sizeBytes
+      type: long
+      description: total size of the message in bytes
+      ecs: null
+      status: unmapped
+      custom: proofpoint_on_demand.message.msg.size_bytes
+      notes: >-
+        ECS has no email message-size field in this dictionary version, so the
+        byte count stays in the vendor namespace and is mapped as a long
+    - vendor: msgParts.sha256
+      type: string
+      description: SHA-256 of a message part (body or attachment)
+      ecs: email.attachments.file.hash.sha256
+      status: mapped
+      notes: >
+        the malware alerting profile reads file.hash.sha256, so the attachment
+        hash needs an explicit copy into that field as well; parts with
+        disposition inline are bodies, not attachments, and should not
+        populate the attachment array
+    - vendor: msgParts.md5
+      type: string
+      description: MD5 of a message part
+      ecs: email.attachments.file.hash.md5
+      status: mapped
+    - vendor: msgParts.detectedName
+      type: string
+      description: >-
+        filename PPS detected for the part by content inspection, which may
+        differ from the declared name
+      ecs: email.attachments.file.name
+      status: partial
+      notes: >-
+        prefer the detected name over labeledName (the declared name) for
+        detection, since a mismatch between the two is itself a signal;
+        unbounded attacker-controlled text, length-cap before crossing
+    - vendor: msgParts.detectedMime
+      type: string
+      description: MIME type PPS detected for the part by content inspection
+      ecs: email.attachments.file.mime_type
+      status: mapped
+    - vendor: msgParts.detectedSizeBytes
+      type: long
+      description: size in bytes of the decoded part as detected
+      ecs: email.attachments.file.size
+      status: mapped
+    - vendor: msgParts.sandboxStatus
+      type: string
+      description: Attachment Defense sandbox verdict for the part
+      ecs: null
+      status: unmapped
+      custom: proofpoint_on_demand.message.msg_parts.sandbox_status
+      notes: >-
+        per-part sandbox disposition; keep queryable for attachment-based
+        triage since no ECS enumeration models it
+    - vendor: msgParts.urls.url
+      type: string
+      description: a URL extracted from the message part
+      ecs: url.original
+      status: partial
+      notes: >-
+        an array - one message yields many; cap and normalize before crossing,
+        and note isRewritten distinguishes URL Defense-wrapped links from
+        originals
+    - vendor: filter.disposition
+      type: string
+      description: message disposition determined by filterd
+      ecs: null
+      status: partial
+      custom: proofpoint_on_demand.message.filter.disposition
+      transform: >
+        drives event.action and, with finalAction, event.outcome -
+        accept/deliver are successes, reject/discard/quarantine are failures;
+        leaving it a raw string means every alert rule re-implements the
+        vocabulary
+    - vendor: filter.qid
+      type: string
+      description: sendmail queue identifier PPS assigned to the message
+      ecs: email.local_id
+      status: mapped
+    - vendor: filter.quarantine.folder
+      type: string
+      description: quarantine folder the message was placed in
+      ecs: null
+      status: unmapped
+      custom: proofpoint_on_demand.message.filter.quarantine.folder
+      notes: >-
+        presence of a folder value is the strongest single indicator that the
+        message was not delivered
+    - vendor: filter.quarantine.rule
+      type: string
+      description: rule that caused the message to be quarantined
+      ecs: null
+      status: unmapped
+      custom: proofpoint_on_demand.message.filter.quarantine.rule
+      notes: >-
+        empty when the message was delivered; kept in the vendor namespace so
+        the decisive filter rule (finalRule) alone owns rule.name
+    - vendor: filter.modules.av.virusNames
+      type: string
+      description: virus names reported by the antivirus module
+      ecs: null
+      status: unmapped
+      custom: proofpoint_on_demand.message.filter.modules.av.virus_names
+      notes: >-
+        vendor detection name; deliberately not threat.indicator.* or
+        rule.name, which model a TI-provider indicator and the filter policy
+        rule respectively
+    - vendor: filter.modules.spam.triggeredClassifier
+      type: string
+      description: the single spam classifier that determined the spam disposition
+      ecs: null
+      status: unmapped
+      custom: proofpoint_on_demand.message.filter.modules.spam.triggered_classifier
+      notes: >-
+        the only explanation of a spam verdict the log carries; keep queryable
+        for false-positive triage
+    - vendor: filter.modules.dmarc.filterdResult
+      type: string
+      description: DMARC evaluation result the filter acted on (pass, fail, none)
+      ecs: null
+      status: unmapped
+      custom: proofpoint_on_demand.message.filter.modules.dmarc.filterd_result
+      notes: >-
+        no ECS DMARC field set exists in this dictionary version; kept custom
+        rather than forced into email.* or an auth namespace
+    - vendor: filter.durationSecs
+      type: number
+      description: total time PPS spent processing the message, in seconds
+      ecs: event.duration
+      status: partial
+      transform: multiply by 1e9 to nanoseconds; ECS event.duration is a long in nanoseconds
+    - vendor: finalAction
+      type: string
+      description: the terminal action PPS took on the message
+      ecs: event.action
+      status: partial
+      transform: >-
+        normalize the vendor disposition verb to an ECS action string; it and
+        filter.disposition together determine event.outcome
+    - vendor: finalRule
+      type: string
+      description: the filter rule that produced the terminal action
+      ecs: rule.name
+      status: partial
+      notes: >-
+        the decisive rule; rule.name is reserved for it so the quarantine rule
+        stays in the vendor namespace
+    - vendor: pps.agent
+      type: string
+      description: identity of the PPS appliance that processed the message
+      ecs: observer.name
+      status: mapped
+      notes: >-
+        the payload names no host otherwise; assert host.name from this value
+        too, since the malware alerting profile requires a host
+    - vendor: pps.version
+      type: string
+      description: PPS software version on the processing appliance
+      ecs: observer.version
+      status: mapped
+    - vendor: pps.cid
+      type: string
+      description: PoD cluster identifier
+      ecs: null
+      status: unmapped
+      custom: proofpoint_on_demand.message.pps.cid
+      notes: >-
+        part of the WSS connection tuple; useful to stamp per-cluster so
+        multi-cluster tenants stay separable
+- id: tap-messages
+  name: TAP SIEM API message events
+  description: >
+    Targeted Attack Protection message events pulled from the SIEM API v2
+    (/v2/siem/messages/blocked and /v2/siem/messages/delivered, or the
+    combined /v2/siem/all), one JSON object per message that TAP condemned.
+    Carries the full RFC 5322 envelope and header set, the four PPS scoring
+    dimensions, the quarantine decision, the parsed message parts with their
+    hashes and sandbox verdicts, and a threatsInfoMap array of every threat
+    found in the message. These are TAP verdicts on messages the PPS already
+    processed, so they are a threat overlay on the filter log rather than a
+    replacement for it - GUID and QID are the join keys.
+  event_categories:
+  - malware
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        A Cribl REST Collector (or the Elastic Agent's TAP input) polls
+        tap-api-v2.proofpoint.com with the Principal/Secret pair on a fixed
+        interval. Because this is an outbound poll of a vendor cloud API, the
+        guarded path puts the collector on the low side - the high side has no
+        egress - which also fixes where deduplication and retraction handling
+        must live.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-proofpoint_tap.message_blocked
+      notes: >
+        the integration ships message_blocked and message_delivered as two
+        separate data streams with parallel field sets; the delivered stream
+        is the higher-value one for the CSOC because those threats reached a
+        mailbox
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        A Cribl REST Collector (or the Elastic Agent's TAP input) polls
+        tap-api-v2.proofpoint.com with the Principal/Secret pair on a fixed
+        interval. This outbound poll of a vendor cloud API is also where
+        deduplication and retraction handling live.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-proofpoint_tap.message_blocked
+      notes: >
+        the integration ships message_blocked and message_delivered as two
+        separate data streams with parallel field sets; the delivered stream
+        is the higher-value one for the CSOC because those threats reached a
+        mailbox
+  formats:
+  - format: api-pull
+    parsing:
+      mechanism: elastic-integration
+      artifact: Proofpoint TAP integration (message_blocked / message_delivered data streams)
+      notes: >
+        The integration's ingest pipeline renames the flat header fields into
+        ECS email.*, expands messageParts into email.attachments and
+        threatsInfoMap into proofpoint_tap.<stream>.threat_info_map, and
+        collects hashes into related.hash. Custom field names below use a
+        single proofpoint_tap.message.* namespace; the stock integration
+        splits the same fields across proofpoint_tap.message_blocked.* and
+        proofpoint_tap.message_delivered.*, which any dashboard querying both
+        dispositions has to union.
+    fields:
+    - vendor: GUID
+      type: string
+      description: globally unique identifier for the message object inside PPS
+      ecs: null
+      status: unmapped
+      custom: proofpoint_tap.guid
+      notes: >-
+        the join key between TAP message events, TAP click events and the PPS
+        filter log's message object; also the natural deduplication key for
+        the poll
+    - vendor: QID
+      type: string
+      description: sendmail queue identifier the PPS assigned to the message
+      ecs: email.local_id
+      status: mapped
+    - vendor: messageTime
+      type: timestamp
+      description: time the message was delivered to the user or quarantined by PPS
+      ecs: email.delivery_timestamp
+      status: mapped
+      transform: >
+        ISO 8601 with offset; the integration sets @timestamp to the later of
+        messageTime and any threatTime in the message, so the event timestamp
+        and the delivery timestamp are not always the same value
+    - vendor: sender
+      type: string
+      description: SMTP envelope sender address, with the user part hashed by TAP
+      ecs: email.sender.address
+      status: partial
+      notes: >
+        TAP hashes the local part of the envelope sender, so this value cannot
+        be joined to the PPS filter log envelope sender or used for sender
+        reputation - use fromAddress for anything analyst-facing
+    - vendor: fromAddress
+      type: string
+      description: 'address parsed from the RFC 5322 From: header, without display name'
+      ecs: email.from.address
+      status: mapped
+    - vendor: recipient
+      type: string
+      description: SMTP envelope recipients of the message (array)
+      ecs: email.to.address
+      status: partial
+      notes: >
+        the envelope recipient set and the header To: set are different lists
+        and the integration writes both into email.to.address; keep the
+        distinction if BCC-style delivery matters to the detection
+    - vendor: subject
+      type: string
+      description: subject line of the message
+      ecs: email.subject
+      status: mapped
+      notes: >-
+        unbounded attacker-controlled free text - the main length and encoding
+        exposure on this dataset for any content-inspection policy
+    - vendor: messageID
+      type: string
+      description: RFC 5322 Message-ID from the message header; not unique in practice
+      ecs: email.message_id
+      status: mapped
+    - vendor: senderIP
+      type: ip
+      description: IP address the message was sent from
+      ecs: source.ip
+      status: mapped
+    - vendor: phishScore
+      type: integer
+      description: phishing likelihood assigned to the message, 0-100
+      ecs: null
+      status: unmapped
+      custom: proofpoint_tap.message.phish_score
+    - vendor: malwareScore
+      type: integer
+      description: malware likelihood assigned to the message, 0-100
+      ecs: null
+      status: unmapped
+      custom: proofpoint_tap.message.malware_score
+    - vendor: spamScore
+      type: integer
+      description: spam likelihood assigned to the message, 0-100
+      ecs: null
+      status: unmapped
+      custom: proofpoint_tap.message.spam_score
+    - vendor: impostorScore
+      type: integer
+      description: impostor (BEC) score of the message; higher values indicate higher certainty
+      ecs: null
+      status: unmapped
+      custom: proofpoint_tap.message.impostor_score
+      notes: >
+        four independent 0-100 scores and one ECS event.risk_score - the
+        deployment has to choose which dimension event.risk_score represents,
+        or leave it unset and alert on the custom fields
+    - vendor: quarantineFolder
+      type: string
+      description: quarantine folder the message was placed in; present on blocked messages only
+      ecs: null
+      status: unmapped
+      custom: proofpoint_tap.message.quarantine.folder
+    - vendor: quarantineRule
+      type: string
+      description: rule that caused the message to be quarantined; present on blocked messages only
+      ecs: rule.name
+      status: partial
+      notes: >
+        rule.name is free in this dataset (no policy rule competes for it) and
+        TAP publishes no companion rule id, so nothing is paired under rule.*;
+        the field is empty on the delivered stream
+    - vendor: threatsInfoMap.classification
+      type: enum
+      description: >-
+        category of the threat found in the message (Malware, Phish, Spam,
+        Impostor, TOAD)
+      ecs: null
+      status: unmapped
+      custom: proofpoint_tap.message.threat.classification
+      notes: >
+        vendor threat taxonomy; Impostor is BEC and TOAD is telephone-oriented
+        attack delivery, neither of which any ECS enumeration models
+    - vendor: threatsInfoMap.threat
+      type: string
+      description: >-
+        the artifact Proofpoint condemned - a SHA-256, a URL, or an email
+        address depending on threatType
+      ecs: null
+      status: partial
+      custom: proofpoint_tap.message.threat.artifact
+      transform: >
+        branch on threatType and copy into file.hash.sha256 (Attachment),
+        url.original (URL) or email.from.address (Message); left as a single
+        polymorphic string it is unusable for correlation and the malware
+        alerting profile has no hash to read
+    - vendor: threatsInfoMap.threatType
+      type: enum
+      description: what kind of object was condemned (Attachment, URL, Message)
+      ecs: null
+      status: unmapped
+      custom: proofpoint_tap.message.threat.type
+      notes: >-
+        the discriminator the threat artifact routing depends on; must survive
+        parsing intact
+    - vendor: threatsInfoMap.threatStatus
+      type: enum
+      description: current disposition of the threat (active, falsePositive, cleared)
+      ecs: null
+      status: unmapped
+      custom: proofpoint_tap.message.threat.status
+      notes: >
+        mutable - a threat condemned as active can later be retracted to
+        falsePositive or cleared, and that revision arrives as a later API
+        response rather than as a correction, so an append-only index will
+        keep alerting on withdrawn verdicts
+    - vendor: messageParts.sha256
+      type: string
+      description: SHA-256 of a message part (body or attachment)
+      ecs: email.attachments.file.hash.sha256
+      status: mapped
+      notes: >
+        the integration also collects it into related.hash; the malware
+        alerting profile reads file.hash.sha256, which needs an explicit copy
+        because ECS keeps attachment hashes under email.attachments.*
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Keep the collector thin: schedule the poll on a bounded interval,
+          checkpoint on the API's time window rather than on document counts,
+          and deduplicate on GUID before the destination because overlapping
+          windows and retries re-deliver the same message events. Do the one
+          piece of enrichment that is cheaper near the source - stamping the
+          PPS cluster and appliance identity so host.name and observer.name
+          are populated, since the API payload itself names no host - and run
+          Persistent Queue backpressure on the destination so an Elastic
+          outage does not silently consume the API's retention window.
+        elastic: >
+          Run the stock message_blocked and message_delivered pipelines and
+          layer a @custom pipeline for the three gaps this map records: copy
+          the condemned artifact into file.hash.sha256, url.original or
+          email.from.address by branching on threatType so the malware profile
+          has a hash to alert on; normalize the four scoring dimensions into
+          typed long mappings and pick exactly one to promote to
+          event.risk_score rather than leaving alert authors to choose; and
+          handle threatStatus retractions, which arrive hours after the
+          original event, with an update-by-query or an explicit retraction
+          index so falsePositive and cleared verdicts do not leave stale
+          alerts behind. Add keyword mappings for the campaign id and threat
+          id so pivots into the Campaign and Forensics APIs resolve.
+        relay: >
+          Nothing CEF-shaped is involved - the feed is already JSON, so the
+          crossing carries the same NDJSON envelope every other dataset uses,
+          UTF-8 and LF-terminated with compression disabled. The
+          content-filter friction is concentrated in three unbounded,
+          attacker-controlled fields - subject, attachment filenames and the
+          condemned artifact string - which should be length-capped and
+          unicode-normalized low-side so a custom JSON filter rule can stay
+          simple. Flatten threatsInfoMap and messageParts to a bounded number
+          of entries before the crossing rather than letting an arbitrarily
+          deep nested array reach the guard.
+      direct:
+        parse_location: high
+        cribl: >
+          Keep the collector thin: schedule the poll on a bounded interval,
+          checkpoint on the API's time window rather than on document counts,
+          and deduplicate on GUID before the destination because overlapping
+          windows and retries re-deliver the same message events. Do the one
+          piece of enrichment that is cheaper near the source - stamping the
+          PPS cluster and appliance identity so host.name and observer.name
+          are populated, since the API payload itself names no host - and run
+          Persistent Queue backpressure on the destination so an Elastic
+          outage does not silently consume the API's retention window.
+        elastic: >
+          Run the stock message_blocked and message_delivered pipelines and
+          layer a @custom pipeline for the three gaps this map records: copy
+          the condemned artifact into file.hash.sha256, url.original or
+          email.from.address by branching on threatType so the malware profile
+          has a hash to alert on; normalize the four scoring dimensions into
+          typed long mappings and pick exactly one to promote to
+          event.risk_score rather than leaving alert authors to choose; and
+          handle threatStatus retractions, which arrive hours after the
+          original event, with an update-by-query or an explicit retraction
+          index so falsePositive and cleared verdicts do not leave stale
+          alerts behind. Add keyword mappings for the campaign id and threat
+          id so pivots into the Campaign and Forensics APIs resolve.
+  - format: syslog-kv
+    enable: >
+      Add &format=syslog to the same SIEM API poll the api-pull feed uses (for
+      example
+      https://tap-api-v2.proofpoint.com/v2/siem/messages/blocked?format=syslog&sinceSeconds=3600,
+      or /v2/siem/all for both dispositions), authenticated with the
+      Service-Principal / Secret pair. The response is RFC 5424 syslog, one
+      line per message event, with the event fields in a [tapmsg@21139 ...]
+      structured-data block; the nested threatsInfoMap and messageParts arrays
+      are flattened into repeated/indexed SD-PARAMs. This is still an outbound
+      HTTPS pull, not a vendor push - Proofpoint does not originate a syslog
+      connection - so the collector placement is unchanged from the api-pull
+      feed.
+    references:
+    - https://help.proofpoint.com/Threat_Insight_Dashboard/API_Documentation/SIEM_API
+    - https://docs.rapid7.com/insightidr/proofpoint-tap/
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        hand-built RFC 5424 SD parser emitting the proofpoint_tap message
+        shape (the stock integration ingests JSON, not this form)
+      notes: >
+        Selecting format=syslog forgoes the packaged proofpoint_tap
+        message_blocked / message_delivered pipelines, which expect the JSON
+        payload. A hand-built pipeline must parse the RFC 5424 header, pull
+        the tapmsg@21139 SD-PARAMs, and un-flatten the threatsInfoMap and
+        messageParts SD-PARAMs back into arrays before it can populate the
+        same ECS email.* and proofpoint_tap.* fields the JSON path produces.
+        Because the field content is identical to the api-pull, the member
+        names and ECS homes below match that dataset; the only work the syslog
+        form adds is the RFC 5424 decode and array un-flattening. Prefer the
+        JSON feed unless a site is already committed to a syslog collector for
+        this data.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Parse the RFC 5424 SD low-side and emit structured NDJSON before the
+          crossing - do not relay the raw syslog line, because a hand-built
+          downstream parser working from raw text at the guard is exactly the
+          fragility to avoid. Decode the tapmsg@21139 SD-PARAMs, un-flatten
+          threatsInfoMap and messageParts into arrays, dedup on GUID across
+          overlapping poll windows, and stamp the PPS cluster and appliance
+          identity so observer.name / host.name are populated, since the
+          payload names no host. Cap and normalize the free-text trio
+          (subject, attachment filenames, the condemned threat artifact) at
+          this stage and run Persistent Queue backpressure on the destination.
+        elastic: >
+          With the stock message pipelines bypassed, land the low-side-parsed
+          events on a custom ingest pipeline that reproduces the integration's
+          key mappings: QID to email.local_id, messageTime to
+          email.delivery_timestamp, fromAddress to email.from.address, sender
+          to email.sender.address, recipient to email.to.address, subject to
+          email.subject, senderIP to source.ip, and messageParts.sha256 to
+          email.attachments.file.hash.sha256 with a copy into file.hash.sha256
+          for the malware profile. Keep the four scoring dimensions as typed
+          longs and branch the flattened threatsInfoMap.threat onto
+          file.hash.sha256 / url.original / email.from.address by threatType
+          exactly as the JSON path would, and handle threatStatus retractions
+          with update-by-query so withdrawn verdicts do not leave stale
+          alerts.
+        relay: >
+          Cross the low-side-parsed NDJSON, never the RFC 5424 line - the
+          syslog framing carries no integrity benefit across the guard and the
+          flattened arrays are easier to bound once re-expanded and re-capped
+          low-side. The content-filter friction is the same three unbounded,
+          attacker-controlled fields as the JSON feed - subject, attachment
+          filenames and the condemned artifact string - which must be
+          length-capped and unicode-normalized before the guard destination.
+          Reconcile low-side and high-side counts per (dataset, hour) and
+          dedup on GUID, since overlapping windows re-deliver events.
+      direct:
+        parse_location: low
+        cribl: >
+          High-side collector with no guard: the calculus still favors the
+          JSON feed, but if syslog is the only available form, parse the RFC
+          5424 SD at the collector, un-flatten the arrays, and dedup on GUID -
+          there is no packaged parser to lean on, so keep the decode in one
+          hand-built pipeline rather than spreading it across routes.
+        elastic: >
+          With the stock message pipelines bypassed, land the parsed events on
+          a custom ingest pipeline that reproduces the integration's key
+          mappings: QID to email.local_id, messageTime to
+          email.delivery_timestamp, fromAddress to email.from.address, sender
+          to email.sender.address, recipient to email.to.address, subject to
+          email.subject, senderIP to source.ip, and messageParts.sha256 to
+          email.attachments.file.hash.sha256 with a copy into file.hash.sha256
+          for the malware profile. Keep the four scoring dimensions as typed
+          longs and branch the flattened threatsInfoMap.threat onto
+          file.hash.sha256 / url.original / email.from.address by threatType
+          exactly as the JSON path would, and handle threatStatus retractions
+          with update-by-query so withdrawn verdicts do not leave stale
+          alerts. Treat this as a migration-era or already-committed-syslog
+          fallback: the JSON feed keeps the stock message_blocked /
+          message_delivered pipelines, and the syslog form gives up that
+          packaged parsing for no gain in field content.
+    fields:
+    - vendor: GUID
+      type: string
+      description: globally unique identifier for the message object inside PPS
+      ecs: null
+      status: unmapped
+      custom: proofpoint_tap.guid
+      notes: >-
+        join key between TAP message events, TAP click events and the PPS
+        filter log message object; also the dedup key for overlapping polls
+    - vendor: QID
+      type: string
+      description: sendmail queue identifier the PPS assigned to the message
+      ecs: email.local_id
+      status: mapped
+    - vendor: messageTime
+      type: timestamp
+      description: time the message was delivered or quarantined by PPS
+      ecs: email.delivery_timestamp
+      status: partial
+      notes: >-
+        the JSON path sets @timestamp to the later of messageTime and any
+        threatTime, so delivery time and event time are not always equal; keep
+        messageTime as the delivery timestamp specifically
+    - vendor: fromAddress
+      type: string
+      description: 'address parsed from the RFC 5322 From: header, without display name'
+      ecs: email.from.address
+      status: mapped
+    - vendor: sender
+      type: string
+      description: SMTP envelope sender address, with the user part hashed by TAP
+      ecs: email.sender.address
+      status: partial
+      notes: >-
+        TAP hashes the local part, so this cannot be joined to the filter-log
+        envelope sender or used for sender reputation; use fromAddress for
+        anything analyst-facing
+    - vendor: recipient
+      type: string
+      description: SMTP envelope recipients (flattened to repeated SD-PARAMs in the syslog form)
+      ecs: email.to.address
+      status: partial
+      notes: >-
+        the envelope recipient set and the header To set differ and both land
+        in email.to.address; keep the distinction if BCC-style delivery
+        matters
+    - vendor: subject
+      type: string
+      description: subject line of the message
+      ecs: email.subject
+      status: mapped
+      notes: >-
+        unbounded attacker-controlled free text - the main length and encoding
+        exposure for any content-inspection policy on this dataset
+    - vendor: messageID
+      type: string
+      description: RFC 5322 Message-ID from the header; not unique in practice
+      ecs: email.message_id
+      status: mapped
+    - vendor: senderIP
+      type: ip
+      description: IP address the message was sent from
+      ecs: source.ip
+      status: mapped
+    - vendor: phishScore
+      type: integer
+      description: phishing likelihood assigned to the message, 0-100
+      ecs: null
+      status: unmapped
+      custom: proofpoint_tap.message.phish_score
+    - vendor: malwareScore
+      type: integer
+      description: malware likelihood assigned to the message, 0-100
+      ecs: null
+      status: unmapped
+      custom: proofpoint_tap.message.malware_score
+    - vendor: spamScore
+      type: integer
+      description: spam likelihood assigned to the message, 0-100
+      ecs: null
+      status: unmapped
+      custom: proofpoint_tap.message.spam_score
+    - vendor: impostorScore
+      type: integer
+      description: impostor (BEC) score of the message; higher values indicate higher certainty
+      ecs: null
+      status: unmapped
+      custom: proofpoint_tap.message.impostor_score
+      notes: >-
+        four independent 0-100 scores and one ECS event.risk_score - the
+        deployment must choose which dimension event.risk_score represents or
+        leave it unset and alert on the custom fields
+    - vendor: quarantineFolder
+      type: string
+      description: quarantine folder the message was placed in; blocked messages only
+      ecs: null
+      status: unmapped
+      custom: proofpoint_tap.message.quarantine.folder
+    - vendor: quarantineRule
+      type: string
+      description: rule that caused the message to be quarantined; blocked messages only
+      ecs: rule.name
+      status: partial
+      notes: >-
+        rule.name is free in this dataset (no policy rule competes for it) and
+        TAP publishes no companion rule id; the field is empty on delivered
+        messages
+    - vendor: threatsInfoMap.classification
+      type: enum
+      description: >-
+        category of the threat found in the message (Malware, Phish, Spam,
+        Impostor, TOAD)
+      ecs: null
+      status: unmapped
+      custom: proofpoint_tap.message.threat.classification
+      notes: >-
+        flattened out of the threatsInfoMap array in the syslog form; Impostor
+        is BEC and TOAD is telephone-oriented attack delivery, neither
+        modelled by any ECS enumeration
+    - vendor: threatsInfoMap.threat
+      type: string
+      description: >-
+        the artifact Proofpoint condemned - a SHA-256, a URL or an email
+        address depending on threatType
+      ecs: null
+      status: partial
+      custom: proofpoint_tap.message.threat.artifact
+      transform: >-
+        branch on threatType and copy into file.hash.sha256 (Attachment),
+        url.original (URL) or email.from.address (Message); left polymorphic
+        it is unusable for correlation
+    - vendor: threatsInfoMap.threatType
+      type: enum
+      description: what kind of object was condemned (Attachment, URL, Message)
+      ecs: null
+      status: unmapped
+      custom: proofpoint_tap.message.threat.type
+      notes: >-
+        the discriminator the threat-artifact routing depends on; it must
+        survive the SD un-flattening intact
+    - vendor: threatsInfoMap.threatStatus
+      type: enum
+      description: current disposition of the threat (active, falsePositive, cleared)
+      ecs: null
+      status: unmapped
+      custom: proofpoint_tap.message.threat.status
+      notes: >-
+        mutable - a later poll can retract an active verdict to falsePositive
+        or cleared, so an append-only index keeps alerting on withdrawn
+        verdicts
+    - vendor: messageParts.sha256
+      type: string
+      description: >-
+        SHA-256 of a message part (body or attachment), flattened from the
+        messageParts array
+      ecs: email.attachments.file.hash.sha256
+      status: mapped
+      notes: >-
+        the malware alerting profile reads file.hash.sha256, which needs an
+        explicit copy because ECS keeps attachment hashes under
+        email.attachments.*
+- id: tap-clicks
+  name: TAP SIEM API URL click events
+  description: >
+    URL Defense click events pulled from the SIEM API v2
+    (/v2/siem/clicks/blocked and /v2/siem/clicks/permitted). One JSON object
+    per click on a rewritten URL that TAP had condemned, recording who
+    clicked, from what address and user agent, when the URL was first
+    identified as a threat, and whether the click was intercepted or allowed
+    through. Clicks permitted are the operationally urgent half: they mean a
+    user reached a known-malicious destination, usually because the verdict
+    landed after delivery.
+  event_categories:
+  - web
+  - malware
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same REST Collector poll as the message events - clicks and messages
+        come from the same API and the same credential pair - and the guarded
+        path keeps the outbound-polling collector on the low side.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-proofpoint_tap.clicks_permitted
+      notes: >
+        clicks_blocked and clicks_permitted are separate data streams with
+        identical field sets; the integration sets event.action to denied on
+        the blocked stream and allowed on the permitted stream, so the two
+        streams are the only carrier of that distinction
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Same REST Collector poll as the message events - clicks and messages
+        come from the same API and the same credential pair - so the click
+        collector shares that poll rather than running a second one.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-proofpoint_tap.clicks_permitted
+      notes: >
+        clicks_blocked and clicks_permitted are separate data streams with
+        identical field sets; the integration sets event.action to denied on
+        the blocked stream and allowed on the permitted stream, so the two
+        streams are the only carrier of that distinction
+  formats:
+  - format: api-pull
+    parsing:
+      mechanism: elastic-integration
+      artifact: Proofpoint TAP integration (clicks_blocked / clicks_permitted data streams)
+      notes: >
+        The integration URL-decodes the URL Defense rewrite into url.full,
+        geo-enriches the clicker address, and sets @timestamp to the later of
+        clickTime and threatTime. Custom field names below use a single
+        proofpoint_tap.clicks.* namespace; the stock integration splits them
+        across proofpoint_tap.clicks_blocked.* and
+        proofpoint_tap.clicks_permitted.*.
+    fields:
+    - vendor: id
+      type: string
+      description: unique identifier for this click event
+      ecs: event.id
+      status: mapped
+    - vendor: GUID
+      type: string
+      description: identifier of the message within PPS that carried the clicked URL
+      ecs: null
+      status: unmapped
+      custom: proofpoint_tap.guid
+      notes: >-
+        joins the click back to the TAP message event and to the PPS filter
+        log record for the same message
+    - vendor: clickTime
+      type: timestamp
+      description: time the user clicked the rewritten URL
+      ecs: null
+      status: partial
+      custom: proofpoint_tap.clicks.click_time
+      transform: >
+        the integration sets @timestamp to the later of clickTime and
+        threatTime, so the click time must be kept as its own field or the
+        post-delivery detection gap (threatTime minus clickTime) cannot be
+        measured
+    - vendor: threatTime
+      type: timestamp
+      description: time Proofpoint identified the URL as a threat
+      ecs: null
+      status: partial
+      custom: proofpoint_tap.clicks.threat.time
+      notes: >
+        on the permitted stream this is routinely later than clickTime - the
+        difference is the exposure window and is the most useful derived
+        metric on this dataset
+    - vendor: clickIP
+      type: ip
+      description: external IP address of the user who clicked the link
+      ecs: destination.ip
+      status: partial
+      notes: >
+        the Elastic integration puts the clicking user in destination.ip and
+        the message sender in source.ip, orienting the event around the email
+        rather than the HTTP request; the web alerting profile reads source.ip
+        for the client, so this inversion has to be resolved explicitly or
+        every click rule will read the wrong end
+    - vendor: senderIP
+      type: ip
+      description: IP address the message carrying the URL was sent from
+      ecs: source.ip
+      status: mapped
+    - vendor: sender
+      type: string
+      description: envelope sender of the message carrying the URL, with the user part hashed
+      ecs: email.sender.address
+      status: partial
+      notes: >-
+        the hashed local part makes this unusable for joining to sender-based
+        detections; the click events carry no unhashed header From
+    - vendor: recipient
+      type: string
+      description: email address of the user who clicked the URL
+      ecs: email.to.address
+      status: mapped
+      notes: >
+        this is also the identity that needs response action; consider copying
+        it to user.target.email so identity-centric rules resolve without
+        parsing the email object
+    - vendor: url
+      type: string
+      description: the malicious URL that was clicked
+      ecs: url.original
+      status: partial
+      notes: >
+        the integration writes the URL-decoded value to url.full only; the web
+        alerting profile requires url.original, so a copy is needed, and the
+        URL Defense rewrite wrapper should be preserved separately from the
+        decoded target
+    - vendor: userAgent
+      type: string
+      description: 'User-Agent header from the clicking user''s HTTP request'
+      ecs: user_agent.original
+      status: mapped
+    - vendor: messageID
+      type: string
+      description: RFC 5322 Message-ID of the message that carried the clicked URL
+      ecs: email.message_id
+      status: mapped
+    - vendor: classification
+      type: enum
+      description: threat category of the malicious URL (Malware, Phish, Spam)
+      ecs: null
+      status: unmapped
+      custom: proofpoint_tap.clicks.classification
+      notes: vendor URL threat taxonomy, narrower than the message-event classification list
+    - vendor: threatID
+      type: string
+      description: unique identifier for the threat, usable against the Forensics and Campaign APIs
+      ecs: null
+      status: unmapped
+      custom: proofpoint_tap.clicks.threat.id
+      notes: >
+        detection identity, not indicator identity - deliberately not
+        threat.indicator.id, which models an id issued by a threat-intel
+        provider for an indicator document
+    - vendor: threatStatus
+      type: enum
+      description: current state of the threat (active, falsePositive, cleared)
+      ecs: null
+      status: unmapped
+      custom: proofpoint_tap.clicks.threat.status
+      notes: >-
+        same retraction problem as the message events - the verdict can be
+        revised after the click event is indexed
+    - vendor: campaignId
+      type: string
+      description: identifier of the campaign the threat belongs to, when known at query time
+      ecs: null
+      status: unmapped
+      custom: proofpoint_tap.clicks.campaign_id
+      notes: >
+        often absent at click time and populated only on a later query of the
+        Campaign API, so it cannot be treated as a stable grouping key at
+        ingest
+    - vendor: threatURL
+      type: string
+      description: link to the entry for this threat on the TAP dashboard
+      ecs: null
+      status: unmapped
+      custom: proofpoint_tap.clicks.threat.url
+      notes: >
+        an analyst pivot link into the TAP console, not an observed URL - it
+        must never populate url.original or threat.indicator.url.original or
+        URL-based detections will fire on the vendor's own domain
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Share the message-event collector rather than running a second poll,
+          deduplicate on the click id across overlapping windows, and stamp
+          the PPS cluster identity so host.name is populated - the payload
+          names no host and the malware alerting profile requires one. Keep
+          the raw rewritten URL Defense link alongside the decoded target so
+          the rewrite itself stays available for abuse investigation, and use
+          Persistent Queue backpressure on the destination.
+        elastic: >
+          Run the stock clicks pipelines and add a @custom pipeline that
+          copies url.full into url.original, because the web alerting profile
+          reads url.original and the integration only writes url.full. Decide
+          and document the clicker-address orientation: the integration places
+          the clicking user's IP in destination.ip and the message sender's IP
+          in source.ip, which is coherent for an email-centric view but
+          inverts what every web-category rule expects, so either re-orient in
+          the custom pipeline or write the click rules against destination.ip
+          deliberately. Map the threat id, campaign id and classification as
+          keyword, and drive alert priority off the permitted-versus-blocked
+          stream rather than off any field in the document.
+        relay: >
+          The feed is already JSON, so the standard NDJSON envelope crosses
+          with nothing CEF-shaped involved. The clicked URL is the content
+          filter's whole problem here: percent-encoded, base64-bearing,
+          kilobyte-scale attacker-controlled text that must be length-capped
+          and unicode-normalized low-side, and the URL Defense wrapper should
+          be decoded before the crossing so the filter inspects one canonical
+          form rather than two. Volume is low enough that carrying the raw
+          record across is affordable until the click rules are proven.
+      direct:
+        parse_location: high
+        cribl: >
+          Share the message-event collector rather than running a second poll,
+          deduplicate on the click id across overlapping windows, and stamp
+          the PPS cluster identity so host.name is populated - the payload
+          names no host and the malware alerting profile requires one. Keep
+          the raw rewritten URL Defense link alongside the decoded target so
+          the rewrite itself stays available for abuse investigation, and use
+          Persistent Queue backpressure on the destination.
+        elastic: >
+          Run the stock clicks pipelines and add a @custom pipeline that
+          copies url.full into url.original, because the web alerting profile
+          reads url.original and the integration only writes url.full. Decide
+          and document the clicker-address orientation: the integration places
+          the clicking user's IP in destination.ip and the message sender's IP
+          in source.ip, which is coherent for an email-centric view but
+          inverts what every web-category rule expects, so either re-orient in
+          the custom pipeline or write the click rules against destination.ip
+          deliberately. Map the threat id, campaign id and classification as
+          keyword, and drive alert priority off the permitted-versus-blocked
+          stream rather than off any field in the document.
+  - format: syslog-kv
+    enable: >
+      Add &format=syslog to the same clicks poll the api-pull feed uses (for
+      example
+      https://tap-api-v2.proofpoint.com/v2/siem/clicks/permitted?format=syslog&sinceSeconds=3600,
+      or /v2/siem/all), with the Service-Principal / Secret pair. The response
+      is RFC 5424 syslog, one line per click event, carrying the fields in a
+      [tapclk@21139 ...] structured-data block. It remains an outbound HTTPS
+      pull - the same transport as the JSON feed - so the collector placement
+      is unchanged from the api-pull feed; only the response serialization
+      changes.
+    references:
+    - https://help.proofpoint.com/Threat_Insight_Dashboard/API_Documentation/SIEM_API
+    - https://docs.rapid7.com/insightidr/proofpoint-tap/
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: >-
+        hand-built RFC 5424 SD parser emitting the proofpoint_tap clicks shape
+        (the stock integration ingests JSON, not this form)
+      notes: >
+        format=syslog forgoes the packaged clicks_blocked / clicks_permitted
+        pipelines, which expect JSON. A hand-built pipeline must parse the RFC
+        5424 header and the tapclk@21139 SD-PARAMs, then populate the same
+        url.*, source.ip / destination.ip and proofpoint_tap.clicks.* fields
+        the JSON path produces. The permitted-versus-blocked distinction the
+        JSON integration carries in two data streams must be reconstructed
+        from the endpoint (or eventTypeString) the line came from, since one
+        syslog stream carries both. Field homes below match the api-pull
+        because the content is identical.
+    recommendations:
+      guarded:
+        parse_location: low
+        cribl: >
+          Parse the RFC 5424 SD low-side and emit structured NDJSON - do not
+          relay raw click lines. Decode the tapclk@21139 SD-PARAMs, carry the
+          blocked-versus-permitted disposition explicitly (the two JSON data
+          streams collapse into one syslog stream, so derive it from the
+          endpoint or eventTypeString), dedup on the click id across
+          overlapping windows, and stamp the PPS cluster identity so host.name
+          is populated. Keep the raw URL Defense rewrite alongside the decoded
+          target and cap/normalize the clicked URL before the destination,
+          since it is the whole content-filter problem here.
+        elastic: >
+          With the stock clicks pipelines bypassed, land the parsed events on
+          a custom ingest pipeline: url to url.original with a copy to
+          url.full, userAgent to user_agent.original, senderIP to source.ip,
+          recipient to email.to.address, messageID to email.message_id, and id
+          to event.id. Decide and document the clicker-address orientation -
+          the JSON integration puts the clicking user in destination.ip and
+          the sender in source.ip, which inverts what web rules expect - and
+          either re-orient here or write click rules against destination.ip
+          deliberately. Preserve clickTime and threatTime as their own fields
+          so the post-delivery exposure window (threatTime minus clickTime)
+          stays measurable, and handle threatStatus retractions with
+          update-by-query.
+        relay: >
+          Cross the low-side-parsed NDJSON, never the RFC 5424 line. The
+          clicked URL is the content filter's whole problem - percent-encoded,
+          base64-bearing, kilobyte-scale attacker-controlled text - so decode
+          the URL Defense wrapper and length-cap and unicode-normalize the
+          target low-side before the guard destination, so the filter inspects
+          one canonical form. Volume is low enough that carrying the record
+          across is affordable until the click rules are proven; dedup on the
+          click id and reconcile counts per (dataset, hour).
+      direct:
+        parse_location: low
+        cribl: >
+          High-side collector with no guard: prefer the JSON feed, but if
+          syslog is the only form, parse the RFC 5424 SD at the collector,
+          reconstruct the blocked/permitted disposition from the endpoint, and
+          dedup on the click id in one hand-built pipeline.
+        elastic: >
+          With the stock clicks pipelines bypassed, land the parsed events on
+          a custom ingest pipeline: url to url.original with a copy to
+          url.full, userAgent to user_agent.original, senderIP to source.ip,
+          recipient to email.to.address, messageID to email.message_id, and id
+          to event.id. Decide and document the clicker-address orientation -
+          the JSON integration puts the clicking user in destination.ip and
+          the sender in source.ip, which inverts what web rules expect - and
+          either re-orient here or write click rules against destination.ip
+          deliberately. Preserve clickTime and threatTime as their own fields
+          so the post-delivery exposure window (threatTime minus clickTime)
+          stays measurable, and handle threatStatus retractions with
+          update-by-query. Treat this as a fallback: the JSON feed retains the
+          stock clicks_blocked / clicks_permitted pipelines and the
+          event.action (denied/allowed) they set per stream, which the single
+          syslog stream makes you reconstruct by hand.
+    fields:
+    - vendor: id
+      type: string
+      description: unique identifier for this click event
+      ecs: event.id
+      status: mapped
+    - vendor: GUID
+      type: string
+      description: identifier of the message within PPS that carried the clicked URL
+      ecs: null
+      status: unmapped
+      custom: proofpoint_tap.guid
+      notes: >-
+        joins the click back to the TAP message event and the PPS filter log
+        record for the same message
+    - vendor: clickTime
+      type: timestamp
+      description: time the user clicked the rewritten URL
+      ecs: null
+      status: partial
+      custom: proofpoint_tap.clicks.click_time
+      transform: >-
+        the JSON path sets @timestamp to the later of clickTime and
+        threatTime, so clickTime must be kept as its own field or the
+        post-delivery detection gap cannot be measured
+    - vendor: threatTime
+      type: timestamp
+      description: time Proofpoint identified the URL as a threat
+      ecs: null
+      status: partial
+      custom: proofpoint_tap.clicks.threat.time
+      notes: >-
+        on the permitted stream routinely later than clickTime; the difference
+        is the exposure window and the most useful derived metric on this
+        dataset
+    - vendor: clickIP
+      type: ip
+      description: external IP address of the user who clicked the link
+      ecs: destination.ip
+      status: partial
+      notes: >-
+        the JSON integration puts the clicking user in destination.ip and the
+        sender in source.ip, orienting around the email rather than the HTTP
+        request; web rules read source.ip for the client, so resolve the
+        inversion explicitly
+    - vendor: senderIP
+      type: ip
+      description: IP address the message carrying the URL was sent from
+      ecs: source.ip
+      status: mapped
+    - vendor: sender
+      type: string
+      description: envelope sender of the message carrying the URL, with the user part hashed
+      ecs: email.sender.address
+      status: partial
+      notes: >-
+        the hashed local part makes this unusable for joining to sender-based
+        detections; the click events carry no unhashed header From
+    - vendor: recipient
+      type: string
+      description: email address of the user who clicked the URL
+      ecs: email.to.address
+      status: mapped
+      notes: >-
+        also the identity that needs response action; consider copying to
+        user.target.email so identity-centric rules resolve without parsing
+        the email object
+    - vendor: url
+      type: string
+      description: the malicious URL that was clicked
+      ecs: url.original
+      status: partial
+      notes: >-
+        the JSON integration writes the decoded value to url.full only; the
+        web alerting profile requires url.original, so a copy is needed and
+        the URL Defense wrapper should be preserved separately from the
+        decoded target
+    - vendor: userAgent
+      type: string
+      description: 'User-Agent header from the clicking user''s HTTP request'
+      ecs: user_agent.original
+      status: mapped
+    - vendor: messageID
+      type: string
+      description: RFC 5322 Message-ID of the message that carried the clicked URL
+      ecs: email.message_id
+      status: mapped
+    - vendor: classification
+      type: enum
+      description: threat category of the malicious URL (Malware, Phish, Spam)
+      ecs: null
+      status: unmapped
+      custom: proofpoint_tap.clicks.classification
+      notes: vendor URL threat taxonomy, narrower than the message-event classification list
+    - vendor: threatID
+      type: string
+      description: unique identifier for the threat, usable against the Forensics and Campaign APIs
+      ecs: null
+      status: unmapped
+      custom: proofpoint_tap.clicks.threat.id
+      notes: >-
+        detection identity, not indicator identity - deliberately not
+        threat.indicator.id, which models an id issued by a threat-intel
+        provider
+    - vendor: threatStatus
+      type: enum
+      description: current state of the threat (active, falsePositive, cleared)
+      ecs: null
+      status: unmapped
+      custom: proofpoint_tap.clicks.threat.status
+      notes: >-
+        same retraction problem as the message events - the verdict can be
+        revised after the click event is indexed
+    - vendor: campaignId
+      type: string
+      description: identifier of the campaign the threat belongs to, when known at query time
+      ecs: null
+      status: unmapped
+      custom: proofpoint_tap.clicks.campaign_id
+      notes: >-
+        often absent at click time and populated only on a later Campaign API
+        query, so not a stable grouping key at ingest

@@ -1,0 +1,1334 @@
+id: aws-vpcflow
+name: AWS GovCloud VPC Flow Logs
+vendor: Amazon Web Services
+versions: flow log record versions 2-7 (GovCloud us-gov-west-1, us-gov-east-1)
+draft: true
+references:
+- https://docs.aws.amazon.com/vpc/latest/userguide/flow-log-records.html
+- https://docs.aws.amazon.com/vpc/latest/tgw/tgw-flow-logs.html
+- https://www.elastic.co/docs/reference/integrations/aws/vpcflow
+- >-
+  https://github.com/elastic/integrations/blob/main/packages/aws/data_stream/vpcflow/fields/fields.yml
+- https://docs.cribl.io/stream/sources-s3/
+datasets:
+- id: flow
+  name: VPC flow log record
+  description: >
+    Per-network-interface IP flow summaries aggregated over a capture window
+    (10 minutes by default, 1 minute on Nitro instances). Each record is a
+    single space-separated positional line: the version-2 default format
+    carries version, account-id, interface-id, srcaddr, dstaddr, srcport,
+    dstport, protocol, packets, bytes, start, end, action and log-status, and
+    a custom format adds the version 3-7 fields documented below. A missing or
+    uncomputable value is the literal '-', not an empty column. Delivered to
+    an S3 bucket in the aws-us-gov partition (with SQS object-create
+    notifications) or to CloudWatch Logs; text delivery makes every field a
+    string, Parquet delivery preserves the documented numeric types.
+  event_categories:
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Amazon S3 source reading gzipped flow-log objects off SQS
+        object-create notifications from the GovCloud log-archive account
+        (CloudWatch Logs source where a VPC still publishes there); this
+        collector runs in the low-side enclave and pushes across the guard.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-aws.vpcflow
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Amazon S3 source reading gzipped flow-log objects off SQS
+        object-create notifications from the GovCloud log-archive account
+        (CloudWatch Logs source where a VPC still publishes there); this
+        collector reads and forwards to Elastic directly.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-aws.vpcflow
+  formats:
+  - format: api-pull
+    parsing:
+      mechanism: elastic-integration
+      artifact: AWS integration, vpcflow data stream
+      notes: >
+        The integration's vpcflow ingest pipeline does the positional split
+        (it accepts the custom field order declared on the subscription) and
+        drops the vendor columns it copies into ECS. GovCloud needs the
+        aws-us-gov endpoint and partition set on the S3/SQS input; the parsing
+        logic itself is region-independent.
+    fields:
+    - vendor: account-id
+      type: string
+      description: AWS account ID of the owner of the source network interface
+      ecs: cloud.account.id
+      status: mapped
+    - vendor: interface-id
+      type: string
+      description: ID of the elastic network interface the traffic was recorded on
+      ecs: null
+      status: unmapped
+      custom: aws.vpcflow.interface_id
+      notes: >
+        the ENI the capture window belongs to, and the primary pivot for
+        per-workload flow triage. Deliberately not
+        observer.ingress.interface.id: that field models an interface on an
+        observing device (a firewall or tap), whereas the ENI here is the
+        endpoint whose traffic is being summarized, and the Elastic
+        integration likewise leaves it in the aws.vpcflow namespace.
+    - vendor: srcaddr
+      type: ip
+      description: source IP address of the flow as seen at the recording network interface
+      ecs: source.ip
+      status: mapped
+      notes: >
+        for traffic through a NAT gateway or an EKS pod this is the
+        intermediate address, not the originator - compare with pkt-srcaddr
+    - vendor: dstaddr
+      type: ip
+      description: destination IP address of the flow as seen at the recording network interface
+      ecs: destination.ip
+      status: mapped
+    - vendor: srcport
+      type: port
+      description: source port of the traffic
+      ecs: source.port
+      status: mapped
+    - vendor: dstport
+      type: port
+      description: destination port of the traffic
+      ecs: destination.port
+      status: mapped
+    - vendor: protocol
+      type: integer
+      description: IANA protocol number of the traffic (6 = TCP, 17 = UDP, 1 = ICMP)
+      ecs: network.iana_number
+      status: mapped
+      transform: >
+        the numeric IANA value is copied to network.iana_number as a keyword
+        and resolved through the IANA protocol table into the lowercase
+        network.transport name; there is no vendor column carrying the
+        protocol name
+    - vendor: packets
+      type: long
+      description: number of packets transferred during the flow
+      ecs: network.packets
+      status: mapped
+    - vendor: bytes
+      type: bytes
+      description: number of bytes transferred during the flow
+      ecs: network.bytes
+      status: mapped
+    - vendor: start
+      type: timestamp
+      description: >-
+        Unix seconds when the first packet of the flow was received within the
+        aggregation interval
+      ecs: event.start
+      status: mapped
+      transform: >
+        epoch seconds converted to a date; the value can sit up to 60 seconds
+        either side of the real packet time, so it is a window boundary rather
+        than a precise first-packet timestamp
+    - vendor: end
+      type: timestamp
+      description: >-
+        Unix seconds when the last packet of the flow was received within the
+        aggregation interval
+      ecs: event.end
+      status: mapped
+      transform: >
+        epoch seconds converted to a date, and also the source of @timestamp
+        for the document; with event.start it yields event.duration, which no
+        vendor column provides
+    - vendor: action
+      type: enum
+      description: action associated with the traffic, ACCEPT or REJECT
+      ecs: event.action
+      status: mapped
+      transform: >
+        ACCEPT/REJECT is copied to event.action and is the only source of
+        event.outcome (ACCEPT to success, REJECT to failure); there is no
+        separate outcome column, and log-status must not be folded in
+    - vendor: log-status
+      type: enum
+      description: >-
+        logging status of the flow log - OK, NODATA (no traffic in the window)
+        or SKIPDATA (records were skipped)
+      ecs: null
+      status: partial
+      custom: aws.vpcflow.log_status
+      notes: >
+        a capture-health signal, not a traffic outcome: SKIPDATA means AWS
+        dropped records during the window because of an internal capacity
+        error, so it is a visibility-gap indicator the CSOC should alert on
+        separately, and NODATA records carry no flow tuple at all
+    - vendor: vpc-id
+      type: string
+      description: ID of the VPC containing the network interface for which the traffic is recorded
+      ecs: null
+      status: unmapped
+      custom: aws.vpcflow.vpc_id
+      notes: >
+        ECS models cloud account, region and availability zone but has no
+        field for a VPC or subnet identity, so this and subnet-id both stay
+        custom; they are the main enclave-scoping dimension for GovCloud
+        dashboards
+    - vendor: subnet-id
+      type: string
+      description: >-
+        ID of the subnet containing the network interface for which the
+        traffic is recorded
+      ecs: null
+      status: unmapped
+      custom: aws.vpcflow.subnet_id
+    - vendor: instance-id
+      type: string
+      description: >-
+        ID of the EC2 instance associated with the network interface, when the
+        instance is owned by the account
+      ecs: cloud.instance.id
+      status: mapped
+      notes: >
+        '-' for requester-managed interfaces such as NAT gateway and
+        load-balancer ENIs, so absence is normal rather than a mapping gap
+    - vendor: tcp-flags
+      type: integer
+      description: >-
+        bitmask of the TCP flags observed during the aggregation interval (1
+        FIN, 2 SYN, 4 RST, 8 PSH, 16 ACK, 32 URG)
+      ecs: null
+      status: partial
+      custom: aws.vpcflow.tcp_flags
+      transform: >
+        the bitmask is decomposed into a lowercase flag array
+        (aws.vpcflow.tcp_flags_array) so SYN-without-ACK and RST-heavy
+        patterns are queryable; flags are OR-ed across the whole window, so 3
+        means SYN and FIN appeared in the same aggregated flow
+      notes: >-
+        ECS has no TCP flag field in 9.4, so both the raw bitmask and the
+        derived array stay in the vendor namespace
+    - vendor: pkt-srcaddr
+      type: ip
+      description: >-
+        packet-level (original) source IP address of the traffic, before any
+        intermediate hop
+      ecs: null
+      status: partial
+      custom: aws.vpcflow.pkt_srcaddr
+      notes: >
+        the true originator where srcaddr is a NAT gateway or EKS node
+        address; deliberately not source.nat.ip, whose semantics are inverted
+        (ECS nat fields hold the translated address, whereas here srcaddr is
+        the translated one and pkt-srcaddr the original). Its twin pkt-dstaddr
+        behaves identically and lands on aws.vpcflow.pkt_dstaddr.
+    - vendor: flow-direction
+      type: enum
+      description: >-
+        direction of the flow relative to the interface that captured it -
+        ingress or egress
+      ecs: network.direction
+      status: mapped
+      notes: ingress/egress are valid ECS network.direction values and pass through unchanged
+    - vendor: traffic-path
+      type: integer
+      description: >-
+        numeric code for the path egress traffic takes to its destination,
+        populated only when flow-direction is egress
+      ecs: null
+      status: partial
+      custom: aws.vpcflow.traffic_path
+      transform: >
+        the 1-8 code needs a lookup to a readable path (within the same VPC,
+        through an internet gateway or gateway VPC endpoint, through a virtual
+        private gateway, through a transit gateway, through a peering
+        connection, etc.) before it is usable in an egress-to-internet
+        detection
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Keep the core worker group a pass-through on this route: the Amazon
+          S3 source unpacks the gzipped objects and hands whole lines to the
+          Elastic destination with _raw intact, and Persistent Queue
+          backpressure absorbs the bursty per-object delivery. Do the two
+          things that are genuinely cheaper near the collector - suppress the
+          NODATA and SKIPDATA heartbeat records into a low-volume operational
+          route instead of the security index, and attach the vpc-id/subnet-id
+          to enclave-owner enrichment from the account inventory - and, if
+          volume forces reduction, sample or aggregate ACCEPT flows here
+          rather than trimming columns, since positional parsing downstream
+          depends on the column count staying whole.
+        elastic: >
+          The AWS integration's vpcflow ingest pipeline is the parser; layer a
+          logs-aws.vpcflow@custom pipeline for the gaps this map records -
+          resolve the numeric traffic-path code to a readable egress path,
+          decode the tcp-flags bitmask into the flag array so SYN-without-ACK
+          scan detections work, and assert that event.outcome is derived from
+          action alone and never from log-status, so a SKIPDATA record is not
+          counted as a rejected flow. Add explicitly typed custom-namespace
+          index-template mappings for aws.vpcflow.interface_id, .vpc_id,
+          .subnet_id, .log_status and .traffic_path as keyword and
+          .pkt_srcaddr/.pkt_dstaddr as ip, and set the S3/SQS input to the
+          aws-us-gov partition endpoints rather than relying on the commercial
+          defaults.
+        relay: >
+          Low-side instances cross the guard: run this dataset as a
+          thin-envelope hybrid - {_dataId, @timestamp, host, _raw} with
+          _dataId set to the logs-aws.vpcflow route key - rather than parsing
+          low-side, because the integration's pipeline is the parser and one
+          stable envelope is easier to filter than a positional grammar whose
+          column count changes with the subscription's custom format. The
+          content filter's job is unusually easy here: every field is short
+          bounded ASCII from a fixed vocabulary with no free text, so the only
+          real constraints are the '-' placeholder (which must survive as a
+          literal, not be coerced to null) and sheer volume, which makes this
+          the first dataset to drop _raw once the parser is proven. Treat the
+          crossing as at-most-once and reconcile low-side and high-side record
+          counts per (dataset, hour); do not use log-status for this, since
+          NODATA and SKIPDATA describe capture gaps at the interface, not
+          losses at the boundary.
+      direct:
+        parse_location: high
+        cribl: >
+          Keep the core worker group a pass-through on this route: the Amazon
+          S3 source unpacks the gzipped objects and hands whole lines to the
+          Elastic destination with _raw intact, and Persistent Queue
+          backpressure absorbs the bursty per-object delivery. Do the two
+          things that are genuinely cheaper near the collector - suppress the
+          NODATA and SKIPDATA heartbeat records into a low-volume operational
+          route instead of the security index, and attach the vpc-id/subnet-id
+          to enclave-owner enrichment from the account inventory - and, if
+          volume forces reduction, sample or aggregate ACCEPT flows here
+          rather than trimming columns, since positional parsing downstream
+          depends on the column count staying whole.
+        elastic: >
+          The AWS integration's vpcflow ingest pipeline is the parser; layer a
+          logs-aws.vpcflow@custom pipeline for the gaps this map records -
+          resolve the numeric traffic-path code to a readable egress path,
+          decode the tcp-flags bitmask into the flag array so SYN-without-ACK
+          scan detections work, and assert that event.outcome is derived from
+          action alone and never from log-status, so a SKIPDATA record is not
+          counted as a rejected flow. Add explicitly typed custom-namespace
+          index-template mappings for aws.vpcflow.interface_id, .vpc_id,
+          .subnet_id, .log_status and .traffic_path as keyword and
+          .pkt_srcaddr/.pkt_dstaddr as ip, and set the S3/SQS input to the
+          aws-us-gov partition endpoints rather than relying on the commercial
+          defaults.
+  - format: parquet-s3
+    enable: >
+      On the VPC flow log subscription (VPC console - select the VPC, subnet
+      or network interface, Flow logs tab, Create flow log; or aws ec2
+      create-flow-logs) set the destination to "Send to an Amazon S3 bucket"
+      and choose Log file format = Parquet rather than the default Text.
+      Optionally enable "Hive-compatible S3 prefixes" (delivers under
+      AWSLogs/aws-account-id=.../service=vpcflowlogs/...) and "Partition logs
+      by the hour" for cheaper partitioned Athena/Glue reads. Each object is a
+      single Gzip-compressed Parquet file under
+      AWSLogs/<account>/vpcflowlogs/<region>/... . In GovCloud target an
+      aws-us-gov partition bucket and wire the same SQS object-create
+      notification the text feed uses. The field SET is exactly whatever the
+      subscription's default or custom format already selects - Parquet
+      changes only the encoding and the column data types, so a Parquet
+      subscription and a text subscription of the same custom format carry
+      identical fields.
+    references:
+    - https://docs.aws.amazon.com/vpc/latest/userguide/flow-log-records.html
+    - https://docs.aws.amazon.com/vpc/latest/userguide/flow-logs-s3.html
+    - >-
+      https://aws.amazon.com/about-aws/whats-new/2021/10/amazon-vpc-flow-logs-parquet-hive-prefixes-partitioned-files
+    - https://docs.aws.amazon.com/athena/latest/ug/vpc-flow-logs.html
+    - https://docs.cribl.io/stream/sources-s3/
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: Cribl S3 source with the Parquet reader feeding a column-to-ECS pipeline
+      notes: >
+        The stock Elastic AWS vpcflow integration expects the space-delimited
+        line and does a positional split; a Parquet object has no line to
+        split, so that pipeline is bypassed. Decode the row groups to
+        structured events (Cribl's Parquet reader on the S3 source, or the
+        Elastic aws-s3 input's parquet decoding codec) and map the
+        already-named, already-typed columns straight to ECS. The one real
+        benefit downstream: packets, bytes, ports, protocol and the timestamps
+        arrive as INT_64 / INT_32, so none of the string-to-number convert
+        steps the text feed needs are required - but the same semantic
+        enrichments still apply (IANA protocol lookup, tcp-flags bitmask
+        decompose, traffic-path code lookup, event.outcome from action). Only
+        the integer-typed columns are tabled below; every other selected
+        column (srcaddr, dstaddr, account-id, interface-id, vpc-id, subnet-id,
+        instance-id, action, log-status, region, az-id, type, pkt-srcaddr,
+        pkt-dstaddr, flow-direction, the pkt-*-aws-service fields and any
+        v7-v11 fields the subscription selects) carries the identical name and
+        STRING encoding as the text field list and maps to ECS exactly as that
+        feed maps it, so only the typed columns change between the two
+        encodings.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Adopt Parquet only where the downstream reader can decode it, then
+          treat the columnar shape as an advantage: Cribl's Parquet reader
+          yields typed, named columns, so prune the columns you do not carry
+          at the S3 source (column pruning is far cheaper on Parquet than
+          trimming a positional line, and unlike the text feed it does NOT
+          break a downstream positional parser because there is no longer
+          one). Keep the NODATA/SKIPDATA heartbeat suppression and the
+          vpc-id/subnet-id owner enrichment exactly as on the text feed, back
+          the Elastic destination with Persistent Queue for the bursty
+          per-object delivery, and do not re-serialize to a text line just to
+          reuse the stock integration - carry the typed record forward.
+        elastic: >
+          Do not route a Parquet feed through the vpcflow integration's
+          positional pipeline. Land the decoded columns and apply a dedicated
+          ingest pipeline that does what logs-aws.vpcflow@custom does on the
+          text feed minus the type coercion: resolve protocol to
+          network.transport via the IANA table, decompose the tcp-flags
+          bitmask into a flag array, look up the traffic-path 1-8 code to a
+          readable egress path, and derive event.outcome from action alone
+          (never from log-status). Type the custom-namespace columns
+          explicitly in the index template -
+          aws.vpcflow.interface_id/.vpc_id/.subnet_id/
+          .log_status/.traffic_path as keyword, .pkt_srcaddr/.pkt_dstaddr as
+          ip - and point the S3/SQS input at the aws-us-gov endpoints.
+        relay: >
+          A Parquet object is a binary columnar container and does NOT cross a
+          line-oriented content filter cleanly - the guard cannot inspect row
+          groups the way it inspects an NDJSON line. Decode Parquet to the
+          same typed thin envelope the text feed crosses ({_dataId,
+          @timestamp, host, _raw or typed columns}) LOW-side, before the
+          guard, and never ship the Parquet container across. Once decoded,
+          the crossing shape and its easy content profile are identical to the
+          text feed - short bounded ASCII from a fixed vocabulary, no free
+          text - so the only real constraints remain the '-'/null distinction
+          (Parquet stores a real null where text carries the literal '-', so
+          pick one representation and hold it across) and sheer volume. Treat
+          as at-most-once and reconcile per (dataset, hour).
+      direct:
+        parse_location: high
+        cribl: >
+          High-side instances take cribl -> elastic directly with no guard:
+          the decision is purely whether Parquet's cheaper storage and faster
+          Athena reads justify the decode step, since the collector must now
+          run a Parquet reader rather than pass whole text lines through. If
+          Parquet is chosen, decode at the S3 source, prune columns there, and
+          pass the typed record to the Elastic destination; there is no
+          low-side shaping to apply, so the worker group is a
+          Parquet-decode-and-forward stage.
+        elastic: >
+          Skip the positional integration and apply a dedicated typed-column
+          pipeline: resolve protocol to network.transport via the IANA table,
+          decompose the tcp-flags bitmask into a flag array, look up the
+          traffic-path 1-8 code to a readable egress path, and derive
+          event.outcome from action alone. Rely on Parquet's native typing so
+          packets, bytes, ports and the epoch timestamps need no convert
+          processors. Map the aws.vpcflow.* custom columns as keyword/ip in
+          the index template so the per-workload flow aggregations do not fall
+          back to dynamic mapping.
+    fields:
+    - vendor: srcport
+      type: integer
+      description: source port of the traffic; Parquet data type INT_32
+      ecs: source.port
+      status: mapped
+    - vendor: dstport
+      type: integer
+      description: destination port of the traffic; Parquet data type INT_32
+      ecs: destination.port
+      status: mapped
+    - vendor: protocol
+      type: integer
+      description: >-
+        IANA protocol number of the traffic; Parquet data type INT_32 (a real
+        integer here rather than the STRING the text feed emits)
+      ecs: network.iana_number
+      status: mapped
+      transform: >
+        the typed integer is copied to network.iana_number and resolved
+        through the IANA protocol table into the lowercase network.transport
+        name; no string-to-int cast is needed as it is on the text feed
+    - vendor: packets
+      type: long
+      description: number of packets transferred during the flow; Parquet data type INT_64
+      ecs: network.packets
+      status: mapped
+    - vendor: bytes
+      type: long
+      description: number of bytes transferred during the flow; Parquet data type INT_64
+      ecs: network.bytes
+      status: mapped
+    - vendor: start
+      type: long
+      description: >-
+        Unix seconds when the first packet of the flow was received within the
+        aggregation interval; Parquet data type INT_64
+      ecs: event.start
+      status: mapped
+      transform: >-
+        epoch seconds (already numeric under Parquet) converted to a date; the
+        same +/-60s window-boundary caveat as the text feed applies
+    - vendor: end
+      type: long
+      description: >-
+        Unix seconds when the last packet of the flow was received within the
+        aggregation interval; Parquet data type INT_64
+      ecs: event.end
+      status: mapped
+      transform: >-
+        epoch seconds converted to a date and used as @timestamp; with start
+        it yields event.duration, which no column provides
+    - vendor: tcp-flags
+      type: integer
+      description: >-
+        bitmask of the TCP flags observed during the aggregation interval (FIN
+        1, SYN 2, RST 4, SYN-ACK 18); Parquet data type INT_32
+      ecs: null
+      status: partial
+      custom: aws.vpcflow.tcp_flags
+      transform: >
+        decomposed into a lowercase flag array (aws.vpcflow.tcp_flags_array)
+        so SYN-without-ACK and RST-heavy patterns are queryable; flags are
+        OR-ed across the whole window. ECS has no TCP flag field, so both the
+        raw bitmask and the derived array stay in the vendor namespace
+    - vendor: traffic-path
+      type: integer
+      description: >-
+        numeric 1-8 code for the path egress traffic takes, populated only
+        when flow-direction is egress; Parquet data type INT_32
+      ecs: null
+      status: partial
+      custom: aws.vpcflow.traffic_path
+      transform: >
+        the code needs a lookup to a readable egress path (same VPC, internet
+        gateway or gateway VPC endpoint, virtual private gateway, VPC peering,
+        transit gateway, etc.) before it is usable in an egress-to-internet
+        detection
+    - vendor: version
+      type: integer
+      description: >-
+        VPC Flow Logs record version (2-11), the highest version among the
+        selected fields; Parquet data type INT_32
+      ecs: null
+      status: unmapped
+      custom: aws.vpcflow.version
+      notes: >-
+        a schema-provenance marker, not traffic data; typed under Parquet
+        where the text feed carries it as a STRING
+  - format: ocsf
+    enable: >
+      Enable Amazon Security Lake in the GovCloud Region(s) - available at
+      securitylake.us-gov-west-1.amazonaws.com and
+      securitylake.us-gov-east-1.amazonaws.com - and add "VPC Flow Logs"
+      (sourceName VPC_FLOW) as an ingested AWS log source. Security Lake
+      consumes VPC Flow Logs directly from Amazon VPC through its own
+      independent, duplicate stream (it does not read your flow-log S3 bucket
+      and does not change the existing subscription), normalizes each record
+      to the OCSF 1.1.0 Network Activity class (category_uid 4, class_uid
+      4001), and writes Gzip Parquet objects partitioned by
+      time/region/account to the Security Lake managed bucket. Create a
+      subscriber with data access (S3/SQS) so a collector can drain the
+      objects: Security Lake writes an object and emits an SQS notification.
+      Managing or stopping the flow logs themselves is still done in the VPC
+      console; Security Lake only mirrors them.
+    references:
+    - https://docs.aws.amazon.com/security-lake/latest/userguide/vpc-flow-logs.html
+    - >-
+      https://github.com/ocsf/examples/tree/main/mappings/markdown/AWS/v1.1.0/VPC%20Flowlogs
+    - https://docs.aws.amazon.com/general/latest/gr/securitylake.html
+    - https://www.elastic.co/docs/reference/integrations/amazon_security_lake
+    parsing:
+      mechanism: elastic-integration
+      artifact: Elastic Amazon Security Lake integration (OCSF), S3/SQS input
+      notes: >
+        The Elastic Amazon Security Lake integration reads the OCSF Parquet
+        objects from the subscriber bucket (S3-polling or S3-SQS) and ships
+        them through its own pipeline - a different integration from the AWS
+        vpcflow data stream, expecting OCSF attribute names (src_endpoint.ip,
+        connection_info.protocol_num), not the positional line. The reshape is
+        rich in some places and lossy in others: OCSF resolves srcaddr vs
+        pkt-srcaddr into src_endpoint.ip plus src_endpoint.intermediate_ips
+        for you and derives connection_info.direction/boundary, but it
+        flattens the ACCEPT/REJECT action across several attributes (activity,
+        action, disposition) and pushes anything without an OCSF home into the
+        unmapped object. Fixed schema markers: metadata.product.name "Amazon
+        VPC", metadata.product.feature.name "Flowlogs".
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Worth adopting only where OCSF is already the low-side house schema;
+          otherwise it stacks an OCSF-to-ECS translation on top of the
+          VPC-to-OCSF reshape Security Lake already did. If used, drain the
+          subscriber SQS with a Cribl S3 source, keep the Parquet-decoded OCSF
+          record intact, and do not try to reconstruct the native positional
+          line - carry the OCSF attribute names across and let Elastic's
+          Security Lake integration own the OCSF-to-ECS mapping. Because
+          Security Lake runs an independent duplicate stream, reconcile counts
+          against any co-collected native flow feed per (account, hour) so a
+          divergence between the two AWS collection paths is visible rather
+          than assumed equal.
+        elastic: >
+          Use the stock Amazon Security Lake integration rather than the AWS
+          vpcflow integration, then layer a custom pipeline for the signals
+          OCSF buries: derive event.outcome from disposition/action_id
+          (Allowed vs Denied, resolved by Security Lake from ACCEPT/REJECT)
+          since there is no log-status-independent outcome column, normalize
+          connection_info.direction (Inbound/Outbound) back to the ECS
+          ingress/egress vocabulary for network.direction, and decompose
+          connection_info.tcp_flags exactly as on the native feed. Keep
+          class_uid, severity_id and activity_name as typed aws.securitylake.*
+          keywords, map the unmapped object as flattened (type, sublocation,
+          ecs-* and reject-reason land there), and confirm cloud.account.uid
+          feeds cloud.account.id.
+        relay: >
+          What crosses the guard is OCSF JSON decoded from Parquet - never the
+          Parquet container and never the native line. The content profile is
+          still easy (bounded ASCII identifiers, IPs, ports, integer
+          counters), so the crossing discipline is light: decode Parquet
+          low-side, hold the OCSF record to a declared nesting depth, flatten
+          and size-cap the unmapped catch-all, and preserve the OCSF null
+          (Security Lake stores a real null where the native feed carries '-')
+          as a single agreed representation. Treat as at-most-once with
+          per-(account, hour) reconciliation, and note this stream is
+          independent of the native feed, so counts will not match a native
+          subscription one-for-one.
+      direct:
+        parse_location: high
+        cribl: >
+          High side with no guard: drain the subscriber SQS with a Cribl S3
+          source and pass the OCSF record through with minimal shaping, or
+          skip Cribl and let an Elastic Agent run the Security Lake
+          integration's S3-SQS input directly. The decision that matters is
+          deduplication against any co-collected native flow feed for the same
+          accounts - Security Lake is an independent duplicate stream, so key
+          on a stable flow identity (the 5-tuple plus start/end window) to
+          avoid double-counting the same flow from two collection paths.
+        elastic: >
+          Use the stock Amazon Security Lake integration with
+          aws.securitylake.* keyword mappings; because there is no boundary,
+          retain the unmapped object for hunting rather than capping it, and
+          treat this feed as complementary to - not a replacement for - the
+          native vpcflow feed, which preserves the exact positional field
+          order and the literal '-' placeholders the OCSF reshape normalizes
+          away.
+    fields:
+    - vendor: time
+      type: timestamp
+      description: >-
+        event time in epoch milliseconds, set from the flow start; OCSF also
+        carries time_dt and start_time_dt from start
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        OCSF anchors time on the flow start, whereas the native/Elastic feed
+        uses end as @timestamp; keep event.start from start_time_dt and
+        event.end from end_time_dt, and decide one @timestamp source
+        consistently across the two feeds
+    - vendor: start_time_dt
+      type: timestamp
+      description: flow start as an ISO datetime, from the native start
+      ecs: event.start
+      status: mapped
+    - vendor: end_time_dt
+      type: timestamp
+      description: flow end as an ISO datetime, from the native end
+      ecs: event.end
+      status: mapped
+    - vendor: src_endpoint.ip
+      type: ip
+      description: >-
+        source IP of the flow; OCSF uses pkt-srcaddr when it differs from
+        srcaddr, else srcaddr
+      ecs: source.ip
+      status: mapped
+      notes: >-
+        OCSF resolves the NAT/EKS intermediate-address case for you and
+        records the intermediate hop in src_endpoint.intermediate_ips
+    - vendor: src_endpoint.intermediate_ips
+      type: ip
+      description: >-
+        the intermediate source address (the srcaddr NAT gateway or EKS node
+        hop) when it differs from the packet-level pkt-srcaddr
+      ecs: null
+      status: unmapped
+      custom: aws.securitylake.src_endpoint.intermediate_ips
+      notes: >
+        the inverse framing of the native pair - OCSF puts the original
+        address in src_endpoint.ip and the intermediate one here, whereas the
+        native feed puts the intermediate in srcaddr and the original in
+        pkt-srcaddr; deliberately not source.nat.ip, whose ECS semantics are
+        different again
+    - vendor: dst_endpoint.ip
+      type: ip
+      description: >-
+        destination IP of the flow; OCSF uses pkt-dstaddr when it differs from
+        dstaddr, else dstaddr
+      ecs: destination.ip
+      status: mapped
+      notes: >-
+        the intermediate destination hop, when present, lands in
+        dst_endpoint.intermediate_ips (custom
+        aws.securitylake.dst_endpoint.intermediate_ips)
+    - vendor: src_endpoint.port
+      type: integer
+      description: source port, from srcport
+      ecs: source.port
+      status: mapped
+    - vendor: dst_endpoint.port
+      type: integer
+      description: destination port, from dstport
+      ecs: destination.port
+      status: mapped
+    - vendor: connection_info.protocol_num
+      type: integer
+      description: IANA protocol number, from protocol
+      ecs: network.iana_number
+      status: mapped
+      transform: >-
+        same IANA lookup as the native feed - numeric value to
+        network.iana_number, resolved name to network.transport
+    - vendor: connection_info.tcp_flags
+      type: integer
+      description: TCP flag bitmask, from tcp-flags
+      ecs: null
+      status: partial
+      custom: aws.securitylake.connection_info.tcp_flags
+      transform: >-
+        decompose into a lowercase flag array as on the native feed; ECS has
+        no TCP flag field, so both the bitmask and the derived array stay
+        custom
+    - vendor: connection_info.direction
+      type: string
+      description: >-
+        flow direction as OCSF Inbound/Outbound, derived from flow-direction
+        (ingress/egress); OCSF also sets connection_info.direction_id
+      ecs: network.direction
+      status: partial
+      transform: >-
+        normalize the OCSF Inbound/Outbound value back to the ECS
+        ingress/egress vocabulary
+    - vendor: connection_info.boundary
+      type: string
+      description: >-
+        egress boundary classification, derived from traffic-path (also
+        connection_info.boundary_id)
+      ecs: null
+      status: partial
+      custom: aws.securitylake.connection_info.boundary
+      notes: >-
+        the OCSF-normalized form of the native traffic-path 1-8 code; carries
+        the same egress-path meaning and is the field an egress-to-internet
+        detection reads on the OCSF feed
+    - vendor: traffic.bytes
+      type: long
+      description: bytes transferred during the flow, from bytes
+      ecs: network.bytes
+      status: mapped
+    - vendor: traffic.packets
+      type: long
+      description: packets transferred during the flow, from packets
+      ecs: network.packets
+      status: mapped
+    - vendor: disposition
+      type: string
+      description: >-
+        Allowed/Denied traffic disposition, derived from action
+        (ACCEPT/REJECT); OCSF also sets action, action_id, activity_id and
+        type_uid from the same value
+      ecs: event.action
+      status: partial
+      transform: >
+        ACCEPT/REJECT drives the whole OCSF action cluster; map the
+        disposition to event.action and derive event.outcome from it
+        (Allowed->success, Denied->failure), the OCSF equivalent of the native
+        rule that event.outcome comes from action alone and never from
+        log-status
+    - vendor: activity_name
+      type: string
+      description: OCSF activity for the flow (Traffic), from the action-driven activity_id
+      ecs: null
+      status: unmapped
+      custom: aws.securitylake.activity_name
+      notes: >-
+        kept custom to avoid a second write into event.action, which is fed
+        from disposition above
+    - vendor: class_uid
+      type: integer
+      description: >-
+        OCSF class identifier - 4001 (Network Activity) for VPC flow records;
+        category_uid is 4
+      ecs: null
+      status: unmapped
+      custom: aws.securitylake.class_uid
+      notes: >-
+        the OCSF-schema discriminator; distinct from ECS
+        event.category/event.kind, which have their own closed vocabularies
+        and must not be fed from this integer
+    - vendor: severity_id
+      type: integer
+      description: OCSF severity - fixed at 1 (Informational) for flow records
+      ecs: null
+      status: unmapped
+      custom: aws.securitylake.severity_id
+      notes: >-
+        a constant on this source, so deliberately not event.severity - it
+        carries no per-event signal
+    - vendor: metadata.product.name
+      type: string
+      description: >-
+        constant 'Amazon VPC' identifying the producing product
+        (metadata.product.feature.name is 'Flowlogs')
+      ecs: observer.product
+      status: mapped
+    - vendor: metadata.product.version
+      type: string
+      description: the flow-log record version (2-11), from version
+      ecs: null
+      status: unmapped
+      custom: aws.securitylake.metadata.product_version
+      notes: >-
+        the flow-log schema version, not the version of any observing
+        software, so deliberately not observer.version
+    - vendor: cloud.account.uid
+      type: string
+      description: account that owns the source network interface, from account-id
+      ecs: cloud.account.id
+      status: mapped
+    - vendor: cloud.region
+      type: string
+      description: Region containing the interface, from region
+      ecs: cloud.region
+      status: mapped
+    - vendor: cloud.zone
+      type: string
+      description: Availability Zone ID containing the interface, from az-id
+      ecs: null
+      status: unmapped
+      custom: aws.securitylake.cloud.zone
+      notes: >-
+        az-id is the zone ID (e.g. usgw1-az1), not the human AZ name, so
+        deliberately not cloud.availability_zone, which models the name
+    - vendor: src_endpoint.instance_uid
+      type: string
+      description: >-
+        EC2 instance owning the interface, from instance-id (on ingress this
+        lands under dst_endpoint.instance_uid instead, per flow-direction)
+      ecs: cloud.instance.id
+      status: mapped
+      notes: >-
+        the '-' placeholder for requester-managed interfaces (NAT gateway,
+        load balancer), so absence is normal
+    - vendor: src_endpoint.interface_uid
+      type: string
+      description: >-
+        the ENI the capture belongs to, from interface-id
+        (dst_endpoint.interface_uid on ingress)
+      ecs: null
+      status: unmapped
+      custom: aws.vpcflow.interface_id
+      notes: >-
+        reuses the api-pull feed's custom namespace so the per-workload flow
+        pivot is the same field across the native and OCSF feeds; deliberately
+        not observer.ingress.interface.id (the ENI is the summarized endpoint,
+        not an observing device)
+    - vendor: src_endpoint.vpc_uid
+      type: string
+      description: VPC containing the interface, from vpc-id (dst_endpoint.vpc_uid on ingress)
+      ecs: null
+      status: unmapped
+      custom: aws.vpcflow.vpc_id
+      notes: >-
+        ECS has no VPC/subnet identity field; reuses the aws.vpcflow namespace
+        so enclave-scoping dashboards work across both feeds. subnet-id
+        behaves identically and lands on aws.vpcflow.subnet_id (OCSF
+        src_endpoint.subnet_uid / dst_endpoint.subnet_uid)
+    - vendor: status_code
+      type: string
+      description: logging status of the flow log - OK, NODATA or SKIPDATA, from log-status
+      ecs: null
+      status: partial
+      custom: aws.vpcflow.log_status
+      notes: >-
+        a capture-health signal carried straight through by OCSF, not a
+        traffic outcome; SKIPDATA is a visibility-gap indicator to alert on
+        separately, as on the native feed
+    - vendor: src_endpoint.svc_name
+      type: string
+      description: >-
+        AWS service name for the source address when it belongs to an AWS
+        service range, from pkt-src-aws-service (dst_endpoint.svc_name from
+        pkt-dst-aws-service)
+      ecs: null
+      status: unmapped
+      custom: aws.securitylake.src_endpoint.svc_name
+    - vendor: unmapped
+      type: string
+      description: >-
+        OCSF catch-all object holding native fields with no OCSF home - type
+        (IPv4/IPv6/EFA), the sublocation-* fields, the v7-v11
+        ecs-*/reject-reason/encryption-status fields, and any custom-format
+        columns without an OCSF attribute
+      ecs: null
+      status: unmapped
+      custom: aws.securitylake.unmapped
+      notes: >-
+        map as flattened so the traffic type and any selected higher-version
+        columns remain searchable; anything the subscription's custom format
+        adds beyond the OCSF-modelled set arrives here
+- id: tgw-flow
+  name: Transit Gateway flow log record
+  description: >
+    Flow summaries captured on a transit gateway rather than on a VPC network
+    interface, describing traffic between attachments in a hub-and-spoke
+    GovCloud architecture. Same space-separated positional shape and same
+    Elastic data stream as the VPC records, but a different column set: the
+    default format is versions 2 through 6, it adds the tgw-* attachment and
+    source/destination VPC identity columns and the four packets-lost-* drop
+    counters, and notably it has no ACCEPT/REJECT action column at all.
+  event_categories:
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same Amazon S3 plus SQS collection as the VPC flow dataset, usually a
+        separate subscription and prefix in the same log-archive bucket.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-aws.vpcflow
+    direct:
+    - hop: cribl
+      location: edge worker group
+      notes: >
+        Same Amazon S3 plus SQS collection as the VPC flow dataset, usually a
+        separate subscription and prefix in the same log-archive bucket.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-aws.vpcflow
+  formats:
+  - format: api-pull
+    parsing:
+      mechanism: elastic-integration
+      artifact: AWS integration, vpcflow data stream
+      notes: >
+        The vpcflow data stream carries transit gateway records too - the
+        integration's field set already defines aws.vpcflow.tgw_* and the
+        packets_lost_* counters - but the subscription's custom field order
+        must be declared to the input separately from the VPC subscription,
+        since the two grammars are not interchangeable.
+    fields:
+    - vendor: account-id
+      type: string
+      description: AWS account ID of the owner of the source transit gateway
+      ecs: cloud.account.id
+      status: mapped
+    - vendor: tgw-id
+      type: string
+      description: ID of the transit gateway for which traffic is being recorded
+      ecs: null
+      status: unmapped
+      custom: aws.vpcflow.tgw_id
+      notes: >-
+        the hub device identity; ECS has no cloud network-appliance field, and
+        observer.* would misstate a managed AWS service as a monitoring device
+    - vendor: tgw-attachment-id
+      type: string
+      description: ID of the transit gateway attachment for which traffic is being recorded
+      ecs: null
+      status: unmapped
+      custom: aws.vpcflow.tgw_attachment_id
+      notes: >-
+        the per-spoke attachment, and the field enclave-scoped dashboards
+        actually group on
+    - vendor: tgw-src-vpc-id
+      type: string
+      description: ID of the source VPC for the transit gateway flow
+      ecs: null
+      status: unmapped
+      custom: aws.vpcflow.tgw_src_vpc_id
+      notes: >
+        source-side and destination-side VPC identity are separate columns
+        here, so neither can share the single VPC field the VPC dataset uses;
+        the paired account-id columns (tgw-src-vpc-account-id,
+        tgw-dst-vpc-account-id) have the same problem against
+        cloud.account.id, which already holds the transit gateway owner
+    - vendor: tgw-dst-vpc-id
+      type: string
+      description: ID of the destination VPC for the transit gateway flow
+      ecs: null
+      status: unmapped
+      custom: aws.vpcflow.tgw_dst_vpc_id
+    - vendor: tgw-src-eni
+      type: string
+      description: ID of the source transit gateway attachment ENI for the flow
+      ecs: null
+      status: unmapped
+      custom: aws.vpcflow.tgw_src_eni
+    - vendor: tgw-dst-eni
+      type: string
+      description: ID of the destination transit gateway attachment ENI for the flow
+      ecs: null
+      status: unmapped
+      custom: aws.vpcflow.tgw_dst_eni
+    - vendor: srcaddr
+      type: ip
+      description: source address for incoming traffic
+      ecs: source.ip
+      status: mapped
+    - vendor: dstaddr
+      type: ip
+      description: destination address for outgoing traffic
+      ecs: destination.ip
+      status: mapped
+    - vendor: srcport
+      type: port
+      description: source port of the traffic
+      ecs: source.port
+      status: mapped
+    - vendor: dstport
+      type: port
+      description: destination port of the traffic
+      ecs: destination.port
+      status: mapped
+    - vendor: protocol
+      type: integer
+      description: IANA protocol number of the traffic
+      ecs: network.iana_number
+      status: mapped
+      transform: >-
+        same IANA lookup as the VPC dataset - numeric value to
+        network.iana_number, resolved name to network.transport
+    - vendor: packets
+      type: long
+      description: number of packets transferred during the flow
+      ecs: network.packets
+      status: mapped
+    - vendor: bytes
+      type: bytes
+      description: number of bytes transferred during the flow
+      ecs: network.bytes
+      status: mapped
+    - vendor: end
+      type: timestamp
+      description: >-
+        Unix seconds when the last packet of the flow was received within the
+        aggregation interval
+      ecs: event.end
+      status: mapped
+      transform: epoch seconds converted to a date and used as @timestamp, as on the VPC dataset
+    - vendor: flow-direction
+      type: enum
+      description: direction of the flow relative to the transit gateway - ingress or egress
+      ecs: network.direction
+      status: mapped
+    - vendor: packets-lost-blackhole
+      type: long
+      description: >-
+        number of packets dropped because the transit gateway route table
+        matched a blackhole route
+      ecs: null
+      status: partial
+      custom: aws.vpcflow.packets_lost_blackhole
+      notes: >
+        this dataset has no ACCEPT/REJECT column, so the drop counters are the
+        only denial signal available; a non-zero value is the closest
+        equivalent to a REJECT and should drive event.action rather than being
+        left as a bare counter
+    - vendor: packets-lost-no-route
+      type: long
+      description: number of packets dropped because no matching route was found
+      ecs: null
+      status: unmapped
+      custom: aws.vpcflow.packets_lost_no_route
+      notes: >
+        its two siblings packets-lost-mtu-exceeded and
+        packets-lost-ttl-expired follow the same shape and namespace; ECS has
+        no per-drop-reason packet counter
+    - vendor: log-status
+      type: enum
+      description: status of the flow log - OK, NODATA or SKIPDATA
+      ecs: null
+      status: partial
+      custom: aws.vpcflow.log_status
+      notes: capture-health signal shared with the VPC dataset, not a traffic outcome
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Pass through on the core worker group with Persistent Queue
+          backpressure, exactly as for the VPC records, but keep this
+          subscription on its own Cribl route and _dataId: the two column
+          orders are different and a single shared route would let transit
+          gateway lines be parsed against the VPC grammar. Enrich
+          tgw-attachment-id to the owning enclave from the attachment
+          inventory near the collector, and do not sample this feed for volume
+          - it is far lower volume than the VPC records and the blackhole
+          counters are individually significant.
+        elastic: >
+          Parse with the AWS integration's vpcflow pipeline and add a
+          logs-aws.vpcflow@custom pipeline that handles the structural
+          difference this dataset has from the VPC records: with no action
+          column, event.outcome must be left unset rather than defaulted to
+          success, and a non-zero packets-lost-blackhole or
+          packets-lost-no-route should drive event.action and a routing-drop
+          detection instead. Map aws.vpcflow.tgw_id, .tgw_attachment_id,
+          .tgw_src_vpc_id, .tgw_dst_vpc_id, .tgw_src_eni and .tgw_dst_eni as
+          keyword and the four packets_lost_* counters as long in the
+          custom-namespace index template, so attachment-level drop dashboards
+          aggregate without dynamic mapping.
+        relay: >
+          Low-side instances cross the guard: ship the same thin envelope as
+          the VPC dataset so the boundary inspects one schema for both
+          subscriptions and the differing column orders stay a high-side
+          concern. Content-filter friction is minimal - every column is a
+          short bounded ASCII identifier, an integer counter or the '-'
+          placeholder, with no free text and no user-supplied strings - so the
+          constraint worth stating to the guard owner is only that the
+          placeholder must cross intact. At-most-once crossing with no return
+          channel: reconcile counts per (dataset, hour), which matters more
+          here than on the VPC feed because the volume is low enough that a
+          silent drop will not show up as a rate anomaly.
+      direct:
+        parse_location: high
+        cribl: >
+          Pass through on the core worker group with Persistent Queue
+          backpressure, exactly as for the VPC records, but keep this
+          subscription on its own Cribl route and _dataId: the two column
+          orders are different and a single shared route would let transit
+          gateway lines be parsed against the VPC grammar. Enrich
+          tgw-attachment-id to the owning enclave from the attachment
+          inventory near the collector, and do not sample this feed for volume
+          - it is far lower volume than the VPC records and the blackhole
+          counters are individually significant.
+        elastic: >
+          Parse with the AWS integration's vpcflow pipeline and add a
+          logs-aws.vpcflow@custom pipeline that handles the structural
+          difference this dataset has from the VPC records: with no action
+          column, event.outcome must be left unset rather than defaulted to
+          success, and a non-zero packets-lost-blackhole or
+          packets-lost-no-route should drive event.action and a routing-drop
+          detection instead. Map aws.vpcflow.tgw_id, .tgw_attachment_id,
+          .tgw_src_vpc_id, .tgw_dst_vpc_id, .tgw_src_eni and .tgw_dst_eni as
+          keyword and the four packets_lost_* counters as long in the
+          custom-namespace index template, so attachment-level drop dashboards
+          aggregate without dynamic mapping.
+  - format: parquet-s3
+    enable: >
+      On the transit gateway flow log subscription (VPC console - Transit
+      gateways or Transit gateway attachments, Flow logs, Create flow log; or
+      aws ec2 create-flow-logs with the transit gateway resource) set the
+      destination to Amazon S3 and choose Log file format = Parquet rather
+      than Text, optionally with Hive-compatible S3 prefixes and hourly
+      partitions. Objects are Gzip-compressed Parquet files under
+      AWSLogs/<account>/vpcflowlogs/<region>/... in the same GovCloud
+      aws-us-gov bucket the text TGW feed uses, usually a separate
+      subscription and prefix from the VPC flow logs. As with the VPC feed the
+      field SET is whatever the default (v2-v6) or custom TGW format selects;
+      Parquet changes only the encoding and the column data types.
+    references:
+    - https://docs.aws.amazon.com/vpc/latest/tgw/tgw-flow-logs.html
+    - https://docs.aws.amazon.com/vpc/latest/tgw/flow-logs-s3.html
+    - https://docs.cribl.io/stream/sources-s3/
+    parsing:
+      mechanism: cribl-pipeline
+      artifact: Cribl S3 source with the Parquet reader feeding a column-to-ECS pipeline
+      notes: >
+        As with the VPC Parquet feed, the Elastic vpcflow integration's
+        positional split does not apply to a Parquet object - decode the row
+        groups to typed, named columns and map them to ECS. The TGW column set
+        is its own grammar (tgw-* identity columns, the four packets-lost-*
+        counters, no ACCEPT/REJECT action), so keep this subscription on its
+        own pipeline and route: a shared route would let TGW columns be read
+        against the VPC schema. Parquet types packets/bytes/start/end and the
+        packets-lost-* counters as INT_64 and
+        srcport/dstport/protocol/tcp-flags/ version as INT_32, so the counters
+        arrive numeric with no cast. Only the integer-typed columns are tabled
+        below; every other selected column (account-id, resource-type, the
+        tgw-* identity columns, srcaddr, dstaddr, log-status, type, region,
+        flow-direction and the pkt-*-aws-service fields) carries the identical
+        name and STRING encoding as the text TGW field list and maps to ECS
+        exactly as that feed maps it, so only the typed columns change between
+        the two encodings.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Decode Parquet at the S3 source and keep this subscription on its
+          own route and identity, exactly as for the text TGW feed - the two
+          column orders are different and a shared route would misparse.
+          Enrich tgw-attachment-id to the owning enclave from the attachment
+          inventory near the collector, and do not sample this feed: it is far
+          lower volume than the VPC records and the blackhole/no-route drop
+          counters are individually significant. Persistent Queue on the
+          Elastic destination for the bursty per-object delivery; prune unused
+          columns at the source since Parquet makes that cheap.
+        elastic: >
+          Skip the positional integration and apply a dedicated ingest
+          pipeline that handles this dataset's structural difference from the
+          VPC records: with no action column, event.outcome must be left unset
+          rather than defaulted to success, and a non-zero
+          packets-lost-blackhole or packets-lost-no-route should drive
+          event.action and a routing-drop detection. Type
+          aws.vpcflow.tgw_id/.tgw_attachment_id/.tgw_src_vpc_id/
+          .tgw_dst_vpc_id/.tgw_src_eni/.tgw_dst_eni as keyword and the four
+          packets_lost_* counters as long in the custom-namespace index
+          template (Parquet already delivers them as INT_64) so
+          attachment-level drop dashboards aggregate without dynamic mapping.
+        relay: >
+          A Parquet object does not cross a line-oriented content filter -
+          decode it to the same typed thin envelope the text TGW feed crosses
+          LOW-side, before the guard, and never ship the Parquet container
+          across. Once decoded the content profile is trivial (bounded ASCII
+          identifiers, integer counters, the null/'-' placeholder), so the
+          only constraint to state to the guard owner is that the null
+          representation crosses intact. At-most-once with no return channel:
+          reconcile per (dataset, hour), which matters more here than on the
+          VPC feed because the low volume means a silent drop will not show up
+          as a rate anomaly.
+      direct:
+        parse_location: high
+        cribl: >
+          High-side instances go cribl -> elastic directly: decide whether
+          Parquet's storage/query benefit justifies running a Parquet reader
+          on a comparatively low-volume feed. If adopted, decode at the
+          source, keep the TGW subscription on its own route and identity, and
+          forward the typed record; there is no low-side shaping to apply.
+        elastic: >
+          Apply a dedicated TGW pipeline: with no action column, leave
+          event.outcome unset rather than defaulting it, let a non-zero
+          packets-lost-blackhole or packets-lost-no-route drive event.action,
+          and type the tgw-* identity and packets_lost_* counters in the
+          custom-namespace index template. Parquet's native INT_64 counters
+          remove the string cast the text feed needs.
+    fields:
+    - vendor: srcport
+      type: integer
+      description: source port of the traffic; Parquet data type INT_32
+      ecs: source.port
+      status: mapped
+    - vendor: dstport
+      type: integer
+      description: destination port of the traffic; Parquet data type INT_32
+      ecs: destination.port
+      status: mapped
+    - vendor: protocol
+      type: integer
+      description: IANA protocol number of the traffic; Parquet data type INT_32
+      ecs: network.iana_number
+      status: mapped
+      transform: >-
+        numeric value to network.iana_number, resolved name to
+        network.transport; no string cast under Parquet
+    - vendor: packets
+      type: long
+      description: number of packets transferred during the flow; Parquet data type INT_64
+      ecs: network.packets
+      status: mapped
+    - vendor: bytes
+      type: long
+      description: number of bytes transferred during the flow; Parquet data type INT_64
+      ecs: network.bytes
+      status: mapped
+    - vendor: start
+      type: long
+      description: >-
+        Unix seconds when the first packet of the flow was received within the
+        aggregation interval; Parquet data type INT_64
+      ecs: event.start
+      status: mapped
+      transform: >-
+        epoch seconds converted to a date; the text TGW default format omits a
+        separate typed start, so Parquet makes event.duration cleanly
+        derivable with end
+    - vendor: end
+      type: long
+      description: >-
+        Unix seconds when the last packet of the flow was received within the
+        aggregation interval; Parquet data type INT_64
+      ecs: event.end
+      status: mapped
+      transform: >-
+        epoch seconds converted to a date and used as @timestamp, as on the
+        text TGW feed
+    - vendor: tcp-flags
+      type: integer
+      description: >-
+        bitmask of the TCP flags observed during the aggregation interval (FIN
+        1, SYN 2, RST 4, PSH 8, ACK 16, SYN-ACK 18, URG 32); Parquet data type
+        INT_32
+      ecs: null
+      status: partial
+      custom: aws.vpcflow.tcp_flags
+      transform: >
+        decompose into a lowercase flag array; the TGW record documents a
+        wider flag set than the VPC record (PSH/ACK/URG in addition to
+        FIN/SYN/RST), so the decode table must cover all of them. ECS has no
+        TCP flag field
+    - vendor: packets-lost-blackhole
+      type: long
+      description: >-
+        packets dropped because the transit gateway route table matched a
+        blackhole route; Parquet data type INT_64
+      ecs: null
+      status: partial
+      custom: aws.vpcflow.packets_lost_blackhole
+      notes: >-
+        with no ACCEPT/REJECT column, the drop counters are the only denial
+        signal; a non-zero value is the closest equivalent to a REJECT and
+        should drive event.action rather than sit as a bare counter
+    - vendor: packets-lost-no-route
+      type: long
+      description: packets dropped because no matching route was found; Parquet data type INT_64
+      ecs: null
+      status: unmapped
+      custom: aws.vpcflow.packets_lost_no_route
+    - vendor: packets-lost-mtu-exceeded
+      type: long
+      description: packets dropped because the size exceeded the MTU; Parquet data type INT_64
+      ecs: null
+      status: unmapped
+      custom: aws.vpcflow.packets_lost_mtu_exceeded
+    - vendor: packets-lost-ttl-expired
+      type: long
+      description: packets dropped because time-to-live expired; Parquet data type INT_64
+      ecs: null
+      status: unmapped
+      custom: aws.vpcflow.packets_lost_ttl_expired
+    - vendor: version
+      type: integer
+      description: >-
+        TGW flow-log record version (2-6), the highest among the selected
+        fields; Parquet data type INT_32
+      ecs: null
+      status: unmapped
+      custom: aws.vpcflow.version
+      notes: a schema-provenance marker, typed under Parquet where text carries it as STRING

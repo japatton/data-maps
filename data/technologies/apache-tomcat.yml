@@ -1,0 +1,1709 @@
+id: apache-tomcat
+name: Apache Tomcat
+vendor: ASF
+versions: Tomcat 9.0.x, 10.1.x (8.5.x legacy)
+draft: true
+references:
+- https://tomcat.apache.org/tomcat-10.1-doc/config/valve.html
+- https://tomcat.apache.org/tomcat-10.1-doc/logging.html
+- https://tomcat.apache.org/tomcat-10.1-doc/manager-howto.html
+- https://www.elastic.co/docs/reference/integrations/apache_tomcat
+- https://github.com/elastic/integrations/tree/main/packages/apache_tomcat
+datasets:
+- id: access
+  name: Access log (AccessLogValve)
+  description: >
+    Per-request transaction log written by
+    org.apache.catalina.valves.AccessLogValve to
+    $CATALINA_BASE/logs/localhost_access_log.<date>.txt. The valve's pattern
+    attribute accepts the aliases "common" (%h %l %u %t "%r" %s %b) and
+    "combined" (common plus "%{Referer}i" "%{User-Agent}i"), so the on-disk
+    format is site-specific in exactly the way Apache httpd's LogFormat is —
+    the deployed server.xml AccessLogValve pattern is the authoritative field
+    list for any given instance. Tomcat's token vocabulary overlaps httpd's
+    but adds server-specific extras that are the reason to ingest this log
+    rather than the reverse-proxy's: %S (HTTP session id), %I (request thread
+    name, which joins to the bracketed thread in catalina/manager lines), %X
+    (connection completion status) and %F (time to commit the response).
+    Manager and host-manager activity surfaces here first — a webshell
+    delivered by PUT /manager/text/deploy?path=/x appears as an access-log
+    record with an authenticated %u before it appears anywhere else.
+  event_categories:
+  - web
+  - network
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Plain-text access lines collected by the Elastic Agent apache_tomcat
+        integration (filestream tail of the logs directory), or shipped as raw
+        syslog where the valve output is piped to logger. Internet-facing
+        Tomcat tiers are the low-side instances that cross the guard; internal
+        application-server instances ship direct.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-apache_tomcat.access
+    direct:
+    - hop: cribl
+      location: edge worker group
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-apache_tomcat.access
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: elastic-integration
+      artifact: Apache Tomcat integration (apache_tomcat), access data stream
+      notes: >
+        The stock integration does NOT parse arbitrary AccessLogValve
+        patterns. Its access pipeline dissects three documented shapes only —
+        '%h %l %u %t "%r" %s %b ms:%D', the same with '"%{Referrer}i"
+        "%{User-Agent}i"' appended, and a variant adding '%A %X %F ...
+        X-Forwarded-For="%{X-Forwarded-For}i"'. Anything else falls to the
+        on_failure branch and lands with event.kind pipeline_error. Note also
+        that the integration's own required pattern spells the header
+        "%{Referrer}i" while the HTTP header (and Tomcat's combined alias) is
+        "%{Referer}i"; the valve emits "-" for an unknown header name, so a
+        server configured from the Elastic doc silently logs an empty
+        referrer. Standardising server.xml on one of the three supported
+        patterns is the main operational task on this dataset, not the ECS
+        mapping.
+    fields:
+    - vendor: '%h'
+      type: string
+      description: >-
+        remote host name, or the client IP address when the connector's
+        enableLookups is false
+      ecs: source.address
+      status: partial
+      notes: >
+        an IP under the default enableLookups="false" and a reverse-resolved
+        hostname otherwise, so source.ip should only be populated when the
+        value parses as an address. The stock pipeline groks this token as "IP
+        or else source.user.name", which quietly files a resolved hostname as
+        a username; a custom pipeline should null it instead
+    - vendor: '%l'
+      type: string
+      description: remote logical username from identd
+      ecs: null
+      status: unmapped
+      custom: apache_tomcat.access.http.ident
+      transform: >
+        Tomcat's valve documents this token as always returning "-"; drop the
+        placeholder rather than indexing it
+    - vendor: '%u'
+      type: string
+      description: 'remote user authenticated by the container, else ''-'''
+      ecs: user.name
+      status: partial
+      notes: >
+        the load-bearing field for manager-app abuse, since /manager and
+        /host-manager require an authenticated role. The stock pipeline
+        dissects this third CLF token into apache_tomcat.access.http.useragent
+        — a misnamed field whose own description reads "the user id of the
+        authenticated user" — so user.name and related.user are empty until a
+        custom pipeline copies it across
+    - vendor: '%t'
+      type: timestamp
+      description: date and time the request was received, in Common Log Format
+      ecs: '@timestamp'
+      status: mapped
+      transform: >
+        parse dd/MMM/yyyy:HH:mm:ss Z, e.g. [07/Jun/2026:10:12:34 -0400]; the
+        %{xxx}t form with a begin/end prefix and an explicit SimpleDateFormat
+        is the cleaner choice where server.xml can be changed
+    - vendor: '%r'
+      type: string
+      description: first line of the request as sent by the client (method, request URI, protocol)
+      ecs: url.original
+      status: partial
+      notes: >
+        composite value like "PUT /manager/text/deploy?path=/x HTTP/1.1" that
+        must be split into http.request.method, url.original and http.version;
+        the stock dissect only splits it when the token contains "HTTP/", so
+        malformed or hostile request lines — exactly the ones worth alerting
+        on — pass through unsplit
+    - vendor: '%s'
+      type: integer
+      description: HTTP status code of the response
+      ecs: http.response.status_code
+      status: mapped
+      transform: also drives event.outcome — status < 400 is success, >= 400 is failure
+    - vendor: '%b'
+      type: bytes
+      description: 'bytes sent to the client excluding HTTP headers, or ''-'' if zero'
+      ecs: http.response.body.bytes
+      status: partial
+      notes: >
+        the stock pipeline writes this to destination.bytes rather than
+        http.response.body.bytes, which is where the web alerting profile
+        looks; %B is the identical token that emits 0 instead of '-' and is
+        the better choice in new server.xml patterns
+    - vendor: '%{Referer}i'
+      type: string
+      description: Referer request header - the page the client was referred from
+      ecs: http.request.referrer
+      status: mapped
+      notes: >
+        spelled "Referer" in Tomcat's combined alias and in HTTP itself; the
+        Elastic integration's required pattern spells it "Referrer", and an
+        unmatched header name is emitted as "-" rather than failing loudly
+    - vendor: '%{User-Agent}i'
+      type: string
+      description: User-Agent request header identifying the client browser or tool
+      ecs: user_agent.original
+      status: mapped
+      notes: >-
+        raw UA string only; the browser/OS/device breakdown comes from the
+        pipeline's user_agent processor
+    - vendor: '%S'
+      type: string
+      description: user session ID (the JSESSIONID of the HttpSession bound to the request)
+      ecs: null
+      status: unmapped
+      custom: apache_tomcat.access.session_id
+      notes: >
+        ECS has no HTTP session identifier (process.session_leader.* models OS
+        sessions, not web ones), so this stays custom. It is the strongest
+        pivot on this dataset — it ties a whole request chain to one
+        authenticated session across rotating source IPs — and it is absent
+        from all three integration-supported patterns, so it has to be added
+        to server.xml and extracted by a custom pipeline. Treat the value as a
+        credential: it must be masked or hashed rather than indexed in the
+        clear
+    - vendor: '%D'
+      type: integer
+      description: time taken to process the request, in microseconds
+      ecs: event.duration
+      status: partial
+      transform: >
+        multiply by 1000 to reach ECS nanoseconds. The integration's supported
+        patterns log this token as the literal "ms:%D" and store it in
+        apache_tomcat.access.request_process_time with a declared unit of
+        milliseconds, so the shipped value is microseconds mislabelled as ms
+        by a factor of 1000; %{ms}T is the token that genuinely yields
+        milliseconds
+    - vendor: '%F'
+      type: integer
+      description: time taken to commit the response, in milliseconds
+      ecs: null
+      status: unmapped
+      custom: apache_tomcat.access.response_time
+      notes: >
+        time to first byte of the response rather than end-to-end service
+        time, so it is not interchangeable with %D; a large %D with a small %F
+        is the signature of a slow backend, the reverse points at a slow or
+        stalled client
+    - vendor: '%I'
+      type: string
+      description: name of the thread that handled the request, e.g. http-nio-8080-exec-7
+      ecs: process.thread.name
+      status: mapped
+      notes: >
+        the cross-dataset join key for this map: the same thread name appears
+        in square brackets on every catalina and manager line, so %I is what
+        connects a request to the stack trace or deployment message it caused.
+        Not present in any integration-supported pattern
+    - vendor: '%X'
+      type: enum
+      description: >-
+        connection status when the response completed - X aborted, +
+        keep-alive, - connection closed
+      ecs: null
+      status: unmapped
+      custom: apache_tomcat.access.connection_status
+      notes: >
+        'X' means the client disconnected before the response finished, which
+        is the tell for interrupted large-file retrieval and for scanners that
+        read only response headers; no ECS field models connection completion
+        state
+    - vendor: '%A'
+      type: ip
+      description: local IP address the request was received on
+      ecs: destination.ip
+      status: partial
+      notes: >
+        the stock pipeline keeps this at apache_tomcat.access.ip.local and
+        adds it to related.ip but never populates destination.ip; on
+        multi-homed hosts it is the only way to tell which listener served the
+        request
+    - vendor: '%p'
+      type: port
+      description: local port on which this request was received
+      ecs: destination.port
+      status: mapped
+      notes: >
+        distinguishes the AJP and HTTP connectors and the admin listener from
+        the application one; %{local}p and %{remote}p select server and client
+        port explicitly
+    - vendor: '%v'
+      type: string
+      description: local server name (the Host element that served the request)
+      ecs: destination.domain
+      status: mapped
+      notes: >
+        absent from both the common and combined aliases, so multi-Host
+        instances must add it to the valve pattern or lose per-vhost
+        attribution
+    - vendor: '%q'
+      type: string
+      description: 'query string, prepended with a ''?'' if it exists'
+      ecs: url.query
+      status: mapped
+      transform: >
+        strip the leading "?" - ECS url.query holds the query without the
+        delimiter. Carries the manager app's path=, war=, config= and tag=
+        parameters, which is where deployment intent is visible
+    - vendor: '%H'
+      type: string
+      description: request protocol
+      ecs: http.version
+      status: partial
+      transform: >-
+        value is "HTTP/1.1" or "HTTP/2.0"; ECS http.version expects the bare
+        version, so the HTTP/ prefix must be stripped
+    - vendor: '%{X-Forwarded-For}i'
+      type: string
+      description: >-
+        X-Forwarded-For request header, logged where Tomcat sits behind httpd,
+        a load balancer, or an ingress controller
+      ecs: client.ip
+      status: partial
+      notes: >
+        renamed from apache_tomcat.access.header_forwarder to client.ip in
+        integration 0.16.1, and the pipeline splits the comma-separated chain
+        into an ARRAY on client.ip - which is not what ECS client.ip means.
+        The left-most address beyond the trusted hops belongs on client.ip and
+        the rest on network.forwarded_ip; the header is client-supplied and
+        spoofable, and RemoteIpValve with requestAttributesEnabled is the
+        server-side alternative that makes %h itself trustworthy
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Keep the core worker group a pass-through and let the integration
+          dissect, but normalise the AccessLogValve pattern per source
+          low-side: tag each event with which of the three supported shapes it
+          is so the high side selects a branch deterministically instead of
+          falling through to pipeline_error, and alert when an instance's
+          pattern drifts after a server.xml change. Stamp vhost/site and
+          device-owner context on the event because bare "common" lines carry
+          no %v, mask session material and tokens or api keys carried in %q
+          and %S before forwarding, and run the Elastic destination on
+          Persistent Queue backpressure rather than Block.
+        elastic: >
+          Use the apache_tomcat access ingest pipeline as the parser and add a
+          logs-apache_tomcat.access@custom pipeline for the three misroutings
+          it leaves behind: copy apache_tomcat.access.http.useragent — which
+          despite its name holds %u, the authenticated user — to user.name and
+          related.user, move %b off destination.bytes onto
+          http.response.body.bytes, and stop treating a non-IP %h as
+          source.user.name. Convert apache_tomcat.access.request_process_time
+          to event.duration nanoseconds remembering it is %D microseconds
+          despite the "ms:" literal and the double's ms unit declaration,
+          strip the HTTP/ prefix from http.version, and resolve
+          X-Forwarded-For to a single trusted-proxy-aware client.ip with the
+          remaining hops in network.forwarded_ip instead of an array on
+          client.ip. Declare apache_tomcat.access.session_id,
+          .connection_status, .http.ident and .response_time as keyword or
+          double in the custom-namespace index template.
+        relay: >
+          Low-side instances cross the guard as a thin NDJSON envelope (mode
+          A) — {_dataId, "@timestamp", host, _raw} — so the integration's
+          dissect still runs high-side and one JSON schema faces the content
+          filter instead of every site's AccessLogValve grammar. The friction
+          to settle with the guard owner is unbounded attacker-controlled free
+          text: %r, %q and %{User-Agent}i carry percent-encoded, non-ASCII and
+          multi-kilobyte values on any internet-facing connector, so cap and
+          flag them low-side to a length a simple custom LUA filter accepts.
+          Nothing CEF-shaped crosses. This is the highest-volume dataset in
+          this map and therefore the first candidate for dropping _raw once
+          the dissect is proven — but hold _raw on any vhost serving /manager
+          or /host-manager, where the request line is the deployment evidence.
+      direct:
+        parse_location: high
+        cribl: >
+          Keep the core worker group a pass-through and let the integration
+          dissect, but normalise the AccessLogValve pattern per source: tag
+          each event with which of the three supported shapes it is so the
+          ingest pipeline selects a branch deterministically instead of
+          falling through to pipeline_error, and alert when an instance's
+          pattern drifts after a server.xml change. Stamp vhost/site and
+          device-owner context on the event because bare "common" lines carry
+          no %v, mask session material and tokens or api keys carried in %q
+          and %S before forwarding, and run the Elastic destination on
+          Persistent Queue backpressure rather than Block.
+        elastic: >
+          Use the apache_tomcat access ingest pipeline as the parser and add a
+          logs-apache_tomcat.access@custom pipeline for the three misroutings
+          it leaves behind: copy apache_tomcat.access.http.useragent — which
+          despite its name holds %u, the authenticated user — to user.name and
+          related.user, move %b off destination.bytes onto
+          http.response.body.bytes, and stop treating a non-IP %h as
+          source.user.name. Convert apache_tomcat.access.request_process_time
+          to event.duration nanoseconds remembering it is %D microseconds
+          despite the "ms:" literal and the double's ms unit declaration,
+          strip the HTTP/ prefix from http.version, and resolve
+          X-Forwarded-For to a single trusted-proxy-aware client.ip with the
+          remaining hops in network.forwarded_ip instead of an array on
+          client.ip. Declare apache_tomcat.access.session_id,
+          .connection_status, .http.ident and .response_time as keyword or
+          double in the custom-namespace index template.
+  - format: json
+    enable: >
+      Swap the access valve's className from
+      org.apache.catalina.valves.AccessLogValve to
+      org.apache.catalina.valves.JsonAccessLogValve in the Host (or Engine)
+      element of server.xml; every other attribute — pattern, prefix, suffix,
+      directory, rotatable, fileDateFormat — is inherited unchanged, so the
+      same pattern string that drives the raw log now selects which keys the
+      JSON object carries. Each single-letter token is emitted as a named key
+      (%a->remoteAddr, %s->statusCode, %u->user, %I->threadName, and so on)
+      and header/cookie/attribute tokens (%{name}i, %{name}c, %{name}o,
+      %{name}r, %{name}s) become the requestHeaders, cookies, responseHeaders,
+      requestAttributes and sessionAttributes sub-objects keyed by name; an
+      unknown token is emitted as other-X and verbatim text between tokens is
+      dropped. Available on the Tomcat 10.1.x and 11.0.x lines and backported
+      to the 9.0.x line in 9.0.74 (and to 8.5.100), so a 9.0.x estate must be
+      at 9.0.74 or newer. In container deployments point prefix/suffix at
+      stdout or configure the valve to write to the console so the JSON
+      records land on the container log stream.
+    references:
+    - https://tomcat.apache.org/tomcat-10.1-doc/config/valve.html
+    - https://tomcat.apache.org/tomcat-9.0-doc/config/valve.html
+    - https://github.com/apache/tomcat/pull/539
+    parsing:
+      mechanism: elastic-ingest-pipeline
+      artifact: >-
+        custom logs-apache_tomcat.access@custom JSON decode (the stock
+        integration access pipeline dissects raw CLF only and cannot parse
+        this format)
+      notes: >
+        The Elastic apache_tomcat integration's access pipeline dissects the
+        three raw AccessLogValve shapes and has no JSON branch, so the JSON
+        valve is decoded at the filestream input (ndjson parser) and the
+        JsonAccessLogValve keys are renamed to ECS by a bespoke @custom
+        pipeline. This is a simpler and far more robust parse than the raw
+        dissect it replaces: every field is a stable named key, so there is no
+        three-pattern branch selection and no on_failure fall-through to
+        pipeline_error when a hostile request line does not contain "HTTP/".
+        The two structural bugs of the raw path also vanish — %u arrives as
+        the key "user" instead of being misfiled into a field named useragent,
+        and there is no "Referrer" vs "Referer" header-name mismatch because
+        the header name is whatever the pattern requested.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          The JSON valve removes the dissect fragility that dominates the raw
+          feed — tokens are stable named keys, so the low side no longer has
+          to tag which of three shapes a line is or watch for server.xml
+          pattern drift. Ship the thin NDJSON envelope ({_dataId,
+          "@timestamp", host, _raw}) with the JSON object intact in _raw
+          rather than re-serialising it. Because a JSON object cut mid-string
+          is unrecoverable high-side — unlike a truncated raw line a cut
+          object yields nothing — enforce a hard maximum record size low-side
+          and dead-letter oversize records instead of letting the content
+          filter trim them in flight. Mask sessionId and strip tokens or api
+          keys carried in query before forwarding, cap the attacker-controlled
+          request, query and requestHeaders.User-Agent values to a declared
+          length, stamp vhost/site and device-owner context because a bare
+          pattern carries no localServerName, and run the guard destination on
+          Persistent Queue backpressure rather than Block. Hold _raw on any
+          vhost serving /manager or /host-manager.
+        elastic: >
+          Decode the JSON at the filestream input and run a
+          logs-apache_tomcat.access@custom pipeline that renames the valve
+          keys to ECS: user to user.name and related.user, statusCode to
+          http.response.status_code with event.outcome from the <400/>=400
+          split, size to http.response.body.bytes, threadName to
+          process.thread.name (the join key to the catalina thread),
+          method/path/protocol to http.request.method/url.path/http.version
+          stripping the HTTP/ prefix, and elapsedTime to event.duration
+          multiplied by 1000 since it is microseconds. Resolve
+          requestHeaders.X-Forwarded-For to a single trusted-proxy-aware
+          client.ip with the remaining hops on network.forwarded_ip rather
+          than an array. Declare sessionId, connectionStatus, firstByteTime
+          and logicalUserName as keyword or double in the custom-namespace
+          template. The stock integration access pipeline cannot be reused, so
+          this is bespoke, but it is the simpler pipeline to own long-term.
+        relay: >
+          A thin envelope crosses with the JSON object in _raw, so one JSON
+          schema faces the content filter instead of every site's
+          AccessLogValve grammar — the standardisation the raw feed can only
+          approximate by forcing server.xml onto one of three patterns is
+          intrinsic here. The cost is that truncation is unrecoverable, so the
+          size and character policy must be applied to the raw line low-side
+          with dead-lettering, never left to the guard. The unbounded,
+          attacker-controlled values are request, query and the User-Agent and
+          Referer request headers, which carry percent-encoded, non-ASCII and
+          multi-kilobyte content on internet-facing connectors; cap and flag
+          them low-side and mask sessionId before the crossing. This is the
+          highest-volume dataset in the map and the first candidate for
+          dropping _raw once the decode is proven, except on manager and
+          host-manager vhosts where the request line is deployment evidence.
+      direct:
+        parse_location: high
+        cribl: >
+          Keep the core worker group a pass-through: with a self-describing
+          JSON record there is nothing to normalise that the ingest pipeline
+          cannot do more cheaply, so forward the object unmodified and let the
+          ingest pipeline decode. Still mask sessionId and cap the free-text
+          request, query and User-Agent values, and run Persistent Queue
+          backpressure on the Elastic destination.
+        elastic: >
+          Decode the JSON at the filestream input and run a
+          logs-apache_tomcat.access@custom pipeline that renames the valve
+          keys to ECS: user to user.name and related.user, statusCode to
+          http.response.status_code with event.outcome from the <400/>=400
+          split, size to http.response.body.bytes, threadName to
+          process.thread.name (the join key to the catalina thread),
+          method/path/protocol to http.request.method/url.path/http.version
+          stripping the HTTP/ prefix, and elapsedTime to event.duration
+          multiplied by 1000 since it is microseconds. Resolve
+          requestHeaders.X-Forwarded-For to a single trusted-proxy-aware
+          client.ip with the remaining hops on network.forwarded_ip rather
+          than an array. Declare sessionId, connectionStatus, firstByteTime
+          and logicalUserName as keyword or double in the custom-namespace
+          template. The stock integration access pipeline cannot be reused, so
+          this is bespoke, but it is the simpler pipeline to own long-term.
+    fields:
+    - vendor: host
+      type: string
+      description: >-
+        %h — remote host name, or the client IP when the connector's
+        enableLookups is false
+      ecs: source.address
+      status: partial
+      notes: >
+        an IP under the default enableLookups="false" and a reverse-resolved
+        hostname otherwise, so source.ip should be populated only when the
+        value parses as an address; unlike the raw dissect there is no
+        built-in "IP or else user name" grok to misfile a resolved hostname
+    - vendor: remoteAddr
+      type: ip
+      description: '%a — numeric IP address of the immediate connection peer'
+      ecs: source.ip
+      status: partial
+      notes: >
+        the connecting peer, which is the upstream proxy or load balancer when
+        Tomcat sits behind one; the true client is then in
+        requestHeaders.X-Forwarded-For, so do not treat this as the client
+        address on proxied tiers
+    - vendor: localAddr
+      type: ip
+      description: '%A — local IP address the request was received on'
+      ecs: destination.ip
+      status: partial
+      notes: >-
+        on multi-homed hosts it is the only way to tell which listener served
+        the request
+    - vendor: size
+      type: bytes
+      description: '%b — bytes sent to the client excluding HTTP headers, or ''-'' when zero'
+      ecs: http.response.body.bytes
+      status: partial
+      notes: >
+        emitted as the string "-" for a zero-byte body; byteSentNC (%B) is the
+        identical token that emits 0 instead and maps to the same ECS field,
+        and is the better choice in a new pattern
+    - vendor: elapsedTime
+      type: integer
+      description: '%D — time taken to process the request, in microseconds'
+      ecs: event.duration
+      status: partial
+      transform: >
+        multiply by 1000 to reach ECS nanoseconds; elapsedTimeS (%T) is the
+        same measurement expressed in seconds and would need multiplying by
+        1e9 instead
+    - vendor: firstByteTime
+      type: integer
+      description: '%F — time taken to commit the first byte of the response, in milliseconds'
+      ecs: null
+      status: unmapped
+      custom: apache_tomcat.access.response_time
+      notes: >
+        time to first byte rather than end-to-end service time, so not
+        interchangeable with elapsedTime; a large elapsedTime with a small
+        firstByteTime is the signature of a slow backend, the reverse a slow
+        or stalled client
+    - vendor: protocol
+      type: string
+      description: '%H — request protocol, e.g. HTTP/1.1 or HTTP/2.0'
+      ecs: http.version
+      status: partial
+      transform: ECS http.version expects the bare version, so strip the HTTP/ prefix
+    - vendor: threadName
+      type: string
+      description: '%I — name of the thread that handled the request, e.g. http-nio-8080-exec-7'
+      ecs: process.thread.name
+      status: mapped
+      notes: >
+        the cross-dataset join key: the same thread name appears in the
+        catalina and manager JSON records' process.thread.name, so this is
+        what connects a request to the stack trace or deployment it caused
+    - vendor: logicalUserName
+      type: string
+      description: '%l — remote logical username from identd'
+      ecs: null
+      status: unmapped
+      custom: apache_tomcat.access.http.ident
+      transform: >-
+        the valve documents this token as always returning "-"; drop the
+        placeholder rather than indexing it
+    - vendor: method
+      type: string
+      description: '%m — HTTP request method'
+      ecs: http.request.method
+      status: mapped
+      notes: >
+        a standalone key in this format, so the method is available without
+        splitting the composite request line — the advantage over the raw
+        feed, whose dissect only splits %r when it contains "HTTP/"
+    - vendor: port
+      type: port
+      description: '%p — local port the request was received on'
+      ecs: destination.port
+      status: mapped
+      notes: distinguishes the AJP, HTTP and admin listeners from the application connector
+    - vendor: query
+      type: string
+      description: '%q — query string, prepended with ''?'' when present'
+      ecs: url.query
+      status: mapped
+      transform: >
+        strip the leading "?" — ECS url.query holds the query without the
+        delimiter; carries the manager app's path=, war=, config= and tag=
+        parameters where deployment intent is visible
+    - vendor: request
+      type: string
+      description: '%r — first line of the request (method, URI, protocol)'
+      ecs: url.original
+      status: partial
+      notes: >
+        the composite request line; where the pattern already emits method,
+        path and protocol as their own keys this is redundant, but it is the
+        only field that preserves a malformed or hostile request line
+        verbatim, which is exactly what is worth alerting on
+    - vendor: statusCode
+      type: integer
+      description: '%s — HTTP status code of the response'
+      ecs: http.response.status_code
+      status: mapped
+      transform: also drives event.outcome — status < 400 is success, >= 400 is failure
+    - vendor: sessionId
+      type: string
+      description: '%S — user session ID (the JSESSIONID of the HttpSession bound to the request)'
+      ecs: null
+      status: unmapped
+      custom: apache_tomcat.access.session_id
+      notes: >
+        ECS has no HTTP session identifier, so this stays custom; it is the
+        strongest pivot on this dataset — it ties a request chain to one
+        authenticated session across rotating source IPs — and must be treated
+        as a credential, masked or hashed rather than indexed clear
+    - vendor: time
+      type: timestamp
+      description: '%t — date and time the request was received, in Common Log Format'
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        the default token emits the CLF string dd/MMM/yyyy:HH:mm:ss Z; the
+        %{begin:...}t / %{yyyy-MM-dd'T'HH:mm:ss.SSSX}t form with an explicit
+        SimpleDateFormat is the cleaner choice where server.xml can be changed
+        so the key carries an unambiguous ISO-8601 value
+    - vendor: user
+      type: string
+      description: '%u — remote user authenticated by the container, else ''-'''
+      ecs: user.name
+      status: mapped
+      notes: >
+        the load-bearing field for manager-app abuse; in this format it
+        arrives as the key "user" and maps cleanly to user.name and
+        related.user, without the raw feed's misfiling into a field named
+        useragent
+    - vendor: path
+      type: string
+      description: '%U — requested URI path, without the query string'
+      ecs: url.path
+      status: mapped
+      notes: >-
+        paired with the query key it reconstructs url.original without parsing
+        the composite request line
+    - vendor: localServerName
+      type: string
+      description: '%v — local server name (the Host element that served the request)'
+      ecs: destination.domain
+      status: mapped
+      notes: >-
+        absent unless %v is in the pattern, so multi-Host instances must add
+        it or lose per-vhost attribution
+    - vendor: connectionStatus
+      type: enum
+      description: >-
+        %X — connection status when the response completed: X aborted, +
+        keep-alive, - closed
+      ecs: null
+      status: unmapped
+      custom: apache_tomcat.access.connection_status
+      notes: >
+        'X' means the client disconnected before the response finished — the
+        tell for interrupted large-file retrieval and for scanners that read
+        only response headers; no ECS field models connection completion
+    - vendor: requestHeaders.Referer
+      type: string
+      description: '%{Referer}i — Referer request header, nested under the requestHeaders sub-object'
+      ecs: http.request.referrer
+      status: mapped
+      notes: >
+        the key name is exactly the header name requested in the pattern, so
+        the raw feed's "Referrer" vs "Referer" spelling trap does not apply;
+        an unmatched header name is still emitted as "-"
+    - vendor: requestHeaders.User-Agent
+      type: string
+      description: '%{User-Agent}i — User-Agent request header, nested under requestHeaders'
+      ecs: user_agent.original
+      status: mapped
+      notes: >-
+        raw UA string only; the browser/OS/device breakdown comes from a
+        user_agent processor in the pipeline
+    - vendor: requestHeaders.X-Forwarded-For
+      type: string
+      description: >-
+        %{X-Forwarded-For}i — X-Forwarded-For header where Tomcat sits behind
+        httpd, a load balancer or an ingress
+      ecs: client.ip
+      status: partial
+      notes: >
+        a comma-separated chain, not a single address; the left-most address
+        beyond the trusted hops belongs on client.ip and the rest on
+        network.forwarded_ip. The header is client-supplied and spoofable —
+        RemoteIpValve with requestAttributesEnabled is the server-side
+        alternative that makes remoteAddr itself trustworthy
+- id: catalina
+  name: Catalina and application log (JULI)
+  description: >
+    The java.util.logging (JULI) log written by the container and by every
+    deployed application to $CATALINA_BASE/logs/catalina.<date>.log, with
+    per-Host application output in localhost.<date>.log and console output
+    duplicated to catalina.out. The default org.apache.juli.OneLineFormatter
+    emits, in order, a "dd-MMM-yyyy HH:mm:ss.SSS" timestamp, the JUL level,
+    the thread name in square brackets, the dotted
+    sourceClassName.sourceMethodName, and the message; a thrown Throwable
+    follows as whitespace-indented continuation lines. Multi-line stack traces
+    are the parsing reality of this dataset - a single application error is
+    tens of physical lines, and any collector that treats lines as events
+    shreds it. Autodeploy is visible here and nowhere else: a WAR dropped
+    straight into the appBase directory produces an
+    org.apache.catalina.startup.HostConfig.deployWAR line with no
+    corresponding manager-app or access-log record.
+  event_categories:
+  - configuration
+  - web
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Same collection path as the access log - Elastic Agent filestream tail
+        of catalina.*.log and localhost.*.log - with the same split of
+        instances across the two enclaves as its access-log sibling.
+        Stack-trace reassembly must happen here, before the crossing, because
+        a trace split across records cannot be rejoined high-side.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-apache_tomcat.catalina
+    direct:
+    - hop: cribl
+      location: edge worker group
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-apache_tomcat.catalina
+  formats:
+  - format: syslog-raw
+    parsing:
+      mechanism: elastic-integration
+      artifact: >-
+        Apache Tomcat integration (apache_tomcat), catalina data stream
+        (localhost data stream is identical)
+      notes: >
+        The catalina pipeline groks the OneLineFormatter shape with a
+        GREEDYMULTILINE tail into error.stack_trace, but the multi-line
+        assembly itself happens at the INPUT, not in the pipeline: the data
+        stream ships a default filestream parser of multiline pattern
+        '^\d{2}-\w{3}-\d{4}', negate true, match after. Any path that bypasses
+        filestream - raw syslog, a container stdout collector - must reproduce
+        that reassembly upstream or the pipeline receives orphaned stack-trace
+        fragments. The grok also captures the bracketed thread name into
+        apache_tomcat.catalina.subsystem and leaves
+        sourceClassName.sourceMethodName inside message. The localhost data
+        stream is the same pipeline against the per-Host file.
+    fields:
+    - vendor: timestamp
+      type: timestamp
+      description: record timestamp emitted by OneLineFormatter as dd-MMM-yyyy HH:mm:ss.SSS
+      ecs: '@timestamp'
+      status: partial
+      transform: >
+        the default format carries NO timezone offset, so the value is
+        ambiguous on the wire; the integration applies the tz_offset variable
+        (default UTC) and a JVM running in local time is therefore silently
+        skewed. Setting an explicit timezone in the handler's format property
+        is the durable fix
+    - vendor: level
+      type: enum
+      description: JUL log level - SEVERE, WARNING, INFO, CONFIG, FINE, FINER, FINEST
+      ecs: log.level
+      status: mapped
+      transform: >
+        lowercased by the ingest pipeline; JUL's seven-level vocabulary needs
+        a lookup to a numeric event.severity, and SEVERE is the only level
+        that should raise event.kind alert-adjacent handling
+    - vendor: thread
+      type: string
+      description: name of the thread that emitted the record, written inside square brackets
+      ecs: process.thread.name
+      status: partial
+      notes: >
+        the stock grok stores this in apache_tomcat.catalina.subsystem, a
+        field documented as naming a Tomcat subsystem or module; it is in fact
+        the thread name (main, Catalina-utility-N, http-nio-8080-exec-N).
+        Renaming it to process.thread.name is what makes this dataset joinable
+        to the access log's %I
+    - vendor: sourceClassName
+      type: string
+      description: fully qualified class that issued the log record
+      ecs: log.logger
+      status: partial
+      notes: >
+        OneLineFormatter emits sourceClassName and sourceMethodName as a
+        single dotted token and the stock grok leaves both inside message;
+        extracting the class is what lets rules key on stable identifiers such
+        as org.apache.catalina.startup.HostConfig or
+        org.apache.catalina.core.StandardContext
+    - vendor: sourceMethodName
+      type: string
+      description: method within the source class that issued the record
+      ecs: log.origin.function
+      status: partial
+      notes: >
+        the second half of the same dotted token; deployWAR, undeploy,
+        startInternal and log are the method names that carry detection
+        meaning
+    - vendor: message
+      type: string
+      description: the formatted log message text
+      ecs: message
+      status: mapped
+      notes: >
+        free-text and application-specific; on a deployed application this is
+        whatever the app's own logger writes, so it carries user input
+        verbatim and is the least bounded field in the dataset
+    - vendor: thrown
+      type: string
+      description: >-
+        stack trace of the Throwable attached to the record, written as
+        whitespace-indented continuation lines
+      ecs: error.stack_trace
+      status: partial
+      notes: >
+        always preceded by whitespace so it is simple to skip, but it is a
+        multi-line block: the pipeline's GREEDYMULTILINE only works if the
+        collector already joined the lines into one event. This is the single
+        largest field on the dataset and the one that dictates message size
+        limits
+    - vendor: 'thrown: exception class'
+      type: string
+      description: >-
+        fully qualified exception class name at the head of the stack trace,
+        e.g. java.lang.NullPointerException
+      ecs: error.type
+      status: partial
+      notes: >
+        the stable classifier for an application failure, but the stock
+        pipeline never extracts it from the first line of error.stack_trace,
+        so alerting has to substring-match the trace until a custom grok pass
+        adds it
+    - vendor: org.apache.catalina.startup.HostConfig.deployWAR
+      type: string
+      description: >-
+        autodeploy record emitted when a WAR appearing in the Host appBase is
+        expanded and deployed
+      ecs: null
+      status: unmapped
+      custom: apache_tomcat.catalina.deployed_war
+      transform: >
+        the WAR path sits inside the free-text message ("Deploying web
+        application archive [/opt/tomcat/webapps/x.war]") and must be grokked
+        out. This is the detection that has no access-log counterpart: an
+        attacker with filesystem write access to appBase gets code execution
+        without ever touching /manager, so this line is the only evidence
+    - vendor: org.apache.catalina.startup.VersionLoggerListener.log
+      type: string
+      description: >-
+        startup banner recording the Tomcat server version, JVM version, and
+        CATALINA_BASE
+      ecs: service.version
+      status: partial
+      notes: >
+        present only in the startup burst rather than on every event, so it
+        belongs in asset inventory via a transform or enrich policy rather
+        than being expected per-record; it is nonetheless the cheapest
+        authoritative source of Tomcat version for vulnerability triage
+    - vendor: log file path
+      type: string
+      description: >-
+        file the record was harvested from - catalina.<date>.log,
+        localhost.<date>.log, or catalina.out
+      ecs: log.file.path
+      status: mapped
+      notes: >
+        set by the filestream input, not by Tomcat, and the only discriminator
+        between container-level (catalina) and per-Host application
+        (localhost) records once both land in the same data stream;
+        catalina.out duplicates console output and will double-count events if
+        tailed alongside catalina.<date>.log
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Do the one job the high side genuinely cannot: reassemble multi-line
+          records. Where events reach Cribl as raw syslog rather than a
+          filestream tail, run the same '^\d{2}-\w{3}-\d{4}' negate/after rule
+          low-side so one stack trace is one event, and cap runaway traces (a
+          recursive exception can emit hundreds of frames) with an explicit
+          truncation flag rather than letting them set the event size ceiling.
+          Otherwise pass through unparsed with _raw intact - this stream is
+          lower volume and higher forensic value than the access log - attach
+          app-owner and Host context low-side, and run Persistent Queue
+          backpressure on the Elastic destination.
+        elastic: >
+          Parse with the integration's catalina pipeline and add a
+          logs-apache_tomcat.catalina@custom pipeline that undoes its two
+          structural errors: rename apache_tomcat.catalina.subsystem to
+          process.thread.name - it holds the thread, not a subsystem, and it
+          is the join key back to the access log's %I - and split the leading
+          sourceClassName.sourceMethodName token out of message into
+          log.logger and log.origin.function so alerting can key on
+          org.apache.catalina.startup.HostConfig.deployWAR rather than
+          matching free text. Map JUL's seven levels to a numeric
+          event.severity and set event.outcome/event.kind consistently for
+          SEVERE, grok error.type from the first stack-trace line, and confirm
+          the tz_offset var matches the JVM's actual zone because the
+          OneLineFormatter timestamp carries no offset and defaults to UTC.
+        relay: >
+          Low-side instances use the same thin NDJSON envelope as the access
+          dataset (mode A) so both Tomcat streams present one schema to the
+          content filter, and carry _raw across here - deployment and
+          exception records are the forensic account of how an application was
+          compromised and cannot be rebuilt high-side after an at-most-once
+          drop. The specific friction is error.stack_trace: unbounded
+          multi-kilobyte free text that echoes attacker-supplied paths, SQL
+          fragments and header values with arbitrary byte sequences, and that
+          must be reassembled BEFORE the crossing because a trace split across
+          records can never be rejoined without a return channel. Cap and flag
+          it low-side; nothing CEF-shaped crosses, and silent drops are
+          detected by low-side versus high-side count reconciliation per
+          (dataset, hour).
+      direct:
+        parse_location: high
+        cribl: >
+          Reassemble multi-line records at the collector. Where events reach
+          Cribl as raw syslog rather than a filestream tail, run the
+          '^\d{2}-\w{3}-\d{4}' negate/after rule so one stack trace is one
+          event, and cap runaway traces (a recursive exception can emit
+          hundreds of frames) with an explicit truncation flag rather than
+          letting them set the event size ceiling. Otherwise pass through
+          unparsed with _raw intact - this stream is lower volume and higher
+          forensic value than the access log - attach app-owner and Host
+          context, and run Persistent Queue backpressure on the Elastic
+          destination.
+        elastic: >
+          Parse with the integration's catalina pipeline and add a
+          logs-apache_tomcat.catalina@custom pipeline that undoes its two
+          structural errors: rename apache_tomcat.catalina.subsystem to
+          process.thread.name - it holds the thread, not a subsystem, and it
+          is the join key back to the access log's %I - and split the leading
+          sourceClassName.sourceMethodName token out of message into
+          log.logger and log.origin.function so alerting can key on
+          org.apache.catalina.startup.HostConfig.deployWAR rather than
+          matching free text. Map JUL's seven levels to a numeric
+          event.severity and set event.outcome/event.kind consistently for
+          SEVERE, grok error.type from the first stack-trace line, and confirm
+          the tz_offset var matches the JVM's actual zone because the
+          OneLineFormatter timestamp carries no offset and defaults to UTC.
+  - format: json
+    enable: >
+      Replace JULI with Log4j Core as Tomcat's internal logging backend and
+      give it a JSON layout. Following the Log4j project's own replace-tomcat
+      instructions, drop log4j-api, log4j-core, log4j-appserver (the
+      JULI-to-Log4j bridge) and log4j-layout-template-json into
+      $CATALINA_BASE/log4j, add that directory to the container's system
+      classpath via a bin/setenv.sh line
+      (CLASSPATH="$CATALINA_HOME/log4j/*:$CATALINA_HOME/log4j/"), and place a
+      configuration file named log4j2.xml or log4j2-tomcat.xml in
+      $CATALINA_BASE/log4j. In that file give the console/rolling-file
+      appender a JsonTemplateLayout; its eventTemplateUri defaults to the
+      bundled classpath:EcsLayout.json, which renders each record as a single
+      JSON object already shaped to the Elastic Common Schema (@timestamp with
+      an explicit offset, log.level, message, log.logger, process.thread.name
+      and error.* fields), so catalina.<date>.log and localhost.<date>.log
+      become newline-delimited JSON instead of the OneLineFormatter text
+      shape. LogstashJsonEventLayoutV1.json and GelfLayout.json are the other
+      bundled templates if a non-ECS JSON schema is required.
+    references:
+    - https://tomcat.apache.org/tomcat-10.1-doc/logging.html
+    - https://logging.apache.org/log4j/2.x/jakarta.html
+    - https://logging.apache.org/log4j/2.x/manual/json-template-layout.html
+    parsing:
+      mechanism: elastic-ingest-pipeline
+      artifact: >-
+        custom logs-apache_tomcat.catalina@custom over a JSON-decoded
+        filestream (the stock catalina grok matches the OneLineFormatter text
+        shape, not JSON)
+      notes: >
+        EcsLayout emits top-level ECS field names, so most of the work the
+        stock catalina pipeline does by grok is already done at the source and
+        the high side only decodes ndjson and validates. Two consequences
+        follow. First, the multi-line problem disappears: JsonTemplateLayout
+        serialises the whole Throwable into one escaped error.stack_trace
+        string, so one application error is one JSON object and no filestream
+        multiline reassembly (the '^\d{2}-\w{3}-\d{4}' negate/after rule) is
+        needed. Second, because the records carry log.logger and
+        process.thread.name rather than apache_tomcat.catalina.*, the stock
+        integration's index template and dashboards will not populate — either
+        conform the field set in the custom pipeline or accept a custom
+        template. The autodeploy and version-banner detections still live
+        inside the message string and must be grokked out as on the raw feed.
+    recommendations:
+      guarded:
+        parse_location: hybrid
+        cribl: >
+          This format removes the one job the syslog-raw feed forces onto the
+          low side: JsonTemplateLayout renders the Throwable into a single
+          error.stack_trace string, so a stack trace is already one event and
+          one JSON object and the '^\d{2}-\w{3}-\d{4}' negate/after reassembly
+          is unnecessary. Ship the thin NDJSON envelope with the object intact
+          in _raw. Because a JSON object cut mid-string is unrecoverable
+          high-side, enforce a hard maximum record size low-side and
+          dead-letter oversize records — a recursive exception can still
+          produce a multi-kilobyte stack_trace string — rather than letting
+          the content filter trim them. Cap error.stack_trace and message,
+          which echo attacker-supplied paths, SQL fragments and header values,
+          attach app-owner and Host context, and run Persistent Queue
+          backpressure. This stream is lower volume and higher forensic value
+          than the access log, so keep _raw across the crossing.
+        elastic: >
+          Decode the ndjson at the input and run a thin
+          logs-apache_tomcat.catalina@custom pipeline for validation and for
+          the two things EcsLayout leaves inside message: grok the autodeploy
+          "Deploying web application archive [...]" path into
+          apache_tomcat.catalina.deployed_war and the VersionLoggerListener
+          startup banner into service.version. Everything else arrives already
+          mapped — @timestamp carries an explicit offset so the zone ambiguity
+          of the OneLineFormatter timestamp is gone, log.level is populated,
+          error.type comes off the Throwable without a grok pass, and
+          process.thread.name is correctly named, preserving the join to the
+          access log's threadName. Map JUL's levels to a numeric
+          event.severity and set event.outcome/event.kind for SEVERE. Enable
+          includeCallerData only if you need log.origin.function/file, since
+          it is off by default for cost.
+        relay: >
+          The thin NDJSON envelope crosses with the JSON object in _raw and
+          _raw is carried across — deployment and exception records are the
+          forensic account of how an application was compromised and cannot be
+          rebuilt after an at-most-once drop. The syslog-raw feed's most
+          fragile step, reassembling a stack trace before the crossing because
+          a trace split across records can never be rejoined without a return
+          channel, is eliminated: the layout already joins it. The residual
+          friction is that error.stack_trace and message remain unbounded,
+          attacker-influenced free text and a cut JSON object is
+          unrecoverable, so bound them and dead-letter oversize records
+          low-side, and detect silent drops by low-side versus high-side count
+          reconciliation per (dataset, hour).
+      direct:
+        parse_location: high
+        cribl: >
+          Forward the JSON object unmodified — with a self-describing,
+          already-ECS record there is nothing to reassemble or normalise —
+          attach app-owner and Host context, cap error.stack_trace and
+          message, and run Persistent Queue backpressure on the Elastic
+          destination.
+        elastic: >
+          Decode the ndjson and run a thin logs-apache_tomcat.catalina@custom
+          pipeline that validates the ECS fields the layout already emits,
+          groks deployWAR into apache_tomcat.catalina.deployed_war and the
+          version banner into service.version, and derives
+          event.severity/event.outcome from log.level.
+    fields:
+    - vendor: '@timestamp'
+      type: timestamp
+      description: >-
+        record timestamp rendered by EcsLayout as ISO-8601 with an explicit
+        timezone offset
+      ecs: '@timestamp'
+      status: mapped
+      notes: >
+        carries an explicit offset, so the zone ambiguity of the
+        OneLineFormatter "dd-MMM-yyyy HH:mm:ss.SSS" timestamp — which has no
+        offset and defaults to UTC — is resolved at the source
+    - vendor: ecs.version
+      type: string
+      description: ECS schema version stamped by the EcsLayout template, e.g. "1.2.0"
+      ecs: ecs.version
+      status: mapped
+      notes: >-
+        identifies the template's target ECS version, not the pipeline's;
+        confirm it against the cluster's ECS version
+    - vendor: log.level
+      type: enum
+      description: >-
+        JUL/Log4j level of the record — SEVERE/ERROR, WARNING/WARN, INFO,
+        CONFIG, FINE/DEBUG, FINER, FINEST/TRACE
+      ecs: log.level
+      status: mapped
+      transform: >
+        Log4j level names replace JUL's when the bridge maps them; a lookup to
+        a numeric event.severity is still needed, and ERROR/SEVERE is the
+        level that should raise alert-adjacent handling
+    - vendor: message
+      type: string
+      description: the formatted log message text
+      ecs: message
+      status: mapped
+      notes: >
+        free-text and application-specific; on a deployed application this is
+        whatever the app's own logger writes, so it carries user input
+        verbatim and is the least bounded scalar field on the dataset
+    - vendor: process.thread.name
+      type: string
+      description: >-
+        name of the thread that emitted the record, e.g. http-nio-8080-exec-N
+        or Catalina-utility-N
+      ecs: process.thread.name
+      status: mapped
+      notes: >
+        emitted natively under the correct ECS key, unlike the raw feed whose
+        grok files the thread under apache_tomcat.catalina.subsystem; this is
+        what makes the dataset joinable to the access log's threadName
+    - vendor: process.thread.id
+      type: integer
+      description: numeric identifier of the emitting thread
+      ecs: process.thread.id
+      status: mapped
+      notes: >-
+        present in the EcsLayout template; a stable per-thread integer that
+        complements the thread name
+    - vendor: log.logger
+      type: string
+      description: >-
+        fully qualified class that issued the record, e.g.
+        org.apache.catalina.startup.HostConfig
+      ecs: log.logger
+      status: mapped
+      notes: >
+        extracted natively so rules can key on stable identifiers such as
+        org.apache.catalina.startup.HostConfig or
+        org.apache.catalina.core.StandardContext, which on the raw feed are
+        buried inside the message token
+    - vendor: log.origin.function
+      type: string
+      description: method that issued the record (source/caller method name)
+      ecs: log.origin.function
+      status: partial
+      notes: >
+        present only when includeCallerData / location info is enabled on the
+        layout, which is off by default because capturing the call site is
+        expensive; deployWAR, undeploy, startInternal and log are the method
+        names that carry detection meaning when it is enabled
+    - vendor: log.origin.file.name
+      type: string
+      description: source file name of the call site
+      ecs: log.origin.file.name
+      status: partial
+      notes: >-
+        same caller-data dependency as log.origin.function; absent unless
+        location info is enabled
+    - vendor: log.origin.file.line
+      type: integer
+      description: source line number of the call site
+      ecs: log.origin.file.line
+      status: partial
+      notes: >-
+        same caller-data dependency; useful for pinpointing a container's own
+        error site, not application errors
+    - vendor: error.type
+      type: string
+      description: >-
+        fully qualified class of the thrown Throwable, e.g.
+        java.lang.NullPointerException
+      ecs: error.type
+      status: mapped
+      notes: >
+        taken off the Throwable by the layout, so the stable classifier for an
+        application failure is available without the substring-matching the
+        raw feed needs until a custom grok pass adds it
+    - vendor: error.message
+      type: string
+      description: message of the thrown Throwable
+      ecs: error.message
+      status: mapped
+    - vendor: error.stack_trace
+      type: string
+      description: full stack trace of the Throwable, serialised as a single escaped JSON string
+      ecs: error.stack_trace
+      status: mapped
+      notes: >
+        rendered into one string rather than the raw feed's
+        whitespace-indented continuation lines, which removes the multi-line
+        reassembly problem entirely; still the single largest field on the
+        dataset and the one that dictates message-size limits
+    - vendor: labels
+      type: object
+      description: Log4j ThreadContext (MDC) key/value pairs, flattened by EcsLayout under labels.*
+      ecs: labels
+      status: mapped
+      notes: >
+        carries whatever MDC context the container or application sets
+        (request id, principal); a durable per-request correlator when the
+        application populates it, but application-defined and not guaranteed
+    - vendor: tags
+      type: string
+      description: Log4j markers / NDC values, emitted by EcsLayout as the ECS tags array
+      ecs: tags
+      status: mapped
+      notes: >-
+        coarse classification only; markers are developer-assigned and vary by
+        application
+    - vendor: service.name
+      type: string
+      description: >-
+        service name emitted when configured on the layout via a KeyValuePair
+        / eventTemplateAdditionalField
+      ecs: service.name
+      status: partial
+      notes: >
+        not populated by default; set it on the layout to distinguish catalina
+        instances rather than relying on the harvested file path
+    - vendor: org.apache.catalina.startup.HostConfig.deployWAR
+      type: string
+      description: >-
+        autodeploy record emitted when a WAR appearing in the Host appBase is
+        expanded and deployed
+      ecs: null
+      status: unmapped
+      custom: apache_tomcat.catalina.deployed_war
+      transform: >
+        still inside the free-text message even in JSON ("Deploying web
+        application archive [/opt/tomcat/webapps/x.war]") and must be grokked
+        out; the detection with no access-log counterpart, since an attacker
+        with write access to appBase gets code execution without touching
+        /manager
+    - vendor: org.apache.catalina.startup.VersionLoggerListener.log
+      type: string
+      description: >-
+        startup banner recording the Tomcat server version, JVM version and
+        CATALINA_BASE
+      ecs: service.version
+      status: partial
+      notes: >
+        present only in the startup burst rather than on every event, so it
+        belongs in asset inventory via a transform or enrich policy; the
+        cheapest authoritative source of Tomcat version for vulnerability
+        triage, and it sits inside message here too
+    - vendor: log file path
+      type: string
+      description: file the record was harvested from — catalina.<date>.log or localhost.<date>.log
+      ecs: log.file.path
+      status: mapped
+      notes: >
+        set by the filestream input, not by Log4j, and the discriminator
+        between container-level (catalina) and per-Host application
+        (localhost) records once both land in the same data stream
+- id: manager
+  name: Manager and host-manager application log
+  description: >
+    Output of the /manager and /host-manager web applications, written through
+    ServletContext.log() to $CATALINA_BASE/logs/manager.<date>.log and
+    host-manager.<date>.log by the loggers configured in logging.properties.
+    Same OneLineFormatter shape as catalina, but the message payloads are a
+    small closed vocabulary of administrative verbs - "deploy: Deploying web
+    application '/foo'", "undeploy: Undeploying web application at '/foo'",
+    "Uploading WAR file to <path>", plus start, stop, restart, list, sessions,
+    resources and serverinfo. This is the deployment audit trail for the text
+    interface (/manager/text/deploy?path=/foo with the WAR as an HTTP PUT
+    body) and the HTML interface, and it is the highest-value low-volume
+    stream on a Tomcat estate: manager-script access plus a PUT deploy is the
+    canonical webshell installation path. The log records the ACTION but not
+    the ACTOR - no source IP and no username appear on these lines, so it only
+    becomes an audit trail when joined to the access-log record for the same
+    request.
+  event_categories:
+  - configuration
+  - web
+  route:
+    guarded:
+    - hop: cribl
+      location: edge worker group, low-side enclave
+      notes: >
+        Elastic Agent filestream tail of manager.*.log and host-manager.*.log
+        on the same servers as the other two datasets, with the same split of
+        instances across the two enclaves.
+    - hop: guard
+      device: Everfox High Speed Guard
+      constraints: >-
+        Per-feed content-filter policy not yet defined with the guard owner;
+        expected friction and the crossing shape are detailed in this
+        dataset's relay recommendation.
+      notes: >
+        Current crossing: Cribl Syslog Destination (__syslogout carrying a
+        CEF-structured string), being retired; plan of record: Cribl HTTP
+        Destination -> guard -> Cribl HTTP Source carrying NDJSON. High side
+        parses _raw (Extract JSON) then adds Cribl fields before Routes.
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-apache_tomcat.catalina
+    direct:
+    - hop: cribl
+      location: edge worker group
+    - hop: cribl
+      location: core worker group, Elastic side
+    - hop: elastic
+      data_stream: logs-apache_tomcat.catalina
+  formats:
+  - format: syslog-raw
+    recommended: true
+    recommended_because: >-
+      the default JULI output is collected the same way as the catalina
+      dataset with no change inside the application server; the JSON path
+      replaces JULI with Log4j Core on every instance, a change owned by each
+      application team rather than the device owner.
+    parsing:
+      mechanism: elastic-ingest-pipeline
+      artifact: >-
+        custom logs-apache_tomcat.catalina@custom extraction over the catalina
+        data stream
+      notes: >
+        The apache_tomcat integration ships no manager data stream. Because
+        the file uses the same OneLineFormatter layout, the practical route is
+        to add manager.*.log and host-manager.*.log to the catalina data
+        stream's paths variable and reuse its grok and multiline parser; the
+        administrative verb, context path and WAR path then have to be
+        extracted by a custom ingest pipeline, since the stock grok stops at
+        message. Routing these records to their own data stream is the
+        alternative if retention or access control needs to differ from
+        ordinary application logs.
+    fields:
+    - vendor: timestamp
+      type: timestamp
+      description: record timestamp emitted by OneLineFormatter as dd-MMM-yyyy HH:mm:ss.SSS
+      ecs: '@timestamp'
+      status: partial
+      transform: >-
+        same zone-less format as the catalina dataset; the collector's
+        tz_offset must match the JVM's actual timezone
+    - vendor: level
+      type: enum
+      description: >-
+        JUL log level of the record - INFO for successful commands, SEVERE for
+        managerServlet.error.* records
+      ecs: log.level
+      status: mapped
+      notes: >
+        the level alone separates a completed administrative action from a
+        failed one, since the message vocabulary does not carry an explicit
+        outcome token
+    - vendor: thread
+      type: string
+      description: name of the request-processing thread, e.g. http-nio-8080-exec-3
+      ecs: process.thread.name
+      status: partial
+      notes: >
+        the ONLY link from a deployment record back to the requester - the
+        manager log carries neither source IP nor authenticated user, so this
+        thread name plus the timestamp is what joins to the access log's %I,
+        %h and %u. The stock catalina grok files it under
+        apache_tomcat.catalina.subsystem, which breaks that join until renamed
+    - vendor: sourceClassName
+      type: string
+      description: >-
+        class issuing the record - org.apache.catalina.core.ApplicationContext
+        for manager output
+      ecs: log.logger
+      status: partial
+      notes: >
+        ManagerServlet writes through ServletContext.log(), so every line is
+        attributed to ApplicationContext.log rather than to ManagerServlet;
+        the discriminator between the manager and host-manager applications is
+        the configured logger name and the file path, not this token
+    - vendor: message
+      type: string
+      description: 'the administrative message text, e.g. "deploy: Deploying web application ''/foo''"'
+      ecs: message
+      status: mapped
+    - vendor: message verb
+      type: enum
+      description: >-
+        leading command token of the message - deploy, undeploy, start, stop,
+        restart, list, sessions, resources, serverinfo, install
+      ecs: event.action
+      status: partial
+      transform: >
+        grok the leading "<verb>:" token out of the message and normalise to a
+        lowercase action. deploy and undeploy are the two that matter for
+        detection; undeploy immediately followed by deploy on the same context
+        path is the update=true redeploy pattern used to overwrite a
+        legitimate application
+    - vendor: message context path
+      type: string
+      description: 'quoted web application context path the command acted on, e.g. ''/foo'''
+      ecs: null
+      status: unmapped
+      custom: apache_tomcat.manager.context_path
+      transform: >
+        extracted from inside the single quotes in the message; there is no
+        ECS field for a servlet context path, and url.path on the correlated
+        access record holds the manager endpoint rather than the target
+        application
+    - vendor: Uploading WAR file to
+      type: string
+      description: filesystem path the PUT-uploaded WAR was written to before deployment
+      ecs: file.path
+      status: partial
+      notes: >
+        emitted only on the HTTP PUT deploy variant, which is precisely the
+        webshell delivery path; the value is derived from the client-supplied
+        path parameter, so it is attacker-influenced and must be bounded and
+        checked for traversal rather than trusted
+    - vendor: managerServlet.error.*
+      type: string
+      description: >-
+        localised failure message for a command that did not complete, e.g.
+        managerServlet.error.deploy
+      ecs: error.message
+      status: partial
+      notes: >
+        a failed deploy is as interesting as a successful one - repeated
+        managerServlet.error.deploy records are what an authenticated attacker
+        probing for a writable context path looks like; the localised message
+        text varies by JVM locale, so alert on the level and verb rather than
+        on the string
+    - vendor: thrown
+      type: string
+      description: stack trace attached to a failed administrative command
+      ecs: error.stack_trace
+      status: partial
+      notes: >
+        same multi-line indented block as the catalina dataset and the same
+        requirement that the collector join the lines before the pipeline sees
+        them
+    - vendor: log file path
+      type: string
+      description: file the record came from - manager.<date>.log or host-manager.<date>.log
+      ecs: log.file.path
+      status: mapped
+      notes: >
+        the only reliable separator between the manager application (deploys
+        applications into a Host) and the host-manager application (creates
+        and removes virtual Hosts themselves); host-manager activity is rarer
+        and correspondingly more suspicious
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Add the manager and host-manager paths to the same filestream
+          collection as catalina and apply the identical '^\d{2}-\w{3}-\d{4}'
+          multiline rule, then tag these records low-side so they can be
+          routed and retained separately from bulk application logging despite
+          sharing a data stream. Volume is negligible, so keep _raw
+          indefinitely and never sample this stream; run Persistent Queue
+          backpressure and attach app-owner context so a deployment can be
+          attributed without a lookup at query time.
+        elastic: >
+          Own a logs-apache_tomcat.catalina@custom pipeline that grok-extracts
+          the leading administrative verb into event.action (deploy, undeploy,
+          start, stop, reload, sessions, list, serverinfo), the quoted context
+          path into apache_tomcat.manager.context_path, and the uploaded WAR
+          path into file.path, then sets event.outcome from whether the line
+          is a verb record or a managerServlet.error.* record. Because these
+          lines carry no actor, the pipeline's real job is correlation
+          support: keep process.thread.name populated so a transform or
+          correlation rule can join each deployment to the access-log record
+          with the same %I thread and recover source.ip and user.name from
+          there. Declare apache_tomcat.manager.context_path and .command as
+          keyword in the custom-namespace index template.
+        relay: >
+          Low-side instances ship it in the same thin NDJSON envelope as the
+          other two datasets so all three Tomcat streams present one schema to
+          the filter, and carry _raw across unconditionally - at a few records
+          a day the bandwidth is free and an at-most-once drop here loses the
+          only record of a deployment. The one unbounded value is the WAR or
+          context.xml path echoed from the request, which is
+          attacker-controlled and may carry traversal sequences and non-ASCII
+          bytes: bound and normalise it low-side so the custom filter stays
+          simple. Because the stream is tiny, per-hour count reconciliation is
+          not sufficient here - reconcile deployment records against the
+          access log's /manager and /host-manager requests instead.
+      direct:
+        parse_location: high
+        cribl: >
+          Add the manager and host-manager paths to the same filestream
+          collection as catalina and apply the identical '^\d{2}-\w{3}-\d{4}'
+          multiline rule, then tag these records so they can be routed and
+          retained separately from bulk application logging despite sharing a
+          data stream. Volume is negligible, so keep _raw indefinitely and
+          never sample this stream; run Persistent Queue backpressure and
+          attach app-owner context so a deployment can be attributed without a
+          lookup at query time.
+        elastic: >
+          Own a logs-apache_tomcat.catalina@custom pipeline that grok-extracts
+          the leading administrative verb into event.action (deploy, undeploy,
+          start, stop, reload, sessions, list, serverinfo), the quoted context
+          path into apache_tomcat.manager.context_path, and the uploaded WAR
+          path into file.path, then sets event.outcome from whether the line
+          is a verb record or a managerServlet.error.* record. Because these
+          lines carry no actor, the pipeline's real job is correlation
+          support: keep process.thread.name populated so a transform or
+          correlation rule can join each deployment to the access-log record
+          with the same %I thread and recover source.ip and user.name from
+          there. Declare apache_tomcat.manager.context_path and .command as
+          keyword in the custom-namespace index template.
+  - format: json
+    enable: >
+      The /manager and /host-manager applications write through
+      ServletContext.log() to the loggers configured in logging.properties;
+      once Log4j Core is the backend (the same replace-tomcat setup as the
+      catalina dataset — log4j-api, log4j-core, log4j-appserver and
+      log4j-layout-template-json in $CATALINA_BASE/log4j, config in log4j2.xml
+      or log4j2-tomcat.xml), point the manager and host-manager loggers at an
+      appender carrying a JsonTemplateLayout so manager.<date>.log and
+      host-manager.<date>.log render as newline-delimited JSON with
+      EcsLayout's fields (@timestamp with offset, log.level, log.logger,
+      process.thread.name, message and error.* on failures). The
+      administrative sentence — "deploy: Deploying web application '/foo'" —
+      is written whole into the message field; the layout structures the
+      envelope, not the message text.
+    references:
+    - https://tomcat.apache.org/tomcat-10.1-doc/logging.html
+    - https://logging.apache.org/log4j/2.x/jakarta.html
+    - https://logging.apache.org/log4j/2.x/manual/json-template-layout.html
+    parsing:
+      mechanism: elastic-ingest-pipeline
+      artifact: >-
+        custom logs-apache_tomcat.catalina@custom over the JSON-decoded
+        manager.*.log and host-manager.*.log files
+      notes: >
+        The apache_tomcat integration ships no manager data stream, so as with
+        the raw feed the practical route is to add the manager and
+        host-manager paths to the catalina data stream's ndjson filestream and
+        reuse a shared @custom pipeline. The JSON layout fixes the timestamp,
+        thread and logger natively, but it does not split the administrative
+        sentence: the verb, context path and uploaded-WAR path still live
+        inside the message string and must be grokked out. Routing these
+        records to their own data stream remains the alternative where
+        retention or access control must differ from ordinary application
+        logs.
+    recommendations:
+      guarded:
+        parse_location: high
+        cribl: >
+          Route the manager and host-manager log4j2 loggers into the same JSON
+          filestream collection as catalina and ship the thin NDJSON envelope
+          with the object in _raw; tag these records low-side so they can be
+          routed and retained separately despite sharing the catalina schema.
+          Volume is negligible, so keep _raw indefinitely and never sample
+          this stream. The one unbounded value is the WAR or context path
+          echoed from the request, which is attacker-controlled and may carry
+          traversal sequences and non-ASCII bytes, so bound and normalise it
+          low-side; because a JSON object cut mid-string is unrecoverable,
+          dead-letter oversize records rather than letting the filter trim
+          them, and run Persistent Queue backpressure.
+        elastic: >
+          The JSON layout supplies @timestamp with an explicit offset,
+          log.level and process.thread.name natively, but the administrative
+          verb, context path and uploaded-WAR path remain inside message, so a
+          logs-apache_tomcat.catalina@custom pipeline must still grok
+          event.action (deploy, undeploy, start, stop, reload, sessions, list,
+          serverinfo), the quoted context path into
+          apache_tomcat.manager.context_path and the WAR path into file.path,
+          and set event.outcome from log.level — INFO for a completed command,
+          SEVERE for a managerServlet.error.* record. Keep process.thread.name
+          populated: these lines carry no actor, so the thread name plus the
+          timestamp is the only join back to the access log's threadName that
+          recovers source.ip and user.name.
+        relay: >
+          Ship it in the same thin NDJSON envelope as the other two Tomcat
+          streams so all three present one JSON schema to the filter, and
+          carry _raw across unconditionally — at a few records a day the
+          bandwidth is free and an at-most-once drop loses the only record of
+          a deployment. The one unbounded value is the WAR or context.xml path
+          echoed from the request, so bound and normalise it low-side and
+          dead-letter oversize records. Because the stream is tiny, per-hour
+          count reconciliation is not sufficient: reconcile deployment records
+          against the access log's /manager and /host-manager requests
+          instead.
+      direct:
+        parse_location: high
+        cribl: >
+          Forward the JSON object unmodified into the same catalina
+          collection, tag it for separate routing/retention, keep _raw, bound
+          the request-echoed WAR/context path, and run Persistent Queue
+          backpressure.
+        elastic: >
+          Run a logs-apache_tomcat.catalina@custom pipeline that groks the
+          administrative verb into event.action (deploy, undeploy, start,
+          stop, reload, sessions, list, serverinfo), the quoted context path
+          into apache_tomcat.manager.context_path and the uploaded-WAR path
+          into file.path out of message, and sets event.outcome from log.level
+          — INFO for a completed command, SEVERE for a managerServlet.error.*
+          record. Keep process.thread.name populated: these lines carry no
+          actor, so the thread name plus the timestamp is the only join back
+          to the access log's threadName that recovers source.ip and
+          user.name.
+    fields:
+    - vendor: '@timestamp'
+      type: timestamp
+      description: record timestamp rendered by EcsLayout as ISO-8601 with an explicit offset
+      ecs: '@timestamp'
+      status: mapped
+      notes: >-
+        unlike the raw OneLineFormatter timestamp this carries an explicit
+        offset, so no tz_offset guess is needed at ingest
+    - vendor: log.level
+      type: enum
+      description: >-
+        level of the record — INFO for a successful command, SEVERE/ERROR for
+        a managerServlet.error.* record
+      ecs: log.level
+      status: mapped
+      notes: >-
+        the level alone separates a completed administrative action from a
+        failed one, since the message vocabulary carries no explicit outcome
+        token
+    - vendor: process.thread.name
+      type: string
+      description: name of the request-processing thread, e.g. http-nio-8080-exec-3
+      ecs: process.thread.name
+      status: partial
+      notes: >
+        the ONLY link from a deployment record back to the requester — the
+        manager log carries neither source IP nor authenticated user, so this
+        thread name plus the timestamp is what joins to the access log's
+        threadName, host and user; emitted under the correct ECS key here,
+        unlike the raw feed's subsystem misfiling
+    - vendor: log.logger
+      type: string
+      description: >-
+        class issuing the record — org.apache.catalina.core.ApplicationContext
+        for manager output
+      ecs: log.logger
+      status: partial
+      notes: >
+        ManagerServlet writes through ServletContext.log(), so every line is
+        attributed to ApplicationContext.log rather than to ManagerServlet;
+        the discriminator between the manager and host-manager applications is
+        the configured logger name and the file path, not this token
+    - vendor: message
+      type: string
+      description: 'the administrative message text, e.g. "deploy: Deploying web application ''/foo''"'
+      ecs: message
+      status: mapped
+      notes: >-
+        the layout structures the envelope but writes the whole administrative
+        sentence into this one field
+    - vendor: message verb
+      type: enum
+      description: >-
+        leading command token of the message — deploy, undeploy, start, stop,
+        restart, list, sessions, resources, serverinfo, install
+      ecs: event.action
+      status: partial
+      transform: >
+        grok the leading "<verb>:" token out of message and normalise to a
+        lowercase action even in JSON, since the layout does not split the
+        sentence; undeploy immediately followed by deploy on the same context
+        path is the update=true redeploy pattern used to overwrite a
+        legitimate application
+    - vendor: message context path
+      type: string
+      description: 'quoted web application context path the command acted on, e.g. ''/foo'''
+      ecs: null
+      status: unmapped
+      custom: apache_tomcat.manager.context_path
+      transform: >
+        extracted from inside the single quotes in message; there is no ECS
+        field for a servlet context path, and url.path on the correlated
+        access record holds the manager endpoint rather than the target
+        application
+    - vendor: Uploading WAR file to
+      type: string
+      description: filesystem path the PUT-uploaded WAR was written to before deployment
+      ecs: file.path
+      status: partial
+      notes: >
+        emitted only on the HTTP PUT deploy variant, which is precisely the
+        webshell delivery path; the value is derived from the client-supplied
+        path parameter, so it is attacker-influenced and must be bounded and
+        checked for traversal rather than trusted
+    - vendor: managerServlet.error.*
+      type: string
+      description: >-
+        localised failure message for a command that did not complete, e.g.
+        managerServlet.error.deploy
+      ecs: error.message
+      status: partial
+      notes: >
+        a failed deploy is as interesting as a successful one — repeated
+        managerServlet.error.deploy records are what an authenticated attacker
+        probing for a writable context path looks like; the localised text
+        varies by JVM locale, so alert on the level and verb rather than on
+        the string
+    - vendor: error.stack_trace
+      type: string
+      description: >-
+        stack trace attached to a failed administrative command, serialised as
+        a single JSON string
+      ecs: error.stack_trace
+      status: mapped
+      notes: >
+        rendered as one escaped string by the layout rather than the raw
+        feed's multi-line indented block, so no collector-side line joining is
+        required before the pipeline sees it
+    - vendor: log file path
+      type: string
+      description: file the record came from — manager.<date>.log or host-manager.<date>.log
+      ecs: log.file.path
+      status: mapped
+      notes: >
+        the only reliable separator between the manager application (deploys
+        applications into a Host) and the host-manager application (creates
+        and removes virtual Hosts); host-manager activity is rarer and
+        correspondingly more suspicious
