@@ -6,8 +6,11 @@ What to do, in the order to do it.
 
 Nothing to run by hand: the site rebuilds when the default branch moves.
 Both CI definitions in this repository — `.gitlab-ci.yml` and
-`.github/workflows/pages.yml` — publish from that branch and from no
-other.
+`.forgejo/workflows/pages.yml` — publish from that branch and from no
+other.  The Forgejo workflow lives under `.forgejo/` rather than
+`.github/` so that a mirror to GitHub can carry it: GitHub refuses a
+push that writes `.github/workflows/` unless the credential holds
+workflow permission, and this one deliberately does not.
 
 To see what a build would produce before pushing:
 
