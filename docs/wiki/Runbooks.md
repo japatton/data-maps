@@ -21,6 +21,18 @@ it touches `public/`, so the site that is up stays up. Which problems fail
 a build and which merely get flagged on the published site is in the
 README's [validation tiers][validation].
 
+### Public hosting on GitHub Pages
+
+`.github/workflows/pages.yml` builds and publishes the site from the GitHub
+mirror. Two one-time steps by the repository owner gate it:
+
+1. The Forgejo → GitHub push-mirror credential must carry the `workflow`
+   scope, or GitHub refuses the push that carries this file. Reissue the
+   token with that scope and update the mirror's credential in Forgejo.
+2. In the GitHub repository settings, set Pages → Source to **GitHub
+   Actions**. Do this only after a report exists under
+   `docs/verification/`.
+
 ## Point a deployment at its own endpoints
 
 The `STUDIO_*` variables that override `data/studio.yml`, and why they
