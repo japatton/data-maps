@@ -6,8 +6,10 @@ ingest: the vendor's real field names, their ECS targets, how each feed
 moves through the pipeline (Cribl worker groups and the cross-domain
 guard), how it gets parsed, and what work remains on each side. The
 catalog is authored as YAML in this repository and published as a static
-GitLab Pages site with JSON exports, a printable view, and Studio, a
-browser editor and log-analysis workbench.
+GitLab Pages site with JSON exports, a printable view, Studio, a browser
+editor and log-analysis workbench, and the Picker, which hands a consumer
+one feed's map together with its Cribl pipeline or an Elasticsearch ingest
+pipeline translated from it.
 
 **Who it serves**
 
@@ -169,6 +171,10 @@ spreadsheets and tribal knowledge. Version control makes this material
   workbench, served at `studio/` and linked from the header of every
   page. Edits leave as merge requests, so review stays the gate; see
   [Studio](#studio) below.
+- **Picker** — the consumer entry point at `picker.html`, also linked from
+  the header: pick a technology, a dataset and the wire format you have,
+  say whether Cribl Stream is in your path, and take away that block's map
+  plus the pipeline that parses it; see [The Picker](#the-picker) below.
 
 ![The ECS index: alerting coverage by category, one collapsible table per alerting profile, then the unmapped-required-field gap lists and every ECS field in use](docs/images/ecs-index.png)
 
@@ -511,7 +517,7 @@ suite and the deploy run on the Python floor image; on GitLab the `test`
 and `pages` jobs name no image and take the runner's default. Neither
 image ever needs the other runtime.
 
-    node --test studio/tests/*.test.js
+    node --test studio/tests/*.test.js static/picker/tests/*.test.js
 
 For endpoints that do not answer CORS there is a development-only
 server: it serves `public/` with proxies that add the headers, and
@@ -581,6 +587,87 @@ read the key order and required keys from the schema the build
 publishes, and the Python suite fails with the regeneration command in
 its message if either committed fixture drifts.
 
+### The Picker
+
+**The Picker** is the site's other half: Studio is for the people who
+*own* a map, and `picker.html` is for the people who have to *consume*
+one. It answers a single question — "I have this feed; give me its map and
+the pipeline that parses it" — and it runs entirely in the browser off
+`exports/picker.json` and the per-block exports, with no server component
+and no build step of its own. The header of every page links to it.
+
+Five choices, each narrowing the next:
+
+1. **Technology** — the whole catalog in one list, each entry labelled
+   with its category.
+2. **Dataset** — that technology's log types.
+3. **Wire format** — what the device actually emits. The recommended
+   format is preselected and marked *recommended*; the others are there
+   because a real deployment often cannot emit the recommended one.
+4. **Cribl Stream is in the path** — on by default. This is the question
+   that decides which parser you get, not a preference.
+5. **Destination** — one value, `elastic`. The axis exists in the exported
+   data so that adding another is a data change rather than a redesign.
+
+Changing the technology clears the dataset and the format; changing the
+dataset moves to that dataset's recommended format. No block's files are
+fetched until all three are chosen.
+
+**A result is a link.** Every change rewrites the URL hash, and opening
+that URL restores the selection, so a result can be mailed or pasted into
+a ticket:
+
+    picker.html#<tech>/<dataset>/<format>?cribl=1|0&dest=elastic
+    picker.html#cisco-asa/device-admin/snmp-trap?cribl=0&dest=elastic
+
+An id the catalog does not have resets the selection at that level and
+draws a notice naming what it could not find, rather than silently
+showing something else.
+
+The result panel carries, top to bottom:
+
+- **The data map** — the format block rendered by the same partial the
+  technology page uses, so the page and the Picker cannot drift, with
+  **JSON**, **Markdown** and **CSV** downloads. Those three are static
+  files at `exports/map/<tech>/<dataset>__<format>.{json,md,csv}`: the
+  buttons are plain links to files the build already wrote.
+- **The Cribl pipeline**, when Cribl is in the path — the committed
+  pipeline shown verbatim, with copy and download. The download is the
+  byte copy at `exports/cribl/<tech>/<dataset>__<format>.json`.
+- **The Elasticsearch ingest pipeline**, when it is not — the transpiler's
+  envelope from `exports/ingest/<tech>/<dataset>__<format>.json`: a
+  coverage badge (*"N of M steps translated"*, with the partial and manual
+  counts when there are any), the `requires` list, the pipeline body, the
+  notes, and every manual step with its reason, its description and the
+  original Cribl function in a collapsed `<details>`. This is the one
+  download the browser generates rather than links: it writes the
+  envelope's `pipeline` value alone — exactly the body for
+  `PUT _ingest/pipeline/<id>` — as `<id>.ingest.json`, so the coverage
+  report stays on the page instead of travelling into Elasticsearch.
+
+Three situations answer in words rather than just handing over JSON:
+
+- **The block is parsed downstream** — `parsing.mechanism` is
+  `elastic-integration` or `elastic-ingest-pipeline`. A note above the
+  artifact reads *"Parsing happens downstream in `<artifact>`; this
+  pipeline only identifies the event and tags event.dataset."* The
+  pipeline is still shown, on both sides of the Cribl toggle: it is real,
+  and it is deliberately thin.
+- **`mechanism: none`** — *"Cribl is not in this path for this feed."*
+  Nothing is generated, because there is nothing to generate from.
+- **No pipeline yet** — *"No pipeline has been authored for this block yet."*
+  with a link to the technology page. No block is in this state today; the
+  build reports it as the `no-pipeline` flag if one ever is.
+
+One detail about the HTML fragment, for anyone consuming it outside the
+Picker: it is rendered with an asset prefix of `../../../`, so its
+relative links are written for the directory it lives in,
+`exports/map/<tech>/` — not for `picker.html`, which inlines it at the
+site root and would resolve them against the page instead. The format
+block carries no such link today, so nothing is broken; if it ever gains
+one — a download for a dataset's example record is the obvious candidate —
+that prefix is what has to change.
+
 ## Repository layout
 
     data/
@@ -594,11 +681,22 @@ its message if either committed fixture drifts.
                                truth for valid `ecs:` values)
       examples/<tech-id>/      raw captured records, one per file
                                (work-side only; absent here)
+      pipelines/<tech>/        the committed Cribl Stream 4.19 pipelines,
+                               one <dataset>__<format>.json per format
+                               block Cribl is in the path of
       studio.yml               Studio's endpoints (no secrets)
     datamaps/                  the generator (validate -> model -> render)
     datamaps/studio.py         publishes public/studio/ (config, schema
                                vocabularies, source documents, the
                                example-record index)
+    datamaps/pipelines.py      loads data/pipelines/ and cross-checks it
+                               against the catalog
+    datamaps/cribl_lint.py     semantic lint for the committed pipelines
+    datamaps/ingest/           the Cribl -> Elasticsearch transpiler
+                               (expr.py the expression subset, functions.py
+                               and evaluate.py the per-function rules,
+                               pipeline.py the envelope)
+    datamaps/export_text.py    Markdown and CSV for one format block
     studio/                    the browser editor (no framework, no build)
       lib/                     store and drafts, the validation port, the
                                YAML emitter, the change list, and the
@@ -609,6 +707,12 @@ its message if either committed fixture drifts.
                                python3 -m datamaps.studio --write-fixture
     templates/, static/        site templates, CSS, JS (no frameworks,
                                no external fetches)
+    static/picker/             the Picker's ES modules and its node --test
+                               suites (the tests are never published)
+    templates/picker.html.j2   the Picker page; _format_block.html.j2
+                               beside it is the one format block, included
+                               by the technology page and rendered alone
+                               as the exported HTML fragment
     docs/images/               the screenshots this README embeds, of the
                                real built site rather than mockups
     tools/vendor_ecs.py        re-vendor the ECS dictionary (never in CI)
@@ -619,10 +723,17 @@ its message if either committed fixture drifts.
                                Chrome; never in CI)
     tools/wiki.py              publish docs/wiki/ into the wiki repository
                                (run by a person, never in CI)
+    tools/pipelines/           pipeline provenance: the authoring brief,
+                               the work-order builder and the thin-pipeline
+                               generator
+    tools/validate_live/       the launch gate: every Cribl pipeline POSTed
+                               to a real Cribl and every ingest pipeline
+                               PUT to a real Elasticsearch (never in CI)
     tools/*.ps1                Windows-side helpers: probe an analysis
                                endpoint's reachability and CORS from outside
                                the browser, and apply the field-table layout
                                change to a deployed copy
+    docs/verification/         the reports that gate writes, committed
     docs/wiki/                 the how-to pages, and the source the hosted
                                wiki is published from
     tests/                     unit tests (stdlib unittest)
@@ -830,6 +941,261 @@ the plan of record is a Cribl HTTP Destination → guard → Cribl HTTP
 Source carrying NDJSON, retiring CEF from the wire entirely. Per-feed
 content-filter policy is pending with the guard owner; each dataset's
 `relay:` recommendation records what that feed needs from the crossing.
+
+## Cribl pipelines and the Elasticsearch translation
+
+### The committed pipelines
+
+    data/pipelines/<tech>/<dataset>__<format>.json
+
+**605 Cribl Stream 4.19 pipelines, one per format block Cribl is in the
+path of.** The catalog has 610 format blocks; five carry
+`parsing.mechanism: none`, and those are the five with no pipeline. Each
+file is exactly the body that was POSTed to Cribl's
+`/api/v1/pipelines` — `{ "id": …, "conf": { "output", "description",
+"functions": [ … ] } }` — so it can be pasted into a Cribl instance
+without translation.
+
+**Provenance.** 603 of them were authored in September 2026 by LLM agents
+working one work order at a time from `tools/pipelines/AGENT-BRIEF.md`,
+and every one was accepted by a live Cribl Stream 4.19 instance
+(`POST /api/v1/pipelines` returned 200) before it was kept. The remaining
+two are `cisco-cucm`'s `api-pull` blocks, added afterwards: the SOAP pull
+delivers the same records the sibling format carries, so those two copy
+the sibling's parsing verbatim and differ only in their id, their
+description and their leading comment.
+
+**The build enforces the relationship between a pipeline and its block.**
+`datamaps/pipelines.py` loads the directory and cross-checks it against
+the model. Four things are `FATAL` and produce no site:
+
+- a pipeline whose `(technology, dataset, format)` is not a block in the
+  catalog — a renamed dataset would otherwise unpublish its pipeline
+  silently;
+- a pipeline whose `id` is not `dm_<tech>_<dataset>_<format>` for its own
+  path, with every non-alphanumeric run replaced by `_`;
+- a pipeline that exists for a block whose mechanism is `none`, reported
+  as `pipeline-for-none`: if Cribl is not in that path, a pipeline for it
+  is a claim the catalog contradicts;
+- a file that is not valid JSON, is not named `<dataset>__<format>.json`,
+  or has no `conf.functions`.
+
+The other direction is a soft flag, because it is authoring work rather
+than a contradiction: `no-pipeline` names a block whose mechanism is not
+`none` and which has no pipeline file. It joins the data-quality flag panel
+on the index, like every other flag. The count is zero today.
+
+**HTTP 200 does not mean the pipeline means anything.** One generator bug
+shipped `{"name":"name","value":"value"}` eval rows and Cribl accepted
+them, and Cribl does not validate a `rename` conf at all — an empty one
+returns 200 and silently renames nothing. So there is a semantic lint:
+
+    python3 -m datamaps.cribl_lint
+
+It reports an empty pipeline, a comment over Cribl's 1000-character limit,
+a JavaScript global read off the event (`__e['Date'].parse(x)` evaluates
+to `undefined.parse(x)` and throws at runtime), echoed placeholder rows, a
+row whose name equals its value, an `event.dataset` value containing a
+hyphen, a field path Cribl's property accessor will reject, a malformed or
+no-op `rename`, a `regex_extract` whose regex is missing its slashes, a
+pipeline that never sets `event.dataset`, and two pipelines sharing an id.
+`tests/test_cribl_lint.py` asserts that all 605 lint clean and that each
+rule fires on a hand-built bad example, so the lint runs on every push
+whether or not anyone types the command.
+
+**Regenerating one.** `tools/pipelines/README.md` is the procedure, and it
+splits by what changed: a thin block (the mechanism defers to Elastic) is
+mechanical and `generate_thin.py` rewrites it; a full block needs its work
+order rebuilt and re-authoring against the brief; either way the lint and
+the live validation come before publishing.
+
+### What translates and what does not
+
+`datamaps/ingest/` turns a committed Cribl pipeline into an Elasticsearch
+ingest pipeline. It is deterministic, does no I/O, and **never guesses**:
+a construct outside the declared subset raises `Untranslatable` and that
+step becomes a *manual step*, listed in the envelope with the original
+Cribl function so a human can finish it. Manual steps are omitted, not
+stubbed — the generated pipeline does only what it claims to do.
+
+Over the whole corpus, 2,093 non-comment steps produce 1,758 translated
+whole, 194 translated in part, and 141 manual: **93.3% of steps are
+usable**. 79 of the 141 manual steps are `code` functions, which are
+arbitrary JavaScript and will never translate; `tests/test_ingest_pipeline.py`
+holds the aggregate as a floor so a regression in the subset fails CI.
+
+One row per Cribl function, as the translator is built:
+
+| Cribl function | Elasticsearch processors |
+|---|---|
+| `comment` | none; the text is folded into the following step's processor descriptions |
+| `serde` extract json | `json`, with `add_to_root` or a `target_field` when `dstField` is set |
+| `serde` extract kvp | one `script` that scans `key=value` pairs left to right the way Cribl's extractor does. Not the `kv` processor: `kv` throws on the first token that has no delimiter, and an unquoted CEF value with spaces produces exactly such a token, so the whole extraction would be dropped |
+| `serde` extract csv / delim | `csv` with `target_fields` from the `fields` list |
+| `regex_extract` | one `grok` per regex — `regex` first, then each `regexList` entry, because Cribl applies all of them while grok's own list means first-match — each with `ignore_failure`, since grok raises where Cribl extracts nothing |
+| `eval` add, constant row | `set` with `ignore_failure` |
+| `eval` add, single field read | `set` with `copy_from`, `ignore_empty_value` and `ignore_failure` |
+| `eval` add, any other row | one `script` holding one `try`/`catch` per row. The catch is the isolation, not `ignore_failure`: a row that throws leaves its own field unset and the remaining rows still run, which is Cribl's per-row behaviour |
+| `eval` remove | one `remove` with `ignore_missing`; a wildcard entry becomes a manual part of the step |
+| `eval` keep | manual (absent from the corpus; defined so the behaviour is not a surprise) |
+| `rename` | `rename` per pair with `ignore_missing` and `ignore_failure`; a wildcard or `baseFields` form is manual |
+| `drop` | `drop`, carrying the step's own filter as its `if` |
+| `mask` | `gsub` per rule per listed field, with `ignore_missing` and `ignore_failure`; a rule whose replacement is not a string literal is manual |
+| `auto_timestamp` | `date` into the mapped `dstField` (`_time`, so `@timestamp`, in all but one committed pipeline) with `formats: ["ISO8601", "UNIX", "UNIX_MS"]`, plus a note that Cribl auto-detected the format instead |
+| `numerify` | `convert` with `type: auto` per listed field; the "every numeric-looking field" form is manual |
+| `code`, `distinct`, `unroll`, `xml_unroll`, `flatten`, `rollup_metrics` | manual |
+
+A row that writes or removes a Cribl internal field (`__*`) is skipped
+with a note rather than made manual: there is nothing on the
+Elasticsearch side for it to mean. A step's own `filter`, when it is not
+`"true"`, becomes an `if` on every processor that step emits; if the
+filter itself cannot be translated the whole step is manual, because
+running unconditionally what Cribl ran conditionally would be a different
+pipeline.
+
+**The expression subset.** `eval` values and non-trivial filters are
+JavaScript, and `datamaps/ingest/expr.py` tokenizes, parses and emits
+Painless for this much of it. Literals: strings in either quote with JS
+escapes including `\uXXXX`, numbers, `true`, `false`, `null`, `undefined`,
+and array literals. Field reads: `__e['name']`, `__e["name"]`, `__e.name`,
+a dotted path inside the string (`__e['source.ip']` → `ctx.source?.ip`),
+and a **bare identifier, which is a field read** — Cribl evaluates these
+inside `with(__e)`, so `action` means the `action` field; a bare
+identifier followed by `(` is refused. Operators: the ternary, `||`,
+`&&`, `!`, `===`, `!==`, `==`, `!=`, the four relational operators,
+`+ - * / %`, unary minus, unary plus, and `typeof x` compared with a
+string literal. Calls: `parseInt` (radix 10 only), `parseFloat`, `Number`,
+`String`, `Boolean`, `Date.parse`, `new Date(x).toISOString()`,
+`new Date(x).getTime()`, `Math.floor`, `Math.round`, `Math.abs`,
+`Math.max`, `Math.min`, `Array.isArray`. Methods on an expression:
+`.toLowerCase()`, `.toUpperCase()`, `.trim()`, `.split(sep)`,
+`.replace(pattern, 'literal')`, `.startsWith()`, `.endsWith()`,
+`.includes()`, `.indexOf()`, `.substring()` and `.slice()` with
+non-negative indices, `.toString()`, `.test(x)` on a regex literal, and
+`.match(/re/)` as a condition.
+
+Three emission rules are worth knowing because they are not the obvious
+translation. First, `||` and `&&` do not become Java's operators as they
+stand: in a value position they become a ternary that yields the operand
+JavaScript would have yielded, and in a condition position each side is
+first turned into an explicit JavaScript truthiness test. That test is
+narrowed to what Painless will actually compile, because Painless is
+statically typed and comparing a `long` with `''` is a compile error:
+where the emitter already knows the operand is numeric it compares against
+`0`, where it knows the operand is a string it compares against `null` and
+`''`, and an untyped field read gets the full `!= null && != false &&
+!= '' && != 0` template. Second, a `+` with a string operand concatenates
+through `String.valueOf`, and a `+` where neither side is known to be a
+string or a number is refused rather than guessed. Third, a regex literal
+becomes a Painless `/re/` literal, which is why some pipelines carry a
+deployment prerequisite (below).
+
+**Field names.** Every path read or written goes through one table:
+
+| Cribl | Elasticsearch |
+|---|---|
+| `_time` | `@timestamp` |
+| `_raw` | `message` |
+| `__*` | no equivalent: a write or a remove is skipped with a note, a *read* makes its row untranslatable |
+
+A key containing `/` or `:` is also refused — whether its separators nest
+or are literal is exactly the kind of guess this transpiler does not make.
+Dotted names become `ctx.a.b` on the Painless side and stay dotted in
+`csv` target fields and `rename` targets, which Elasticsearch expands into
+objects. The table travels in every envelope as `field_map`.
+
+**Semantic divergences worth knowing before you trust one of these
+pipelines.** Each of these is a place where the generated pipeline is
+*correct Painless* and still does not behave the way the Cribl step did:
+
+- `parseInt(x)` and `Number(x)` on non-numeric text **throw** in Painless
+  where JavaScript yields `NaN`. Inside an `eval` row the per-row
+  `try`/`catch` swallows it and the field is left unset, which is usually
+  what you wanted — but it is unset, not `NaN`.
+- `Date.parse(x)` becomes `ZonedDateTime.parse(…)`, which throws on input
+  it cannot parse where JavaScript returns `NaN`. A Cribl idiom like
+  `Date.parse(x) || 0` therefore **never reaches its fallback**: the
+  exception is taken before the `||` is evaluated.
+- A **missing** bare-identifier read is `null` in Painless, where Cribl
+  throws. The divergence runs toward forgiveness: a transpiled filter
+  evaluates on events that Cribl would have failed on.
+- `.replace('a', 'b')` with a **string** pattern replaces every
+  occurrence, because Painless's `String.replace` does; JavaScript
+  replaces only the first. A regex pattern keeps the distinction —
+  `replaceAll` with the `g` flag, `replaceFirst` without.
+- `mask` becomes `gsub`, which replaces **every** match even where the
+  Cribl rule had no `g` flag and replaced only the first. The envelope
+  records a note whenever that applies.
+- Loose `==` and `!=` against a string or number literal compare **as
+  strings**: `x == 5` emits `String.valueOf(ctx.x) == '5'`. That matches
+  what the corpus means by it, and it is not JavaScript's coercion table.
+- `.length` is refused outright. Painless spells it `.length()` on a
+  string and `.length` on a list, and the transpiler cannot tell which a
+  field holds.
+- `rename` **never overwrites** an existing target field. Elasticsearch's
+  `rename` fails when the target exists, and `ignore_failure` turns that
+  into a silent no-op; Cribl's `rename` overwrites.
+- A step-level `filter` becomes an `if` on **every processor the step
+  emits**, and one `eval` can emit several. Elasticsearch therefore
+  re-evaluates the condition once per processor, where Cribl evaluated it
+  once per step. Same result, more work.
+- The `kvp` scan does not trim quotes and brackets from values the way
+  Cribl's extractor does beyond keeping a quoted value intact. Values that
+  Cribl would have cleaned up arrive with their punctuation.
+
+**One deployment prerequisite.** A pipeline whose envelope lists
+`painless-regex` in `requires` uses a Painless regex literal, and
+Elasticsearch refuses to compile those unless the node is started with
+`script.painless.regex.enabled: true`. 239 of the 605 envelopes are in
+that set. The failure is a compile error at
+`PUT _ingest/pipeline/<id>` time, and it is the node setting rather than
+the pipeline; the Picker says so beside the `requires` list.
+
+### What verification means
+
+Every push, on the unchanged runners:
+
+    python3 -m unittest discover -s tests
+    node --test studio/tests/*.test.js static/picker/tests/*.test.js
+
+The Python suite runs `datamaps.cribl_lint` over all 605 committed
+pipelines, the transpiler's expression, function, `eval` and envelope
+tests, the aggregate coverage floor over the whole corpus, the export
+parity checks (the exported HTML fragment must be a substring of the
+technology page; the Python CSV header must equal Studio's
+`CSV_COLUMNS`), and `check_pipelines`'s invariants through the build test.
+The build itself must succeed, with `no-pipeline` reported as a flag
+rather than a failure. The Node suite covers the Picker's hash
+round-trip, its cascading selection rules and each artifact state.
+
+None of that talks to a Cribl or an Elasticsearch. One check does, and it
+is run by a person rather than by CI: `tools/validate_live/` POSTs every
+committed pipeline to a real Cribl Stream 4.19 and PUTs every generated
+ingest pipeline to a real Elasticsearch, where Painless actually compiles,
+then `_simulate`s each one with a stub document. It writes
+`docs/verification/<date>-live-validation.md` with each target's endpoint
+and version, the totals, and every failure verbatim, and that report is
+committed. A target that is neither loopback nor a `.example` placeholder
+is recorded as `<scheme>://<private host>:<port>`, so a run against
+internal infrastructure names no host in this repository.
+[`tools/validate_live/README.md`](tools/validate_live/README.md) is the
+runbook and is authoritative for how to run it.
+
+**What a green report proves, and what it does not.** It proves
+acceptance: Cribl took every conf, and Elasticsearch compiled every
+processor and loaded every pipeline. It does **not** prove that either
+pipeline parses a real record correctly — this repository holds no example
+records to run through them, by design, and a pipeline can be perfectly
+valid and still extract the wrong field. Treat a generated ingest pipeline
+as a reviewed starting point, not as a tested one.
+
+**The run is destructive on its targets.** The `dm_` prefix is reserved
+for validation. On Cribl the run DELETEs each `dm_*` id before it POSTs and
+again when it is done; on Elasticsearch the `PUT` overwrites any pipeline
+already holding that id and the run deletes it afterwards. Nothing is
+backed up first either way, so a Cribl pipeline or an Elasticsearch ingest
+pipeline already named `dm_*` on the instance you point it at is gone and
+is not restored. Point it at a scratch instance.
 
 ## Building locally
 

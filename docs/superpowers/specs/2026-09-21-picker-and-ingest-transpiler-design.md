@@ -166,6 +166,8 @@ produces Painless source:
   identifier reads the field of that name (Cribl evaluates expressions inside
   `with(__e)`); the semantic lint still forbids bare reads in `eval` values,
   where an absent field throws in Cribl, but `filter`s use the idiom widely.
+  A missing bare read is `null` in Painless rather than an exception, so a
+  transpiled filter is more forgiving than the Cribl filter it came from.
   A bare identifier followed by `(` is untranslatable.
 - Operators: `?:`, `||`, `&&`, `!`, `===`, `!==`, `==`, `!=`, `<`, `<=`,
   `>`, `>=`, `+`, `-`, `*`, `/`, `%`, unary `-`, parentheses, `typeof x`.
@@ -208,16 +210,16 @@ if the filter is untranslatable the whole step is manual.
 |---|---|
 | `comment` | none; text appended to the next processor's `description` |
 | `serde` extract json | `json` `{field, add_to_root: true}` or `target_field` when `dstField` given |
-| `serde` extract kvp | `kv` `{field, field_split, value_split, ignore_missing}` from `delimChar`/`quoteChar`/`kvDelim` |
+| `serde` extract kvp | one `script` scanning `key=value` pairs left to right the way Cribl's extractor does, from `pairDelim`/`kvDelim`, into the root or into `dstField`. **Not** the `kv` processor: `kv` throws on the first `field_split` token carrying no kv delimiter, and an unquoted CEF value with spaces (`msg=User logged in cs1=x`) produces exactly such a token, so `ignore_failure` would silently drop the whole extraction |
 | `serde` extract csv / delim | `csv` `{field, target_fields, separator, quote, ignore_missing}` from `fields` |
 | `regex_extract` | one `grok` `{field: source, patterns: [regex], ignore_missing: true, ignore_failure: true}` per regex (`regex` then each `regexList` entry — Cribl applies all of them, grok's own list means first-match). `ignore_failure` because grok raises on no match while Cribl silently extracts nothing. `iterations` is recorded as a note, not a manual step: every named group extracts once either way |
-| `eval` `add` | per row: `set {field, value}` for a constant, `set {field, copy_from, ignore_empty_value: true}` for a single field ref; otherwise `script` assigning `ctx.<field>` with intermediate-map guards and `if (v != null)` so an `undefined` result leaves the field unset. `set`/`script` from `eval` carry `ignore_failure: true`, mirroring Cribl, where a throwing expression leaves the field unset and the event continues. Rows that fail translation make the step *partial*: the good rows are emitted and the failing rows are listed as a manual step |
+| `eval` `add` | per row: `set {field, value, ignore_failure: true}` for a constant, `set {field, copy_from, ignore_empty_value: true, ignore_failure: true}` for a single field ref; otherwise one `script` holding one `try { def v = <expr>; if (v != null) { <target> = v; } } catch (Exception e) { }` per row, with intermediate-map guards, so an `undefined` result leaves the field unset. The per-row `try`/`catch` is what mirrors Cribl, where a throwing expression leaves that field unset and the event continues; the `script` processor carries no `ignore_failure`, which would abandon the remaining rows instead. Rows that fail translation make the step *partial*: the good rows are emitted and the failing rows are listed as a manual step |
 | `eval` `remove` | one `remove {field: [...], ignore_missing: true}`; a wildcard entry makes the step manual |
 | `eval` `keep` | manual (absent from the corpus; listed so the behaviour is defined) |
-| `rename` | `rename {field, target_field, ignore_missing: true}` per row; `baseFields`/wildcard forms → manual |
+| `rename` | `rename {field, target_field, ignore_missing: true, ignore_failure: true}` per row; `baseFields`/wildcard forms → manual. `ignore_failure` because Elasticsearch's `rename` fails when the target field already exists, where Cribl's overwrites |
 | `drop` | `drop {if: <filter>}`; unconditional drop → `drop` |
 | `mask` | `gsub {field, pattern, replacement}` per rule on each listed field; rules with JS replacement functions → manual |
-| `auto_timestamp` | `date {field: srcField or 'message', target_field: '@timestamp', formats: [...]}`; formats from `timeExpression` when it is a strptime string or `iso8601`/`UNIX`/`UNIX_MS`; otherwise `["ISO8601", "UNIX", "UNIX_MS"]` and a note |
+| `auto_timestamp` | `date {field: srcField or 'message', target_field: mapped dstField or '@timestamp', formats: ["ISO8601", "UNIX", "UNIX_MS"], ignore_failure: true}` plus a note that Cribl auto-detected the format. `timeExpression` is not read: no committed pipeline sets one, and a strptime string would be a second format dialect to translate |
 | `numerify` | `convert {field, type: 'auto'}` per listed field; the "all numeric-looking fields" form → manual |
 | `code`, `distinct`, `unroll`, `xml_unroll`, `flatten`, `rollup_metrics` | manual |
 
@@ -225,7 +227,8 @@ Field-name translation applies to every field path read or written:
 `_time` → `@timestamp`, `_raw` → `message`; other Cribl internal fields
 (`__*`) are dropped from writes and flagged when read. Dotted names become
 `ctx.a.b` paths; grok/kv/csv targets keep dots (Elasticsearch expands them).
-The table is `FIELD_MAP` in `functions.py` and is emitted in the envelope.
+The table is `FIELD_MAP` in `expr.py`, re-exported through `functions.py`,
+and is emitted in the envelope.
 
 ### 3.5 `datamaps/ingest/pipeline.py` — envelope
 

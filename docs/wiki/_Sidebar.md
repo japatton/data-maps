@@ -2,6 +2,7 @@
 - **Doing something**
   - [Add a technology](Add-a-technology)
   - [Studio tasks](Studio-tasks)
+  - [Picker](Picker)
 - **When it goes wrong**
   - [Troubleshooting](Troubleshooting)
   - [Runbooks](Runbooks)

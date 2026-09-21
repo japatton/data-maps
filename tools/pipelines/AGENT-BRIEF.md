@@ -210,7 +210,7 @@ in an `eval.add`. Most technologies need both.
 `eval.remove` and by `rename`, and a glob will not always reach it. Read it with
 `__e['Status.Call.0.Status']` in an `eval.add` value and simply LEAVE the original
 in the event — a harmless duplicate field beats a rejected pipeline. Say so in the
-README rather than pretending it was cleaned up.
+pipeline's `conf.description` rather than pretending it was cleaned up.
 
 
 ## ★ Five platform constraints found the hard way — respect all of them
@@ -275,7 +275,7 @@ defines no algorithm or token scheme, do NOT invent one — record it as a gap.
 **Where a field name is unguessable** (a map listing generic vendor mnemonics
 rather than the literal keys an upstream decoder emits, or operator-chosen JSON
 key names with no standard), do NOT guess. Leave it unmapped and say why in the
-README. A documented gap is worth more than a wrong rename.
+pipeline's `conf.description`. A documented gap is worth more than a wrong rename.
 
 ## Validate every pipeline against the live instance
 
@@ -319,10 +319,14 @@ For work order `<tech>` or `<tech>--<dataset>`, write to
 create it if absent):
 - one file per pipeline named `<dataset-id>__<format>.json`, holding the full
   POST body
-- append your rows to `data/pipelines/<tech>/README.md` — a table of dataset,
-  format, mechanism, function count and validation result, plus a "decisions and
-  gaps" section. If the file exists, ADD to it; never overwrite another agent's
-  rows.
+
+Nothing else. There is no per-technology README: that convention was retired,
+and `data/pipelines/` holds pipeline JSON and nothing else. Record your
+decisions and your gaps inside the pipeline itself — `conf.description` names
+the technology, dataset, format and parsing approach in one line, and the
+leading `comment` function is where the reasoning, the deviations from this
+brief and anything you could not map belong. They travel with the pipeline,
+they are visible to whoever loads it into Cribl, and the build publishes them.
 
 ## Report back
 

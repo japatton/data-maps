@@ -44,9 +44,42 @@ crosses the guard has only *direct*.
 **MVX** — FireEye's detonation engine; its output is why some alert feeds
 carry an analysis trace.
 
+**Ingest pipeline** — Elasticsearch's own parsing stage: a named list of
+processors the cluster runs over a document as it is indexed. It is the
+Cribl pipeline's counterpart for anyone who does not run Cribl, and this
+repository generates one per feed by translating the Cribl pipeline.
+
 ## This repository
 
 **Studio** — the browser editor for the catalog, at `studio/` on the site.
+
+**Picker** — the consumer page, at `picker.html` on the site: pick a
+technology, dataset and wire format and it hands back that block's map plus
+either the Cribl pipeline or an Elasticsearch ingest pipeline translated
+from it. Studio is for the people who own a map; the Picker is for the
+people who have to use one.
+
+**Envelope** — what the translator emits for one feed: the ingest pipeline
+itself under `pipeline`, plus the coverage counts, the notes, the manual
+steps and the field map. Elasticsearch only wants the `pipeline` part, so
+that is all the Picker's download contains; the rest is the report.
+
+**Manual step** — a Cribl function the translator refused to translate,
+because doing so would have meant guessing at its meaning. It contributes
+no processor at all, and the envelope lists it with the reason and the
+original Cribl function so a human can finish it. `code` functions are the
+largest group.
+
+**Partial step** — a step that translated in part: some of an `eval`'s rows
+became processors and the others are listed as a manual part of it. The
+pipeline does what the translated rows say and nothing more.
+
+**Coverage** — two different counts, depending on where you are reading
+it. On the catalog, a technology page or the ECS index it means *mapping*
+coverage: how many of a dataset's alerting-required ECS fields its
+recommended format actually maps. On a generated ingest pipeline it means
+*translation* coverage: how many of the Cribl pipeline's steps became
+processors, split into translated, partial and manual.
 
 **Draft** — a map researched but not yet verified against the deployed
 system. Published with a banner saying so.

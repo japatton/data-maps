@@ -138,5 +138,57 @@ reads the change. Either way the refusal is a paragraph on the screen
 rather than a tooltip, and it holds the confirm button shut however
 correctly you type the id.
 
+## My ingest pipeline has manual steps
+
+The Picker's coverage badge reads something like *"6 of 8 steps translated,
+1 partial, 1 manual"*, and the file you downloaded is short by those steps.
+That is deliberate.
+
+A **manual step** is a Cribl function the translator would have had to
+guess at, so it emitted nothing for it. A **partial step** is one where
+some of an `eval`'s rows translated and others did not: the good rows are
+in the pipeline and the rest are listed.
+
+Nothing is stubbed on purpose. There is no placeholder processor to find
+and no marker comment to grep for, because a processor that silently
+half-did the step would be worse than a pipeline that is honestly short —
+you would load it, see no error, and never learn that a field is missing.
+
+Finish one by hand from what the page gives you: the function's name, the
+reason it was refused, the description the pipeline's author wrote for that
+step, and the original Cribl function's own JSON under **Original Cribl
+function**. Read the reason first — it usually names the exact construct
+(`code has no ingest-processor equivalent`, or a regex literal in a
+position the expression subset does not cover) — and the Cribl JSON
+beside it tells you what the step was for.
+
+Two of these are worth knowing before you start. A `code` function is
+arbitrary JavaScript and will never translate; expect to write a `script`
+processor. Every other manual step is a construct the subset does not
+cover, and the README's [translation section][translate] lists what those
+are, so you can tell "not supported yet" from "cannot be supported".
+
+## Elasticsearch rejects the ingest pipeline with a regex error
+
+`PUT _ingest/pipeline/<id>` fails to compile, complaining that regexes
+are disabled. That is the node, not the pipeline.
+
+Check the Picker's **Requires** line for the pipeline: if it says
+`painless-regex`, the generated Painless contains a `/regex/` literal, and
+Elasticsearch refuses to compile one unless the node was started with
+
+    script.painless.regex.enabled: true
+
+It goes in `elasticsearch.yml` (or the container's environment); the
+cluster-settings API cannot set it, so it takes a node restart. 239 of the
+605 generated pipelines are in that set, so a cluster without the setting
+will take some of them and reject these.
+
+The same setting is why `tools/validate_live/compose.yml` sets it on its
+throwaway Elasticsearch: without it every one of those 239 would appear in
+the validation report as a compile failure and the report would be
+measuring the node instead of the pipelines.
+
 [status]: {{REPO}}/README.md#mapping-status
 [studio]: {{REPO}}/README.md#studio
+[translate]: {{REPO}}/README.md#what-translates-and-what-does-not
