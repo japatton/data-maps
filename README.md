@@ -620,9 +620,12 @@ a ticket:
     picker.html#<tech>/<dataset>/<format>?cribl=1|0&dest=elastic
     picker.html#cisco-asa/device-admin/snmp-trap?cribl=0&dest=elastic
 
-An id the catalog does not have resets the selection at that level and
-draws a notice naming what it could not find, rather than silently
-showing something else.
+An id the catalog does not have always draws a notice naming what it could
+not find, and what happens to the selection depends on which level it was.
+An unknown technology clears all three; an unknown dataset keeps the
+technology and clears the dataset and the format. An unknown *format* is
+the exception: the notice appears, and the selection falls back to that
+dataset's recommended format rather than to nothing.
 
 The result panel carries, top to bottom:
 
@@ -1163,21 +1166,24 @@ pipelines, the transpiler's expression, function, `eval` and envelope
 tests, the aggregate coverage floor over the whole corpus, the export
 parity checks (the exported HTML fragment must be a substring of the
 technology page; the Python CSV header must equal Studio's
-`CSV_COLUMNS`), and `check_pipelines`'s invariants through the build test.
-The build itself must succeed, with `no-pipeline` reported as a flag
-rather than a failure. The Node suite covers the Picker's hash
-round-trip, its cascading selection rules and each artifact state.
+`CSV_COLUMNS`), and `check_pipelines`'s three hard invariants — an orphan
+pipeline, a wrong id, a pipeline for a `mechanism: none` block — asserted
+one apiece in `tests/test_pipelines.py`. The build itself must succeed,
+with `no-pipeline` reported as a flag rather than a failure. The Node suite
+covers the Picker's hash round-trip, its cascading selection rules and each
+artifact state.
 
 None of that talks to a Cribl or an Elasticsearch. One check does, and it
 is run by a person rather than by CI: `tools/validate_live/` POSTs every
-committed pipeline to a real Cribl Stream 4.19 and PUTs every generated
-ingest pipeline to a real Elasticsearch, where Painless actually compiles,
-then `_simulate`s each one with a stub document. It writes
-`docs/verification/<date>-live-validation.md` with each target's endpoint
-and version, the totals, and every failure verbatim, and that report is
-committed. A target that is neither loopback nor a `.example` placeholder
-is recorded as `<scheme>://<private host>:<port>`, so a run against
-internal infrastructure names no host in this repository.
+committed pipeline to a real Cribl Stream 4.19, and PUTs every generated
+ingest pipeline to a real Elasticsearch — where Painless actually compiles
+— and then `_simulate`s it there with a stub document. (Only the
+Elasticsearch side simulates; the Cribl side is a DELETE, a POST and a
+DELETE.) It writes `docs/verification/<date>-live-validation.md` with each
+target's endpoint and version, the totals, and every failure verbatim, and
+that report is committed. A target that is neither loopback nor a
+`.example` placeholder is recorded as `<scheme>://<private host>:<port>`,
+so a run against internal infrastructure names no host in this repository.
 [`tools/validate_live/README.md`](tools/validate_live/README.md) is the
 runbook and is authoritative for how to run it.
 

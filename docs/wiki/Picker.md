@@ -93,10 +93,11 @@ it:
     picker.html#forcepoint-dlp/incident/syslog-cef?cribl=0&dest=elastic
 
 `cribl=0` is the Cribl toggle off — the ingest-pipeline view — and `1` is
-on. A link whose technology, dataset or format the catalog does not have
-resets the selection at that level and says what it could not find, so a
-stale link tells you it is stale instead of quietly showing a different
-feed.
+on. A stale link always says what it could not find rather than quietly
+showing a different feed. A technology the catalog no longer has clears the
+whole selection; a missing dataset keeps the technology and clears the
+rest; a format that is gone leaves you on that dataset's recommended
+format, with the notice telling you the one in the link is not there.
 
 ## The result says the parsing happens somewhere else
 

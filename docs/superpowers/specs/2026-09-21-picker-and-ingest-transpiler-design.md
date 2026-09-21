@@ -227,8 +227,7 @@ Field-name translation applies to every field path read or written:
 `_time` → `@timestamp`, `_raw` → `message`; other Cribl internal fields
 (`__*`) are dropped from writes and flagged when read. Dotted names become
 `ctx.a.b` paths; grok/kv/csv targets keep dots (Elasticsearch expands them).
-The table is `FIELD_MAP` in `expr.py`, re-exported through `functions.py`,
-and is emitted in the envelope.
+The table is `FIELD_MAP` in `expr.py` and is emitted in the envelope.
 
 ### 3.5 `datamaps/ingest/pipeline.py` — envelope
 
