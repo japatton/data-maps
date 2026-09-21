@@ -1,0 +1,166 @@
+{
+  "id": "dm_cisco_cucm_cdr_api_pull",
+  "conf": {
+    "output": "default",
+    "description": "Cisco CUCM CDR via CDRonDemand SOAP pull (dataset=cdr, format=api-pull): parsing is shared verbatim with format=other because get_file delivers the identical CDR flat file - skip 2 header lines, positionally extract named columns per Cisco's published CDR field order, decode epoch/int-IP/Q.850 values, drop CMR records, map to ECS + cisco.cucm.cdr.* custom fields; the api-pull difference (get_file_list paging, SFTP delivery) is collector-side.",
+    "functions": [
+      {
+        "id": "comment",
+        "filter": "true",
+        "conf": {
+          "comment": "CUCM CDR pulled via the CDRonDemand SOAP service (dataset=cdr, format=api-pull). Parsing is SHARED VERBATIM with format=other: get_file still delivers the identical CDR flat file -- quoted field-name header line, field-type header line, then CSV records -- so there is no new grammar and no new field inventory, and every function below is the format=other pipeline unchanged. api-pull changes collection only, and that lives in the Source rather than here: get_file_list discovery paged in <=1h windows, <=1300 filenames per response, reconciled against what get_file already delivered, on Persistent Queue (recommendations.direct.cribl). Nothing in format=other was transport-specific, so nothing was stripped -- the two header lines and the CMR filter apply to a pulled file too. Column order from Cisco's published CDR Field Descriptions (15/14/12.5)."
+        }
+      },
+      {
+        "id": "drop",
+        "filter": "_raw.indexOf('\"cdrRecordType\"') === 0 || /^\\s*(INTEGER|VARCHAR)/i.test(_raw)",
+        "conf": {},
+        "description": "Skip line 1 (quoted field-name header) and line 2 (field-type header) so they are not ingested as data records"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^(?<cdrRecordType>[^,]*),(?:[^,]*,){1}(?<globalCallID_callId>[^,]*),(?<origLegCallIdentifier>[^,]*),(?<dateTimeOrigination>[^,]*),(?:[^,]*,){2}(?<origIpAddr>[^,]*),(?<callingPartyNumber>[^,]*),(?<callingPartyUnicodeLoginUserID>[^,]*),(?:[^,]*,){1}(?<origCause_value>[^,]*),(?:[^,]*,){17}(?<originalCalledPartyNumber>[^,]*),(?<finalCalledPartyNumber>[^,]*),(?<finalCalledPartyUnicodeLoginUserID>[^,]*),(?:[^,]*,){1}(?<destCause_value>[^,]*),(?:[^,]*,){13}(?<dateTimeConnect>[^,]*),(?<dateTimeDisconnect>[^,]*),(?<lastRedirectDn>[^,]*),(?:[^,]*,){5}(?<duration>[^,]*),(?<origDeviceName>[^,]*),(?<destDeviceName>[^,]*),(?:[^,]*,){15}(?<callSecuredStatus>[^,]*),(?:[^,]*,){6}(?<origIpv4v6Addr>[^,]*),(?<destIpv4v6Addr>[^,]*)/",
+          "source": "_raw"
+        },
+        "description": "Positionally extract the 20 named CDR columns this map covers, using Cisco's documented column order (position-or-name map per recommendation)"
+      },
+      {
+        "id": "comment",
+        "filter": "true",
+        "conf": {
+          "comment": "Companion CMR (diagnostic) records share this repository but are out of scope for this dataset; cdrRecordType==2 marks a CMR record per the work order."
+        }
+      },
+      {
+        "id": "drop",
+        "filter": "cdrRecordType=='2'",
+        "conf": {},
+        "description": "Drop CMR diagnostic records; keep only CDR end-of-call records (cdrRecordType==1)"
+      },
+      {
+        "id": "rename",
+        "filter": "true",
+        "conf": {
+          "rename": [
+            {
+              "currentName": "callingPartyUnicodeLoginUserID",
+              "newName": "source.user.name"
+            },
+            {
+              "currentName": "finalCalledPartyUnicodeLoginUserID",
+              "newName": "destination.user.name"
+            },
+            {
+              "currentName": "destIpv4v6Addr",
+              "newName": "destination.ip"
+            }
+          ]
+        },
+        "description": "Straight-copy the mapped ECS fields that need no value transform"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            {
+              "name": "_time",
+              "value": "__e['dateTimeOrigination'] ? +__e['dateTimeOrigination'] : _time"
+            },
+            {
+              "name": "event.start",
+              "value": "(!__e['dateTimeConnect'] || __e['dateTimeConnect']=='0') ? null : new Date(+__e['dateTimeConnect']*1000).toISOString()"
+            },
+            {
+              "name": "event.end",
+              "value": "__e['dateTimeDisconnect'] ? new Date(+__e['dateTimeDisconnect']*1000).toISOString() : null"
+            },
+            {
+              "name": "event.duration",
+              "value": "__e['duration'] ? +__e['duration']*1e9 : null"
+            },
+            {
+              "name": "source.ip",
+              "value": "(__e['origIpv4v6Addr'] && __e['origIpv4v6Addr']!=='') ? __e['origIpv4v6Addr'] : (((+__e['origIpAddr'])&255)+'.'+(((+__e['origIpAddr'])>>>8)&255)+'.'+(((+__e['origIpAddr'])>>>16)&255)+'.'+(((+__e['origIpAddr'])>>>24)&255))"
+            },
+            {
+              "name": "event.reason",
+              "value": "__e['origCause_value']=='16'?'normal clearing':__e['origCause_value']=='17'?'user busy':__e['origCause_value']=='18'?'no user responding':__e['origCause_value']=='19'?'no answer from user':__e['origCause_value']=='21'?'call rejected':__e['origCause_value']=='22'?'number changed':__e['origCause_value']=='27'?'destination out of order':__e['origCause_value']=='31'?'normal, unspecified':__e['origCause_value']=='34'?'no circuit/channel available':__e['origCause_value']=='38'?'network out of order':__e['origCause_value']=='41'?'temporary failure':__e['origCause_value']=='42'?'switching equipment congestion':__e['origCause_value']=='44'?'requested channel not available':__e['origCause_value']=='63'?'service or option not available':__e['origCause_value']=='127'?'interworking, unspecified':('Q.850 cause '+__e['origCause_value']+' (unmapped)')"
+            },
+            {
+              "name": "cisco.cucm.cdr.record_type",
+              "value": "__e['cdrRecordType']"
+            },
+            {
+              "name": "cisco.cucm.cdr.global_call_id",
+              "value": "__e['globalCallID_callId']"
+            },
+            {
+              "name": "cisco.cucm.cdr.orig_leg_call_identifier",
+              "value": "__e['origLegCallIdentifier']"
+            },
+            {
+              "name": "cisco.cucm.cdr.calling_party_number",
+              "value": "__e['callingPartyNumber']"
+            },
+            {
+              "name": "cisco.cucm.cdr.original_called_party_number",
+              "value": "__e['originalCalledPartyNumber']"
+            },
+            {
+              "name": "cisco.cucm.cdr.final_called_party_number",
+              "value": "__e['finalCalledPartyNumber']"
+            },
+            {
+              "name": "cisco.cucm.cdr.last_redirect_dn",
+              "value": "__e['lastRedirectDn']"
+            },
+            {
+              "name": "cisco.cucm.cdr.orig_device_name",
+              "value": "__e['origDeviceName']"
+            },
+            {
+              "name": "cisco.cucm.cdr.dest_device_name",
+              "value": "__e['destDeviceName']"
+            },
+            {
+              "name": "cisco.cucm.cdr.dest_cause_value",
+              "value": "__e['destCause_value']"
+            },
+            {
+              "name": "cisco.cucm.cdr.call_secured_status",
+              "value": "__e['callSecuredStatus']"
+            },
+            {
+              "name": "event.dataset",
+              "value": "'cisco_cucm.cdr'"
+            }
+          ],
+          "remove": [
+            "cdrRecordType",
+            "globalCallID_callId",
+            "origLegCallIdentifier",
+            "dateTimeOrigination",
+            "dateTimeConnect",
+            "dateTimeDisconnect",
+            "duration",
+            "callingPartyNumber",
+            "originalCalledPartyNumber",
+            "finalCalledPartyNumber",
+            "lastRedirectDn",
+            "origDeviceName",
+            "destDeviceName",
+            "origIpAddr",
+            "origIpv4v6Addr",
+            "origCause_value",
+            "destCause_value",
+            "callSecuredStatus"
+          ]
+        },
+        "description": "Decode epoch/int-IP/Q.850 values, set _time, populate ECS partials, map unmapped columns to cisco.cucm.cdr.* custom fields, set event.dataset, drop consumed raw columns"
+      }
+    ]
+  }
+}

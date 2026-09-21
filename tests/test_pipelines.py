@@ -33,7 +33,7 @@ class TestPipelineId(unittest.TestCase):
 class TestLoad(unittest.TestCase):
     def test_loads_every_committed_pipeline(self):
         loaded = pipelines.load_pipelines(DATA)
-        self.assertEqual(len(loaded), 603)
+        self.assertEqual(len(loaded), 605)
         key = ("cisco-asa", "device-admin", "snmp-trap")
         self.assertIn(key, loaded)
         self.assertEqual(loaded[key]["id"],
@@ -71,14 +71,8 @@ class TestCheck(unittest.TestCase):
         cls.model = real_model()
         cls.loaded = pipelines.load_pipelines(DATA)
 
-    def test_real_data_has_only_no_pipeline_flags(self):
-        flags = pipelines.check_pipelines(self.loaded, self.model)
-        codes = set(f["code"] for f in flags)
-        self.assertLessEqual(codes, {pipelines.NO_PIPELINE})
-        subjects = sorted(f["subject"] for f in flags)
-        # The two cisco-cucm api-pull blocks are the known gaps until Task 4.
-        for s in subjects:
-            self.assertTrue(s.startswith("cisco-cucm/"), s)
+    def test_real_data_has_no_flags(self):
+        self.assertEqual(pipelines.check_pipelines(self.loaded, self.model), [])
 
     def test_none_blocks_have_no_pipeline_and_no_flag(self):
         flags = pipelines.check_pipelines(self.loaded, self.model)
@@ -125,9 +119,9 @@ class TestBuildIntegration(unittest.TestCase):
         with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
             code = build.main(data_dir=DATA, out_dir=out)
         self.assertEqual(code, 0, buf.getvalue())
-        self.assertIn("603 pipelines", buf.getvalue())
+        self.assertIn("605 pipelines", buf.getvalue())
         with open(os.path.join(out, "index.html"), encoding="utf-8") as fh:
-            self.assertIn("no-pipeline", fh.read())
+            self.assertNotIn("no-pipeline", fh.read())
 
 
 if __name__ == "__main__":
