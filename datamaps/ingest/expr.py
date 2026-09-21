@@ -491,7 +491,19 @@ class _Emitter(object):
         return False
 
     def truthy(self, node):
+        """Inlined JS truthiness, narrowed to what Painless will compile.
+
+        Painless is statically typed: comparing the `long` from
+        `...toEpochMilli()` with null, false or '' is a compile-time error that
+        fails the whole script at PUT time.  So when the emitter already knows
+        the operand's type statically, only the comparisons that type admits
+        are emitted; untyped reads (`ctx.x` is `def`) keep the full template.
+        """
         x = self.value(node)
+        if self.is_numeric(node):
+            return "(%s != 0)" % x
+        if self.is_stringy(node):
+            return "(%s != null && %s != '')" % (x, x)
         return "(%s != null && %s != false && %s != '' && %s != 0)" % (x, x, x, x)
 
     # -- condition mode -----------------------------------------------------

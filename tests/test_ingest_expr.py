@@ -35,7 +35,7 @@ class TestTokenize(unittest.TestCase):
             tokenize("'abc")
 
     def test_bad_unicode_escape_is_untranslatable(self):
-        self.assertEqual(tokenize(r"'A'")[0][1], "A")
+        self.assertEqual(tokenize(r"'\u0041'")[0][1], "A")
         for src in (r"'\uZZZZ'", r"'\u12'", r"'\u'"):
             with self.assertRaises(Untranslatable, msg=src):
                 tokenize(src)
@@ -255,6 +255,16 @@ class TestEmitValue(unittest.TestCase):
                          "(%s ? ctx.a : ctx.b)" % truthy("ctx.a"))
         self.assertEqual(self.v("__e['a'] && __e['b']"),
                          "(%s ? ctx.b : ctx.a)" % truthy("ctx.a"))
+
+    def test_truthiness_is_type_aware(self):
+        epoch = "ZonedDateTime.parse(String.valueOf(ctx.t)).toInstant().toEpochMilli()"
+        self.assertEqual(self.v("Date.parse(__e['t']) || 0"),
+                         "((%s != 0) ? %s : 0)" % (epoch, epoch))
+        self.assertEqual(self.v("__e['s'].trim() || 'x'"),
+                         "((ctx.s.trim() != null && ctx.s.trim() != '') "
+                         "? ctx.s.trim() : 'x')")
+        self.assertEqual(self.v("__e['a'] || 'x'"),
+                         "(%s ? ctx.a : 'x')" % truthy("ctx.a"))
 
     def test_comparison_as_value(self):
         self.assertEqual(self.v("__e['signed_flag'] === 'S'"), "(ctx.signed_flag == 'S')")
