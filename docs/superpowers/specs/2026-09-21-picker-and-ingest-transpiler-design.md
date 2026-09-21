@@ -162,8 +162,11 @@ produces Painless source:
 - Literals: string (single/double quoted, JS escapes), number, `true`,
   `false`, `null`, `undefined`, array literal of literals.
 - Field references: `__e['name']`, `__e["name"]`, `__e.name`, and dotted
-  paths inside the string (`__e['source.ip']` → `ctx.source?.ip`). Bare
-  identifiers are rejected (the lint already forbids them).
+  paths inside the string (`__e['source.ip']` → `ctx.source?.ip`). A bare
+  identifier reads the field of that name (Cribl evaluates expressions inside
+  `with(__e)`); the semantic lint still forbids bare reads in `eval` values,
+  where an absent field throws in Cribl, but `filter`s use the idiom widely.
+  A bare identifier followed by `(` is untranslatable.
 - Operators: `?:`, `||`, `&&`, `!`, `===`, `!==`, `==`, `!=`, `<`, `<=`,
   `>`, `>=`, `+`, `-`, `*`, `/`, `%`, unary `-`, parentheses, `typeof x`.
 - Calls: `parseInt(x[, radix])`, `parseFloat(x)`, `Number(x)`, `String(x)`,

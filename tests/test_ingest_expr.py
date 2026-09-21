@@ -103,15 +103,29 @@ class TestParse(unittest.TestCase):
         self.assertEqual(parse("typeof __e['m'] !== 'undefined'"),
                          ("binary", "!==", ("typeof", ("field", ["m"])), ("str", "undefined")))
 
+    def test_bare_identifier_is_a_field_read(self):
+        self.assertEqual(parse("cdrRecordType=='2'"),
+                         ("binary", "==", ("field", ["cdrRecordType"]), ("str", "2")))
+        self.assertEqual(parse("cef_ext !== undefined"),
+                         ("binary", "!==", ("field", ["cef_ext"]), ("undef",)))
+        self.assertEqual(parse("a.b"), ("field", ["a", "b"]))
+        self.assertEqual(parse("a.length"), ("prop", ("field", ["a"]), "length"))
+        self.assertEqual(parse("_raw"), ("field", ["_raw"]))
+
+    def test_bare_identifier_call_is_untranslatable(self):
+        with self.assertRaises(Untranslatable) as ctx:
+            parse("foo(1)")
+        self.assertIn("foo", ctx.exception.reason)
+
     def test_untranslatable_constructs(self):
-        for src in ("foo", "__e['a'] = 1", "x => x", "JSON.parse(__e['a'])",
+        for src in ("foo(1)", "__e['a'] = 1", "x => x", "JSON.parse(__e['a'])",
                     "new Foo()", "__e['a']++", "function(){}", "a; b"):
             with self.assertRaises(Untranslatable, msg=src):
                 parse(src)
 
     def test_error_names_the_token(self):
         with self.assertRaises(Untranslatable) as ctx:
-            parse("__e['a'] + foo")
+            parse("__e['a'] + foo(1)")
         self.assertIn("foo", ctx.exception.reason)
 
 
@@ -356,6 +370,11 @@ class TestEmitCondition(unittest.TestCase):
 
     def test_true_literal(self):
         self.assertEqual(self.c("true"), "true")
+
+    def test_bare_identifier_reads_ctx(self):
+        self.assertEqual(self.c("cdrRecordType=='2'"),
+                         "(String.valueOf(ctx.cdrRecordType) == '2')")
+        self.assertEqual(translate_value("_raw").source, "ctx.message")
 
 
 if __name__ == "__main__":

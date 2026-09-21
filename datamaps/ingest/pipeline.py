@@ -51,7 +51,12 @@ def translate_pipeline(cribl):
         processors.extend(result.processors)
         regex = regex or result.regex
         for note in result.notes:
-            notes.append("%s #%d: %s" % (fid, index, note.split(": ", 1)[-1]))
+            # A note names its own function ("mask: ...") which the "<fid> #N"
+            # prefix repeats; a note naming something else (serde's "kvp: ...")
+            # keeps that qualifier.
+            if note.startswith("%s: " % fid):
+                note = note[len(fid) + 2:]
+            notes.append("%s #%d: %s" % (fid, index, note))
         if result.manual:
             counts["partial"] += 1
             original = copy.deepcopy(fn)

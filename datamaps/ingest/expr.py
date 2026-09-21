@@ -328,8 +328,13 @@ class _Parser(object):
                 return ("call", value, self.args())
             if value in KNOWN_GLOBALS:
                 raise Untranslatable("%s is not supported here" % value, offset)
-            raise Untranslatable("bare identifier %r (fields must be read as "
-                                 "__e['%s'])" % (value, value), offset)
+            # Cribl evaluates expressions inside with(__e), so a bare name
+            # reads the event field of that name.  A call is not a field.
+            self.take()
+            if self.at("punct", "("):
+                raise Untranslatable("bare identifier %r called as a function"
+                                     % value, offset)
+            return ("field", [value])
         self.fail()
 
 

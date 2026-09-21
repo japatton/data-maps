@@ -30,6 +30,14 @@ PARTIAL = {"id": "eval", "filter": "true",
            "description": "mixed"}
 REGEX = {"id": "regex_extract", "filter": "true",
          "conf": {"regex": "/(?<a>\\d+)/", "source": "_raw"}, "description": "grab"}
+KVP = {"id": "serde", "filter": "true",
+       "conf": {"mode": "extract", "type": "kvp", "srcField": "_raw"},
+       "description": "scan pairs"}
+MASK = {"id": "mask", "filter": "true",
+        "conf": {"fields": ["a"],
+                 "rules": [{"matchRegex": "/x/", "replaceExpr": "'1'"},
+                           {"matchRegex": "/y/", "replaceExpr": "'2'"}]},
+        "description": "redact"}
 
 
 class TestEnvelope(unittest.TestCase):
@@ -75,6 +83,16 @@ class TestEnvelope(unittest.TestCase):
         env = ip.translate_pipeline(cribl(DATASET, ts))
         self.assertTrue(any(n.startswith("auto_timestamp #1:") for n in env["notes"]))
 
+    def test_note_keeps_a_qualifier_the_function_id_does_not_match(self):
+        env = ip.translate_pipeline(cribl(KVP))
+        self.assertIn("serde #0: kvp: pairs are scanned", env["notes"][0])
+
+    def test_identical_notes_from_two_rules_are_said_once(self):
+        env = ip.translate_pipeline(cribl(DATASET, MASK))
+        mask_notes = [n for n in env["notes"] if n.startswith("mask #1:")]
+        self.assertEqual(len(mask_notes), 1)
+        self.assertIn("had no g flag", mask_notes[0])
+
 
 class TestCorpus(unittest.TestCase):
     @classmethod
@@ -103,7 +121,7 @@ class TestCorpus(unittest.TestCase):
         self.assertGreaterEqual(usable, FLOOR)
 
 
-FLOOR = 1835
+FLOOR = 1952
 
 
 if __name__ == "__main__":

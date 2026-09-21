@@ -118,7 +118,7 @@ class TestEval(unittest.TestCase):
 
     def test_all_rows_failing_raises(self):
         with self.assertRaises(Untranslatable):
-            evaluate.translate_eval({"add": [{"name": "b", "value": "foo"}]}, D)
+            evaluate.translate_eval({"add": [{"name": "b", "value": "foo(1)"}]}, D)
 
     def test_internal_target_is_skipped_with_note(self):
         r = evaluate.translate_eval(
