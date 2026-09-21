@@ -8,6 +8,9 @@ let index = null;
 let state = null;
 let loaded = { path: null, cribl: null, ingest: null, map: null };
 let blobUrl = null;
+// Bumped on every fetch so a slow earlier selection cannot render over a
+// newer one when the responses come back out of order.
+let requestId = 0;
 
 function fill(selectEl, items, value, label) {
   selectEl.innerHTML = '<option value="">—</option>';
@@ -49,13 +52,21 @@ function loadArtifacts(sel) {
   const path = sel.format.path;
   if (loaded.path === path) return Promise.resolve(loaded);
   const wants = sel.format.has_cribl_pipeline;
+  const id = ++requestId;
   return Promise.all([
     getText("exports/map/" + path + ".html"),
     wants ? getJson("exports/cribl/" + path + ".json") : Promise.resolve(null),
     wants ? getJson("exports/ingest/" + path + ".json") : Promise.resolve(null),
   ]).then((results) => {
-    loaded = { path, map: results[0], cribl: results[1], ingest: results[2] };
-    return loaded;
+    if (id !== requestId) return null;
+    const data = { path, map: results[0], cribl: results[1], ingest: results[2] };
+    // Memoise a complete result only.  getJson and getText swallow a failed
+    // request into null/"", so caching one under its path would leave that
+    // block broken for the rest of the session and, worse, read as an
+    // unauthored block; leaving loaded.path alone makes the next selection
+    // of this block try again.
+    if (data.map && (!wants || (data.cribl && data.ingest))) loaded = data;
+    return data;
   });
 }
 
@@ -89,12 +100,16 @@ function renderResult() {
     return;
   }
   loadArtifacts(sel).then((data) => {
+    if (!data) return;
     el("result-header").innerHTML = headerHtml(sel);
     el("result-map").innerHTML = downloadsHtml(sel.format.path)
       + '<div class="format-variant active">' + (data.map || "<p>Map unavailable.</p>") + "</div>";
     el("result-artifact").innerHTML = artifactHtml(sel, state, data);
     wireButtons(sel, data);
     result.hidden = false;
+  }).catch(() => {
+    notice("The result could not be loaded; try again.");
+    result.hidden = true;
   });
 }
 

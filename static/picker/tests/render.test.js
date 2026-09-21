@@ -75,6 +75,18 @@ test("cribl off, thin block: note first, no manual list", () => {
   assert.doesNotMatch(html, /Manual steps/);
 });
 
+// A block that has a pipeline but whose artifacts did not arrive is a failed
+// fetch, not an unauthored block: saying "not authored" there would send the
+// reader to a technology page that has nothing more to tell them.
+test("authored pipeline whose artifacts failed to load says so", () => {
+  const on = artifactHtml(SEL(FULL), { cribl: true, dest: "elastic" }, { cribl: null, ingest: null });
+  assert.match(on, /The pipeline files could not be loaded from this site; try again\./);
+  assert.doesNotMatch(on, /No pipeline has been authored/);
+  const off = artifactHtml(SEL(FULL), { cribl: false, dest: "elastic" }, { cribl: CRIBL, ingest: null });
+  assert.match(off, /The pipeline files could not be loaded from this site; try again\./);
+  assert.doesNotMatch(off, /No pipeline has been authored/);
+});
+
 test("mechanism none and missing pipeline", () => {
   assert.match(artifactHtml(SEL(NONE), { cribl: true, dest: "elastic" }, { cribl: null, ingest: null }),
                /Cribl is not in this path for this feed\./);

@@ -59,9 +59,16 @@ export function artifactHtml(sel, state, data) {
   if (f.mechanism === "none") {
     return '<h3>Parser</h3><p class="artifact-note">Cribl is not in this path for this feed.</p>';
   }
-  if (!f.has_cribl_pipeline || !data.cribl || !data.ingest) {
+  if (!f.has_cribl_pipeline) {
     return '<h3>Parser</h3><p class="artifact-note">No pipeline has been authored for this block yet. '
       + 'See the <a href="tech/' + esc(sel.tech.id) + '.html">technology page</a>.</p>';
+  }
+  // The index says a pipeline exists, so an absent artifact is a fetch that
+  // failed, not an unauthored block; telling the reader otherwise would send
+  // them to a technology page that has nothing more to say.
+  if (!data.cribl || !data.ingest) {
+    return '<h3>Parser</h3><p class="artifact-note">The pipeline files could not be '
+      + 'loaded from this site; try again.</p>';
   }
   const parts = [];
   if (state.cribl) {
