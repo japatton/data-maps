@@ -688,5 +688,42 @@ class TestRecommendationRender(unittest.TestCase):
         self.assertIn("recommended", guide)
 
 
+class TestFragment(unittest.TestCase):
+    def test_fragment_is_a_substring_of_the_technology_page(self):
+        techs = {"paloalto-ngfw": {
+            "id": "paloalto-ngfw", "name": "Palo Alto NGFW", "vendor": "PAN",
+            "datasets": [{
+                "id": "traffic", "name": "Traffic", "description": "flows",
+                "event_categories": ["network"],
+                "route": {"direct": [{"hop": "cribl", "location": "core"},
+                                     {"hop": "elastic", "data_stream": "logs-panw"}]},
+                "formats": [{
+                    "format": "syslog-csv",
+                    "parsing": {"mechanism": "cribl-pipeline",
+                                "artifact": "dm_paloalto_ngfw_traffic_syslog_csv",
+                                "notes": "positional CSV"},
+                    "recommendations": {"direct": {"parse_location": "high",
+                                                   "cribl": "split the CSV",
+                                                   "elastic": "index as-is"}},
+                    "fields": [{"vendor": "src", "type": "ip",
+                                "description": "source", "ecs": "source.ip",
+                                "status": "mapped"},
+                               {"vendor": "odd <field>", "type": "keyword",
+                                "description": "x & y", "ecs": None,
+                                "custom": "panw.odd", "status": "unmapped"}]}]}]}}
+        m = model.build_model(catalog(), techs, copy.deepcopy(PROFILES), ECS)
+        out = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, out, True)
+        render.render_site(m, ROOT, out)
+        page = read(out, "tech", "paloalto-ngfw.html")
+        env = render.build_env(ROOT)
+        view = m["technologies"][0]
+        frag = render.fragment_html(env, view["datasets"][0],
+                                    view["datasets"][0]["formats"][0], "../")
+        self.assertIn("odd &lt;field&gt;", frag)
+        self.assertIn("x &amp; y", frag)
+        self.assertIn(frag.strip(), page)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -14,6 +14,12 @@ def build_env(root):
     )
 
 
+def fragment_html(env, ds_view, fmt_view, asset_prefix):
+    """The one format block, rendered by the same partial the page uses."""
+    template = env.get_template("_format_block.html.j2")
+    return template.render(ds=ds_view, fv=fmt_view, asset_prefix=asset_prefix)
+
+
 def render_site(model, root, out_dir):
     env = build_env(root)
     tech_dir = os.path.join(out_dir, "tech")
