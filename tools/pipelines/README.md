@@ -20,6 +20,18 @@ technologies in the script's `SKIP` set, whose thin-mechanism pipelines were
 hand-authored and are authoritative.  On an unchanged catalog it changes
 nothing; `git status` shows exactly the blocks whose text moved.
 
+`--out DIR` writes the same tree under `DIR/<tech>/` instead, leaving
+`data/pipelines/` untouched — how `tests/test_pipeline_tools.py` checks the
+committed pipelines without dirtying the working tree, and the safe way to
+preview a catalog change before letting it overwrite anything:
+
+    python3 tools/pipelines/generate_thin.py --out /tmp/thin
+    diff -r /tmp/thin data/pipelines
+
+`diff -r` also lists every full-parse and pilot pipeline as `Only in
+data/pipelines`; that is expected, because `generate_thin.py` emits only the
+217 thin ones.
+
 **A full block changed** (mechanism `cribl-pipeline` or `cribl-pack`).
 Build the work orders, then hand the affected order to an agent with the
 brief:

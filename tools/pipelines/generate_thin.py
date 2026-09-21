@@ -18,6 +18,7 @@ Constraints verified against the live Cribl 4.19 instance:
   - `event.dataset` must not contain a hyphen: it becomes the dataset component
     of an Elastic data stream name, which forbids `-`.
 """
+import argparse
 import glob
 import json
 import os
@@ -62,14 +63,15 @@ def comment_for(tech, ds, fmt, mech, artifact):
     return text[:COMMENT_MAX]
 
 
-def main():
+def main(out_dir=None):
+    out_root = out_dir or OUT
     made = skipped_none = 0
     for path in sorted(glob.glob(os.path.join(DATA, "*.yml"))):
         tech_id = os.path.basename(path)[:-4]
         if tech_id in SKIP:
             continue
         doc = yaml.safe_load(open(path))
-        outdir = os.path.join(OUT, tech_id)
+        outdir = os.path.join(out_root, tech_id)
         for ds in doc.get("datasets") or []:
             for fmt in ds.get("formats") or []:
                 parsing = fmt.get("parsing") or {}
@@ -110,4 +112,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--out", default=OUT, metavar="DIR",
+                    help="write the pipelines under DIR/<tech>/ instead of "
+                         "data/pipelines (the tests regenerate into a scratch "
+                         "directory and diff against the committed bytes)")
+    main(ap.parse_args().out)
