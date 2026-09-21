@@ -504,7 +504,16 @@ class _Emitter(object):
             return "(%s != 0)" % x
         if self.is_stringy(node):
             return "(%s != null && %s != '')" % (x, x)
+        if self.is_bool(node) and not self._is_logical(node):
+            # A boolean comparison is its own truthiness; equality() and the
+            # relational emission already parenthesise it.
+            return x
         return "(%s != null && %s != false && %s != '' && %s != 0)" % (x, x, x, x)
+
+    @staticmethod
+    def _is_logical(node):
+        """True for `a || b` / `a && b`, which value mode emits as a def ternary."""
+        return node[0] == "binary" and node[1] in ("||", "&&")
 
     # -- condition mode -----------------------------------------------------
     def cond(self, node):

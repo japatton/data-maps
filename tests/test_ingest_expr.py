@@ -266,6 +266,17 @@ class TestEmitValue(unittest.TestCase):
         self.assertEqual(self.v("__e['a'] || 'x'"),
                          "(%s ? ctx.a : 'x')" % truthy("ctx.a"))
 
+    def test_boolean_operand_is_its_own_truthiness(self):
+        self.assertEqual(self.v("(__e['a'] === 'x') || __e['b']"),
+                         "((ctx.a == 'x') ? (ctx.a == 'x') : ctx.b)")
+        self.assertEqual(self.v("!__e['a'] || __e['b']"),
+                         "(!%s ? !%s : ctx.b)" % (truthy("ctx.a"), truthy("ctx.a")))
+
+    def test_logical_operand_keeps_the_def_template(self):
+        inner = "(%s ? ctx.a : ctx.b)" % truthy("ctx.a")
+        self.assertEqual(self.v("__e['a'] || __e['b'] || 'z'"),
+                         "(%s ? %s : 'z')" % (truthy(inner), inner))
+
     def test_comparison_as_value(self):
         self.assertEqual(self.v("__e['signed_flag'] === 'S'"), "(ctx.signed_flag == 'S')")
 
