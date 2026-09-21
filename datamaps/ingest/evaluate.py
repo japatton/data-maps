@@ -6,7 +6,7 @@ A constant becomes `set`, a single field read becomes `set` with
 semantics: an expression that throws leaves its field unset and the event
 continues.  Rows that cannot be translated are returned as a manual step
 alongside the rows that could, so a partially translatable eval still
-emits everything it can.
+emits everything it can; a wildcard `remove` is one of those manual parts.
 """
 from datamaps.ingest import expr
 from datamaps.ingest.expr import Untranslatable, map_field
@@ -59,28 +59,44 @@ def translate_eval(conf, description):
                 continue
             flush_script()
             procs.append({"set": {"field": target, "value": result.constant,
+                                  "ignore_failure": True,
                                   "description": description}})
         elif result.is_field:
             flush_script()
             procs.append({"set": {"field": target, "copy_from": result.is_field,
                                   "ignore_empty_value": True,
+                                  "ignore_failure": True,
                                   "description": description}})
         else:
             pending_script.append(_row_script(result.source, target))
     flush_script()
 
-    remove = conf.get("remove") or []
-    if remove:
-        if any("*" in str(f) for f in remove):
-            raise Untranslatable("eval remove with a wildcard")
-        procs.append({"remove": {"field": [map_field(str(f)) for f in remove],
-                                 "ignore_missing": True,
+    fields = []
+    wildcards = []
+    for entry in conf.get("remove") or []:
+        text = str(entry)
+        if "*" in text:
+            wildcards.append(entry)
+            reasons.append("remove: wildcard %s has no processor equivalent"
+                           % text)
+        elif text.startswith("__"):
+            notes.append("eval: remove of %s is a Cribl internal field; entry "
+                         "skipped" % text)
+        else:
+            fields.append(map_field(text))
+    if fields:
+        procs.append({"remove": {"field": fields, "ignore_missing": True,
                                  "description": description}})
 
     manual = None
-    if failing:
+    if failing or wildcards:
         if not procs:
             raise Untranslatable("; ".join(reasons))
+        original = {}
+        if failing:
+            original["add"] = failing
+        if wildcards:
+            original["remove"] = wildcards
         manual = {"function": "eval", "reason": "; ".join(reasons),
-                  "original": {"add": failing}}
+                  "original": original}
     return Result(procs, notes, manual=manual, regex=regex)

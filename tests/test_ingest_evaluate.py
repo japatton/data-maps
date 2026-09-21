@@ -16,7 +16,8 @@ class TestEval(unittest.TestCase):
         r = evaluate.translate_eval(
             {"add": [{"name": "event.dataset", "value": "'ad.account'"}]}, D)
         self.assertEqual(r.processors, [{"set": {
-            "field": "event.dataset", "value": "ad.account", "description": D}}])
+            "field": "event.dataset", "value": "ad.account",
+            "ignore_failure": True, "description": D}}])
         self.assertIsNone(r.manual)
 
     def test_array_and_number_constants(self):
@@ -32,9 +33,11 @@ class TestEval(unittest.TestCase):
                      {"name": "message", "value": "__e['_raw']"}]}, D)
         self.assertEqual(r.processors, [
             {"set": {"field": "host.name", "copy_from": "Computer",
-                     "ignore_empty_value": True, "description": D}},
+                     "ignore_empty_value": True, "ignore_failure": True,
+                     "description": D}},
             {"set": {"field": "message", "copy_from": "message",
-                     "ignore_empty_value": True, "description": D}}])
+                     "ignore_empty_value": True, "ignore_failure": True,
+                     "description": D}}])
 
     def test_expression_rows_share_one_script(self):
         r = evaluate.translate_eval(
@@ -72,9 +75,31 @@ class TestEval(unittest.TestCase):
             "field": ["a", "b.c", "message"], "ignore_missing": True,
             "description": D}}])
 
-    def test_wildcard_remove_is_untranslatable(self):
+    def test_wildcard_remove_is_a_partial_step(self):
+        r = evaluate.translate_eval(
+            {"add": [{"name": "a", "value": "'1'"}],
+             "remove": ["tmp_*", "b"]}, D)
+        kinds = [list(p)[0] for p in r.processors]
+        self.assertEqual(kinds, ["set", "remove"])
+        self.assertEqual(r.processors[1]["remove"]["field"], ["b"])
+        self.assertEqual(r.manual["original"], {"remove": ["tmp_*"]})
+        self.assertIn("tmp_*", r.manual["reason"])
+
+    def test_wildcard_only_remove_raises(self):
         with self.assertRaises(Untranslatable):
             evaluate.translate_eval({"remove": ["tmp_*"]}, D)
+
+    def test_internal_remove_entry_is_skipped_with_note(self):
+        r = evaluate.translate_eval({"remove": ["__ctrl", "a"]}, D)
+        self.assertEqual(r.processors, [{"remove": {
+            "field": ["a"], "ignore_missing": True, "description": D}}])
+        self.assertTrue(any("__ctrl" in n for n in r.notes))
+        self.assertIsNone(r.manual)
+
+    def test_only_internal_removes_emit_nothing(self):
+        r = evaluate.translate_eval({"remove": ["__ctrl"]}, D)
+        self.assertEqual(r.processors, [])
+        self.assertIsNone(r.manual)
 
     def test_keep_is_untranslatable(self):
         with self.assertRaises(Untranslatable):
