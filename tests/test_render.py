@@ -725,5 +725,18 @@ class TestFragment(unittest.TestCase):
         self.assertIn(frag.strip(), page)
 
 
+class TestPickerPage(unittest.TestCase):
+    def test_picker_page_and_scripts_are_emitted(self):
+        out = build_site(catalog()["technologies"], {})
+        self.addCleanup(shutil.rmtree, out, True)
+        page = read(out, "picker.html")
+        self.assertIn('id="pick-tech"', page)
+        self.assertIn('src="picker/picker.js"', page)
+        self.assertIn('href="picker.html">Picker</a>', read(out, "index.html"))
+        for name in ("picker.js", "hash.js", "state.js", "render.js"):
+            self.assertTrue(os.path.exists(os.path.join(out, "picker", name)), name)
+        self.assertFalse(os.path.exists(os.path.join(out, "picker", "tests")))
+
+
 if __name__ == "__main__":
     unittest.main()
