@@ -41,8 +41,11 @@ def _cell(value):
     return " ".join(_text(value).split()).replace("|", "\\|")
 
 
+# Backticks do not exempt a cell from the table's own escaping: GFM splits
+# the row on a bare pipe before it ever looks for a code span, so a vendor
+# field spelled "{permitted | denied}" would render as extra columns.
 def _code(value):
-    text = _text(value)
+    text = " ".join(_text(value).split()).replace("|", "\\|")
     return "`%s`" % text if text else ""
 
 

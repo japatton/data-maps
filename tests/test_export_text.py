@@ -1,5 +1,6 @@
 import copy
 import os
+import re
 import sys
 import unittest
 
@@ -73,8 +74,12 @@ class TestMarkdown(unittest.TestCase):
     def test_pipes_in_cells_are_escaped(self):
         tv, dv, fv = views()
         fv["fields"][0]["field"]["description"] = "a | b"
+        fv["fields"][0]["field"]["vendor"] = "{a | b}"
         md = export_text.block_markdown(tv, dv, fv)
         self.assertIn("a \\| b", md)
+        self.assertIn("| `{a \\| b}` |", md)
+        for row in [line for line in md.split("\n") if line.startswith("|")]:
+            self.assertEqual(len(re.findall(r"(?<!\\)\|", row)), 9, row)
 
 
 if __name__ == "__main__":
