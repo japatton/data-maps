@@ -146,5 +146,17 @@ class TestPythonJavaScriptParity(unittest.TestCase):
                                 if l.startswith("real/")]), 50)
 
 
+class TestCsvColumnParity(unittest.TestCase):
+    def test_python_csv_columns_equal_studios(self):
+        from datamaps import export_text
+        import re
+        with open(os.path.join(ROOT, "studio", "lib", "export.js"),
+                  encoding="utf-8") as fh:
+            js = fh.read()
+        block = re.search(r"export const CSV_COLUMNS = \[(.*?)\];", js, re.S).group(1)
+        columns = re.findall(r'"([^"]+)"', block)
+        self.assertEqual(columns, export_text.CSV_COLUMNS)
+
+
 if __name__ == "__main__":
     unittest.main()
