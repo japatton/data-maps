@@ -9,9 +9,12 @@ or credential is committed:
     CRIBL_PASSWORD  its password
     ES_URL          e.g. http://localhost:9200         (skipped when unset)
 
-Everything created is named dm_* and is deleted again at the end.  The
-report is written to docs/verification/<date>-live-validation.md and is
-meant to be committed.
+Everything created is named dm_* and is deleted again at the end; the
+dm_ prefix is reserved for validation, so anything already carrying it on
+the target is deleted too and is not restored.  The report is written to
+docs/verification/<date>-live-validation.md and is meant to be committed,
+which is why it records a target that is neither loopback nor a .example
+placeholder as <scheme>://<private host>:<port> and never by name.
 
 What a green report proves: every Cribl pipeline is accepted by the API
 (schema and conf valid) and every ingest pipeline compiles and loads in
@@ -23,6 +26,7 @@ import json
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -33,6 +37,7 @@ from datamaps import pipelines as pipelines_mod  # noqa: E402
 from datamaps.ingest import pipeline as ingest_mod  # noqa: E402
 
 SIMULATE_BODY = {"docs": [{"_source": {"message": ""}}]}
+QUOTABLE_HOSTS = ("localhost", "127.0.0.1", "::1")
 
 
 def targets(env):
@@ -42,6 +47,24 @@ def targets(env):
                  env.get("CRIBL_PASSWORD", ""))
     es = env["ES_URL"].rstrip("/") if env.get("ES_URL") else None
     return {"cribl": cribl, "es": es}
+
+
+def display_endpoint(url):
+    """The endpoint as the committed report is allowed to name it.
+
+    A loopback or .example target is a placeholder and goes in verbatim.
+    Any other host is somebody's real infrastructure and this repository is
+    public, so only the scheme and the port survive.
+    """
+    parts = urllib.parse.urlsplit(url)
+    host = (parts.hostname or "").lower()
+    if host in QUOTABLE_HOSTS or host.endswith(".example"):
+        return url
+    try:
+        port = ":%d" % parts.port if parts.port else ""
+    except ValueError:
+        port = ""
+    return "%s://<private host>%s" % (parts.scheme, port)
 
 
 def request(method, url, body=None, headers=None):
@@ -170,11 +193,11 @@ def main():
     if t["cribl"]:
         url, user, password = t["cribl"]
         token = cribl_login(url, user, password)
-        meta["cribl"] = url
+        meta["cribl"] = display_endpoint(url)
         meta["cribl_version"] = cribl_version(url, token)
         cribl_results = cribl_validate(url, token, loaded)
     if t["es"]:
-        meta["es"] = t["es"]
+        meta["es"] = display_endpoint(t["es"])
         meta["es_version"] = es_version(t["es"])
         es_results = es_validate(t["es"], envelopes)
     path = os.path.join(REPO, "docs", "verification",

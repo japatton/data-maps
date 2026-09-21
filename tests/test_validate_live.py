@@ -24,6 +24,22 @@ class TestBodies(unittest.TestCase):
         self.assertIsNone(t["es"])
 
 
+class TestDisplayEndpoint(unittest.TestCase):
+    def test_loopback_and_placeholder_kept(self):
+        self.assertEqual(vl.display_endpoint("http://localhost:9200"),
+                         "http://localhost:9200")
+        self.assertEqual(vl.display_endpoint("http://cribl.example:19000"),
+                         "http://cribl.example:19000")
+
+    def test_private_host_masked_port_kept(self):
+        self.assertEqual(vl.display_endpoint("http://cribl.corp.internal:19000"),
+                         "http://<private host>:19000")
+
+    def test_private_host_masked_without_port(self):
+        self.assertEqual(vl.display_endpoint("https://10.0.0.5"),
+                         "https://<private host>")
+
+
 class TestReport(unittest.TestCase):
     def test_report_lists_failures_verbatim(self):
         out = tempfile.mkdtemp()

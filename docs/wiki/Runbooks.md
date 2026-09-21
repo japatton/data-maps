@@ -126,7 +126,10 @@ or `datamaps/ingest/`, run the live validation described in
 `tools/validate_live/README.md` and commit the report it writes under
 `docs/verification/`.  CI runs the offline lint and the transpiler tests on
 every push; this is the one check that needs a real Cribl and a real
-Elasticsearch, so it is run by a person and recorded.
+Elasticsearch, so it is run by a person and recorded.  The `dm_` prefix is
+reserved for validation: any pipeline or ingest pipeline already named
+`dm_*` on the target is deleted by the run and not restored, so point it at
+a scratch instance.
 
 A report proves acceptance — Cribl took the conf, Elasticsearch compiled the
 processors.  It does not prove parsing correctness: this repository holds no
