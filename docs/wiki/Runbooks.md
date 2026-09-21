@@ -5,9 +5,11 @@ What to do, in the order to do it.
 ## Publish the site
 
 Nothing to run by hand: the site rebuilds when the default branch moves.
-Both CI definitions in this repository — `.gitlab-ci.yml` and
-`.forgejo/workflows/pages.yml` — publish from that branch and from no
-other.  The Forgejo workflow lives under `.forgejo/` rather than
+All three CI definitions in this repository — `.gitlab-ci.yml`,
+`.forgejo/workflows/pages.yml` and `.github/workflows/pages.yml` —
+publish from that branch and from no other, and the GitHub one publishes
+only from the mirror `japatton/data-maps`, never from the canonical
+Forgejo remote.  The Forgejo workflow lives under `.forgejo/` rather than
 `.github/` so that a mirror to GitHub can carry it: GitHub refuses a
 push that writes `.github/workflows/` unless the credential holds
 workflow permission, and this one deliberately does not.
@@ -32,6 +34,13 @@ mirror. Two one-time steps by the repository owner gate it:
 2. In the GitHub repository settings, set Pages → Source to **GitHub
    Actions**. Do this only after a report exists under
    `docs/verification/`.
+
+The two steps happen in that order, so the first run after the mirror push
+fails: `actions/deploy-pages` needs Pages → Source already pointing at
+GitHub Actions, and step 1 is what delivers the workflow that step 2 then
+enables. Re-run that failed run once the setting is in place, or start a
+fresh one from the workflow's manual trigger (Actions → pages → Run
+workflow, which the workflow's `workflow_dispatch` provides).
 
 ## Point a deployment at its own endpoints
 

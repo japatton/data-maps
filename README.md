@@ -1006,6 +1006,12 @@ pipeline that never sets `event.dataset`, and two pipelines sharing an id.
 rule fires on a hand-built bad example, so the lint runs on every push
 whether or not anyone types the command.
 
+One known gap the lint does not yet flag: 104 `eval` rows in the committed
+corpus read their fields as bare identifiers (`src_ip` rather than
+`__e['src_ip']`), which works only because Cribl evaluates an expression
+inside `with(__e)` and throws there when the field is absent. Re-authoring
+those rows into the `__e['name']` form the brief asks for is open work.
+
 **Regenerating one.** `tools/pipelines/README.md` is the procedure, and it
 splits by what changed: a thin block (the mechanism defers to Elastic) is
 mechanical and `generate_thin.py` rewrites it; a full block needs its work

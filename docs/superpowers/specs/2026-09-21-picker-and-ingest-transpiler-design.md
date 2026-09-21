@@ -66,7 +66,7 @@ Hard failures (build exits non-zero):
 2. A pipeline whose `id` is not `dm_<tech>_<dataset>_<format>` for its path.
 3. A file that is not valid JSON or lacks `conf.functions`.
 
-Flags (join the existing catalog flag panel and `exports/catalog.json`):
+Flags (join the existing catalog flag panel):
 
 - `no-pipeline` — a format block whose `parsing.mechanism` is not `none`
   and has no pipeline file. As of this spec 605 blocks want one and 603
@@ -81,9 +81,11 @@ and is reported as `pipeline-for-none` and fails the build.
 
 `cribl-pipelines/_lint.py` moves into the package unchanged in behaviour:
 it detects wrong-but-well-formed output (garbage `{"name":"name"}` eval
-rows, invalid property paths, bare-identifier reads in `eval` values and
-`filter`s, duplicate function ids where one is expected, comment length over
-1000 characters). It exposes `lint_pipeline(pipeline) -> list[str]` and a
+rows, invalid property paths, a hyphen in `event.dataset`, the
+`__e['Date'].` global-read shape, malformed or no-op `rename` confs, bare
+non-literal regexes, a pipeline that never sets `event.dataset`, comment
+length over 1000 characters, and duplicate pipeline ids across the
+corpus). It exposes `lint_pipeline(pipeline) -> list[str]` and a
 `__main__` that lints a directory. `tests/test_cribl_lint.py` asserts that
 every committed pipeline lints clean and that each rule fires on a
 hand-built bad example.
@@ -128,7 +130,7 @@ Census of the 603 pipelines (2026-09-21):
 | `comment` | 613 | dropped; text folded into processor descriptions |
 | `regex_extract` | 542 | `grok` |
 | `rename` | 294 | `rename` |
-| `serde` | 195 (json 112, kvp 69, csv 12, delim 2) | `json` / `kv` / `csv` |
+| `serde` | 195 (json 112, kvp 69, csv 12, delim 2) | `json` / Painless `script` scan / `csv` |
 | `auto_timestamp` | 83 | `date` |
 | `code` | 79 | manual step |
 | `drop` | 36 | `drop` with `if` |
@@ -164,8 +166,10 @@ produces Painless source:
 - Field references: `__e['name']`, `__e["name"]`, `__e.name`, and dotted
   paths inside the string (`__e['source.ip']` → `ctx.source?.ip`). A bare
   identifier reads the field of that name (Cribl evaluates expressions inside
-  `with(__e)`); the semantic lint still forbids bare reads in `eval` values,
-  where an absent field throws in Cribl, but `filter`s use the idiom widely.
+  `with(__e)`); the authoring brief (`tools/pipelines/AGENT-BRIEF.md`) still
+  tells authors to read fields as `__e['name']` in `eval` values, where an
+  absent field throws in Cribl; 104 committed rows predate that rule and rely
+  on the `with(__e)` scope, and `filter`s use the idiom widely.
   A missing bare read is `null` in Painless rather than an exception, so a
   transpiled filter is more forgiving than the Cribl filter it came from.
   A bare identifier followed by `(` is untranslatable.
@@ -178,7 +182,7 @@ produces Painless source:
   `.split(sep)`, `.replace(/re/[flags], repl)` (string or regex literal;
   flags `g` and `i` only), `.startsWith(s)`, `.endsWith(s)`, `.includes(s)`,
   `.indexOf(s)`, `.substring(a[, b])`, `.slice(a[, b])`, `.length`,
-  `.test(x)` on a regex literal, `.match(/re/)`, `.join(s)`.
+  `.test(x)` on a regex literal, `.match(/re/)`.
 
 Emission rules that matter:
 
@@ -235,7 +239,7 @@ The table is `FIELD_MAP` in `expr.py` and is emitted in the envelope.
 
 ```
 { "id": "dm_<tech>_<dataset>_<format>",
-  "pipeline": { "description": "<Cribl description> (translated by data-maps; N of M steps manual)",
+  "pipeline": { "description": "<cribl description> (translated from Cribl by data-maps: T of N steps translated, P partial, M manual)",
                 "processors": [ ... ] },
   "coverage": { "translated": N, "partial": P, "manual": K, "total": M },
   "notes": [ "regex_extract #4: iterations=100 ignored; each named group extracts once" ],
@@ -332,7 +336,9 @@ pointer.
 State: `{ tech, dataset, format, cribl: bool, dest: "elastic" }`. URL hash
 form `#<tech>/<dataset>/<format>?cribl=1|0&dest=elastic`; every state change
 rewrites the hash, and load/hashchange parses it and restores selection.
-Unknown ids in the hash reset to the first invalid level and show a notice.
+An unknown technology or dataset in the hash clears from that level down and
+shows a notice; an unknown format falls back to the dataset's recommended
+format and shows a notice.
 
 Flow: on load fetch `exports/picker.json`. Technology select (grouped by
 category, searchable by typing) → dataset select → format select (the
@@ -389,7 +395,8 @@ Launch gate, run once by hand before public hosting, never in CI:
   compiles here — the real check) and `_simulate` it with a stub document
   `{"message": ""}` to confirm it loads. Writes
   `docs/verification/<date>-live-validation.md` with totals, every failure
-  verbatim, and the image tags used. The report is committed.
+  verbatim, and the endpoints (private hosts redacted) and versions. The
+  report is committed.
 - What this proves and does not: every pipeline is accepted by its target
   and compiles. It does not prove correct parsing of real events; the
   public tree holds no example records. The runbook and README say so.
