@@ -207,10 +207,10 @@ if the filter is untranslatable the whole step is manual.
 | `serde` extract json | `json` `{field, add_to_root: true}` or `target_field` when `dstField` given |
 | `serde` extract kvp | `kv` `{field, field_split, value_split, ignore_missing}` from `delimChar`/`quoteChar`/`kvDelim` |
 | `serde` extract csv / delim | `csv` `{field, target_fields, separator, quote, ignore_missing}` from `fields` |
-| `regex_extract` | `grok` `{field: source, patterns: [regex], ignore_missing}`; `regexList` → one pattern per entry; `iterations > 1` → manual |
-| `eval` `add` | per row: `set {field, value}` when the value is a constant or a single field ref (mustache `{{{field}}}`); otherwise `script` with `ctx.<field> = <expr>`; `undefined` results wrap in `if (expr != null)` |
-| `eval` `remove` | one `remove {field: [...], ignore_missing: true}` |
-| `eval` `keep` | `script` that removes every top-level key not in the list (`ctx.keySet().retainAll(...)` pattern) |
+| `regex_extract` | one `grok` `{field: source, patterns: [regex], ignore_missing: true, ignore_failure: true}` per regex (`regex` then each `regexList` entry — Cribl applies all of them, grok's own list means first-match). `ignore_failure` because grok raises on no match while Cribl silently extracts nothing. `iterations` is recorded as a note, not a manual step: every named group extracts once either way |
+| `eval` `add` | per row: `set {field, value}` for a constant, `set {field, copy_from, ignore_empty_value: true}` for a single field ref; otherwise `script` assigning `ctx.<field>` with intermediate-map guards and `if (v != null)` so an `undefined` result leaves the field unset. `set`/`script` from `eval` carry `ignore_failure: true`, mirroring Cribl, where a throwing expression leaves the field unset and the event continues. Rows that fail translation make the step *partial*: the good rows are emitted and the failing rows are listed as a manual step |
+| `eval` `remove` | one `remove {field: [...], ignore_missing: true}`; a wildcard entry makes the step manual |
+| `eval` `keep` | manual (absent from the corpus; listed so the behaviour is defined) |
 | `rename` | `rename {field, target_field, ignore_missing: true}` per row; `baseFields`/wildcard forms → manual |
 | `drop` | `drop {if: <filter>}`; unconditional drop → `drop` |
 | `mask` | `gsub {field, pattern, replacement}` per rule on each listed field; rules with JS replacement functions → manual |
@@ -232,7 +232,8 @@ The table is `FIELD_MAP` in `functions.py` and is emitted in the envelope.
 { "id": "dm_<tech>_<dataset>_<format>",
   "pipeline": { "description": "<Cribl description> (translated by data-maps; N of M steps manual)",
                 "processors": [ ... ] },
-  "coverage": { "translated": N, "manual": K, "total": M },
+  "coverage": { "translated": N, "partial": P, "manual": K, "total": M },
+  "notes": [ "regex_extract #4: iterations=100 ignored; each named group extracts once" ],
   "manual_steps": [ { "index": i, "function": "code", "reason": "...",
                       "description": "<Cribl step description>",
                       "original": { ...the Cribl function object... } } ],
@@ -240,9 +241,10 @@ The table is `FIELD_MAP` in `functions.py` and is emitted in the envelope.
   "requires": [ "painless-regex" ] }
 ```
 
-`comment` functions are not counted in `total`. The picker's download is
-`pipeline` alone (the body for `PUT _ingest/pipeline/<id>`); the page shows
-`coverage` and `manual_steps`.
+`comment` functions are not counted in `total`; `total = translated +
+partial + manual`. The picker's download is `pipeline` alone (the body for
+`PUT _ingest/pipeline/<id>`); the page shows `coverage`, `notes` and
+`manual_steps`.
 
 ### 3.6 Tests
 
@@ -397,6 +399,14 @@ Node tests, the Python tests and the build on `ubuntu-latest` and publishes
 `public/` with `actions/deploy-pages`. It is added as the final task and
 the repository's Pages setting is enabled only after a
 `docs/verification/` report exists.
+
+Constraint recorded in `docs/wiki/Runbooks.md`: the Forgejo→GitHub mirror
+credential deliberately lacks GitHub `workflow` permission, which is why
+the CI file lives under `.forgejo/`. GitHub rejects a push that writes
+`.github/workflows/` without it, so the mirror will fail on that commit
+until the mirror token is reissued with the `workflow` scope — a one-time
+manual step by the repository owner, documented in the same runbook. The
+task adding the workflow file states this and stops for that step.
 
 ## 8. Execution
 
