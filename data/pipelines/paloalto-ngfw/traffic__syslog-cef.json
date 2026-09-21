@@ -1,0 +1,125 @@
+{
+  "id": "dm_paloalto_ngfw_traffic_syslog_cef",
+  "conf": {
+    "output": "default",
+    "description": "Palo Alto NGFW Traffic log (syslog-cef, PAN-OS 10.2/11.1), direct route: CEF header/extension parse (regex_extract + serde kvp, not the cef function which is a serializer) to ECS + panw.panos.* customs, action-driven event.outcome, seconds-to-nanoseconds event.duration, cat treated as action_source not category",
+    "functions": [
+      {
+        "id": "comment",
+        "filter": "true",
+        "conf": {
+          "comment": "Palo Alto NGFW Traffic log, syslog-cef, direct route. CEF cat=$action_source here, NOT a category - never fed to category logic. start=$time_generated (dataplane generation time, not session start) so it is used only for _time, never event.start; the vendor's own CEF start/rt tokens carry no timezone offset so this is a documented approximation (device-local treated as UTC). in/out are inverted vs intuition per the vendor template line: in=bytes_received->destination.bytes, out=bytes_sent->source.bytes."
+        },
+        "description": "Pipeline purpose and the cat/start traps"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^CEF:(?<cefVersion>[^|]*)\\|(?<deviceVendor>[^|]*)\\|(?<deviceProduct>[^|]*)\\|(?<deviceVersion>[^|]*)\\|(?<signatureId>[^|]*)\\|(?<name>[^|]*)\\|(?<severity>[^|]*)\\|(?<extension>.*)$/",
+          "source": "_raw"
+        },
+        "description": "Split the 7 pipe-delimited CEF header slots from the extension blob"
+      },
+      {
+        "id": "serde",
+        "filter": "true",
+        "conf": {
+          "mode": "extract",
+          "type": "kvp",
+          "srcField": "extension"
+        },
+        "description": "Explode the CEF extension's space-separated key=value pairs into top-level fields"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            {
+              "name": "event.outcome",
+              "value": "__e['act']=='allow' ? 'success' : (__e['act']=='deny' || __e['act']=='drop' || __e['act']=='reset-client' || __e['act']=='reset-server' || __e['act']=='reset-both' ? 'failure' : 'unknown')"
+            },
+            {
+              "name": "event.duration",
+              "value": "__e['cn3'] !== undefined && __e['cn3'] !== '' ? Number(__e['cn3']) * 1e9 : undefined"
+            }
+          ]
+        },
+        "description": "Derive event.outcome from act and event.duration from cn3 (seconds->nanoseconds) BEFORE rename, reading the flat vendor fields"
+      },
+      {
+        "id": "rename",
+        "filter": "true",
+        "conf": {
+          "rename": [
+            { "currentName": "src", "newName": "source.ip" },
+            { "currentName": "dst", "newName": "destination.ip" },
+            { "currentName": "sourceTranslatedAddress", "newName": "source.nat.ip" },
+            { "currentName": "destinationTranslatedAddress", "newName": "destination.nat.ip" },
+            { "currentName": "spt", "newName": "source.port" },
+            { "currentName": "dpt", "newName": "destination.port" },
+            { "currentName": "sourceTranslatedPort", "newName": "source.nat.port" },
+            { "currentName": "destinationTranslatedPort", "newName": "destination.nat.port" },
+            { "currentName": "proto", "newName": "network.transport" },
+            { "currentName": "act", "newName": "event.action" },
+            { "currentName": "cs1", "newName": "rule.name" },
+            { "currentName": "suser", "newName": "source.user.name" },
+            { "currentName": "duser", "newName": "destination.user.name" },
+            { "currentName": "app", "newName": "network.application" },
+            { "currentName": "flexNumber1", "newName": "network.bytes" },
+            { "currentName": "in", "newName": "destination.bytes" },
+            { "currentName": "out", "newName": "source.bytes" },
+            { "currentName": "cn2", "newName": "network.packets" },
+            { "currentName": "PanOSPacketsSent", "newName": "source.packets" },
+            { "currentName": "PanOSPacketsReceived", "newName": "destination.packets" },
+            { "currentName": "deviceInboundInterface", "newName": "observer.ingress.interface.name" },
+            { "currentName": "deviceOutboundInterface", "newName": "observer.egress.interface.name" },
+            { "currentName": "dvchost", "newName": "observer.name" },
+            { "currentName": "deviceExternalId", "newName": "observer.serial_number" },
+            { "currentName": "PanOSRuleUUID", "newName": "rule.uuid" },
+            { "currentName": "cn1", "newName": "panw.panos.session_id" },
+            { "currentName": "cs3", "newName": "panw.panos.vsys" },
+            { "currentName": "cs4", "newName": "panw.panos.source_zone" },
+            { "currentName": "cs5", "newName": "panw.panos.destination_zone" },
+            { "currentName": "reason", "newName": "panw.panos.session_end_reason" },
+            { "currentName": "cat", "newName": "panw.panos.action_source" }
+          ]
+        },
+        "description": "Batch rename of every mapped/custom CEF extension key; cn3/start excluded (already consumed by the derived eval above) and cat mapped to action_source, never category"
+      },
+      {
+        "id": "auto_timestamp",
+        "filter": "true",
+        "conf": {
+          "srcField": "start",
+          "dstField": "_time"
+        },
+        "description": "Set _time from the CEF start slot (actually carries $time_generated, dataplane generation time) - the only event-time source in this format; device-local with no offset, so this is a best-effort approximation, not a verified UTC conversion"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            { "name": "event.dataset", "value": "'paloalto_ngfw.traffic'" }
+          ],
+          "remove": [
+            "cn3",
+            "start",
+            "cefVersion",
+            "deviceVendor",
+            "deviceProduct",
+            "deviceVersion",
+            "signatureId",
+            "name",
+            "severity",
+            "extension",
+            "_raw"
+          ]
+        },
+        "description": "Tag event.dataset; drop now-consumed parse artifacts and CEF header metadata not requested by the work order, and drop _raw since every field row in this format's full inventory was captured (discretionary - not explicitly instructed for this format the way the CSV form is)"
+      }
+    ]
+  }
+}

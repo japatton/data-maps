@@ -1,0 +1,130 @@
+{
+  "id": "dm_suricata_alert_syslog_raw",
+  "conf": {
+    "output": "default",
+    "description": "Suricata alert via the standalone syslog-alerting module (dataset=alert, format=syslog-raw), direct route: RFC3164 header decode (standard facility/severity, not Suricata-specific) plus the public, stable fast.log line grammar for the message body. No stock Elastic integration or Cribl pack covers this exact transport, so it is hand-built per recommendations.direct.cribl. Deliberately does NOT route the syslog envelope severity to event.severity - that is the fixed configured `level`, not the per-alert priority.",
+    "functions": [
+      {
+        "id": "comment",
+        "filter": "true",
+        "conf": {
+          "comment": "Suricata alert, syslog-raw, direct route (module deprecated in 8.0; documented per the work order for sensors already on this collection lane). Two grammars, both public/standard, neither Suricata-proprietary: (1) RFC3164 header - PRI decodes to facility name + syslog severity code per RFC3164 4.1.1, a fixed 24-entry facility table, not vendor-specific; (2) the fast.log body line - timestamp, [gid:sid:rev], signature, [Classification:], [Priority: N], {proto}, src ip:port -> dst ip:port - the same public, stable format the deprecated fast.log file output and this syslog module share (confirmed against Suricata 8.0.6 docs, referenced in the work order). event.severity comes ONLY from the body's [Priority: N] token, inverted to this repo's high-is-more-severe ECS convention (1=4,2=3,3=2,4=1) - never from the syslog severity, which is a fixed per-config constant per the work order's explicit warning."
+        }
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^(?:<(?<pri>\\d+)>)?\\S+\\s+\\d+\\s+[\\d:]+\\s+(?<syshost>\\S+)\\s+[^:\\s]+(?:\\[\\d+\\])?:\\s*(?<body>.*)$/",
+          "source": "_raw"
+        },
+        "description": "Strip the RFC3164 header: capture the optional PRI value, the reporting hostname, and the message body after the program tag (tag/identity is not hard-coded, since `identity` is a configurable option)"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^(?<ts>\\S+)\\s+\\[\\*\\*\\]\\s+\\[(?<gid>\\d+):(?<sid>\\d+):(?<rev>\\d+)\\]\\s+(?<signature>.*?)\\s+\\[\\*\\*\\]\\s+\\[Classification:\\s*(?<classification>[^\\]]*)\\]\\s+\\[Priority:\\s*(?<priority>\\d+)\\]\\s+\\{(?<proto>[^}]*)\\}\\s+(?<src_ip>[^:\\s]+):?(?<src_port>\\d*)\\s*->\\s*(?<dest_ip>[^:\\s]+):?(?<dest_port>\\d*)/",
+          "source": "body"
+        },
+        "description": "Parse the fast.log-format body line into its documented tokens"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^(?<mm>\\d{2})\\/(?<dd>\\d{2})\\/(?<yy>\\d{2})-(?<hh>\\d{2}):(?<mi>\\d{2}):(?<ss>\\d{2})\\.(?<frac>\\d+)$/",
+          "source": "ts"
+        },
+        "description": "Break the body's MM/DD/YY-HH:MM:SS.ffffff local timestamp into components for ISO reassembly (no timezone in the token, so UTC is assumed - documented gap)"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            {
+              "name": "log.syslog.facility.name",
+              "value": "__e['pri']!=null && __e['pri']!=='' ? (['kern','user','mail','daemon','auth','syslog','lpr','news','uucp','cron','authpriv','ftp','ntp','security','console','solaris-cron','local0','local1','local2','local3','local4','local5','local6','local7'][Math.floor(+__e['pri']/8)] || null) : null"
+            },
+            {
+              "name": "log.syslog.severity.code",
+              "value": "__e['pri']!=null && __e['pri']!=='' ? (+__e['pri'])%8 : null"
+            },
+            {
+              "name": "event.severity",
+              "value": "__e['priority']=='1'?4:__e['priority']=='2'?3:__e['priority']=='3'?2:__e['priority']=='4'?1:(__e['priority']?+__e['priority']:null)"
+            },
+            {
+              "name": "rule.id",
+              "value": "__e['sid'] ? String(__e['sid']) : null"
+            },
+            {
+              "name": "suricata.eve.alert.gid",
+              "value": "__e['gid'] ? +__e['gid'] : null"
+            },
+            {
+              "name": "source.port",
+              "value": "__e['src_port'] ? +__e['src_port'] : null"
+            },
+            {
+              "name": "destination.port",
+              "value": "__e['dest_port'] ? +__e['dest_port'] : null"
+            },
+            {
+              "name": "_time",
+              "value": "__e['mm'] ? (isNaN(Date.parse('20'+__e['yy']+'-'+__e['mm']+'-'+__e['dd']+'T'+__e['hh']+':'+__e['mi']+':'+__e['ss']+'.'+__e['frac']+'Z')) ? _time : Date.parse('20'+__e['yy']+'-'+__e['mm']+'-'+__e['dd']+'T'+__e['hh']+':'+__e['mi']+':'+__e['ss']+'.'+__e['frac']+'Z')/1000) : _time"
+            }
+          ]
+        },
+        "description": "Derive facility name + syslog severity code from PRI (RFC3164, standard), invert body [Priority: N] to event.severity, stringify sid to rule.id, coerce gid/ports to numbers, reassemble the body timestamp (UTC assumed, no zone in the token) into _time - all BEFORE rename, reading the flat regex_extract field names"
+      },
+      {
+        "id": "rename",
+        "filter": "true",
+        "conf": {
+          "rename": [
+            { "currentName": "syshost", "newName": "observer.hostname" },
+            { "currentName": "proto", "newName": "network.transport" },
+            { "currentName": "src_ip", "newName": "source.ip" },
+            { "currentName": "dest_ip", "newName": "destination.ip" },
+            { "currentName": "signature", "newName": "rule.name" },
+            { "currentName": "classification", "newName": "rule.category" },
+            { "currentName": "rev", "newName": "rule.version" }
+          ]
+        },
+        "description": "Straight-copy every field with a direct 1:1 ECS target and no transform"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            {
+              "name": "event.dataset",
+              "value": "'suricata.alert'"
+            }
+          ],
+          "remove": [
+            "pri",
+            "body",
+            "gid",
+            "sid",
+            "priority",
+            "ts",
+            "mm",
+            "dd",
+            "yy",
+            "hh",
+            "mi",
+            "ss",
+            "frac",
+            "src_port",
+            "dest_port"
+          ]
+        },
+        "description": "Tag event.dataset; drop now-consumed parse scratch fields (their ECS/custom copies were already set above)"
+      }
+    ]
+  }
+}

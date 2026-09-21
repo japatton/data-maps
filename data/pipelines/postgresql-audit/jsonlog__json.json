@@ -1,0 +1,109 @@
+{
+  "id": "dm_postgresql_audit_jsonlog_json",
+  "conf": {
+    "output": "default",
+    "description": "PostgreSQL Audit (pgaudit) / jsonlog dataset / json: JSON-parses PostgreSQL's jsonlog line, splits source.ip vs source.address for remote_host, reuses the pgAudit tail parser on the message key, then renames the flat envelope into ECS/custom.",
+    "functions": [
+      {
+        "id": "comment",
+        "filter": "true",
+        "conf": {
+          "comment": "postgresql-audit / jsonlog / json. jsonlog re-encodes the SAME server-log/pgaudit events as one JSON object per line with stable keys - no operator prefix gap, but the Elastic PostgreSQL integration does not parse jsonlog at all (its grok expects a bare leading timestamp), so this pipeline owns the whole record, not just the AUDIT tail. message still carries pgAudit's full 'AUDIT: SESSION,...' string unstructured, so the same tail regex used on the syslog-raw/csv-file datasets runs again here. jsonlog omits null-valued string keys entirely, so absent keys (e.g. detail) are normal, not a parse failure - every eval below reads via __e[...] and tolerates undefined. Order: parse JSON -> parse AUDIT tail out of message -> compute derived fields from ORIGINAL names -> batched rename -> event.dataset."
+        },
+        "description": "why this pipeline must do the full parse, not just the AUDIT tail"
+      },
+      {
+        "id": "serde",
+        "filter": "true",
+        "conf": {
+          "mode": "extract",
+          "type": "json",
+          "srcField": "_raw"
+        },
+        "description": "parse the jsonlog JSON object into top-level fields"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^AUDIT: (?<audit_type>SESSION|OBJECT),(?<statement_id>\\d+),(?<substatement_id>\\d+),(?<class>[A-Z_]+),(?<command>[^,]*),(?<object_type>[^,]*),(?<object_name>[^,]*),(?<statement>\"(?:[^\"]|\"\")*\"|<not logged>),(?<parameter>\"(?:[^\"]|\"\")*\"|<none>|<not logged>|<long param suppressed>)(?:,(?<rows>\\d+))?$/",
+          "source": "message"
+        },
+        "description": "if this record is a pgAudit entry, split the AUDIT tail out of message; no-ops harmlessly on ordinary server-log jsonlog records"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            {
+              "name": "event.type",
+              "value": "__e['class']===undefined ? undefined : __e['class']==='READ' ? ['access'] : __e['class']==='WRITE' ? ['change'] : __e['class']==='DDL' ? (String(__e['command']).indexOf('CREATE')===0 ? ['creation'] : String(__e['command']).indexOf('DROP')===0 ? ['deletion'] : ['change']) : __e['class']==='ROLE' ? ['admin'] : ['info']"
+            },
+            {
+              "name": "event.action",
+              "value": "__e['command'] !== undefined ? String(__e['command']).toLowerCase().replace(/ /g, '_') : undefined"
+            },
+            {
+              "name": "_time",
+              "value": "__e['timestamp'] === undefined ? undefined : Date.parse(__e['timestamp'])/1000"
+            },
+            {
+              "name": "source.address",
+              "value": "__e['remote_host']"
+            },
+            {
+              "name": "source.ip",
+              "value": "__e['remote_host'] === undefined ? undefined : (/^\\d{1,3}(\\.\\d{1,3}){3}$/.test(__e['remote_host']) || __e['remote_host'].indexOf(':') !== -1 ? __e['remote_host'] : undefined)"
+            }
+          ]
+        },
+        "description": "derive event.type/event.action/_time/source.ip from ORIGINAL field names; remote_host may be a resolved hostname (log_hostname on), so source.ip is set only when it looks like an address, source.address always carries the raw value"
+      },
+      {
+        "id": "rename",
+        "filter": "true",
+        "conf": {
+          "rename": [
+            { "currentName": "user", "newName": "user.name" },
+            { "currentName": "dbname", "newName": "postgresql.log.database" },
+            { "currentName": "pid", "newName": "process.pid" },
+            { "currentName": "remote_port", "newName": "source.port" },
+            { "currentName": "session_id", "newName": "postgresql.log.session_id" },
+            { "currentName": "error_severity", "newName": "log.level" },
+            { "currentName": "state_code", "newName": "error.code" },
+            { "currentName": "statement", "newName": "postgresql.log.query" },
+            { "currentName": "backend_type", "newName": "postgresql.log.backend_type" },
+            { "currentName": "application_name", "newName": "postgresql.log.application_name" },
+            { "currentName": "query_id", "newName": "postgresql.log.query_id" },
+            { "currentName": "detail", "newName": "error.message" },
+            { "currentName": "statement_id", "newName": "postgresql.pgaudit.statement_id" },
+            { "currentName": "substatement_id", "newName": "postgresql.pgaudit.substatement_id" },
+            { "currentName": "audit_type", "newName": "postgresql.pgaudit.audit_type" },
+            { "currentName": "class", "newName": "postgresql.pgaudit.class" },
+            { "currentName": "object_type", "newName": "postgresql.pgaudit.object_type" },
+            { "currentName": "object_name", "newName": "postgresql.pgaudit.object_name" },
+            { "currentName": "parameter", "newName": "postgresql.pgaudit.parameter" },
+            { "currentName": "rows", "newName": "postgresql.pgaudit.rows" }
+          ]
+        },
+        "description": "batch rename the flat jsonlog envelope plus any parsed AUDIT-tail fields to ECS or custom postgresql.* targets; message is already the ECS-correct key name so it is left untouched"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            { "name": "event.dataset", "value": "'postgresql_audit.jsonlog'" }
+          ],
+          "remove": [
+            "timestamp",
+            "remote_host",
+            "command"
+          ]
+        },
+        "description": "tag the dataset (no hyphen, per Elastic data-stream naming) and drop fields fully consumed above"
+      }
+    ]
+  }
+}

@@ -1,0 +1,165 @@
+{
+  "id": "dm_cisco_ios_interface_state_snmp_trap",
+  "conf": {
+    "output": "default",
+    "description": "Cisco IOS/IOS-XE interface-state / snmp-trap: no stock branch extracts the interface name or up/down state for UPDOWN/ADJCHG/NBRCHANGE, so this is a genuine Cribl-side reparse of clogHistMsgText, keyed on clogHistFacility as well as clogHistMsgName since LINK and LINEPROTO share the UPDOWN mnemonic, per direct.elastic recommendation.",
+    "functions": [
+      {
+        "id": "comment",
+        "filter": "true",
+        "conf": {
+          "comment": "cisco-ios / interface-state / snmp-trap. Upstream SNMP trap receiver decodes the PDU and forwards varbinds as JSON in _raw. LINK-3-UPDOWN and LINEPROTO-5-UPDOWN share the UPDOWN mnemonic -- clogHistFacility is what disambiguates a physical-layer failure from a protocol-layer one, so every branch below keys on facility too. Interface name is homed on the custom cisco.ios.interface.name rather than observer.ingress.interface.name per recommendation; only one is populated. 'administratively down' is kept distinct from 'down' in event.action so maintenance shutdowns do not alert the same as a real link failure. No flap-suppression/aggregation step is implemented here -- that is a guarded-route-specific cost/build decision the direct recommendation does not call for."
+        },
+        "description": "document the varbind source, the facility-disambiguation requirement, and the flap-suppression scope decision"
+      },
+      {
+        "id": "serde",
+        "filter": "true",
+        "conf": {
+          "mode": "extract",
+          "type": "json",
+          "srcField": "_raw"
+        },
+        "description": "extract the JSON-encoded varbind object the upstream SNMP trap receiver forwards"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "clogHistMsgName === 'UPDOWN' && clogHistFacility === 'LINK'",
+        "conf": {
+          "regex": "/Interface\\s+(?<if_name>\\S+),\\s*changed state to\\s+(?<if_state>administratively down|up|down)/",
+          "source": "clogHistMsgText"
+        },
+        "description": "dissect the LINK-3-UPDOWN physical-layer transition"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "clogHistMsgName === 'UPDOWN' && clogHistFacility === 'LINEPROTO'",
+        "conf": {
+          "regex": "/Line protocol on Interface\\s+(?<if_name>\\S+),\\s*changed state to\\s+(?<if_state>administratively down|up|down)/",
+          "source": "clogHistMsgText"
+        },
+        "description": "dissect the LINEPROTO-5-UPDOWN protocol-layer transition"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "clogHistMsgName === 'ADJCHG'",
+        "conf": {
+          "regex": "/Process\\s+(?<ospf_pid>\\d+),\\s*Nbr\\s+(?<nbr_ip>\\S+)\\s+on\\s+(?<if_name>\\S+)\\s+from\\s+(?<old_state>\\S+)\\s+to\\s+(?<new_state>\\S+)/",
+          "source": "clogHistMsgText"
+        },
+        "description": "dissect the OSPF-5-ADJCHG neighbour-adjacency transition"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "clogHistMsgName === 'NBRCHANGE'",
+        "conf": {
+          "regex": "/Neighbor\\s+(?<nbr_ip>\\S+)\\s+\\((?<if_name>[^)]+)\\)\\s+is\\s+(?<new_state>up|down)/",
+          "source": "clogHistMsgText"
+        },
+        "description": "dissect the DUAL-5-NBRCHANGE (EIGRP) neighbour-adjacency transition"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            {
+              "name": "cisco.ios.interface.name",
+              "value": "__e['if_name']"
+            },
+            {
+              "name": "cisco.ios.neighbor.ip",
+              "value": "__e['nbr_ip']"
+            },
+            {
+              "name": "cisco.ios.adjacency.old_state",
+              "value": "__e['old_state']"
+            },
+            {
+              "name": "cisco.ios.adjacency.new_state",
+              "value": "__e['new_state']"
+            },
+            {
+              "name": "cisco.ios.ospf.process_id",
+              "value": "__e['ospf_pid'] !== undefined ? Number(__e['ospf_pid']) : undefined"
+            },
+            {
+              "name": "observer.type",
+              "value": "(__e['clogHistFacility'] === 'LINK' || __e['clogHistFacility'] === 'LINEPROTO') ? 'switch' : undefined"
+            },
+            {
+              "name": "event.action",
+              "value": "__e['if_state'] === 'up' ? 'interface-up' : (__e['if_state'] === 'down' ? 'interface-down' : (__e['if_state'] === 'administratively down' ? 'interface-down-admin' : (__e['clogHistMsgName'] === 'ADJCHG' ? ('ospf-adjacency-' + __e['new_state']) : (__e['clogHistMsgName'] === 'NBRCHANGE' ? ('eigrp-neighbor-' + __e['new_state']) : undefined))))"
+            },
+            {
+              "name": "event.severity",
+              "value": "__e['clogHistSeverity'] !== undefined ? Number(__e['clogHistSeverity']) - 1 : undefined"
+            },
+            {
+              "name": "log.level",
+              "value": "__e['clogHistSeverity'] !== undefined ? ['emergency','alert','critical','error','warning','notice','informational','debug'][Number(__e['clogHistSeverity']) - 1] : undefined"
+            },
+            {
+              "name": "cisco.ios.snmp.sysuptime",
+              "value": "__e['clogHistTimestamp']"
+            },
+            {
+              "name": "cisco.ios.snmp.history_index",
+              "value": "__e['clogHistIndex']"
+            },
+            {
+              "name": "cisco.ios.snmp.truncated",
+              "value": "__e['clogHistMsgText'] ? __e['clogHistMsgText'].length >= 254 : undefined"
+            }
+          ],
+          "remove": [
+            "if_name",
+            "if_state",
+            "nbr_ip",
+            "old_state",
+            "new_state",
+            "ospf_pid",
+            "clogHistSeverity",
+            "clogHistTimestamp",
+            "clogHistIndex"
+          ]
+        },
+        "description": "per direct.elastic: normalise the state token to interface-up/interface-down while keeping administratively-down distinct, split the adjacency transition into old/new fields, home the interface name on the custom field, set observer.type=switch for LINK/LINEPROTO, and convert the inverted MIB severity via the shared lookup"
+      },
+      {
+        "id": "rename",
+        "filter": "true",
+        "conf": {
+          "rename": [
+            {
+              "currentName": "clogHistMsgText",
+              "newName": "event.original"
+            },
+            {
+              "currentName": "clogHistMsgName",
+              "newName": "event.code"
+            },
+            {
+              "currentName": "clogHistFacility",
+              "newName": "cisco.ios.facility"
+            }
+          ]
+        },
+        "description": "map the straight 1:1 CISCO-SYSLOG-MIB varbinds onto their ECS/custom targets (event.original was already reparsed above)"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            {
+              "name": "event.dataset",
+              "value": "'cisco_ios.interface_state'"
+            }
+          ]
+        },
+        "description": "tag the event with its dataset"
+      }
+    ]
+  }
+}

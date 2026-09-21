@@ -1,0 +1,99 @@
+{
+  "id": "dm_aws_cloudtrail_management_events_eventbridge",
+  "conf": {
+    "output": "default",
+    "description": "AWS GovCloud CloudTrail management-events / eventbridge direct route: strip the EventBridge envelope, extract the ECS anchor fields, and restore the untouched inner CloudTrail record to _raw so it reaches the same logs-aws.cloudtrail data stream as the S3 feed, per recommendations.direct.cribl (detail kept as _raw audit-of-last-resort artifact, overriding the field table's aws.cloudtrail.flattened.detail custom target)",
+    "functions": [
+      {
+        "id": "comment",
+        "filter": "true",
+        "conf": {
+          "comment": "EventBridge delivers one CloudTrail management-event per message with the native record under detail{}. Per recommendations.direct.cribl this pipeline is a thin envelope-stripper: extract the envelope-only fields, pull the four ECS anchors CloudTrail's own record gives us, then snapshot the ORIGINAL untouched detail object into _raw before any rename mutates it, so the record stays byte-identical audit evidence and can still be reprocessed by whatever handles the S3-fed json record. cloud.account.id is deliberately taken from detail.recipientAccountId, never the envelope's account, per the field table's own note."
+        },
+        "description": "Pipeline purpose, envelope-vs-record precedence, and _raw-snapshot ordering"
+      },
+      {
+        "id": "serde",
+        "filter": "true",
+        "conf": {
+          "mode": "extract",
+          "type": "json",
+          "srcField": "_raw"
+        },
+        "description": "Parse the EventBridge envelope (version/id/detail-type/source/account/time/region/resources/detail) from _raw JSON"
+      },
+      {
+        "id": "code",
+        "filter": "true",
+        "conf": {
+          "code": "__e['_raw'] = JSON.stringify(__e['detail']);"
+        },
+        "description": "Snapshot the pristine, unmutated CloudTrail record into _raw BEFORE the rename step below consumes any of detail's sub-fields - this is what recommendations.direct.cribl means by 'pass through with detail as _raw'"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            {
+              "name": "aws.eventbridge.detail_type",
+              "value": "__e['detail-type']"
+            },
+            {
+              "name": "source.ip",
+              "value": "(__e['detail']&&/^\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}$/.test(__e['detail'].sourceIPAddress))?__e['detail'].sourceIPAddress:undefined"
+            },
+            {
+              "name": "source.address",
+              "value": "(__e['detail']&&__e['detail'].sourceIPAddress!==undefined&&!/^\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}$/.test(__e['detail'].sourceIPAddress))?__e['detail'].sourceIPAddress:undefined"
+            }
+          ]
+        },
+        "description": "Computed fields read from ORIGINAL vendor names before rename: 'detail-type' has a hyphen so it needs bracket access (path-based rename/eval.add.name would 500), and sourceIPAddress gets the conditional IP-vs-AWS-service-DNS-name split the field notes call for (own conditional, since the S3-json feed's own regex is a separate work order not supplied here)"
+      },
+      {
+        "id": "auto_timestamp",
+        "filter": "true",
+        "conf": {
+          "srcField": "detail.eventTime",
+          "dstField": "_time"
+        },
+        "description": "_time from the in-record API-completion time (detail.eventTime is a genuinely nested path here, not a flat dotted key, since serde just built real nested JSON) - never @timestamp (platform constraint). The envelope's own 'time' (bus-delivery time) is kept separately as event.created below, not used for _time."
+      },
+      {
+        "id": "rename",
+        "filter": "true",
+        "conf": {
+          "rename": [
+            { "currentName": "version", "newName": "aws.eventbridge.version" },
+            { "currentName": "id", "newName": "aws.eventbridge.event_id" },
+            { "currentName": "source", "newName": "aws.eventbridge.source" },
+            { "currentName": "resources", "newName": "aws.eventbridge.resources" },
+            { "currentName": "time", "newName": "event.created" },
+            { "currentName": "region", "newName": "cloud.region" },
+            { "currentName": "detail.eventName", "newName": "event.action" },
+            { "currentName": "detail.eventSource", "newName": "event.provider" },
+            { "currentName": "detail.recipientAccountId", "newName": "cloud.account.id" },
+            { "currentName": "detail.eventID", "newName": "event.id" }
+          ]
+        },
+        "description": "Batch rename of the clean envelope fields and the clean nested detail.* ECS anchors. detail.recipientAccountId -> cloud.account.id is the authoritative account (per field notes); the envelope's own 'account' is intentionally NOT mapped to cloud.account.id (would silently collide/override on cross-account events) and carries no alternate custom target in the field table, so it is dropped below rather than invented a name for."
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            { "name": "event.dataset", "value": "'aws_cloudtrail.management_events'" }
+          ],
+          "remove": [
+            "account",
+            "detail",
+            "detail-*"
+          ]
+        },
+        "description": "event.dataset (no hyphen) and cleanup: the envelope's cross-check-only 'account', the now-partially-mutated 'detail' object (superseded by the pristine _raw snapshot above), and the hyphenated 'detail-type' via glob (literal 'detail-type' is rejected by eval.remove)"
+      }
+    ]
+  }
+}

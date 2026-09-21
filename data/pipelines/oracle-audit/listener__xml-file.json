@@ -1,0 +1,122 @@
+{
+  "id": "dm_oracle_audit_listener_xml_file",
+  "conf": {
+    "output": "default",
+    "description": "Oracle Database Audit, listener, xml-file (ADR log.xml): extracts the <msg> envelope (time, host_id, host_addr, pid, comp_id, org_id, type, level) then reuses the listener/other two-stage TNS walk on the <txt> body - per recommendations.direct.cribl, this is that pipeline's XML branch, not a new parser.",
+    "functions": [
+      {
+        "id": "comment",
+        "filter": "true",
+        "conf": {
+          "comment": "listener / xml-file. Assumes the Source already delivers one <msg>...</msg> record as one event's _raw - splitting the ADR log.xml stream on that boundary is a Source-level Event Breaker Ruleset concern, out of scope for this pipeline (Sources are not touched here). msg attribute order is not assumed - each is matched with an independent lookahead. Envelope 'time' is authoritative and used for _time; the <txt> body's own leading DD-MON-YYYY timestamp is intentionally not extracted here. Numeric ADR 'level' has no documented level-to-ECS-log.level table in the work order, so it is left as a raw duplicate field rather than guessed (gap, see README) - same treatment as an unremovable numeric path segment. Body field mappings (service.name, source.ip, event.action, error.code/event.outcome, etc.) are identical to the listener/other pipeline and share its same scope/gaps (establish-shape lines only, unverified regex against a real sample)."
+        },
+        "description": "pipeline summary, scope and gaps"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/<msg(?=[^>]*\\btime='(?<time>[^']*)')(?=[^>]*\\borg_id='(?<org_id>[^']*)')(?=[^>]*\\bcomp_id='(?<comp_id>[^']*)')(?=[^>]*\\btype='(?<type>[^']*)')(?=[^>]*\\blevel='(?<level>[^']*)')(?=[^>]*\\bhost_id='(?<host_id>[^']*)')(?=[^>]*\\bhost_addr='(?<host_addr>[^']*)')(?=[^>]*\\bpid='(?<pid>[^']*)')[^>]*>\\s*<txt>(?<txt>[\\s\\S]*?)<\\/txt>/",
+          "source": "_raw"
+        },
+        "description": "extract the <msg> envelope attributes (order-independent, via lookaheads) and the <txt> body text in one pass"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^\\((?:SERVICE_NAME=(?<svc_name>[^()]*)|SID=(?<svc_sid>[^()]*))\\)(?:\\(CID=(?:\\(PROGRAM=(?<cid_program>[^()]*)\\))?(?:\\(HOST=(?<cid_host>[^()]*)\\))?(?:\\(USER=(?<cid_user>[^()]*)\\))?\\))?$/",
+          "source": "connect_inner"
+        },
+        "description": "same CONNECT_DATA sub-group walk as listener/other, run once connect_inner is pulled out of the <txt> body below"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/\\(CONNECT_DATA=(?<connect_inner>(?:[^()]|\\((?:[^()]|\\([^()]*\\))*\\))*)\\)\\s*\\*\\s*\\(ADDRESS=(?<addr_inner>(?:[^()]|\\([^()]*\\))*)\\)\\s*\\*\\s*(?<evt_action>[a-zA-Z_]+)\\s*\\*\\s*(?<line_tail>[^*]+?)\\s*\\*\\s*(?<rc>-?\\d+)/",
+          "source": "txt"
+        },
+        "description": "pull the CONNECT_DATA/ADDRESS blobs, event, trailing SID|Service segment (unmapped, not in this work order's field list) and return code out of the <txt> body - the body's own leading timestamp is skipped since the msg time attribute is authoritative"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^\\(PROTOCOL=(?<protocol>[^()]*)\\)\\(HOST=(?<addr_host>[^()]*)\\)\\(PORT=(?<addr_port>[^()]*)\\)$/",
+          "source": "addr_inner"
+        },
+        "description": "walk the ADDRESS sub-group extracted from the <txt> body"
+      },
+      {
+        "id": "rename",
+        "filter": "true",
+        "conf": {
+          "rename": [
+            { "currentName": "host_id", "newName": "observer.name" },
+            { "currentName": "host_addr", "newName": "observer.ip" },
+            { "currentName": "comp_id", "newName": "oracle.listener.component" },
+            { "currentName": "org_id", "newName": "oracle.listener.org_id" },
+            { "currentName": "type", "newName": "oracle.listener.message_type" },
+            { "currentName": "svc_name", "newName": "service.name" },
+            { "currentName": "svc_sid", "newName": "oracle.listener.sid" },
+            { "currentName": "cid_program", "newName": "process.name" },
+            { "currentName": "cid_host", "newName": "oracle.listener.client_asserted_host" },
+            { "currentName": "cid_user", "newName": "client.user.name" },
+            { "currentName": "addr_host", "newName": "source.ip" },
+            { "currentName": "evt_action", "newName": "event.action" }
+          ]
+        },
+        "description": "batch rename the envelope and body straight-copy captures; CID HOST stays a custom claim field, never overwriting the observer-verified source.ip"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            {
+              "name": "_time",
+              "value": "__e['time'] ? Date.parse(__e['time'])/1000 : undefined"
+            },
+            {
+              "name": "process.pid",
+              "value": "__e['pid'] !== undefined ? Number(__e['pid']) : undefined"
+            },
+            {
+              "name": "network.transport",
+              "value": "__e['protocol'] === 'tcps' ? 'tls' : __e['protocol']"
+            },
+            {
+              "name": "source.port",
+              "value": "__e['addr_port'] !== undefined ? Number(__e['addr_port']) : undefined"
+            },
+            {
+              "name": "error.code",
+              "value": "__e['rc'] !== undefined ? Number(__e['rc']) : undefined"
+            },
+            {
+              "name": "event.outcome",
+              "value": "__e['rc'] === undefined ? undefined : (Number(__e['rc']) === 0 ? 'success' : 'failure')"
+            },
+            {
+              "name": "event.dataset",
+              "value": "'oracle_audit.listener'"
+            }
+          ],
+          "remove": [
+            "time",
+            "pid",
+            "protocol",
+            "addr_port",
+            "rc",
+            "txt",
+            "connect_inner",
+            "addr_inner",
+            "line_tail"
+          ]
+        },
+        "description": "_time from the authoritative msg time attribute (ISO 8601 with offset, no timezone reconstruction needed), process.pid/source.port/error.code cast to number, tcps flagged as TLS-wrapped TNS, event.outcome derived from the return code, event.dataset tagged for the shared logs-oracle.listener stream; 'level' (raw numeric ADR severity) is deliberately left in the event unmapped - no level-to-log.level table was supplied, so it is kept as a harmless duplicate rather than guessed"
+      }
+    ]
+  }
+}

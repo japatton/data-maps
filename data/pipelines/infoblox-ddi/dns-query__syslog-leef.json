@@ -1,0 +1,198 @@
+{
+  "id": "dm_infoblox_ddi_dns_query_syslog_leef",
+  "conf": {
+    "output": "default",
+    "description": "Infoblox NIOS DDI - dns-query (named combined query/response log), syslog-leef format. Same shape as the CEF sibling with the LEEF header/attribute grammar and its two renamed keys (srcPort, url).",
+    "functions": [
+      {
+        "id": "comment",
+        "filter": "true",
+        "conf": {
+          "comment": "infoblox-ddi / dns-query / syslog-leef. Same two hazards as the CEF sibling: InfobloxDNSQFlags collides between Query Flags and Response Flags (both captured, kept separate), and the answer RR set inside msg can contain '=' and spaces (TXT rdata), parsed with a dedicated code step. LEEF differs from CEF in exactly two key names: srcPort (not spt) -> source.port, url (not destinationDnsDomain) -> dns.question.name. Never routed through the stock integration's BIND-grammar pipeline_dns. 'Timestamp' names no literal LEEF key, so _time uses the syslog header instead - see README gap."
+        },
+        "description": "why this pipeline exists, scope, and the two known hazards"
+      },
+      {
+        "id": "drop",
+        "filter": "!(_raw && _raw.indexOf('LEEF:') !== -1)",
+        "conf": {},
+        "description": "coarse guard: only LEEF: lines from the shared named stream continue"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^(?<syslog_ts>\\w{3}\\s+\\d{1,2}\\s+\\d{2}:\\d{2}:\\d{2})\\s+(?<syslog_host>\\S+)\\s+(?<syslog_tag>[^\\s:\\[]+)(?:\\[\\d+\\])?:\\s*(?<leef_full>LEEF:.*)$/",
+          "source": "_raw"
+        },
+        "description": "split the syslog header (timestamp, grid member, tag) from the LEEF payload"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^LEEF:(?<leef_version>[^|]*)\\|(?<leef_vendor>[^|]*)\\|(?<leef_product>[^|]*)\\|(?<leef_devversion>[^|]*)\\|(?<leef_eventid>[^|]*)\\|(?<leef_ext>.*)$/",
+          "source": "leef_full"
+        },
+        "description": "split the 5 pipe-delimited LEEF header fields from the attribute blob"
+      },
+      {
+        "id": "serde",
+        "filter": "true",
+        "conf": {
+          "mode": "extract",
+          "type": "kvp",
+          "srcField": "leef_ext"
+        },
+        "description": "explode the LEEF key=value attributes (src, srcPort, dst, dest_port, InfobloxDNSView, url, InfobloxDNSQClass, InfobloxDNSQType, proto, InfobloxDNSRCode, transaction_id, opcode, and a first pass at msg/InfobloxDNSQFlags which the next two steps correct)"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/msg=(?<msg_raw>[\\s\\S]*)$/",
+          "source": "leef_ext"
+        },
+        "description": "capture the full msg attribute value (answer RR set) to end of line"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/InfobloxDNSQFlags=(?<qflags_a>\\S+)[\\s\\S]*InfobloxDNSQFlags=(?<qflags_b>\\S+)/",
+          "source": "leef_ext"
+        },
+        "description": "de-collide InfobloxDNSQFlags: query-side (first) vs response-side (second) occurrence"
+      },
+      {
+        "id": "code",
+        "filter": "true",
+        "conf": {
+          "code": "var rrs = String(__e['msg_raw']||'').split(';').map(function(s){return s.trim();}).filter(function(s){return s.length>0;}); var answers = []; var resolved = []; for (var i=0;i<rrs.length;i++){   var m = /^(\\S+)\\s+(\\S+)\\s+(\\S+)\\s+(\\S+)\\s+([\\s\\S]*)$/.exec(rrs[i]);   if (m){     var rrType = m[4]; var rdata = m[5];     answers.push({name:m[1], ttl:parseInt(m[2],10), class:m[3], type:rrType, data:rdata});     if ((rrType==='A'||rrType==='AAAA') && resolved.indexOf(rdata)===-1){ resolved.push(rdata); }   } } __e['dns'] = __e['dns'] || {}; __e['dns']['answers'] = answers; if (resolved.length>0){ __e['dns']['resolved_ip'] = resolved; }"
+        },
+        "description": "parse msg_raw's semicolon-delimited RR set into dns.answers[] and dns.resolved_ip"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            {
+              "name": "_time",
+              "value": "__e['syslog_ts'] ? Date.parse(__e['syslog_ts'] + ' ' + (new Date()).getFullYear())/1000 : undefined"
+            },
+            {
+              "name": "observer.hostname",
+              "value": "__e['syslog_host']"
+            },
+            {
+              "name": "observer.name",
+              "value": "__e['syslog_host']"
+            },
+            {
+              "name": "observer.vendor",
+              "value": "'Infoblox'"
+            },
+            {
+              "name": "observer.product",
+              "value": "__e['leef_product']"
+            },
+            {
+              "name": "observer.version",
+              "value": "__e['leef_devversion'] ? __e['leef_devversion'].split('-')[0] : undefined"
+            },
+            {
+              "name": "dns.question.name",
+              "value": "__e['url'] ? __e['url'].replace(/\\.$/,'').toLowerCase() : undefined"
+            },
+            {
+              "name": "network.transport",
+              "value": "__e['proto'] ? __e['proto'].toLowerCase() : undefined"
+            },
+            {
+              "name": "infoblox.nios.dns.view",
+              "value": "__e['InfobloxDNSView']"
+            },
+            {
+              "name": "infoblox.nios.dns.query_flags",
+              "value": "__e['qflags_a'] ? __e['qflags_a'] : __e['InfobloxDNSQFlags']"
+            },
+            {
+              "name": "infoblox.nios.dns.response_flags",
+              "value": "__e['qflags_b'] ? __e['qflags_b'] : undefined"
+            },
+            {
+              "name": "event.dataset",
+              "value": "'infoblox_ddi.dns_query'"
+            }
+          ],
+          "remove": [
+            "leef_full",
+            "leef_ext",
+            "leef_version",
+            "leef_eventid",
+            "syslog_ts",
+            "syslog_host",
+            "syslog_tag",
+            "msg_raw",
+            "qflags_a",
+            "qflags_b",
+            "msg",
+            "proto",
+            "InfobloxDNSQFlags",
+            "url",
+            "leef_vendor",
+            "leef_product",
+            "leef_devversion"
+          ]
+        },
+        "description": "derived fields read from ORIGINAL vendor/regex-capture names, then drop pipeline-internal scratch fields and superseded originals"
+      },
+      {
+        "id": "rename",
+        "filter": "true",
+        "conf": {
+          "rename": [
+            {
+              "currentName": "src",
+              "newName": "source.ip"
+            },
+            {
+              "currentName": "srcPort",
+              "newName": "source.port"
+            },
+            {
+              "currentName": "dst",
+              "newName": "destination.ip"
+            },
+            {
+              "currentName": "dest_port",
+              "newName": "destination.port"
+            },
+            {
+              "currentName": "InfobloxDNSQClass",
+              "newName": "dns.question.class"
+            },
+            {
+              "currentName": "InfobloxDNSQType",
+              "newName": "dns.question.type"
+            },
+            {
+              "currentName": "InfobloxDNSRCode",
+              "newName": "dns.response_code"
+            },
+            {
+              "currentName": "transaction_id",
+              "newName": "dns.id"
+            },
+            {
+              "currentName": "opcode",
+              "newName": "dns.op_code"
+            }
+          ]
+        },
+        "description": "batch rename every status:mapped 1:1 LEEF attribute to its ECS target"
+      }
+    ]
+  }
+}

@@ -1,0 +1,78 @@
+{
+  "id": "dm_syslog_relay_syslog_ng_stats_api_pull",
+  "conf": {
+    "output": "default",
+    "description": "syslog-relay/syslog-ng-stats api-pull: parses the syslog-ng-ctl stats semicolon table (one counter per line, type;id;instance;state;counter;value), splits instance by object type, clamps the queued defect, and routes each counter into a typed syslog_ng.stats field before renaming the raw columns.",
+    "functions": [
+      {
+        "id": "comment",
+        "filter": "true",
+        "conf": { "comment": "syslog-ng-ctl stats / syslog-ng-ctl query output, one counter line per event: type;id;instance;state;counter;value. No syslog header - collector-stamped host/time are not named by the map, so _time and host.name are left to the source default (see README gap)." },
+        "description": "document source shape and the collector-timestamp gap up front"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^(?<SourceName>[^;]+);(?<SourceID>[^;]+);(?<SourceInstance>[^;]*);(?<State>[^;]+);(?<Type>[^;]+);(?<Number>[^;]+)$/",
+          "source": "_raw"
+        },
+        "description": "split the semicolon-delimited long-format line into its six raw columns"
+      },
+      {
+        "id": "drop",
+        "filter": "__e['State']==='d'",
+        "conf": {},
+        "description": "drop dynamic (state d) per-sender objects before the guard/cardinality boundary per recommendations.direct.cribl - reconciliation runs on the static drivers"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            { "name": "source.address", "value": "__e['SourceName'] && __e['SourceName'].indexOf('src.')===0 ? __e['SourceInstance'] : undefined" },
+            { "name": "destination.address", "value": "__e['SourceName'] && __e['SourceName'].indexOf('dst.')===0 && __e['SourceInstance'] ? __e['SourceInstance'].split(':')[0] : undefined" },
+            { "name": "destination.port", "value": "__e['SourceName'] && __e['SourceName'].indexOf('dst.')===0 && __e['SourceInstance'] && __e['SourceInstance'].indexOf(':')>-1 ? Number(__e['SourceInstance'].split(':')[1]) : undefined" },
+            { "name": "syslog_ng.stats.instance", "value": "__e['SourceName'] && __e['SourceName'].indexOf('src.')!==0 && __e['SourceName'].indexOf('dst.')!==0 && __e['SourceInstance'] ? __e['SourceInstance'] : undefined" },
+            { "name": "event.end", "value": "__e['Type']==='stamp' ? Number(__e['Number'])*1000 : undefined" }
+          ],
+          "remove": ["SourceInstance"]
+        },
+        "description": "compute the instance split (source.address for src.* objects, destination.address/port for dst.* objects, raw fallback for filter/parser/global objects) and the stamp-to-epoch-ms conversion - all read the ORIGINAL SourceName/SourceInstance/Type/Number before they are renamed (compute-before-rename)"
+      },
+      {
+        "id": "code",
+        "filter": "true",
+        "conf": {
+          "code": "var t = __e['Type']; var num = Number(__e['Number']); if (t === 'queued' && num > 9223372036854775807) { num = num - 18446744073709551616; } __e.syslog_ng = __e.syslog_ng || {}; __e.syslog_ng.stats = __e.syslog_ng.stats || {}; if (t) { __e.syslog_ng.stats[t] = num; }"
+        },
+        "description": "route this line's counter into a typed field named after Type (e.g. syslog_ng.stats.dropped, .processed) rather than a generic name/value pair, clamping the known unsigned-underflow defect on queued - reads the original Type/Number before the batched rename below"
+      },
+      {
+        "id": "rename",
+        "filter": "true",
+        "conf": {
+          "rename": [
+            { "currentName": "SourceName", "newName": "syslog_ng.stats.object_type" },
+            { "currentName": "SourceID", "newName": "syslog_ng.stats.object_id" },
+            { "currentName": "State", "newName": "syslog_ng.stats.state" },
+            { "currentName": "Type", "newName": "syslog_ng.stats.counter" },
+            { "currentName": "Number", "newName": "syslog_ng.stats.value" }
+          ]
+        },
+        "description": "batched rename of the six clean raw columns onto the custom namespace, now that every derived field has already read their pre-rename values"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            { "name": "observer.type", "value": "'syslog-ng'" },
+            { "name": "event.dataset", "value": "'syslog_relay.syslog_ng_stats'" }
+          ]
+        },
+        "description": "stamp the daemon identity (this format has no PROGRAM-equivalent header field, unlike syslog-kv) and set event.dataset"
+      }
+    ]
+  }
+}

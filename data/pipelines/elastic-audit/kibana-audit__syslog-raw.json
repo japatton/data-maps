@@ -1,0 +1,51 @@
+{
+  "id": "dm_elastic_audit_kibana_audit_syslog_raw",
+  "conf": {
+    "output": "default",
+    "description": "Elastic Stack Audit kibana-audit / syslog-raw (pattern-layout audit appender): grok the [%date][%level][%logger] prefix, find %meta's JSON object by brace-depth counting (string/escape aware, not a naive regex), reconstitute _raw into the same NDJSON the json layout produces, then converge onto the json format's own thin-pass-through convention rather than inventing a parallel ECS mapping.",
+    "functions": [
+      {
+        "id": "comment",
+        "filter": "true",
+        "conf": {
+          "comment": "elastic-audit/kibana-audit/syslog-raw. Reconstitutes into the same NDJSON _raw the json-layout produces, then defers exactly like that format's own thin pass-through -- no new ECS mapping invented, per 'do not build a parallel parser... converge onto the json path.' %meta's JSON boundary is found by counting brace depth char-by-char with string/escape awareness, since a naive regex cannot balance nested braces and %message can itself contain stray brackets (the work order's own warning). On any parse failure (missing prefix, unbalanced braces, invalid JSON) the ORIGINAL unparsed line is left in _raw and cribl.audit.parse_error records why -- 'a half-parsed audit line is worse than a flagged gap,' and a dead-letter Route is out of a pipeline's scope. %level/%logger are dropped as documented duplicates of meta's own log.level/log.logger; %date becomes both the reconstituted @timestamp key and Cribl's own _time."
+        },
+        "description": "document the reconstitute-not-reinvent approach and the parse-failure fallback"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/\\[(?<kb_date>[^\\]]*)\\]\\[(?<kb_level>[^\\]]*)\\]\\[(?<kb_logger>[^\\]]*)\\](?<kb_rest>.*)$/",
+          "source": "_raw"
+        },
+        "description": "split the 3 bracketed prefix tokens from the trailing %meta+%message blob (unanchored, tolerates a leading collector envelope)"
+      },
+      {
+        "id": "code",
+        "filter": "true",
+        "conf": {
+          "code": "var body = __e['kb_rest'];\nvar errorTag;\nif (typeof body === 'undefined') {\n  errorTag = 'prefix_not_matched';\n} else {\n  var start = body.indexOf('{');\n  if (start === -1) {\n    errorTag = 'meta_not_found';\n  } else {\n    var depth = 0; var inStr = false; var esc = false; var end = -1;\n    for (var i = start; i < body.length; i++) {\n      var ch = body.charAt(i);\n      if (esc) { esc = false; continue; }\n      if (ch === '\\\\') { esc = true; continue; }\n      if (ch === '\"') { inStr = !inStr; continue; }\n      if (!inStr) {\n        if (ch === '{') { depth++; }\n        else if (ch === '}') { depth--; if (depth === 0) { end = i; break; } }\n      }\n    }\n    if (end === -1) {\n      errorTag = 'meta_unbalanced';\n    } else {\n      var metaStr = body.substring(start, end + 1);\n      var messageStr = body.substring(end + 1).replace(/^\\s+/, '');\n      var meta;\n      try { meta = JSON.parse(metaStr); } catch (e) { meta = undefined; }\n      if (typeof meta === 'undefined' || meta === null) {\n        errorTag = 'meta_json_invalid';\n      } else {\n        if (typeof meta.message === 'undefined' && messageStr.length > 0) { meta.message = messageStr; }\n        if (typeof meta['@timestamp'] === 'undefined' && typeof __e['kb_date'] !== 'undefined') { meta['@timestamp'] = __e['kb_date']; }\n        __e['_raw'] = JSON.stringify(meta);\n        __e['_time'] = Math.floor(Date.parse(__e['kb_date']) / 1000);\n      }\n    }\n  }\n}\nif (typeof errorTag !== 'undefined') { __e['cribl.audit.parse_error'] = errorTag; }\ndelete __e['kb_date'];\ndelete __e['kb_level'];\ndelete __e['kb_logger'];\ndelete __e['kb_rest'];"
+        },
+        "description": "brace-depth-counted (string/escape-aware) extraction of the %meta JSON object, reconstitute _raw as the equivalent NDJSON document, set _time from %date, flag any parse failure without touching _raw so the original line survives for investigation"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            {
+              "name": "event.dataset",
+              "value": "'elastic_audit.kibana_audit'"
+            },
+            {
+              "name": "event.category",
+              "value": "['authentication','configuration']"
+            }
+          ]
+        },
+        "description": "tag the dataset (matching the json format's own tag) and category before Elastic parses the reconstituted _raw, exactly as the json-layout pipeline does"
+      }
+    ]
+  }
+}

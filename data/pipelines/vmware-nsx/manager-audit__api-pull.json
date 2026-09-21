@@ -1,0 +1,237 @@
+{
+  "id": "dm_vmware_nsx_manager_audit_api_pull",
+  "conf": {
+    "output": "default",
+    "description": "VMware NSX Manager audit/system log, api-pull: identical RFC 5424 audit record to the syslog-kv feed (per the work order's own fields_omitted note), reparsed by the same grammar after a REST Collector poll of /api/v1/administration/audit-logs.",
+    "functions": [
+      {
+        "id": "comment",
+        "filter": "true",
+        "conf": {
+          "comment": "vmware-nsx/manager-audit/api-pull. No Elastic integration or Cribl Pack parses NSX appliance audit logs, so this is a hand-built RFC 5424 + structured-data + body-grammar parser. Delivered by a Cribl Collector polling the NSX Manager audit-logs REST endpoint; the collector/watermarking transport plumbing is a Route/Collector-layer concern out of this pipeline's scope, and the payload is byte-identical RFC 5424 text to the syslog-kv feed, so the same parser applies unchanged. Branches the message body on subcomp (http/manager/policy key=\"value\" grammar vs cli CMD: line) per the work order's explicit 3-branch requirement."
+        },
+        "description": "record scope and, for the api-pull variant, that it is the same grammar as the syslog feed"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^<(?<pri>\\d+)>\\d+\\s+(?<timestamp>\\S+)\\s+(?<hostname>\\S+)\\s+\\S+\\s+(?<procid>\\S+)\\s+(?<msgid>\\S+)\\s+\\[nsx@6876\\s+(?<sd>[^\\]]*)\\]\\s*(?<msg>.*)$/",
+          "source": "_raw"
+        },
+        "description": "split the RFC 5424 header (PRI, timestamp, hostname, procid, msgid), the [nsx@6876 ...] structured-data element, and the free-text message body"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/(?<_NAME_0>[a-zA-Z]+)=\"(?<_VALUE_0>[^\"]*)\"/",
+          "source": "sd"
+        },
+        "description": "repeating key=\"value\" extraction of the structured-data params (audit, comp, subcomp, level, username, euser, reqId, entId, update, errorCode) into dynamically-named fields"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/(?<_NAME_0>[A-Za-z][A-Za-z ]*)=\"(?<_VALUE_0>[^\"]*)\"/",
+          "source": "msg"
+        },
+        "description": "repeating key=\"value\" extraction of the audit body (UserName, ModuleName, Operation, \"Operation status\", \"New value\") - the name pattern allows embedded spaces because two of these keys are two words; harmless no-op on cli-branch bodies that don't match this grammar"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "__e['subcomp'] == 'cli'",
+        "conf": {
+          "regex": "/^CMD:\\s*(?<cmd>.*)$/",
+          "source": "msg"
+        },
+        "description": "cli-branch (subcomp=\"cli\") records carry a bare CMD: line instead of the key/value body; the appended duration is not split out separately since the work order gives no delimiter for it (documented gap)"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            {
+              "name": "log.syslog.facility.code",
+              "value": "Math.floor(parseInt(__e['pri'], 10) / 8)"
+            },
+            {
+              "name": "log.syslog.severity.code",
+              "value": "parseInt(__e['pri'], 10) % 8"
+            },
+            {
+              "name": "event.severity",
+              "value": "__e['level'] == 'INFO' ? 6 : (__e['level'] == 'WARNING' ? 4 : (__e['level'] == 'ERROR' ? 3 : (__e['level'] == 'FATAL' ? 2 : undefined)))"
+            },
+            {
+              "name": "event.outcome",
+              "value": "__e['Operation status'] ? (__e['Operation status'] == 'success' ? 'success' : (__e['Operation status'] == 'failure' ? 'failure' : 'unknown')) : undefined"
+            },
+            {
+              "name": "event.code",
+              "value": "(__e['errorCode'] && __e['errorCode'] !== '-') ? __e['errorCode'] : undefined"
+            },
+            {
+              "name": "vmware.nsx.manager.audit",
+              "value": "__e['audit'] == 'true'"
+            },
+            {
+              "name": "vmware.nsx.manager.write",
+              "value": "__e['update'] == 'true'"
+            },
+            {
+              "name": "vmware.nsx.manager.external_user",
+              "value": "(__e['euser'] && __e['euser'] !== '-') ? __e['euser'] : undefined"
+            },
+            {
+              "name": "vmware.nsx.manager.new_value",
+              "value": "__e['New value'] ? (__e['New value'].length > 2000 ? __e['New value'].slice(0, 2000) + '...TRUNCATED' : __e['New value']) : undefined"
+            },
+            {
+              "name": "vmware.nsx.manager.new_value_truncated",
+              "value": "__e['New value'] ? __e['New value'].length > 2000 : false"
+            },
+            {
+              "name": "process.command_line",
+              "value": "__e['cmd'] ? (__e['cmd'].length > 2000 ? __e['cmd'].slice(0, 2000) + '...TRUNCATED' : __e['cmd']) : undefined"
+            },
+            {
+              "name": "process.pid",
+              "value": "(__e['procid'] && __e['procid'] !== '-') ? parseInt(__e['procid'], 10) : undefined"
+            },
+            {
+              "name": "event.category",
+              "value": "['configuration', 'authentication']"
+            },
+            {
+              "name": "event.kind",
+              "value": "'event'"
+            }
+          ]
+        },
+        "description": "compute every derived field (severity scale, outcome vocab, boolean casts, length-capped New value/CMD text with truncation flags) from ORIGINAL vendor names before the batched rename (ORDER MATTERS)"
+      },
+      {
+        "id": "rename",
+        "filter": "true",
+        "conf": {
+          "rename": [
+            {
+              "currentName": "hostname",
+              "newName": "observer.name"
+            },
+            {
+              "currentName": "comp",
+              "newName": "vmware.nsx.manager.component"
+            },
+            {
+              "currentName": "subcomp",
+              "newName": "vmware.nsx.manager.subcomponent"
+            },
+            {
+              "currentName": "reqId",
+              "newName": "vmware.nsx.manager.request_id"
+            },
+            {
+              "currentName": "entId",
+              "newName": "vmware.nsx.manager.entity_id"
+            },
+            {
+              "currentName": "msgid",
+              "newName": "vmware.nsx.manager.msgid"
+            },
+            {
+              "currentName": "username",
+              "newName": "user.name"
+            },
+            {
+              "currentName": "ModuleName",
+              "newName": "vmware.nsx.manager.module"
+            },
+            {
+              "currentName": "Operation",
+              "newName": "event.action"
+            },
+            {
+              "currentName": "level",
+              "newName": "log.level"
+            }
+          ]
+        },
+        "description": "batch every clean-named mapped field into its ECS/custom target"
+      },
+      {
+        "id": "auto_timestamp",
+        "filter": "true",
+        "conf": {
+          "srcField": "timestamp",
+          "dstField": "_time"
+        },
+        "description": "set Cribl's canonical _time from the RFC 5424 header timestamp - never target @timestamp directly (constraint 1)"
+      },
+      {
+        "id": "mask",
+        "filter": "true",
+        "conf": {
+          "rules": [
+            {
+              "matchRegex": "/\"(?:password|secret|token|key|cert|credential)\"\\s*:\\s*\"([^\"]*)\"/i",
+              "replaceExpr": "'REDACTED'"
+            },
+            {
+              "matchRegex": "/(?:password|passwd|secret|token)[=:]\\s*(\\S+)/i",
+              "replaceExpr": "'REDACTED'"
+            }
+          ],
+          "fields": [
+            "_raw",
+            "vmware.nsx.manager.new_value",
+            "process.command_line"
+          ]
+        },
+        "description": "redact password/secret/key-shaped nodes per recommendations.direct.cribl, across every field the parser materialized (raw AND parsed copies) so a masked value cannot leak from _raw"
+      },
+      {
+        "id": "numerify",
+        "filter": "true",
+        "conf": {},
+        "description": "coerce remaining numeric-looking string fields"
+      },
+      {
+        "id": "code",
+        "filter": "true",
+        "conf": {
+          "code": "delete __e['Operation status']; delete __e['New value'];"
+        },
+        "description": "remove the two space-named working fields that eval.remove cannot target literally (awkward-name limitation)"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "remove": [
+            "pri",
+            "audit",
+            "update",
+            "procid",
+            "errorCode",
+            "euser",
+            "sd",
+            "msg",
+            "timestamp",
+            "cmd"
+          ],
+          "add": [
+            {
+              "name": "event.dataset",
+              "value": "'vmware_nsx.manager_audit'"
+            }
+          ]
+        },
+        "description": "drop remaining redundant working fields and tag the dataset - _raw is deliberately KEPT per recommendations.direct.cribl (low-volume, individually significant)"
+      }
+    ]
+  }
+}

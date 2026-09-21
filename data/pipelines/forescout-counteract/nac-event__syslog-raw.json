@@ -1,0 +1,197 @@
+{
+  "id": "dm_forescout_counteract_nac_event_syslog_raw",
+  "conf": {
+    "output": "default",
+    "description": "Forescout eyeSight/CounterACT NAC/threat-protection Syslog Plugin text feed (nac-event, syslog-raw): hand-built grammar parse per recommendations.direct.cribl - no Elastic/Cribl-pack parser exists for this text.",
+    "functions": [
+      {
+        "id": "comment",
+        "filter": "true",
+        "conf": {
+          "comment": "nac-event/syslog-raw: no vendor grammar exists in Elastic or a Cribl pack, so this pipeline owns it per recommendations.direct.cribl. Parses RFC3164 envelope, then branches body on 'NAC Policy Log:' vs the threat-protection 'Type:/Source:/Target:/Vendor:/Severity:' tail vs free operator text. Source is IP or 'MAC Address-<mac>' - routed by shape to source.ip/source.mac. Duration string and Target host:service split are best-effort (vendor format undocumented) - see README gaps."
+        },
+        "description": "why a hand-built grammar parser is required here"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^(?:<(?<pri>\\d{1,3})>)?(?<syslog_ts>[A-Z][a-z]{2}\\s+\\d{1,2}\\s+\\d{2}:\\d{2}:\\d{2})\\s+(?:(?<device_id>\\S+)\\s+)?(?<tag>[^:\\[]+)(?:\\[\\d+\\])?:\\s*(?<body>.*)$/",
+          "source": "_raw"
+        },
+        "description": "Parse RFC3164 envelope: optional PRI, header timestamp, optional CounterACT device identifier, syslog tag (Message Identity), message body"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "typeof body !== 'undefined' && body.indexOf('NAC Policy Log:') > -1",
+        "conf": {
+          "regex": "/NAC Policy Log:\\s*Source:\\s*(?<nac_source>[^,]+),\\s*Rule:\\s*(?<nac_rule>[^,]+),\\s*Match:\\s*(?<nac_match>[^,]+),\\s*Category:\\s*(?<nac_category>[^,]+)(?:,\\s*Duration:\\s*(?<nac_duration>[^,]+))?(?:,\\s*(?<nac_mac_change>MAC Address changed from.*))?/",
+          "source": "body"
+        },
+        "description": "Extract NAC Policy Log fields: Source, Rule, Match, Category, optional Duration and MAC-change clause"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "typeof body !== 'undefined' && /Type:\\s*\\S+[\\s\\S]*Source:\\s*\\S+[\\s\\S]*Target:\\s*\\S+/.test(body)",
+        "conf": {
+          "regex": "/Type:\\s*(?<tp_type>\\S+)[\\s\\S]*?Source:\\s*(?<tp_source>\\S+)[\\s\\S]*?Target:\\s*(?<tp_target>\\S+)[\\s\\S]*?Vendor:\\s*(?<tp_vendor>\\S+)[\\s\\S]*?Severity:\\s*(?<tp_severity>\\w+)/",
+          "source": "body"
+        },
+        "description": "Extract threat-protection key-value tail: Type, Source, Target, Vendor, Severity"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "typeof nac_mac_change !== 'undefined'",
+        "conf": {
+          "regex": "/from\\s+(?<mac_change_from>[0-9A-Fa-f:]+)\\s+to\\s+(?<mac_change_to>[0-9A-Fa-f:]+)/",
+          "source": "nac_mac_change"
+        },
+        "description": "Split the MAC-change detail clause into old/new MAC custom subfields"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "typeof nac_duration !== 'undefined'",
+        "conf": {
+          "regex": "/(?:(?<dur_days>\\d+)\\s*day[s]?)?\\D*(?:(?<dur_hours>\\d+)\\s*hour[s]?)?\\D*(?:(?<dur_minutes>\\d+)\\s*min(?:ute)?[s]?)?\\D*(?:(?<dur_seconds>\\d+)\\s*sec(?:ond)?[s]?)?/",
+          "source": "nac_duration"
+        },
+        "description": "Best-effort decomposition of the human-readable Duration string into day/hour/minute/second components; exact vendor format is undocumented (README gap)"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "typeof tp_target !== 'undefined'",
+        "conf": {
+          "regex": "/^(?<tp_target_host>[^:]+)(?::(?<tp_target_svc>.+))?$/",
+          "source": "tp_target"
+        },
+        "description": "Split the documented 'host + service' Target value so only the host part reaches destination.ip"
+      },
+      {
+        "id": "rename",
+        "filter": "true",
+        "conf": {
+          "rename": [
+            {
+              "currentName": "nac_rule",
+              "newName": "rule.name"
+            },
+            {
+              "currentName": "nac_category",
+              "newName": "rule.category"
+            },
+            {
+              "currentName": "tag",
+              "newName": "log.syslog.appname"
+            },
+            {
+              "currentName": "tp_type",
+              "newName": "event.action"
+            },
+            {
+              "currentName": "tp_vendor",
+              "newName": "device.manufacturer"
+            }
+          ]
+        },
+        "description": "batch every status:mapped field that needed no further transform"
+      },
+      {
+        "id": "auto_timestamp",
+        "filter": "true",
+        "conf": {
+          "srcField": "syslog_ts",
+          "dstField": "_time"
+        },
+        "description": "RFC3164 timestamp has no year/timezone; auto_timestamp infers both from the worker's clock (documented year-rollover risk near 1 Jan - README gap)"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            {
+              "name": "source.ip",
+              "value": "(__e['nac_source']||__e['tp_source']) && (__e['nac_source']||__e['tp_source']).indexOf('MAC Address-')!==0 ? (__e['nac_source']||__e['tp_source']) : undefined"
+            },
+            {
+              "name": "source.mac",
+              "value": "(__e['nac_source']||__e['tp_source']) && (__e['nac_source']||__e['tp_source']).indexOf('MAC Address-')===0 ? (__e['nac_source']||__e['tp_source']).slice(12) : undefined"
+            },
+            {
+              "name": "forescout.nac.match",
+              "value": "__e['nac_match']"
+            },
+            {
+              "name": "forescout.nac.mac_change.from",
+              "value": "__e['mac_change_from']"
+            },
+            {
+              "name": "forescout.nac.mac_change.to",
+              "value": "__e['mac_change_to']"
+            },
+            {
+              "name": "event.duration",
+              "value": "typeof __e['nac_duration'] !== 'undefined' ? ((Number(__e['dur_days']||0)*86400)+(Number(__e['dur_hours']||0)*3600)+(Number(__e['dur_minutes']||0)*60)+Number(__e['dur_seconds']||0))*1000000000 : undefined"
+            },
+            {
+              "name": "destination.ip",
+              "value": "__e['tp_target_host']"
+            },
+            {
+              "name": "event.severity",
+              "value": "__e['tp_severity']==='ERRR'?3:__e['tp_severity']==='WARN'?4:__e['tp_severity']==='INFO'?6:undefined"
+            },
+            {
+              "name": "log.syslog.facility.name",
+              "value": "__e['pri']===undefined?'local5':(Math.floor(Number(__e['pri'])/8)===0?'kern':Math.floor(Number(__e['pri'])/8)===1?'user':Math.floor(Number(__e['pri'])/8)===2?'mail':Math.floor(Number(__e['pri'])/8)===3?'daemon':Math.floor(Number(__e['pri'])/8)===4?'auth':Math.floor(Number(__e['pri'])/8)===5?'syslog':Math.floor(Number(__e['pri'])/8)===6?'lpr':Math.floor(Number(__e['pri'])/8)===7?'news':Math.floor(Number(__e['pri'])/8)===8?'uucp':Math.floor(Number(__e['pri'])/8)===9?'cron':Math.floor(Number(__e['pri'])/8)===10?'authpriv':Math.floor(Number(__e['pri'])/8)===11?'ftp':Math.floor(Number(__e['pri'])/8)===12?'ntp':Math.floor(Number(__e['pri'])/8)===13?'security':Math.floor(Number(__e['pri'])/8)===14?'console':Math.floor(Number(__e['pri'])/8)===15?'solaris_cron':Math.floor(Number(__e['pri'])/8)===16?'local0':Math.floor(Number(__e['pri'])/8)===17?'local1':Math.floor(Number(__e['pri'])/8)===18?'local2':Math.floor(Number(__e['pri'])/8)===19?'local3':Math.floor(Number(__e['pri'])/8)===20?'local4':Math.floor(Number(__e['pri'])/8)===21?'local5':Math.floor(Number(__e['pri'])/8)===22?'local6':Math.floor(Number(__e['pri'])/8)===23?'local7':'unknown')"
+            },
+            {
+              "name": "log.syslog.severity.name",
+              "value": "__e['pri']===undefined?undefined:(Number(__e['pri'])%8===0?'emergency':Number(__e['pri'])%8===1?'alert':Number(__e['pri'])%8===2?'critical':Number(__e['pri'])%8===3?'error':Number(__e['pri'])%8===4?'warning':Number(__e['pri'])%8===5?'notice':Number(__e['pri'])%8===6?'informational':'debug')"
+            },
+            {
+              "name": "observer.name",
+              "value": "__e['device_id'] && !/^\\d{1,3}(\\.\\d{1,3}){3}$/.test(__e['device_id']) ? __e['device_id'] : undefined"
+            },
+            {
+              "name": "observer.ip",
+              "value": "__e['device_id'] && /^\\d{1,3}(\\.\\d{1,3}){3}$/.test(__e['device_id']) ? __e['device_id'] : undefined"
+            },
+            {
+              "name": "message",
+              "value": "(typeof __e['body'] !== 'undefined' && __e['body'].indexOf('NAC Policy Log:')===-1 && !/Type:\\s*\\S+[\\s\\S]*Source:\\s*\\S+[\\s\\S]*Target:\\s*\\S+/.test(__e['body'])) ? __e['body'] : undefined"
+            },
+            {
+              "name": "event.dataset",
+              "value": "'forescout_counteract.nac_event'"
+            }
+          ],
+          "remove": [
+            "pri",
+            "body",
+            "device_id",
+            "syslog_ts",
+            "nac_source",
+            "tp_source",
+            "nac_match",
+            "nac_mac_change",
+            "mac_change_from",
+            "mac_change_to",
+            "nac_duration",
+            "dur_days",
+            "dur_hours",
+            "dur_minutes",
+            "dur_seconds",
+            "tp_target",
+            "tp_target_host",
+            "tp_target_svc",
+            "tp_type",
+            "tp_vendor",
+            "tp_severity"
+          ]
+        },
+        "description": "source.ip/mac shape branch, PRI facility/severity name decode, event.duration ns conversion, threat severity provisional lookup, observer identity shape branch, event.dataset, cleanup"
+      }
+    ]
+  }
+}

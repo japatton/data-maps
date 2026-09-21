@@ -1,0 +1,109 @@
+{
+  "id": "dm_aws_vpcflow_flow_parquet_s3",
+  "conf": {
+    "output": "default",
+    "description": "aws-vpcflow flow / parquet-s3: maps the already-typed Parquet columns (INT_32/INT_64) to ECS - protocol/tcp-flags/traffic-path decode, epoch-seconds timestamps to event.start/event.end/_time. Scope is deliberately limited to the 10 integer-typed columns this work order tables; every other selected column (srcaddr, dstaddr, action, log-status, vpc-id, etc.) is STRING-typed identically to the text feed and maps to ECS exactly as that feed does, per the work order's own notes - not duplicated here.",
+    "functions": [
+      {
+        "id": "comment",
+        "filter": "true",
+        "conf": {
+          "comment": "aws-vpcflow / flow / parquet-s3. Cribl's S3 Parquet reader has already decoded row groups to typed, named fields - no _raw line to split, unlike the text feed. tcp-flags/traffic-path are HYPHENATED source names (THE BIG ONE trap), read via __e['tcp-flags']/__e['traffic-path'] bracket access, never path syntax. traffic-path's 8-value decode uses AWS's own published table (docs.aws.amazon.com/vpc/latest/userguide/flow-log-records.html, fetched live - not guessed); the previous quarantined attempt at this field had an unbalanced ternary, so this version casts Number() once into a flat scratch field first rather than repeating it 8x. network.transport covers only tcp/udp/icmp/icmpv6 - the full IANA table was not supplied and is not invented. Direct route, no guard hop."
+        },
+        "description": "record dataset, format, the hyphenated-source-name handling, and the traffic-path/protocol scope decisions"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            {
+              "name": "_tcp_flags_num",
+              "value": "__e['tcp-flags'] !== undefined ? Number(__e['tcp-flags']) : undefined"
+            },
+            {
+              "name": "_traffic_path_num",
+              "value": "__e['traffic-path'] !== undefined ? Number(__e['traffic-path']) : undefined"
+            }
+          ]
+        },
+        "description": "step 1: cast the two hyphenated-source integer columns into FLAT clean-named scratch fields (no dots), read via bracket access. Deliberately flat, not the final aws.vpcflow.* nested target yet - eval.add with a dotted name builds real nested structure, and reading that back via __e['a.b.c'] (a single flat bracket key) would silently miss it, the same flat-vs-nested landmine the brief warns about for dotted SOURCE keys, self-inflicted here if skipped"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            {
+              "name": "network.transport",
+              "value": "Number(__e['protocol']) === 6 ? 'tcp' : (Number(__e['protocol']) === 17 ? 'udp' : (Number(__e['protocol']) === 1 ? 'icmp' : (Number(__e['protocol']) === 58 ? 'icmpv6' : undefined)))"
+            },
+            {
+              "name": "aws.vpcflow.tcp_flags",
+              "value": "__e['_tcp_flags_num']"
+            },
+            {
+              "name": "aws.vpcflow.tcp_flags_array",
+              "value": "[(__e['_tcp_flags_num'] & 1) !== 0 ? 'fin' : undefined, (__e['_tcp_flags_num'] & 2) !== 0 ? 'syn' : undefined, (__e['_tcp_flags_num'] & 4) !== 0 ? 'rst' : undefined, (__e['_tcp_flags_num'] & 16) !== 0 ? 'ack' : undefined]"
+            },
+            {
+              "name": "aws.vpcflow.traffic_path",
+              "value": "__e['_traffic_path_num']"
+            },
+            {
+              "name": "aws.vpcflow.traffic_path_name",
+              "value": "__e['_traffic_path_num'] === 1 ? 'same-vpc-resource' : (__e['_traffic_path_num'] === 2 ? 'internet-gateway-or-gateway-endpoint' : (__e['_traffic_path_num'] === 3 ? 'virtual-private-gateway' : (__e['_traffic_path_num'] === 4 ? 'intra-region-vpc-peering' : (__e['_traffic_path_num'] === 5 ? 'inter-region-vpc-peering' : (__e['_traffic_path_num'] === 6 ? 'local-zone-or-wavelength-zone' : (__e['_traffic_path_num'] === 7 ? 'gateway-vpc-endpoint' : (__e['_traffic_path_num'] === 8 ? 'internet-gateway' : undefined)))))))"
+            },
+            {
+              "name": "event.start",
+              "value": "__e['start'] !== undefined ? Number(__e['start']) * 1000 : undefined"
+            },
+            {
+              "name": "event.end",
+              "value": "__e['end'] !== undefined ? Number(__e['end']) * 1000 : undefined"
+            },
+            {
+              "name": "event.duration",
+              "value": "(__e['start'] !== undefined && __e['end'] !== undefined) ? (Number(__e['end']) - Number(__e['start'])) * 1000000000 : undefined"
+            },
+            {
+              "name": "_time",
+              "value": "__e['end'] !== undefined ? Number(__e['end']) : undefined"
+            },
+            {
+              "name": "aws.vpcflow.version",
+              "value": "__e['version'] !== undefined ? Number(__e['version']) : undefined"
+            }
+          ]
+        },
+        "description": "step 2 of the derived-field computation, from ORIGINAL vendor names (protocol/start/end/version) and the step-1 scratch fields, before the batched rename: bounded protocol resolution, tcp-flags bit decompose (fin=1/syn=2/rst=4/ack=16, no arrow/filter per constraint 3), the 8-way traffic-path decode against AWS's published table, and epoch-seconds-to-ms/duration/_time (never @timestamp, constraint 1)"
+      },
+      {
+        "id": "rename",
+        "filter": "true",
+        "conf": {
+          "rename": [
+            { "currentName": "srcport", "newName": "source.port" },
+            { "currentName": "dstport", "newName": "destination.port" },
+            { "currentName": "protocol", "newName": "network.iana_number" },
+            { "currentName": "packets", "newName": "network.packets" },
+            { "currentName": "bytes", "newName": "network.bytes" }
+          ]
+        },
+        "description": "batch-rename the five clean 1:1 typed columns to their ECS targets"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            { "name": "event.dataset", "value": "'aws_vpcflow.flow'" },
+            { "name": "event.provider", "value": "'parquet_s3'" }
+          ],
+          "remove": ["start", "end", "version", "tcp-*", "traffic-*", "_tcp_flags_num", "_traffic_path_num"]
+        },
+        "description": "tag event.dataset (no hyphen, constraint 5) and event.provider; drop the clean-named originals consumed into event.start/end/_time/version above, and the hyphenated tcp-flags/traffic-path originals via glob (the literal hyphenated names are rejected by eval.remove)"
+      }
+    ]
+  }
+}

@@ -1,0 +1,137 @@
+{
+  "id": "dm_f5_bigip_apm_access_policy_syslog_raw",
+  "conf": {
+    "output": "default",
+    "description": "F5 BIG-IP APM access-policy/session log, syslog-raw: BSD (RFC 3164 only, no CEF/RFC5424 escape exists) message-id dispatch table per recommendations.direct.cribl",
+    "functions": [
+      {
+        "id": "comment",
+        "filter": "true",
+        "conf": {
+          "comment": "F5 BIG-IP APM access-policy log (syslog-raw, BSD/RFC3164 only). Builds a message-id dispatch table per recommendations.direct.cribl: parses the stable header (msg id, daemon, pid, access-profile:partition:session-id triple) then a per-message-id extractor for 01490500 (new session), 01490010 (username), 01490102 (policy result), 01490005 (branch rule), 01490113/115 (session variable set, Informational/Debug only). Session-id-to-username stitching and password/token session-variable masking are named in the recommendation but NOT implemented here - no lookup data or masking pattern was supplied in the catalog; recorded as a gap in README."
+        },
+        "description": "why this pipeline is shaped this way"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^(?:<\\d+>)?(?<mon>\\w{3})\\s+(?<day>\\d{1,2})\\s(?<time>\\d{2}:\\d{2}:\\d{2})\\s(?<hostname>\\S+)\\s(?<service>\\S+?)\\[(?<pid>\\d+)\\]:\\s(?<message_id>\\d{8}):(?<level_number>\\d):\\s(?<access_profile>\\/[^:]+):(?<partition>[^:]+):(?<session_id>[0-9a-fA-F]+):\\s(?<message>.*)$/",
+          "source": "_raw"
+        },
+        "description": "parse the stable BSD header + profile:partition:sessionid triple shared by every APM access record"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "__e['message_id']==='01490500'",
+        "conf": {
+          "regex": "/^New session from client IP (?<client_ip>\\S+) \\(ST=(?<geo_st>[^\\/]*)\\/CC=(?<geo_cc>[^\\/]*)\\/C=(?<geo_c>[^)]*)\\) at VIP (?<vip>\\S+)(?: Listener (?<listener>\\S+))?(?: \\(Reputation=(?<reputation>[^)]*)\\))?/",
+          "source": "message"
+        },
+        "description": "01490500: client IP, ST/CC/C geolocation triple, VIP, listener and IP-intelligence reputation on the new-session record"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "__e['message_id']==='01490010'",
+        "conf": {
+          "regex": "/username[:=]?\\s*'?(?<username>[^'\"\\s]+)/i",
+          "source": "message"
+        },
+        "description": "01490010: logon name presented to the authentication agent - best-effort label match, exact 01490010 text is not in the catalog, validate against a captured sample"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "__e['message_id']==='01490102'",
+        "conf": {
+          "regex": "/^Access policy result:\\s*(?<policy_result>.+)$/",
+          "source": "message"
+        },
+        "description": "01490102: administrator-named ending the access policy terminated on"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "__e['message_id']==='01490005'",
+        "conf": {
+          "regex": "/^Following rule '(?<rule>[^']*)' from item '(?<item>[^']*)' to ending '[^']*'$/",
+          "source": "message"
+        },
+        "description": "01490005: branch rule taken and the policy item it was taken out of"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "__e['message_id']==='01490113' || __e['message_id']==='01490115'",
+        "conf": {
+          "regex": "/^Session variable (?<session_var_name>\\S+) set to (?<session_var_value>\\S+)$/",
+          "source": "message"
+        },
+        "description": "01490113/01490115: session variable set, only emitted when Access Policy log level is Informational or Debug"
+      },
+      {
+        "id": "rename",
+        "filter": "true",
+        "conf": {
+          "rename": [
+            { "currentName": "message_id", "newName": "event.code" },
+            { "currentName": "hostname", "newName": "observer.hostname" },
+            { "currentName": "access_profile", "newName": "rule.ruleset" },
+            { "currentName": "client_ip", "newName": "source.ip" },
+            { "currentName": "vip", "newName": "destination.ip" },
+            { "currentName": "rule", "newName": "rule.name" }
+          ]
+        },
+        "description": "batch rename every status:mapped field that needs no casting or conditional logic"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            { "name": "log.syslog.severity.code", "value": "__e['level_number']!==undefined ? Number(__e['level_number']) : undefined" },
+            { "name": "process.pid", "value": "__e['pid']!==undefined ? Number(__e['pid']) : undefined" },
+            { "name": "process.name", "value": "/^tmm/.test(__e['service']||'') ? 'tmm' : ((__e['service']==='apd'||__e['service']==='apmd') ? 'apmd' : __e['service'])" },
+            { "name": "f5_bigip.apm.process.instance", "value": "/^tmm\\d+$/.test(__e['service']||'') ? __e['service'].replace('tmm','') : undefined" },
+            { "name": "source.geo.country_iso_code", "value": "(__e['geo_cc'] && __e['geo_cc']!=='') ? __e['geo_cc'] : undefined" },
+            { "name": "f5_bigip.apm.client.reputation", "value": "__e['reputation']" },
+            { "name": "f5_bigip.apm.listener", "value": "__e['listener']" },
+            { "name": "f5_bigip.apm.partition", "value": "__e['partition']" },
+            { "name": "f5_bigip.apm.session.id", "value": "__e['session_id']" },
+            { "name": "f5_bigip.apm.policy.item", "value": "__e['item']" },
+            { "name": "f5_bigip.apm.policy.ending", "value": "__e['policy_result']" },
+            { "name": "event.outcome", "value": "(__e['policy_result']==='Allow') ? 'success' : ((__e['policy_result']==='Deny' || __e['policy_result']==='Logon_Deny') ? 'failure' : (__e['policy_result']!==undefined ? 'unknown' : undefined))" },
+            { "name": "f5_bigip.apm.auth.result", "value": "(__e['session_var_name'] && /\\.authresult$/.test(__e['session_var_name'])) ? (__e['session_var_value']==='1' ? 'success' : (__e['session_var_value']==='0' ? 'failure' : undefined)) : undefined" },
+            { "name": "f5_bigip.apm.auth.agent", "value": "(__e['session_var_name'] && /\\.authresult$/.test(__e['session_var_name'])) ? __e['session_var_name'].split('.')[1] : undefined" },
+            { "name": "user.name", "value": "__e['username']" },
+            { "name": "related.user", "value": "__e['username'] ? [__e['username']] : undefined" }
+          ],
+          "remove": [
+            "service", "pid", "level_number", "geo_st", "geo_c", "geo_cc",
+            "reputation", "listener", "partition", "session_id", "item",
+            "policy_result", "username", "session_var_name", "session_var_value"
+          ]
+        },
+        "description": "implement every partial/unmapped transform: numeric casts, daemon-family normalisation with TMM instance kept separately, empty geolocation dropped, policy-result-driven event.outcome defaulted to unknown (no site lookup was supplied), session-variable auth result/agent split, username mirrored to related.user, then drop intermediate parse artifacts"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            { "name": "_time", "value": "Date.parse(__e['mon'] + ' ' + __e['day'] + ', ' + (new Date()).getFullYear() + ' ' + __e['time'] + ' UTC')/1000" }
+          ],
+          "remove": ["mon", "day", "time"]
+        },
+        "description": "BSD header carries no year or timezone; best-effort current-year/UTC parse into _time per platform constraint 1 (never @timestamp) - true per-device tz correction belongs at the Cribl source, out of scope for a pipeline, recorded as a gap"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            { "name": "event.dataset", "value": "'f5_bigip_apm.access_policy'" }
+          ]
+        },
+        "description": "tag the dataset, hyphen-free per platform constraint 5"
+      }
+    ]
+  }
+}

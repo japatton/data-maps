@@ -1,0 +1,130 @@
+{
+  "id": "dm_linux_auditd_auditd_syslog_raw",
+  "conf": {
+    "output": "default",
+    "description": "Linux auditd, auditd, syslog-raw: hand-built key=value pipeline (no vendor pack exists); regex_extract splits the audit(epoch.msec:seq) header from the kv body, serde kvp parses the body, code reassembles EXECVE a0..aN into process.args (in-record only, no cross-record join) with hex/escape decode and best-effort credential-arg masking per recommendations.direct.cribl, eval implements the mapped/partial transforms.",
+    "functions": [
+      {
+        "id": "comment",
+        "filter": "true",
+        "conf": {
+          "comment": "linux-auditd/auditd/syslog-raw. No vendor pack parses raw auditd key=value records. EXECVE a0..aN reassembly into process.args happens WITHIN this one line only (all argv fields are already on the same EXECVE record); joining that EXECVE record to its sibling SYSCALL/USER_AUTH record by shared msgid is cross-event stateful correlation, which the brief's join-function constraints put out of scope for a Cribl pipeline. Per recommendations.direct.cribl, this pipeline instead stamps auditd.log.msgid (epoch.msec:seq from the audit(...) header) on every record so Elastic can reassemble multi-record events downstream."
+        },
+        "description": "identify technology, dataset, format, and parsing approach"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^type=(?<audit_type>\\S+)\\s+msg=audit\\((?<audit_epoch>\\d+)\\.(?<audit_msec>\\d+):(?<audit_seq>\\d+)\\):\\s*(?<audit_body>.*)$/",
+          "source": "_raw"
+        },
+        "description": "split the audit(epoch.msec:seq) msgid header (type=, msg=audit(...):) from the remaining key=value body so the body can be parsed generically and the msgid components are available for a correlation id"
+      },
+      {
+        "id": "serde",
+        "filter": "true",
+        "conf": {
+          "mode": "extract",
+          "type": "kvp",
+          "srcField": "audit_body"
+        },
+        "description": "parse the remaining key=value pairs (arch=, syscall=, exe=\"...\", comm=\"...\", pid=, uid=, key=\"...\", a0=\"...\"..., addr=, terminal=, hostname=, ...) into top-level fields"
+      },
+      {
+        "id": "code",
+        "filter": "true",
+        "conf": {
+          "code": "function auditdDecode(v) { if (typeof v !== 'string') return v; if (/^[0-9A-Fa-f]{2,}$/.test(v) && v.length % 2 === 0) {   var out = '';   for (var i = 0; i < v.length; i += 2) { out += String.fromCharCode(parseInt(v.substr(i, 2), 16)); }   return out; } return v;}if (__e['exe'] !== undefined) { __e['exe'] = auditdDecode(__e['exe']); }if (__e['comm'] !== undefined) { __e['comm'] = auditdDecode(__e['comm']); }if (__e['key'] !== undefined) { __e['key'] = auditdDecode(__e['key']); }if (__e['audit_type'] === 'EXECVE') {  var args = [];  for (var i = 0; i < 64; i++) {    var k = 'a' + i;    if (__e[k] === undefined) break;    args.push(auditdDecode(__e[k]));  }  for (var j = 0; j < args.length; j++) {    if (typeof args[j] === 'string' && /^-p.+/.test(args[j])) { args[j] = '-pREDACTED'; }    else if (args[j] === '-p' || args[j] === '-u') { if (args[j+1] !== undefined) { args[j+1] = 'REDACTED'; } }    else if (args[j] === 'sshpass') { if (args[j+1] === '-p' && args[j+2] !== undefined) { args[j+2] = 'REDACTED'; } }  }  if (args.length) { __e['process.args'] = args; }}"
+        },
+        "description": "decode auditd's escaped/hex string encoding on exe, comm, key, and each EXECVE argv token; reassemble a0..aN (present together on one EXECVE line, no cross-record join needed) into an ordered process.args array; best-effort redact credential-bearing argv tokens (mysql -p<pw>, sshpass -p <pw>, curl -u <user:pass>) per recommendations.direct.cribl's data-hygiene instruction"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            {
+              "name": "auditd.log.record_type",
+              "value": "__e['audit_type']"
+            },
+            {
+              "name": "auditd.log.syscall",
+              "value": "__e['syscall'] !== undefined ? Number(__e['syscall']) : undefined"
+            },
+            {
+              "name": "auditd.log.auid",
+              "value": "__e['auid'] !== undefined ? Number(__e['auid']) : undefined"
+            },
+            {
+              "name": "auditd.log.terminal",
+              "value": "__e['terminal']"
+            },
+            {
+              "name": "auditd.log.key",
+              "value": "__e['key']"
+            },
+            {
+              "name": "rule.name",
+              "value": "__e['key'] !== undefined && __e['key'] !== '(null)' ? __e['key'].split(String.fromCharCode(1)) : undefined"
+            },
+            {
+              "name": "event.outcome",
+              "value": "__e['success'] === 'yes' ? 'success' : (__e['success'] === 'no' ? 'failure' : undefined)"
+            },
+            {
+              "name": "source.domain",
+              "value": "__e['hostname'] !== undefined && !/^\\d{1,3}(\\.\\d{1,3}){3}$/.test(String(__e['hostname'])) ? __e['hostname'] : undefined"
+            },
+            {
+              "name": "auditd.log.msgid",
+              "value": "__e['audit_epoch'] !== undefined ? (__e['audit_epoch'] + '.' + __e['audit_msec'] + ':' + __e['audit_seq']) : undefined"
+            },
+            {
+              "name": "_time",
+              "value": "__e['audit_epoch'] !== undefined ? Number(__e['audit_epoch']) + (Number(__e['audit_msec']) / 1000) : undefined"
+            },
+            {
+              "name": "event.dataset",
+              "value": "'linux_auditd.auditd'"
+            }
+          ]
+        },
+        "description": "implement the transforms that need the original vendor names before rename: success yes/no to event.outcome, key split into rule.name (auditd joins multiple -k keys with a single 0x01 SOH byte, per the linux-audit convention, not a printable delimiter), numeric casts for syscall/auid, hostname-vs-IP check for source.domain, msgid correlation id for downstream Elastic reassembly, and _time from the audit(epoch.msec:seq) header rather than syslog receipt time"
+      },
+      {
+        "id": "rename",
+        "filter": "true",
+        "conf": {
+          "rename": [
+            {
+              "currentName": "exe",
+              "newName": "process.executable"
+            },
+            {
+              "currentName": "comm",
+              "newName": "process.name"
+            },
+            {
+              "currentName": "pid",
+              "newName": "process.pid"
+            },
+            {
+              "currentName": "ppid",
+              "newName": "process.parent.pid"
+            },
+            {
+              "currentName": "uid",
+              "newName": "user.id"
+            },
+            {
+              "currentName": "addr",
+              "newName": "source.ip"
+            }
+          ]
+        },
+        "description": "batch-rename the status:mapped fields that need no further transform, once the transforms above have already read their original vendor names"
+      }
+    ]
+  }
+}

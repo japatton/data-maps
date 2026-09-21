@@ -1,0 +1,130 @@
+{
+  "id": "dm_bluecat_dhcp_syslog_raw",
+  "conf": {
+    "output": "default",
+    "description": "BlueCat DDI dhcp / syslog-raw: hand-built regex pipeline over ISC dhcpd's free-text DORA/NAK/DECLINE/RELEASE/INFORM lines (no vendor pack; the ISC-dhcpd grok pattern set is the starting point), per recommendations.direct.cribl -- normalizes chaddr to uppercase dash-separated, tests the 'via' token for an IP so relayed requests land in network.forwarded_ip, and suppresses the 'Hostname Unsuitable for Printing' placeholder.",
+    "functions": [
+      {
+        "id": "comment",
+        "filter": "true",
+        "conf": {
+          "comment": "bluecat / dhcp / syslog-raw. ISC dhcpd lines forwarded on the same syslog stream as named querylog, discriminated by the 'dhcpd' tag. One generalized regex covers the on/for/of + to/from + via token positions shared by DISCOVER/OFFER/REQUEST/ACK/NAK/DECLINE/RELEASE/INFORM. Direct route, no guard hop."
+        },
+        "description": "record dataset, format, and the generalized-verb-grammar approach"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^(?:<\\d+>)?(?<syslog_ts>[A-Za-z]{3}\\s+\\d{1,2}\\s\\d{2}:\\d{2}:\\d{2})\\s(?<syslog_host>\\S+)\\s(?<syslog_tag>[^\\s\\[:]+)(?:\\[(?<syslog_pid>\\d+)\\])?:\\s+(?<dhcp_msg>.*)$/",
+          "source": "_raw"
+        },
+        "description": "split the syslog header (BSD-style) from the dhcpd message body"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^(?<msgtype>DHCP[A-Z]+)\\s+(?:(?:on|for|of)\\s(?<addr1>[^\\s(]+)\\s)?(?:\\((?<paren1>[^()]*)\\)\\s)?(?:(?:to|from)\\s(?<addr2>[^\\s(]+)\\s)?(?:\\((?<paren2>[^()]*)\\)\\s)?(?:via\\s(?<via_token>\\S+))?(?::\\s(?<reason>.*))?$/",
+          "source": "dhcp_msg"
+        },
+        "description": "parse the DHCP verb line into its positional slots (msgtype, on/for/of address, parenthetical 1, to/from address, parenthetical 2, via token, trailing reason)"
+      },
+      {
+        "id": "rename",
+        "filter": "true",
+        "conf": {
+          "rename": [
+            {
+              "currentName": "syslog_host",
+              "newName": "observer.hostname"
+            },
+            {
+              "currentName": "syslog_tag",
+              "newName": "process.name"
+            }
+          ]
+        },
+        "description": "batch-rename the clean mapped syslog-header fields to their ECS targets"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            {
+              "name": "event.action",
+              "value": "__e['msgtype'] !== undefined ? __e['msgtype'].toLowerCase() : undefined"
+            },
+            {
+              "name": "event.outcome",
+              "value": "__e['msgtype']==='DHCPNAK' || __e['msgtype']==='DHCPDECLINE' ? 'failure' : (__e['msgtype']==='DHCPACK' ? 'success' : undefined)"
+            },
+            {
+              "name": "event.reason",
+              "value": "__e['reason']"
+            },
+            {
+              "name": "client.ip",
+              "value": "__e['addr1'] !== undefined && /\\d{1,3}(\\.\\d{1,3}){3}/.test(__e['addr1']) ? __e['addr1'] : (__e['addr2'] !== undefined && /\\d{1,3}(\\.\\d{1,3}){3}/.test(__e['addr2']) ? __e['addr2'] : undefined)"
+            },
+            {
+              "name": "client.mac",
+              "value": "__e['addr2'] !== undefined && __e['addr2'].indexOf(':')>=0 ? __e['addr2'].toUpperCase().replace(/:/g,'-') : (__e['addr1'] !== undefined && __e['addr1'].indexOf(':')>=0 ? __e['addr1'].toUpperCase().replace(/:/g,'-') : undefined)"
+            },
+            {
+              "name": "destination.ip",
+              "value": "__e['paren1'] !== undefined && /\\d{1,3}(\\.\\d{1,3}){3}/.test(__e['paren1']) ? __e['paren1'] : undefined"
+            },
+            {
+              "name": "host.hostname",
+              "value": "__e['paren2'] !== undefined && __e['paren2'] !== 'Hostname Unsuitable for Printing' ? __e['paren2'] : undefined"
+            },
+            {
+              "name": "observer.ingress.interface.name",
+              "value": "__e['via_token'] !== undefined && !/\\d{1,3}(\\.\\d{1,3}){3}/.test(__e['via_token']) ? __e['via_token'] : undefined"
+            },
+            {
+              "name": "network.forwarded_ip",
+              "value": "__e['via_token'] !== undefined && /\\d{1,3}(\\.\\d{1,3}){3}/.test(__e['via_token']) ? __e['via_token'] : undefined"
+            },
+            {
+              "name": "observer.name",
+              "value": "__e['observer']!==undefined && __e['observer'].hostname!==undefined ? __e['observer'].hostname : undefined"
+            },
+            {
+              "name": "process.pid",
+              "value": "__e['syslog_pid'] !== undefined ? Number(__e['syslog_pid']) : undefined"
+            },
+            {
+              "name": "message",
+              "value": "__e['dhcp_msg']"
+            },
+            {
+              "name": "event.dataset",
+              "value": "'bluecat.dhcp'"
+            }
+          ]
+        },
+        "description": "derive ECS fields needing transforms: verb lowercasing, outcome, IP-vs-MAC slot disambiguation, chaddr normalization, via-token IP test, hostname-placeholder suppression"
+      },
+      {
+        "id": "auto_timestamp",
+        "filter": "true",
+        "conf": {
+          "srcField": "syslog_ts",
+          "dstField": "_time"
+        },
+        "description": "parse the BSD syslog timestamp into Cribl's canonical _time"
+      },
+      {
+        "id": "code",
+        "filter": "true",
+        "conf": {
+          "code": "delete __e['dhcp_msg']; delete __e['syslog_ts']; delete __e['syslog_pid']; delete __e['msgtype']; delete __e['addr1']; delete __e['addr2']; delete __e['paren1']; delete __e['paren2']; delete __e['via_token']; delete __e['reason'];"
+        },
+        "description": "drop scratch fields used only during parsing"
+      }
+    ]
+  }
+}

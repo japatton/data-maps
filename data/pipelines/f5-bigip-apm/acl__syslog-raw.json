@@ -1,0 +1,112 @@
+{
+  "id": "dm_f5_bigip_apm_acl_syslog_raw",
+  "conf": {
+    "output": "default",
+    "description": "F5 BIG-IP APM ACL enforcement log (0158xxxx family), syslog-raw: positional tail parse with the URL element optional for L4-only matches",
+    "functions": [
+      {
+        "id": "comment",
+        "filter": "true",
+        "conf": {
+          "comment": "F5 BIG-IP APM ACL enforcement log (0158xxxx message family, /var/log/pktfilter via tmm), syslog-raw. Positional tail per recommendations.direct.cribl: <action> ACL: <acl>@<session>:<index> packet: [<url>] <proto> <src>:<port> -> <dst>:<port>, URL optional so L4-only matches aren't dropped. Volume sampling/aggregation of allow records and the action-to-event.type direction are assigned to Elastic/the route by recommendations.elastic and recommendations.cribl's volume guidance respectively - not duplicated in this pipeline. No concrete URL length cap was given in the catalog, so none is applied here; recorded as a gap."
+        },
+        "description": "why this pipeline is shaped this way"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^(?:<\\d+>)?(?<mon>\\w{3})\\s+(?<day>\\d{1,2})\\s(?<time>\\d{2}:\\d{2}:\\d{2})\\s(?<hostname>\\S+)\\s(?<service>\\S+?)\\[\\d+\\]:\\s(?<message_id>\\d{8}):\\d:\\s(?<access_profile>\\/[^:]+):[^:]+:(?<session_id>[0-9a-fA-F]+):\\s(?<message>.*)$/",
+          "source": "_raw"
+        },
+        "description": "parse the stable BSD header + profile:partition:sessionid triple, same shape as the other two APM datasets; confirm the 0158xxxx ids in use on the local platform version rather than trusting only the two examples given"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^(?<action>\\w+)\\s+ACL:\\s*(?<acl_name>\\S+?)@(?<acl_session>[0-9a-fA-F]+):(?<acl_entry_index>\\d+)\\s+packet:\\s*(?<packet_url>\\S+)\\s+(?<protocol>tcp|udp|icmp)\\s+(?<source_ip>[^:\\s]+):(?<source_port>\\d+)\\s*->\\s*(?<dest_ip>[^:\\s]+):(?<dest_port>\\d+)/i",
+          "source": "message"
+        },
+        "description": "L7 shape: action, acl@session:index token, URL, protocol, source and destination address:port"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "__e['protocol']===undefined",
+        "conf": {
+          "regex": "/^(?<action>\\w+)\\s+ACL:\\s*(?<acl_name>\\S+?)@(?<acl_session>[0-9a-fA-F]+):(?<acl_entry_index>\\d+)\\s+packet:\\s*(?<protocol>tcp|udp|icmp)\\s+(?<source_ip>[^:\\s]+):(?<source_port>\\d+)\\s*->\\s*(?<dest_ip>[^:\\s]+):(?<dest_port>\\d+)/i",
+          "source": "message"
+        },
+        "description": "L4-only shape (no URL element); only runs when the L7 pattern above did not already set protocol"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "__e['packet_url'] !== undefined",
+        "conf": {
+          "regex": "/^https?:\\/\\/(?<url_domain>[^\\/]+)(?<url_path>\\/.*)?$/i",
+          "source": "packet_url"
+        },
+        "description": "split the L7 URL into domain and path"
+      },
+      {
+        "id": "rename",
+        "filter": "true",
+        "conf": {
+          "rename": [
+            { "currentName": "message_id", "newName": "event.code" },
+            { "currentName": "hostname", "newName": "observer.hostname" },
+            { "currentName": "access_profile", "newName": "rule.ruleset" },
+            { "currentName": "session_id", "newName": "f5_bigip.apm.session.id" },
+            { "currentName": "acl_name", "newName": "rule.name" },
+            { "currentName": "packet_url", "newName": "url.original" },
+            { "currentName": "source_ip", "newName": "source.ip" },
+            { "currentName": "dest_ip", "newName": "destination.ip" }
+          ]
+        },
+        "description": "batch rename every status:mapped/unmapped field that needs no casting or conditional logic; rule.id is deliberately left unset, per the catalog, since the entry index names a line inside the ACL rather than the ACL itself"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            { "name": "process.name", "value": "/^tmm/.test(__e['service']||'') ? 'tmm' : __e['service']" },
+            { "name": "event.action", "value": "__e['action'] ? __e['action'].toLowerCase() : undefined" },
+            { "name": "network.transport", "value": "__e['protocol'] ? __e['protocol'].toLowerCase() : undefined" },
+            { "name": "source.port", "value": "__e['source_port']!==undefined ? Number(__e['source_port']) : undefined" },
+            { "name": "destination.port", "value": "__e['dest_port']!==undefined ? Number(__e['dest_port']) : undefined" },
+            { "name": "f5_bigip.apm.acl.entry_index", "value": "__e['acl_entry_index']!==undefined ? Number(__e['acl_entry_index']) : undefined" },
+            { "name": "url.domain", "value": "__e['url_domain']" },
+            { "name": "url.path", "value": "__e['url_domain'] ? (__e['url_path'] ? __e['url_path'] : '/') : undefined" }
+          ],
+          "remove": [
+            "service", "action", "protocol", "source_port", "dest_port",
+            "acl_entry_index", "acl_session", "url_domain", "url_path", "message"
+          ]
+        },
+        "description": "TMM instance normalised to a family name; discard/reject/continue kept distinct (no collapsing to a single deny) per the transform note; ports and entry index cast to number; URL split fields promoted"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            { "name": "_time", "value": "Date.parse(__e['mon'] + ' ' + __e['day'] + ', ' + (new Date()).getFullYear() + ' ' + __e['time'] + ' UTC')/1000" }
+          ],
+          "remove": ["mon", "day", "time"]
+        },
+        "description": "BSD header carries no year or timezone; best-effort current-year/UTC parse into _time per platform constraint 1 - same unresolved per-device-tz gap as the other two APM datasets"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            { "name": "event.dataset", "value": "'f5_bigip_apm.acl'" }
+          ]
+        },
+        "description": "tag the dataset, hyphen-free per platform constraint 5"
+      }
+    ]
+  }
+}

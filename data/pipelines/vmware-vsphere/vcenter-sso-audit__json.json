@@ -1,0 +1,130 @@
+{
+  "id": "dm_vmware_vsphere_vcenter_sso_audit_json",
+  "conf": {
+    "output": "default",
+    "description": "VMware vCenter SSO audit log (/var/log/audit/sso-events/audit_events.log), forwarded inside the appliance's syslog stream / json: no Elastic integration parses this JSON body, so this is a genuine Cribl-side strip-header-then-parse pipeline, per direct.cribl recommendation. Fixes the non-ISO US-order timestamp and derives event.outcome from the type suffix rather than trusting the constant-INFO eventSeverity.",
+    "functions": [
+      {
+        "id": "comment",
+        "filter": "true",
+        "conf": {
+          "comment": "vmware-vsphere / vcenter-sso-audit / json. The SSO/STS audit record arrives as one JSON object per line embedded inside the appliance's syslog forwarding, so the syslog header is stripped before the JSON body is parsed. eventSeverity is observed as INFO even on LoginFailure records per the map's own field note, so it is kept only for fidelity (as log.level) and never drives event.outcome or severity. 'created principal' (user.target.name on PrincipalManagement records) is NOT extracted: the map's own note says only that the account name is quoted in the description, without giving a literal sample sentence the way the login-failure description is quoted verbatim, so the surrounding verb/punctuation is a best-effort, moderately-confident extraction of the first quoted token -- flagged in the README."
+        },
+        "description": "document the header-strip step and the eventSeverity/created-principal caveats"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/(?<sso_json>\\{.*\\})\\s*$/",
+          "source": "_raw"
+        },
+        "description": "isolate the JSON body from the syslog-header-prefixed raw line"
+      },
+      {
+        "id": "serde",
+        "filter": "true",
+        "conf": {
+          "mode": "extract",
+          "type": "json",
+          "srcField": "sso_json"
+        },
+        "description": "parse the isolated SSO audit JSON object"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/response code (?<sso_rc>\\d+)/",
+          "source": "description"
+        },
+        "description": "pull the embedded HTTP response code out of the free-text description on login event types (not a separate JSON key)"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "__e['type'] && __e['type'].indexOf('PrincipalManagement') > -1",
+        "conf": {
+          "regex": "/[\"'](?<sso_principal>[^\"']+)[\"']/",
+          "source": "description"
+        },
+        "description": "best-effort extraction of the first quoted account name on PrincipalManagement records -- the map confirms the account name is quoted but gives no literal sample sentence, so this is moderately-confident, not a verified grammar (see README)"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            {
+              "name": "user.domain",
+              "value": "__e['user'] && __e['user'].indexOf('@') > -1 ? __e['user'].split('@')[1].toLowerCase() : (__e['user'] && __e['user'].indexOf('\\\\') > -1 ? __e['user'].split('\\\\')[0].toLowerCase() : undefined)"
+            },
+            {
+              "name": "user.name",
+              "value": "__e['user'] && __e['user'].indexOf('@') > -1 ? __e['user'].split('@')[0].toLowerCase() : (__e['user'] && __e['user'].indexOf('\\\\') > -1 ? __e['user'].split('\\\\')[1].toLowerCase() : (__e['user'] ? __e['user'].toLowerCase() : undefined))"
+            },
+            {
+              "name": "source.ip",
+              "value": "__e['client'] && __e['client'].length > 0 ? __e['client'] : undefined"
+            },
+            {
+              "name": "_time",
+              "value": "Date.parse(__e['timestamp'].substring(6,10) + '-' + __e['timestamp'].substring(0,2) + '-' + __e['timestamp'].substring(3,5) + 'T' + __e['timestamp'].substring(11,19) + 'Z') / 1000"
+            },
+            {
+              "name": "http.response.status_code",
+              "value": "__e['sso_rc'] !== undefined ? Number(__e['sso_rc']) : undefined"
+            },
+            {
+              "name": "event.outcome",
+              "value": "__e['type'] && __e['type'].indexOf('LoginSuccess') > -1 ? 'success' : (__e['type'] && __e['type'].indexOf('LoginFailure') > -1 ? 'failure' : undefined)"
+            },
+            {
+              "name": "user.target.name",
+              "value": "__e['sso_principal']"
+            }
+          ],
+          "remove": [
+            "sso_json",
+            "sso_rc",
+            "sso_principal"
+          ]
+        },
+        "description": "per direct.cribl: reformat the MM/DD/YYYY HH:MM:SS UTC timestamp into epoch seconds for _time before anything downstream sorts on it, split the user@domain / DOMAIN\\user principal case-folded, normalize the empty-string client to null rather than indexing it, pull the response code and derive event.outcome from the type suffix rather than the constant-INFO eventSeverity"
+      },
+      {
+        "id": "rename",
+        "filter": "true",
+        "conf": {
+          "rename": [
+            {
+              "currentName": "type",
+              "newName": "event.code"
+            },
+            {
+              "currentName": "eventSeverity",
+              "newName": "log.level"
+            },
+            {
+              "currentName": "description",
+              "newName": "message"
+            }
+          ]
+        },
+        "description": "batch the straight 1:1 copies -- event.code/log.level/message need no computed transform, unlike user/client/timestamp above"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            {
+              "name": "event.dataset",
+              "value": "'vmware_vsphere.vcenter_sso_audit'"
+            }
+          ]
+        },
+        "description": "tag the event with its dataset"
+      }
+    ]
+  }
+}

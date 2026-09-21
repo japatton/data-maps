@@ -1,0 +1,174 @@
+{
+  "id": "dm_bluecat_dns_query_syslog_raw",
+  "conf": {
+    "output": "default",
+    "description": "BlueCat DDI dns-query / syslog-raw: hand-built regex pipeline over the ISC BIND named querylog line grammar (no Elastic integration, no Cribl pack exists), per recommendations.direct.cribl -- splits the shared BIND channel on category so only 'queries' lines reach this dataset, gives rpz rewrites their own branch, defaults network.transport=udp when the T flag is absent, and expands the +/-, D and C flag characters into the dns.header_flags token array.",
+    "functions": [
+      {
+        "id": "comment",
+        "filter": "true",
+        "conf": {
+          "comment": "bluecat / dns-query / syslog-raw. BIND querylog forwarded by BDDS syslog redirection. Splits the shared queries/query-errors/security/lame-servers/rpz/update/xfer-out channel down to 'queries' category only per recommendations.direct.cribl; rpz rewrites (same category, different verb) get their own branch. Direct route, no guard hop."
+        },
+        "description": "record dataset, format, and the channel-split approach"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^(?:<\\d+>)?(?<syslog_ts>[A-Za-z]{3}\\s+\\d{1,2}\\s\\d{2}:\\d{2}:\\d{2})\\s(?<syslog_host>\\S+)\\s(?<syslog_tag>[^\\s\\[:]+)(?:\\[(?<syslog_pid>\\d+)\\])?:\\s+(?<category>[a-zA-Z-]+):\\s(?<severity>[a-zA-Z]+):\\s(?<bind_msg>.*)$/",
+          "source": "_raw"
+        },
+        "description": "split the syslog header (BSD-style) from the BIND message body, and pull category/severity"
+      },
+      {
+        "id": "drop",
+        "filter": "__e['category'] !== undefined && __e['category'] !== 'queries'",
+        "conf": {},
+        "description": "keep only the 'queries' logging category in this dataset; query-errors/security/lame-servers/update/xfer-out belong to other datasets"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^client\\s@(?<client_handle>0x[0-9a-fA-F]+)\\s(?<client_address>[0-9a-fA-F.:]+)#(?<client_port>\\d+)\\s\\([^)]*\\):\\s(?:view\\s(?<view>[^:]+):\\s)?query:\\s(?<QNAME>\\S+)\\s(?<CLASS>\\S+)\\s(?<TYPE>\\S+)\\s(?<flags>\\S+)\\s\\((?<dest_address>[0-9a-fA-F.:]+)\\)/",
+          "source": "bind_msg"
+        },
+        "description": "parse the plain 'query:' verb line: client handle, client ip#port, view, QNAME/CLASS/TYPE/flags, destination ip"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^client\\s@(?<client_handle>0x[0-9a-fA-F]+)\\s(?<client_address>[0-9a-fA-F.:]+)#(?<client_port>\\d+)\\s\\([^)]*\\):\\s(?:view\\s(?<view>[^:]+):\\s)?rpz\\s(?<rpz_qname>\\S+)\\s(?<rpz_result>\\S+)\\s(?<rpz_policy_text>.*)$/",
+          "source": "bind_msg"
+        },
+        "description": "parse the 'rpz' verb line (Response Policy Zone rewrite), same channel as plain queries"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^(?<rd_flag>[+-])(?<tcp_flag>T)?(?<signed_flag>S)?(?:E\\((?<edns_version>\\d+)\\))?(?<do_flag>D)?(?<cd_flag>C)?$/",
+          "source": "flags"
+        },
+        "description": "decompose the BIND flag token (+/-, T, S, E(n), D, C) into its component characters"
+      },
+      {
+        "id": "rename",
+        "filter": "true",
+        "conf": {
+          "rename": [
+            {
+              "currentName": "CLASS",
+              "newName": "dns.question.class"
+            },
+            {
+              "currentName": "TYPE",
+              "newName": "dns.question.type"
+            },
+            {
+              "currentName": "syslog_host",
+              "newName": "observer.hostname"
+            },
+            {
+              "currentName": "syslog_tag",
+              "newName": "process.name"
+            },
+            {
+              "currentName": "severity",
+              "newName": "log.level"
+            },
+            {
+              "currentName": "dest_address",
+              "newName": "destination.ip"
+            },
+            {
+              "currentName": "client_address",
+              "newName": "source.ip"
+            },
+            {
+              "currentName": "client_port",
+              "newName": "source.port"
+            }
+          ]
+        },
+        "description": "batch-rename every clean (space/hyphen-free) mapped field to its ECS target"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            {
+              "name": "dns.question.name",
+              "value": "(__e['QNAME'] !== undefined ? __e['QNAME'] : __e['rpz_qname']) !== undefined ? (__e['QNAME'] !== undefined ? __e['QNAME'] : __e['rpz_qname']).replace(/\\.$/, '').toLowerCase() : undefined"
+            },
+            {
+              "name": "network.transport",
+              "value": "__e['tcp_flag'] === 'T' ? 'tcp' : 'udp'"
+            },
+            {
+              "name": "dns.header_flags",
+              "value": "[__e['rd_flag']==='+' ? 'RD' : null, __e['do_flag']==='D' ? 'DO' : null, __e['cd_flag']==='C' ? 'CD' : null].filter(Boolean)"
+            },
+            {
+              "name": "observer.name",
+              "value": "__e['observer']!==undefined && __e['observer'].hostname!==undefined ? __e['observer'].hostname : undefined"
+            },
+            {
+              "name": "bluecat.bdds.named.client_handle",
+              "value": "__e['client_handle']"
+            },
+            {
+              "name": "bluecat.bdds.named.view",
+              "value": "__e['view']"
+            },
+            {
+              "name": "bluecat.bdds.named.edns_version",
+              "value": "__e['edns_version'] !== undefined ? Number(__e['edns_version']) : undefined"
+            },
+            {
+              "name": "bluecat.bdds.named.signed_request",
+              "value": "__e['signed_flag'] === 'S'"
+            },
+            {
+              "name": "bluecat.bdds.named.rpz_policy",
+              "value": "__e['rpz_policy_text']"
+            },
+            {
+              "name": "event.action",
+              "value": "__e['rpz_result'] !== undefined ? 'rpz_rewrite' : undefined"
+            },
+            {
+              "name": "message",
+              "value": "__e['bind_msg']"
+            },
+            {
+              "name": "event.dataset",
+              "value": "'bluecat.dns_query'"
+            }
+          ]
+        },
+        "description": "derive ECS fields that need transforms (QNAME cleanup, transport default, header-flags array, rpz action) and set BlueCat-specific customs"
+      },
+      {
+        "id": "auto_timestamp",
+        "filter": "true",
+        "conf": {
+          "srcField": "syslog_ts",
+          "dstField": "_time"
+        },
+        "description": "parse the BSD syslog timestamp into Cribl's canonical _time (Elastic destination maps this to @timestamp)"
+      },
+      {
+        "id": "code",
+        "filter": "true",
+        "conf": {
+          "code": "delete __e['bind_msg']; delete __e['syslog_ts']; delete __e['syslog_pid']; delete __e['category']; delete __e['client_handle']; delete __e['view']; delete __e['QNAME']; delete __e['flags']; delete __e['rd_flag']; delete __e['tcp_flag']; delete __e['signed_flag']; delete __e['edns_version']; delete __e['do_flag']; delete __e['cd_flag']; delete __e['rpz_qname']; delete __e['rpz_result']; delete __e['rpz_policy_text'];"
+        },
+        "description": "drop scratch fields used only during parsing"
+      }
+    ]
+  }
+}

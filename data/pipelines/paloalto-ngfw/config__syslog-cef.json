@@ -1,0 +1,112 @@
+{
+  "id": "dm_paloalto_ngfw_config_syslog_cef",
+  "conf": {
+    "output": "default",
+    "description": "Palo Alto NGFW Config log (syslog-cef, PAN-OS 10.2/11.1), direct route: cribl-pack mechanism implemented natively (no Packs installed). Splits the fixed CEF header, lifts event.outcome from header slot 5 (Device Event Class ID = $result), NOT slot 6 (Name, the constant CONFIG), extracts the extension with lookahead capture for cs1/cs2 (raw XML that routinely contains spaces), then renames to ECS/custom and redacts secret-bearing XML nodes.",
+    "functions": [
+      {
+        "id": "comment",
+        "filter": "true",
+        "conf": {
+          "comment": "paloalto-ngfw / config / syslog-cef. event.outcome comes from the CEF header's Device Event Class ID slot (position 5, $result), never from Name (position 6, the constant 'CONFIG' on this template) - a parser that reaches for Name stamps every record identically. Only Succeeded/Failed collapse to success/failure; Submitted/Unauthorized become 'unknown' with the raw value kept in panw.panos.config.result. cs1/cs2 (before/after change XML) get a lookahead-terminated capture, not \\S+, since XML attribute text routinely contains spaces - the same CEF unescaped-space trap as this map's other datasets. shost is the admin's client address and is deliberately routed to source.* to avoid colliding with ECS host.*. Order: header split -> extension extract -> eval (ORIGINAL names) -> rename -> mask (secret XML nodes)."
+        },
+        "description": "header-slot outcome source, the cs1/cs2 unescaped-space trap, and the shost/host.* collision"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^CEF:(?<cef_version>\\d+)\\|(?<device_vendor>[^|]*)\\|(?<device_product>[^|]*)\\|(?<device_version>[^|]*)\\|(?<signature_id>[^|]*)\\|(?<name>[^|]*)\\|(?<severity>[^|]*)\\|(?<extension>.*)$/",
+          "source": "_raw"
+        },
+        "description": "split the CEF:0|Palo Alto Networks|PAN-OS|$sender_sw_version|$result|$type|1| header from the extension; signature_id carries $result, name carries the constant $type=CONFIG"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/rt=(?<rt>\\S+)/",
+          "source": "extension",
+          "regexList": [
+            { "regex": "/deviceExternalId=(?<deviceExternalId>\\S+)/" },
+            { "regex": "/shost=(?<shost>\\S+)/" },
+            { "regex": "/cs3=(?<cs3>\\S+)/" },
+            { "regex": "/act=(?<act>\\S+)/" },
+            { "regex": "/duser=(?<duser>\\S+)/" },
+            { "regex": "/destinationServiceName=(?<destinationServiceName>\\S+)/" },
+            { "regex": "/msg=(?<msg>\\S+)/" },
+            { "regex": "/externalId=(?<externalId>\\S+)/" },
+            { "regex": "/dvchost=(?<dvchost>\\S+)/" },
+            { "regex": "/cs1=(?<cs1>.*?)(?=(?:\\s(?:cs2|externalId|deviceExternalId|shost|cs3|act|duser|destinationServiceName|msg|dvchost|rt)=)|$)/" },
+            { "regex": "/cs2=(?<cs2>.*?)(?=(?:\\s(?:cs1|externalId|deviceExternalId|shost|cs3|act|duser|destinationServiceName|msg|dvchost|rt)=)|$)/" }
+          ]
+        },
+        "description": "extract each known CEF extension key independently (order-independent); cs1/cs2 alone get a lookahead-terminated capture since the change-detail XML they carry can contain spaces"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            {
+              "name": "event.outcome",
+              "value": "__e['signature_id']==='Succeeded' ? 'success' : (__e['signature_id']==='Failed' ? 'failure' : 'unknown')"
+            },
+            {
+              "name": "panw.panos.config.result",
+              "value": "__e['signature_id']"
+            },
+            {
+              "name": "source.ip",
+              "value": "__e['shost'] !== undefined && /^\\d{1,3}(\\.\\d{1,3}){3}$/.test(String(__e['shost'])) ? __e['shost'] : undefined"
+            },
+            {
+              "name": "source.domain",
+              "value": "__e['shost'] !== undefined && !/^\\d{1,3}(\\.\\d{1,3}){3}$/.test(String(__e['shost'])) ? __e['shost'] : undefined"
+            },
+            {
+              "name": "_time",
+              "value": "__e['rt'] !== undefined && !isNaN(Number(__e['rt'])) ? Number(__e['rt'])/1000 : undefined"
+            },
+            {
+              "name": "event.dataset",
+              "value": "'paloalto_ngfw.config'"
+            }
+          ]
+        },
+        "description": "lift event.outcome from the header's Device Event Class ID slot while preserving the raw vocabulary, branch shost to source.ip vs source.domain by value shape, convert rt from CEF milliseconds, tag the dataset - all from ORIGINAL field names before rename"
+      },
+      {
+        "id": "rename",
+        "filter": "true",
+        "conf": {
+          "rename": [
+            { "currentName": "duser", "newName": "user.name" },
+            { "currentName": "act", "newName": "event.action" },
+            { "currentName": "shost", "newName": "source.address" },
+            { "currentName": "destinationServiceName", "newName": "panw.panos.config.client" },
+            { "currentName": "msg", "newName": "panw.panos.config.path" },
+            { "currentName": "externalId", "newName": "event.sequence" },
+            { "currentName": "dvchost", "newName": "observer.name" },
+            { "currentName": "deviceExternalId", "newName": "observer.serial_number" },
+            { "currentName": "cs3", "newName": "panw.panos.vsys" },
+            { "currentName": "cs1", "newName": "panw.panos.config.before_change_detail" },
+            { "currentName": "cs2", "newName": "panw.panos.config.after_change_detail" }
+          ]
+        },
+        "description": "batch rename every clean-named mapped/custom extension field; signature_id/rt are fully consumed by the eval above and left as raw duplicates"
+      },
+      {
+        "id": "mask",
+        "filter": "true",
+        "conf": {
+          "rules": [
+            { "matchRegex": "/<(password|phash|hash|secret|api-key|apikey|priv-key|key)>[\\s\\S]*?<\\/\\1>/gi", "replaceExpr": "'<' + g1 + '>REDACTED<\\/' + g1 + '>'" }
+          ],
+          "fields": ["panw.panos.config.before_change_detail", "panw.panos.config.after_change_detail", "_raw"]
+        },
+        "description": "redact password/hash/secret/api-key XML nodes in the change-detail blobs and in _raw where the same text still sits verbatim"
+      }
+    ]
+  }
+}

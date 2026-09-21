@@ -1,0 +1,126 @@
+{
+  "id": "dm_cisco_nxos_interface_vpc_state_snmp_trap",
+  "conf": {
+    "output": "default",
+    "description": "Cisco NX-OS interface-vpc-state / snmp-trap: reparse of clogHistMsgText for the LINK/LINEPROTO UPDOWN and ETHPORT up/down(+reason) shapes per direct.elastic, plus a full mnemonic-to-event.action lookup covering the vPC and L2FM_MAC_MOVE2 families (no verbatim body grammar was given for those, so only mnemonic-level action is derived -- see README gap for the vPC domain number and MAC-move address/interface pair).",
+    "functions": [
+      {
+        "id": "comment",
+        "filter": "true",
+        "conf": {
+          "comment": "cisco-nxos / interface-vpc-state / snmp-trap. Trap receiver forwards varbinds as JSON. Dissects '(Line protocol on )Interface X, changed state to up|down' (LINK/LINEPROTO, disambiguated by clogHistFacility since both share the UPDOWN mnemonic) and 'Interface X is up|down (reason)' (ETHPORT, recovering the reason into event.reason). vPC (PEER_LINK_DOWN etc.) and L2FM_MAC_MOVE2 get event.action from clogHistMsgName alone -- the work order gives no sample body grammar for the vPC domain number or the MAC-move address/interface pair, so those are not extracted."
+        },
+        "description": "document the UPDOWN/ETHPORT dissect and the vPC/L2FM mnemonic-only scope limit"
+      },
+      {
+        "id": "serde",
+        "filter": "true",
+        "conf": {
+          "mode": "extract",
+          "type": "json",
+          "srcField": "_raw"
+        },
+        "description": "extract the JSON-encoded varbind object the upstream SNMP trap receiver forwards"
+      },
+      {
+        "id": "rename",
+        "filter": "true",
+        "conf": {
+          "rename": [
+            {
+              "currentName": "clogHistMsgText",
+              "newName": "event.original"
+            },
+            {
+              "currentName": "clogHistMsgName",
+              "newName": "event.code"
+            },
+            {
+              "currentName": "clogHistFacility",
+              "newName": "cisco_nexus.log.facility"
+            }
+          ]
+        },
+        "description": "map the straight 1:1 CISCO-SYSLOG-MIB varbinds onto their targets (event.original is reparsed further below)"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "event.code === 'UPDOWN'",
+        "conf": {
+          "regex": "/(?:Line protocol on )?Interface (?<upd_intf>\\S+?),?\\s+changed state to (?<upd_state>up|down)/",
+          "source": "event.original"
+        },
+        "description": "dissect the LINK/LINEPROTO UPDOWN interface/line-protocol state-change shape"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "cisco_nexus.log.facility === 'ETHPORT'",
+        "conf": {
+          "regex": "/Interface (?<eth_intf>\\S+) is (?<eth_state>up|down)(?:\\s*\\((?<eth_reason>[^)]+)\\))?/",
+          "source": "event.original"
+        },
+        "description": "dissect the ETHPORT up/down shape and recover the parenthesised down reason"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            {
+              "name": "observer.ingress.interface.name",
+              "value": "__e['upd_intf'] !== undefined ? __e['upd_intf'] : (__e['eth_intf'] !== undefined ? __e['eth_intf'] : undefined)"
+            },
+            {
+              "name": "event.reason",
+              "value": "__e['eth_reason']"
+            },
+            {
+              "name": "event.action",
+              "value": "event.code === 'UPDOWN' ? (cisco_nexus.log.facility === 'LINK' ? (__e['upd_state'] === 'up' ? 'link_up' : __e['upd_state'] === 'down' ? 'link_down' : undefined) : cisco_nexus.log.facility === 'LINEPROTO' ? (__e['upd_state'] === 'up' ? 'line_protocol_up' : __e['upd_state'] === 'down' ? 'line_protocol_down' : undefined) : undefined) : event.code === 'IF_UP' ? 'interface_up' : event.code === 'IF_ADMIN_UP' ? 'interface_admin_up' : event.code === 'IF_DOWN_LINK_FAILURE' ? 'interface_down_link_failure' : event.code === 'IF_DOWN_ADMIN_DOWN' ? 'interface_admin_down' : event.code === 'IF_DOWN_INITIALIZING' ? 'interface_down_initializing' : event.code === 'SPEED' ? 'interface_speed_change' : event.code === 'IF_DUPLEX' ? 'interface_duplex_change' : event.code === 'PEER_KEEP_ALIVE_RECV_FAIL' ? 'vpc_peer_keepalive_failed' : event.code === 'PEER_LINK_DOWN' ? 'vpc_peer_link_down' : event.code === 'PEER_KEEP_ALIVE_RECV_SUCCESS' ? 'vpc_peer_keepalive_recovered' : event.code === 'L2FM_MAC_MOVE2' ? 'mac_move_detected' : undefined"
+            },
+            {
+              "name": "event.severity",
+              "value": "__e['clogHistSeverity'] !== undefined ? Number(__e['clogHistSeverity']) - 1 : undefined"
+            },
+            {
+              "name": "log.level",
+              "value": "__e['clogHistSeverity'] !== undefined ? ['emergency','alert','critical','error','warning','notice','informational','debug'][Number(__e['clogHistSeverity']) - 1] : undefined"
+            },
+            {
+              "name": "cisco_nexus.log.snmp.sysuptime",
+              "value": "__e['clogHistTimestamp']"
+            },
+            {
+              "name": "cisco_nexus.log.snmp.history_index",
+              "value": "__e['clogHistIndex']"
+            }
+          ],
+          "remove": [
+            "upd_intf",
+            "upd_state",
+            "eth_intf",
+            "eth_state",
+            "eth_reason",
+            "clogHistSeverity",
+            "clogHistTimestamp",
+            "clogHistIndex"
+          ]
+        },
+        "description": "map interface name and down-reason, derive event.action from the branch match or (vPC/L2FM/admin cases) from a full clogHistMsgName lookup, recover inverted severity, drop temps"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            {
+              "name": "event.dataset",
+              "value": "'cisco_nxos.interface_vpc_state'"
+            }
+          ]
+        },
+        "description": "tag the event with its dataset"
+      }
+    ]
+  }
+}

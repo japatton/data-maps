@@ -1,0 +1,77 @@
+{
+  "id": "dm_trellix_epo_dlp_endpoint_syslog_cef",
+  "conf": {
+    "output": "default",
+    "description": "Trellix ePO DLP Endpoint incident, syslog-cef: Automatic Response renders a DLP incident through ePO's own threat-event CEF envelope (a summary, not the incident record) - parsed with regex_extract, never the cef function, which only serializes.",
+    "functions": [
+      {
+        "id": "comment",
+        "filter": "true",
+        "conf": { "comment": "This is the ePO threat-event envelope, not the DLP incident schema - use for low-latency alerting only; the jdbc-sql pipeline is the record to investigate against and must win any dedup. Assumes upstream routing already selected DLP-branch (ThreatCategory/ThreatEventID) records; no Route logic here." },
+        "description": "flag why this format is a latency shortcut, not the authoritative record"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^CEF:(?<cefVersion>\\d+)\\|(?<deviceVendor>[^|]*)\\|(?<deviceProduct>[^|]*)\\|(?<deviceVersion>[^|]*)\\|(?<signatureId>[^|]*)\\|(?<name>[^|]*)\\|(?<severity>[^|]*)\\|(?<extension>.*)$/",
+          "source": "_raw"
+        },
+        "description": "split the pipe-delimited CEF header from the space-delimited key=value extension blob"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/DetectedUTC=(?<DetectedUTC>.*?) ReceivedUTC=(?<ReceivedUTC>.*?) ThreatEventID=(?<ThreatEventID>.*?) ThreatCategory=(?<ThreatCategory>.*?) ThreatName=(?<ThreatName>.*?) ThreatSeverity=(?<ThreatSeverity>.*?) ThreatActionTaken=(?<ThreatActionTaken>.*?) ThreatHandled=(?<ThreatHandled>.*?) AnalyzerName=(?<AnalyzerName>.*?) TargetHostName=(?<TargetHostName>.*?) TargetIPV4=(?<TargetIPV4>.*?) TargetUserName=(?<TargetUserName>.*?) SourceUserName=(?<SourceUserName>.*?) SourceProcessName=(?<SourceProcessName>.*?) TargetFileName=(?<TargetFileName>.*?) SourceURL=(?<SourceURL>.*)$/",
+          "source": "extension"
+        },
+        "description": "extract all 16 named extension keys in one pass, each bounded by the literal next key, so a value containing an unescaped space (AnalyzerName, ThreatName, file/process paths) is captured whole instead of truncated by a naive kv split"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            { "name": "_time", "value": "Date.parse(__e['DetectedUTC'])/1000" },
+            { "name": "trellix.epo.dlp_endpoint.threat_severity_label", "value": "Number(__e['ThreatSeverity'])<=2 ? 'critical_high' : (Number(__e['ThreatSeverity'])<=4 ? 'medium' : 'informational')" },
+            { "name": "event.outcome", "value": "__e['ThreatHandled']==='true' || __e['ThreatHandled']===true ? 'success' : (__e['ThreatHandled']==='false' || __e['ThreatHandled']===false ? 'failure' : undefined)" },
+            { "name": "user.domain", "value": "__e['TargetUserName'] && __e['TargetUserName'].indexOf('\\\\') > -1 ? __e['TargetUserName'].split('\\\\')[0] : undefined" },
+            { "name": "user.name", "value": "__e['TargetUserName'] ? (__e['TargetUserName'].indexOf('\\\\') > -1 ? __e['TargetUserName'].split('\\\\')[1] : __e['TargetUserName']) : undefined" },
+            { "name": "trellix.epo.dlp_endpoint.collection_transport", "value": "'cef'" }
+          ],
+          "remove": ["DetectedUTC", "TargetUserName", "ThreatHandled", "extension"]
+        },
+        "description": "compute derived fields from the original extension key names before rename nests them, per the compute-before-rename order; drop the raw keys consumed here (CEF header fields kept as an audit trail)"
+      },
+      {
+        "id": "rename",
+        "filter": "true",
+        "conf": {
+          "rename": [
+            { "currentName": "ReceivedUTC", "newName": "event.created" },
+            { "currentName": "ThreatEventID", "newName": "event.code" },
+            { "currentName": "ThreatCategory", "newName": "trellix.epo.dlp_endpoint.category" },
+            { "currentName": "ThreatName", "newName": "trellix.epo.dlp_endpoint.threat_name" },
+            { "currentName": "ThreatSeverity", "newName": "event.severity" },
+            { "currentName": "ThreatActionTaken", "newName": "event.action" },
+            { "currentName": "AnalyzerName", "newName": "observer.product" },
+            { "currentName": "TargetHostName", "newName": "host.name" },
+            { "currentName": "TargetIPV4", "newName": "host.ip" },
+            { "currentName": "SourceUserName", "newName": "source.user.name" },
+            { "currentName": "SourceProcessName", "newName": "process.executable" },
+            { "currentName": "TargetFileName", "newName": "file.path" },
+            { "currentName": "SourceURL", "newName": "url.original" }
+          ]
+        },
+        "description": "batch every clean-identifier extension key into its ECS or vendor-namespace target; event.action here is left as the raw undecoded IDS_ALERT_ACT_TAK_* key - see README gap"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": { "add": [ { "name": "event.dataset", "value": "'trellix_epo.dlp_endpoint'" } ] },
+        "description": "tag the Elastic data-stream dataset component (hyphens replaced with underscores) - same value as the jdbc-sql format so the two land in one data stream"
+      }
+    ]
+  }
+}

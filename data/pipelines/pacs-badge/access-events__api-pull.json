@@ -1,0 +1,120 @@
+{
+  "id": "dm_pacs_badge_access_events_api_pull",
+  "conf": {
+    "output": "default",
+    "description": "PACS Badge System (OnGuard Lnl_LoggedEvent class exemplar) access-events / api-pull: decode Time/AccessResult/Type+SubType at the edge worker group, derive event.id from PanelID+SerialNumber, hash CardNumber before it lands anywhere, leave the Lnl_* join-only fields unmapped (no lookup CSV available).",
+    "functions": [
+      {
+        "id": "comment",
+        "filter": "true",
+        "conf": {
+          "comment": "pacs-badge / access-events / api-pull (OnGuard OpenAccess REST collector on the edge worker group; re-key per deployed vendor - class exemplar only). Per recommendations.direct.cribl: derive event.outcome from the AccessResult enum, not the description string; concatenate PanelID+SerialNumber for a collision-safe event.id and Type+SubType for a stable event.code; tokenize/hash CardNumber before it lands in the index. Lnl_Reader.Name/Lnl_Account.AccountID/Lnl_Cardholder.LASTNAME require a join this environment has no lookup CSV for - left unmapped, see README."
+        },
+        "description": "record approach and rationale"
+      },
+      {
+        "id": "serde",
+        "filter": "typeof _raw === 'string'",
+        "conf": {
+          "mode": "extract",
+          "type": "json",
+          "srcField": "_raw"
+        },
+        "description": "if the REST collector delivered raw JSON text, parse it; a collector that already emits structured fields leaves this a no-op"
+      },
+      {
+        "id": "code",
+        "filter": "true",
+        "conf": {
+          "code": "var t = __e['Time'];\nif (typeof t !== 'undefined') {\n  var s = String(t);\n  var epochSec;\n  var cimMatch = s.match(/^(\\d{4})(\\d{2})(\\d{2})(\\d{2})(\\d{2})(\\d{2})\\.(\\d{6})([+-]\\d{3})$/);\n  if (cimMatch) {\n    var y = parseInt(cimMatch[1], 10);\n    var mo = parseInt(cimMatch[2], 10) - 1;\n    var d = parseInt(cimMatch[3], 10);\n    var h = parseInt(cimMatch[4], 10);\n    var mi = parseInt(cimMatch[5], 10);\n    var se = parseInt(cimMatch[6], 10);\n    var offMin = parseInt(cimMatch[8], 10);\n    var utcMs = Date.UTC(y, mo, d, h, mi, se) - (offMin * 60000);\n    epochSec = utcMs / 1000;\n  } else {\n    var parsed = Date.parse(s);\n    if (!isNaN(parsed)) { epochSec = parsed / 1000; }\n  }\n  if (typeof epochSec !== 'undefined') { __e['_time'] = epochSec; }\n}\nvar panelId = __e['PanelID'];\nvar serial = __e['SerialNumber'];\nif (typeof panelId !== 'undefined' && typeof serial !== 'undefined') {\n  __e['event.id'] = String(panelId) + '-' + String(serial);\n}\nvar desc = __e['Description'];\nif (typeof desc !== 'undefined') {\n  __e['event.action'] = String(desc).toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');\n}\nvar ty = __e['Type'];\nvar subTy = __e['SubType'];\nif (typeof ty !== 'undefined' && typeof subTy !== 'undefined') {\n  __e['event.code'] = String(ty) + '_' + String(subTy);\n}\nvar ar = __e['AccessResult'];\nif (typeof ar !== 'undefined') {\n  var arNum = Number(ar);\n  if (arNum === 2) { __e['event.outcome'] = 'success'; }\n  else if (arNum === 3) { __e['event.outcome'] = 'failure'; }\n  else { __e['event.outcome'] = 'unknown'; }\n}\n__e['event.category'] = ['authentication', 'iam'];\n__e['event.dataset'] = 'pacs_badge.access_events';"
+        },
+        "description": "compute every derived field from the ORIGINAL vendor names before the rename below touches them: parse Time (CIM_DATETIME or ISO-8601) to _time, concatenate PanelID+SerialNumber into event.id, normalize Description into event.action, concatenate Type+SubType into event.code, map the AccessResult enum onto event.outcome, tag category/dataset"
+      },
+      {
+        "id": "mask",
+        "filter": "true",
+        "conf": {
+          "rules": [
+            {
+              "matchRegex": "/^(.+)$/",
+              "replaceExpr": "C.Mask.md5(g1)"
+            }
+          ],
+          "fields": [
+            "CardNumber"
+          ]
+        },
+        "description": "hash the badge/card number before it is renamed into pacs.badge.card_number - the primary correlation key is credential-adjacent and must not land in the index in the clear"
+      },
+      {
+        "id": "mask",
+        "filter": "true",
+        "conf": {
+          "rules": [
+            {
+              "matchRegex": "/(\"CardNumber\"\\s*:\\s*)(\\d+)/",
+              "replaceExpr": "g1 + C.Mask.md5(g2)"
+            }
+          ],
+          "fields": [
+            "_raw"
+          ]
+        },
+        "description": "redact the same card number if it still sits in _raw as JSON text (no-op if the collector never preserved a raw string), so the hashed field above isn't undermined by a plaintext copy alongside it"
+      },
+      {
+        "id": "rename",
+        "filter": "true",
+        "conf": {
+          "rename": [
+            {
+              "currentName": "EventText",
+              "newName": "message"
+            },
+            {
+              "currentName": "PersonID",
+              "newName": "user.id"
+            },
+            {
+              "currentName": "PanelID",
+              "newName": "pacs.panel.id"
+            },
+            {
+              "currentName": "DeviceID",
+              "newName": "pacs.reader.id"
+            },
+            {
+              "currentName": "SecondaryDeviceID",
+              "newName": "pacs.reader.secondary_id"
+            },
+            {
+              "currentName": "SubType",
+              "newName": "pacs.event.subtype_id"
+            },
+            {
+              "currentName": "CardNumber",
+              "newName": "pacs.badge.card_number"
+            },
+            {
+              "currentName": "IssueCode",
+              "newName": "pacs.badge.issue_code"
+            },
+            {
+              "currentName": "CardholderEntered",
+              "newName": "pacs.access.cardholder_entered"
+            },
+            {
+              "currentName": "Duress",
+              "newName": "pacs.access.duress"
+            },
+            {
+              "currentName": "SegmentID",
+              "newName": "pacs.segment.id"
+            }
+          ]
+        },
+        "description": "batch every clean-path field that is a straight copy to its ECS or custom target, run after the compute step and after CardNumber is already hashed"
+      }
+    ]
+  }
+}

@@ -16,6 +16,7 @@ import sys
 
 from datamaps import examples as examples_mod
 from datamaps import model as model_mod
+from datamaps import pipelines as pipelines_mod
 from datamaps import studio as studio_mod
 from datamaps import render, schema, yamlio
 
@@ -318,6 +319,15 @@ def main(argv=None, data_dir=None, out_dir=None, environ=None):
     page_model = model_mod.build_model(
         catalog, technologies, profiles, ecs,
         examples_mod.by_dataset(records))
+    try:
+        loaded = pipelines_mod.load_pipelines(data_dir)
+        page_model["flags"].extend(
+            pipelines_mod.check_pipelines(loaded, page_model))
+    except pipelines_mod.PipelineError as exc:
+        for message in exc.messages:
+            sys.stderr.write("FATAL: %s\n" % message)
+        return 1
+    page_model["pipelines"] = loaded
     if os.path.isdir(out_dir):
         shutil.rmtree(out_dir)
     os.makedirs(out_dir)
@@ -327,12 +337,13 @@ def main(argv=None, data_dir=None, out_dir=None, environ=None):
     studio_mod.publish(ROOT, out_dir, catalog, technologies, profiles, ecs,
                        config, records)
     print("Built %s: %d technologies (%d with maps), %d datasets, "
-          "%d examples, %d flags"
+          "%d examples, %d pipelines, %d flags"
           % (out_dir,
              page_model["summary"]["technologies"],
              sum(1 for v in page_model["technologies"] if v["doc"]),
              page_model["summary"]["datasets"],
              len(records),
+             len(page_model["pipelines"]),
              len(page_model["flags"])))
     return 0
 

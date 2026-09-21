@@ -1,0 +1,133 @@
+{
+  "id": "dm_aws_vpcflow_tgw_flow_parquet_s3",
+  "conf": {
+    "output": "default",
+    "description": "aws-vpcflow tgw-flow / parquet-s3: maps the already-typed Parquet columns to ECS - protocol/tcp-flags decode (wider flag set than the VPC feed), the four packets-lost-* drop counters, epoch-seconds timestamps. No action column exists on TGW records, so event.outcome is deliberately left unset. Scope limited to the 13 integer-typed columns this work order tables; every other selected column is STRING-typed identically to the text TGW feed and maps to ECS exactly as that feed does.",
+    "functions": [
+      {
+        "id": "comment",
+        "filter": "true",
+        "conf": {
+          "comment": "aws-vpcflow / tgw-flow / parquet-s3. Own route/identity from the VPC flow pipeline (the work order's own warning: 'a shared route would let TGW columns be read against the VPC schema'). tcp-flags and the four packets-lost-* columns are HYPHENATED source names (THE BIG ONE trap), read via __e[] bracket access, never path syntax, then dropped via glob in eval.remove. TGW's tcp-flags documents a wider bit set than VPC (PSH=8, URG=32 in addition to FIN/SYN/RST/ACK), decoded here accordingly. No ACCEPT/REJECT action column exists on this record type, so event.outcome is left unset rather than defaulted - matching the Elastic-side instruction not to default it. Driving event.action from a non-zero drop counter is named only in the Elastic recommendation, not the Cribl one, so it is NOT done here - documented scope split. Direct route, no guard hop."
+        },
+        "description": "record dataset, format, own-route rationale, and the wider tcp-flags / no-action-column / event.action scope decisions"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            {
+              "name": "_tcp_flags_num",
+              "value": "__e['tcp-flags'] !== undefined ? Number(__e['tcp-flags']) : undefined"
+            },
+            {
+              "name": "_lost_blackhole_num",
+              "value": "__e['packets-lost-blackhole'] !== undefined ? Number(__e['packets-lost-blackhole']) : undefined"
+            },
+            {
+              "name": "_lost_no_route_num",
+              "value": "__e['packets-lost-no-route'] !== undefined ? Number(__e['packets-lost-no-route']) : undefined"
+            },
+            {
+              "name": "_lost_mtu_num",
+              "value": "__e['packets-lost-mtu-exceeded'] !== undefined ? Number(__e['packets-lost-mtu-exceeded']) : undefined"
+            },
+            {
+              "name": "_lost_ttl_num",
+              "value": "__e['packets-lost-ttl-expired'] !== undefined ? Number(__e['packets-lost-ttl-expired']) : undefined"
+            }
+          ]
+        },
+        "description": "step 1: cast the five hyphenated-source integer columns into FLAT clean-named scratch fields (no dots) via bracket access - kept flat rather than nested aws.vpcflow.* names at this stage so step 2 can read them back safely (a flat bracket read of a dotted target created by eval.add would silently miss it, same landmine documented in the sibling flow/parquet-s3 pipeline)"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            {
+              "name": "network.transport",
+              "value": "Number(__e['protocol']) === 6 ? 'tcp' : (Number(__e['protocol']) === 17 ? 'udp' : (Number(__e['protocol']) === 1 ? 'icmp' : (Number(__e['protocol']) === 58 ? 'icmpv6' : undefined)))"
+            },
+            {
+              "name": "aws.vpcflow.tcp_flags",
+              "value": "__e['_tcp_flags_num']"
+            },
+            {
+              "name": "aws.vpcflow.tcp_flags_array",
+              "value": "[(__e['_tcp_flags_num'] & 1) !== 0 ? 'fin' : undefined, (__e['_tcp_flags_num'] & 2) !== 0 ? 'syn' : undefined, (__e['_tcp_flags_num'] & 4) !== 0 ? 'rst' : undefined, (__e['_tcp_flags_num'] & 8) !== 0 ? 'psh' : undefined, (__e['_tcp_flags_num'] & 16) !== 0 ? 'ack' : undefined, (__e['_tcp_flags_num'] & 32) !== 0 ? 'urg' : undefined]"
+            },
+            {
+              "name": "aws.vpcflow.packets_lost_blackhole",
+              "value": "__e['_lost_blackhole_num']"
+            },
+            {
+              "name": "aws.vpcflow.packets_lost_no_route",
+              "value": "__e['_lost_no_route_num']"
+            },
+            {
+              "name": "aws.vpcflow.packets_lost_mtu_exceeded",
+              "value": "__e['_lost_mtu_num']"
+            },
+            {
+              "name": "aws.vpcflow.packets_lost_ttl_expired",
+              "value": "__e['_lost_ttl_num']"
+            },
+            {
+              "name": "event.start",
+              "value": "__e['start'] !== undefined ? Number(__e['start']) * 1000 : undefined"
+            },
+            {
+              "name": "event.end",
+              "value": "__e['end'] !== undefined ? Number(__e['end']) * 1000 : undefined"
+            },
+            {
+              "name": "event.duration",
+              "value": "(__e['start'] !== undefined && __e['end'] !== undefined) ? (Number(__e['end']) - Number(__e['start'])) * 1000000000 : undefined"
+            },
+            {
+              "name": "_time",
+              "value": "__e['end'] !== undefined ? Number(__e['end']) : undefined"
+            },
+            {
+              "name": "aws.vpcflow.version",
+              "value": "__e['version'] !== undefined ? Number(__e['version']) : undefined"
+            }
+          ]
+        },
+        "description": "step 2, from ORIGINAL vendor names (protocol/start/end/version) and the step-1 flat scratch fields, before the batched rename: bounded protocol resolution (same 4-protocol scope as the VPC pipeline), tcp-flags bit decompose over the WIDER TGW flag set (fin=1/syn=2/rst=4/psh=8/ack=16/urg=32, no arrow/filter per constraint 3), the four drop counters, and epoch-seconds-to-ms/duration/_time (never @timestamp, constraint 1)"
+      },
+      {
+        "id": "rename",
+        "filter": "true",
+        "conf": {
+          "rename": [
+            { "currentName": "srcport", "newName": "source.port" },
+            { "currentName": "dstport", "newName": "destination.port" },
+            { "currentName": "protocol", "newName": "network.iana_number" },
+            { "currentName": "packets", "newName": "network.packets" },
+            { "currentName": "bytes", "newName": "network.bytes" }
+          ]
+        },
+        "description": "batch-rename the five clean 1:1 typed columns to their ECS targets"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            { "name": "event.dataset", "value": "'aws_vpcflow.tgw_flow'" },
+            { "name": "event.provider", "value": "'parquet_s3'" }
+          ],
+          "remove": [
+            "start", "end", "version", "tcp-*", "packets-lost-*",
+            "_tcp_flags_num", "_lost_blackhole_num", "_lost_no_route_num",
+            "_lost_mtu_num", "_lost_ttl_num"
+          ]
+        },
+        "description": "tag event.dataset (no hyphen, constraint 5) and event.provider; drop the clean-named originals consumed above, the hyphenated tcp-flags/packets-lost-* originals via glob (literal hyphenated names are rejected by eval.remove), and every flat scratch field"
+      }
+    ]
+  }
+}
