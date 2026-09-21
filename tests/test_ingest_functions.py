@@ -44,19 +44,34 @@ class TestSerde(unittest.TestCase):
     def test_kvp_defaults_and_delims(self):
         r = fx.translate_function(
             fn("serde", {"mode": "extract", "type": "kvp", "srcField": "extension"}), D)
-        kv = r.processors[0]["kv"]
-        self.assertEqual(kv["field"], "extension")
-        self.assertEqual(kv["field_split"], "\\s+")
-        self.assertEqual(kv["value_split"], "=")
-        self.assertTrue(kv["ignore_missing"])
-        self.assertTrue(kv["ignore_failure"])
+        script = r.processors[0]["script"]
+        self.assertEqual(script["lang"], "painless")
+        self.assertEqual(script["description"], D)
+        self.assertIn('/([^\\s=]+?)=(?:"([^"]*)"|([^\\s]*))/', script["source"])
+        self.assertIn("String.valueOf(ctx.extension)", script["source"])
+        self.assertIn("ctx[k] = v", script["source"])
+        self.assertIs(r.regex, True)
         r = fx.translate_function(
             fn("serde", {"mode": "extract", "type": "kvp", "srcField": "x",
                          "kvDelim": ":", "pairDelim": "|"}), D)
-        kv = r.processors[0]["kv"]
-        self.assertEqual(kv["value_split"], ":")
-        self.assertEqual(kv["field_split"], "\\|")
+        self.assertIn('/([^\\|:]+?):(?:"([^"]*)"|([^\\|]*))/',
+                      r.processors[0]["script"]["source"])
         self.assertTrue(any("quoted" in n or "space" in n for n in r.notes))
+        r = fx.translate_function(
+            fn("serde", {"mode": "extract", "type": "kvp", "srcField": "x",
+                         "dstField": "tanium_fields"}), D)
+        source = r.processors[0]["script"]["source"]
+        self.assertIn("if (ctx.tanium_fields == null) { ctx.tanium_fields = [:]; }",
+                      source)
+        self.assertIn("ctx.tanium_fields[k] = v", source)
+        self.assertNotIn("ctx[k] = v", source)
+        self.assertIs(r.regex, True)
+
+    def test_kvp_multichar_delimiter_untranslatable(self):
+        with self.assertRaises(Untranslatable):
+            fx.translate_function(
+                fn("serde", {"mode": "extract", "type": "kvp", "srcField": "x",
+                             "pairDelim": "||"}), D)
 
     def test_csv_and_delim(self):
         r = fx.translate_function(
@@ -137,9 +152,11 @@ class TestRenameDropMask(unittest.TestCase):
                         "fields": ["Message", "_raw"]}), D)
         self.assertEqual(r.processors, [
             {"gsub": {"field": "Message", "pattern": "[\\s\\S]+", "replacement": "suppressed",
-                      "ignore_missing": True, "description": D}},
+                      "ignore_missing": True, "ignore_failure": True,
+                      "description": D}},
             {"gsub": {"field": "message", "pattern": "[\\s\\S]+", "replacement": "suppressed",
-                      "ignore_missing": True, "description": D}}])
+                      "ignore_missing": True, "ignore_failure": True,
+                      "description": D}}])
 
     def test_mask_expression_replacement_is_manual(self):
         with self.assertRaises(Untranslatable):

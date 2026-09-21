@@ -14,7 +14,12 @@ from datamaps.ingest.expr import Untranslatable, map_field
 MANUAL_FUNCTIONS = ("code", "distinct", "unroll", "xml_unroll", "flatten",
                     "rollup_metrics")
 DATE_FORMATS = ["ISO8601", "UNIX", "UNIX_MS"]
+KVP_NOTE = ("kvp: pairs are scanned key=value left to right as Cribl does; a "
+            "quoted value keeps its spaces, an unquoted one ends at the next "
+            "pair delimiter")
 _REGEX_LITERAL = re.compile(r"^/(.*)/([a-z]*)$", re.S)
+# Delimiters that carry no regex meaning inside or outside a character class.
+_KV_SAFE = re.compile(r"^[A-Za-z0-9_=:]$")
 
 
 class Result(object):
@@ -57,6 +62,50 @@ def _grok_pattern(pattern, flags):
     return _java_regex(pattern.replace("%{", "\\%\\{"), flags)
 
 
+def _kv_regex(ch, what):
+    """One delimiter character, safe to drop into a Painless regex.
+
+    Elasticsearch reads both kv delimiters as regexes, so a bare `|` would
+    match everywhere.  re.escape is not usable: it escapes `:` on Python 3.6
+    but not on 3.7+, and the delimiter has to render identically on both.
+    """
+    if not isinstance(ch, str) or len(ch) != 1:
+        raise Untranslatable("%s %r must be one character" % (what, ch))
+    return ch if _KV_SAFE.match(ch) else "\\" + ch
+
+
+def _kvp_script(c, src):
+    """Painless that scans key=value pairs the way Cribl's kvp extractor does.
+
+    The kv processor cannot stand in here: it throws as soon as a single
+    field_split token lacks the kv delimiter, and an unquoted CEF value with
+    spaces (`msg=User logged in cs1=x`) produces exactly such a token, so
+    ignore_failure would silently drop the whole extraction.  This scan takes
+    the pairs it finds and leaves the rest of the text alone.
+    """
+    pair = c.get("pairDelim")
+    if not pair or (isinstance(pair, str) and pair.isspace()):
+        pair_class = "\\s"
+    else:
+        pair_class = _kv_regex(pair, "kvp pairDelim")
+    kv = _kv_regex(c.get("kvDelim") or "=", "kvp kvDelim")
+    read = expr.read_path(src)
+    pattern = "/([^%s%s]+?)%s(?:\"([^\"]*)\"|([^%s]*))/" % (pair_class, kv, kv,
+                                                            pair_class)
+    guard = ""
+    assign = "ctx[k] = v;"
+    if c.get("dstField"):
+        guards, target = expr.write_target(map_field(c["dstField"]))
+        guards = list(guards) + ["if (%s == null) { %s = [:]; }"
+                                 % (target, target)]
+        guard = " ".join(guards) + " "
+        assign = "%s[k] = v;" % target
+    return ("if (%s != null) { def m = %s.matcher(String.valueOf(%s)); "
+            "%swhile (m.find()) { def k = m.group(1); "
+            "def v = m.group(2) != null ? m.group(2) : m.group(3); %s } }"
+            % (read, pattern, read, guard, assign))
+
+
 def _serde(c, d):
     if c.get("mode") != "extract":
         raise Untranslatable("serde mode %r (only extract is supported)" % c.get("mode"))
@@ -71,19 +120,10 @@ def _serde(c, d):
             body["add_to_root"] = True
         return Result([{"json": body}])
     if kind == "kvp":
-        pair = c.get("pairDelim")
-        body = {"field": src,
-                "field_split": re.escape(pair) if pair else "\\s+",
-                "value_split": c.get("kvDelim") or "=",
-                "ignore_missing": True, "ignore_failure": True,
-                "trim_value": "\"", "strip_brackets": True,
-                "description": d}
-        if c.get("dstField"):
-            body["target_field"] = map_field(c["dstField"])
-        notes.append("kv: values containing the pair delimiter (spaces in a "
-                     "quoted CEF extension value) split differently from "
-                     "Cribl's kvp extractor")
-        return Result([{"kv": body}], notes)
+        notes.append(KVP_NOTE)
+        return Result([{"script": {"lang": "painless",
+                                   "source": _kvp_script(c, src),
+                                   "description": d}}], notes, regex=True)
     if kind in ("csv", "delim"):
         fields = c.get("fields")
         if not fields:
@@ -159,7 +199,8 @@ def _mask(c, d):
             procs.append({"gsub": {"field": map_field(field),
                                    "pattern": _java_regex(pattern, flags),
                                    "replacement": repl.constant,
-                                   "ignore_missing": True, "description": d}})
+                                   "ignore_missing": True,
+                                   "ignore_failure": True, "description": d}})
         regex = True
     return Result(procs, notes, regex=regex)
 
