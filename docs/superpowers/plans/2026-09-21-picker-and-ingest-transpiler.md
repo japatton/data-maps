@@ -61,7 +61,7 @@
 - [ ] **Step 1: Move the files and fix .gitignore**
 
 ```bash
-cd /Users/jasonpatton/data-maps
+cd "$(git rev-parse --show-toplevel)"
 mkdir -p data/pipelines
 for d in cribl-pipelines/*/; do
   t=$(basename "$d"); case "$t" in _*) continue;; esac
@@ -716,7 +716,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - [ ] **Step 1: Move and delete**
 
 ```bash
-cd /Users/jasonpatton/data-maps
+cd "$(git rev-parse --show-toplevel)"
 mkdir -p tools/pipelines
 git mv -k cribl-pipelines/_AGENT-BRIEF.md tools/pipelines/AGENT-BRIEF.md 2>/dev/null || mv cribl-pipelines/_AGENT-BRIEF.md tools/pipelines/AGENT-BRIEF.md
 mv cribl-pipelines/_build_workorders.py tools/pipelines/build_workorders.py
@@ -757,7 +757,7 @@ OUT = os.path.join(HERE, "workorders")
 
 - [ ] **Step 4: Update `AGENT-BRIEF.md` paths**
 
-Replace every `/Users/jasonpatton/data-maps/cribl-pipelines/_workorders/` with `tools/pipelines/workorders/`, every `cribl-pipelines/<tech>/` output path with `data/pipelines/<tech>/`, and any mention of `_lint.py` with `python3 -m datamaps.cribl_lint`. Do not change the technical content (function whitelist, schema, constraints).
+Replace every the absolute `.../cribl-pipelines/_workorders/` path with `tools/pipelines/workorders/`, every `cribl-pipelines/<tech>/` output path with `data/pipelines/<tech>/`, and any mention of `_lint.py` with `python3 -m datamaps.cribl_lint`. Do not change the technical content (function whitelist, schema, constraints).
 
 - [ ] **Step 5: Write `tools/pipelines/README.md`**
 
