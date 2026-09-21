@@ -119,5 +119,18 @@ where Forgejo wants `_Sidebar`, and the tool renames the file on the way
 out; publish with the wrong flavor and the host does not recognise the
 page as a sidebar at all.
 
+## Live validation
+
+Before enabling public hosting, and after any change to `data/pipelines/`
+or `datamaps/ingest/`, run the live validation described in
+`tools/validate_live/README.md` and commit the report it writes under
+`docs/verification/`.  CI runs the offline lint and the transpiler tests on
+every push; this is the one check that needs a real Cribl and a real
+Elasticsearch, so it is run by a person and recorded.
+
+A report proves acceptance — Cribl took the conf, Elasticsearch compiled the
+processors.  It does not prove parsing correctness: this repository holds no
+example records to run through either.
+
 [deploy]: {{REPO}}/README.md#studio
 [validation]: {{REPO}}/README.md#validation-and-data-quality
