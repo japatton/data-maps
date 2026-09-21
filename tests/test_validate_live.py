@@ -57,11 +57,25 @@ class TestReport(unittest.TestCase):
         with open(path, encoding="utf-8") as fh:
             text = fh.read()
         self.assertIn("# Live validation — 2026-09-30", text)
+        self.assertIn("| Cribl Stream | `http://c:19000` | 4.19.0 |", text)
         self.assertIn("Cribl: 1 of 2 accepted", text)
         self.assertIn("Elasticsearch: 0 of 1 accepted", text)
         self.assertIn("bad conf", text)
         self.assertIn("compile error at line 1", text)
         self.assertIn("4.19.0", text)
+
+    def test_masked_endpoint_survives_markdown(self):
+        # `<private host>` outside a code span is an unknown HTML tag, and
+        # every Markdown renderer swallows it: the committed report would then
+        # read `| Cribl Stream | http://:19000 |` and look like a bug.
+        out = tempfile.mkdtemp()
+        path = os.path.join(out, "r.md")
+        masked = vl.display_endpoint("https://cribl.corp.internal:19000")
+        vl.write_report(path, [], None, {"date": "d", "cribl": masked, "es": None,
+                                         "cribl_version": "4.19.0", "es_version": None})
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertIn("| Cribl Stream | `https://<private host>:19000` | 4.19.0 |", text)
 
     def test_report_with_skipped_target(self):
         out = tempfile.mkdtemp()

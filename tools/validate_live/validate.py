@@ -166,10 +166,13 @@ def _section(name, results, skipped_reason):
 def write_report(path, cribl_results, es_results, meta):
     lines = ["# Live validation — %s" % meta["date"], "",
              "| target | endpoint | version |", "|---|---|---|",
-             "| Cribl Stream | %s | %s |" % (meta.get("cribl") or "—",
-                                            meta.get("cribl_version") or "—"),
-             "| Elasticsearch | %s | %s |" % (meta.get("es") or "—",
-                                              meta.get("es_version") or "—"), "",
+             # Code-spanned: a masked endpoint reads `<private host>`, and
+             # outside a code span every Markdown renderer treats that as an
+             # unknown HTML tag and drops it.
+             "| Cribl Stream | `%s` | %s |" % (meta.get("cribl") or "—",
+                                               meta.get("cribl_version") or "—"),
+             "| Elasticsearch | `%s` | %s |" % (meta.get("es") or "—",
+                                                meta.get("es_version") or "—"), "",
              "A green line means the target accepted the pipeline: schema and conf "
              "valid for Cribl, compiled and loaded for Elasticsearch. Neither proves "
              "correct parsing of real events.", ""]

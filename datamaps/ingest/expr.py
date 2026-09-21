@@ -23,10 +23,14 @@ _REGEX_FLAGS = "gimsuy"
 _VALUE_END = ("num", "str", "ident", "regex")
 _VALUE_END_PUNCT = (")", "]")
 
+# A name here is never an event field.  `C` is Cribl's own expression
+# namespace (`C.Lookup`, `C.vars`, `C.Time`): without it the bare-identifier
+# rule would read `C.vars.t` as the field `C.vars.t` and emit something that
+# compiles and is silently wrong, so it has to refuse instead.
 KNOWN_GLOBALS = ("__e", "true", "false", "null", "undefined", "typeof",
                  "new", "Date", "Math", "Array", "String", "Number",
                  "Boolean", "parseInt", "parseFloat", "JSON", "isNaN",
-                 "isFinite")
+                 "isFinite", "C")
 CALLS = ("parseInt", "parseFloat", "Number", "String", "Boolean",
          "Date.parse", "Math.floor", "Math.round", "Math.abs", "Math.max",
          "Math.min", "Array.isArray")
@@ -246,7 +250,7 @@ class _Parser(object):
                                          % name, self.peek()[2])
             elif self.at("punct", "["):
                 if node[0] != "field":
-                    self.fail("indexing is only supported on __e")
+                    self.fail("indexing is only supported on a field")
                 self.take()
                 key = self.expect("str")[1]
                 self.expect("punct", "]")
@@ -477,6 +481,11 @@ class _Emitter(object):
             return True
         if k == "method" and node[2] in _STRING_PRODUCERS:
             return True
+        # `a + b` with either side stringy is concatenation, so the result is a
+        # String; truthy() has to know that or it emits `String != false`,
+        # which is a Painless compile error that fails the whole PUT.
+        if k == "binary" and node[1] == "+":
+            return self.is_stringy(node[2]) or self.is_stringy(node[3])
         return False
 
     def is_numeric(self, node):

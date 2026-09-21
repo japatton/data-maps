@@ -1,5 +1,4 @@
 import copy
-import json
 import os
 import shutil
 import sys
@@ -78,6 +77,18 @@ class TestCheck(unittest.TestCase):
         flags = pipelines.check_pipelines(self.loaded, self.model)
         self.assertNotIn(("arkime", "sessions", "json"), self.loaded)
         self.assertFalse([f for f in flags if f["subject"] == "arkime/sessions"])
+
+    def test_a_block_without_a_pipeline_is_one_flag(self):
+        # The only non-fatal finding the checker produces, and the corpus is
+        # complete today, so the flag path is otherwise never exercised.
+        loaded = dict(self.loaded)
+        key = ("cisco-asa", "device-admin", "snmp-trap")
+        del loaded[key]
+        flags = pipelines.check_pipelines(loaded, self.model)
+        self.assertEqual(len(flags), 1, flags)
+        self.assertEqual(flags[0]["code"], pipelines.NO_PIPELINE)
+        self.assertEqual(flags[0]["subject"], "cisco-asa/device-admin")
+        self.assertIn("snmp-trap", flags[0]["message"])
 
     def test_orphan_pipeline_is_hard_error(self):
         loaded = dict(self.loaded)

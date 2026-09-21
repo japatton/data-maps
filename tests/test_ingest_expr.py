@@ -117,6 +117,14 @@ class TestParse(unittest.TestCase):
             parse("foo(1)")
         self.assertIn("foo", ctx.exception.reason)
 
+    def test_cribl_namespace_is_untranslatable(self):
+        # `C.*` is Cribl's own expression namespace (C.Lookup, C.vars, C.Time).
+        # Without it in KNOWN_GLOBALS the bare-identifier rule would read it as
+        # an event field called `C` and emit a silently wrong ctx.C.vars.t.
+        with self.assertRaises(Untranslatable) as ctx:
+            parse("C.vars.t")
+        self.assertIn("C", ctx.exception.reason)
+
     def test_untranslatable_constructs(self):
         for src in ("foo(1)", "__e['a'] = 1", "x => x", "JSON.parse(__e['a'])",
                     "new Foo()", "__e['a']++", "function(){}", "a; b"):
@@ -279,6 +287,14 @@ class TestEmitValue(unittest.TestCase):
                          "? ctx.s.trim() : 'x')")
         self.assertEqual(self.v("__e['a'] || 'x'"),
                          "(%s ? ctx.a : 'x')" % truthy("ctx.a"))
+
+    def test_concatenation_narrows_to_string_truthiness(self):
+        # A concatenation is a String, and `String != false` is a Painless
+        # compile error that fails the whole PUT, so the def template must
+        # narrow here exactly as it does for .trim() above.
+        cat = "('a' + String.valueOf(ctx.b))"
+        self.assertEqual(self.v("('a' + __e['b']) || 'z'"),
+                         "((%s != null && %s != '') ? %s : 'z')" % (cat, cat, cat))
 
     def test_boolean_operand_is_its_own_truthiness(self):
         self.assertEqual(self.v("(__e['a'] === 'x') || __e['b']"),

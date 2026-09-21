@@ -119,9 +119,13 @@ class TestCorpus(unittest.TestCase):
         # Set once from the first green run of this suite; a drop means the
         # supported subset regressed.
         self.assertGreaterEqual(usable, FLOOR)
+        # usable alone cannot see a fully translated step decaying into a
+        # partial one, so translated carries its own floor.
+        self.assertGreaterEqual(total["translated"], TRANSLATED_FLOOR)
 
 
 FLOOR = 1952
+TRANSLATED_FLOOR = 1758
 
 
 if __name__ == "__main__":
