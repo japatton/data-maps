@@ -1,0 +1,164 @@
+{
+  "id": "dm_cisco_nxos_acl_logging_snmp_trap",
+  "conf": {
+    "output": "default",
+    "description": "Cisco NX-OS acl-logging / snmp-trap: no stock integration or pack parses ACLLOG, so this is a genuine Cribl-side reparse of the CISCO-SYSLOG-MIB clogHistMsgText body (per direct.elastic recommendation), dissecting BOTH the Nexus 5/6k long-form and 7/9k abbreviated ACLLOG label dialects into ECS. Direct topology note: adopt the trap only where SNMP is already the collection path; do not dual-source with logging-server syslog for the same ACL family (double counts flows).",
+    "functions": [
+      {
+        "id": "comment",
+        "filter": "true",
+        "conf": {
+          "comment": "cisco-nxos / acl-logging / snmp-trap. Upstream SNMP trap receiver decodes the PDU and forwards varbinds as JSON. clogHistMsgText carries the whole labelled ACLLOG tuple in one of two dialects (long 'Source IP:'/'Hit-count =' form on N5/6k, abbreviated 'Src IP:'/'ACL Name:'/'ACE Action:' form on N7/9k) -- the trap only re-transports the body, it does not structure it, so both dialects are dissected here. clogHistSeverity is the 1-8 MIB enum, offset by one from the Cisco 0-7 digit and still inverted vs ECS -- log.level is derived from the standard severity-name table. The 255-byte clogHistMsgText cap can clip the abbreviated dialect past ACL name/hit-count; flagged via cisco_nexus.log.snmp.truncated for analyst visibility."
+        },
+        "description": "document the varbind source, the two-dialect reparse, and the truncation caveat"
+      },
+      {
+        "id": "serde",
+        "filter": "true",
+        "conf": {
+          "mode": "extract",
+          "type": "json",
+          "srcField": "_raw"
+        },
+        "description": "extract the JSON-encoded varbind object the upstream SNMP trap receiver forwards"
+      },
+      {
+        "id": "rename",
+        "filter": "true",
+        "conf": {
+          "rename": [
+            {
+              "currentName": "clogHistMsgText",
+              "newName": "event.original"
+            },
+            {
+              "currentName": "clogHistMsgName",
+              "newName": "event.code"
+            },
+            {
+              "currentName": "clogHistFacility",
+              "newName": "cisco_nexus.log.facility"
+            }
+          ]
+        },
+        "description": "map the straight 1:1 CISCO-SYSLOG-MIB varbinds onto their targets (event.original is reparsed further below)"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "event.original && event.original.indexOf('Source IP:') > -1",
+        "conf": {
+          "regex": "/Source IP:\\s*(?<src_ip>[^,]+),\\s*Destination IP:\\s*(?<dst_ip>[^,]+),\\s*Source Port:\\s*(?<src_port>[^,]+),\\s*Destination Port:\\s*(?<dst_port>[^,]+),\\s*Source Interface\\s*:\\s*(?<src_intf>[^,]+),\\s*protocol:\\s*\"(?<proto_name>[A-Za-z0-9]+)\"\\((?<proto_num>\\d+)\\),\\s*Hit-count\\s*=\\s*(?<hit_count>\\d+)/",
+          "source": "event.original"
+        },
+        "description": "dissect the Nexus 5000/6000 long-form ACLLOG dialect"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "event.original && event.original.indexOf('Src IP:') > -1",
+        "conf": {
+          "regex": "/Src IP:\\s*(?<src_ip>[^,]+),\\s*Dst IP:\\s*(?<dst_ip>[^,]+),\\s*Src Port:\\s*(?<src_port>[^,]+),\\s*Dst Port:\\s*(?<dst_port>[^,]+),\\s*Src Intf:\\s*(?<src_intf>[^,]+),\\s*Protocol:\\s*\"(?<proto_name>[A-Za-z0-9]+)\"\\((?<proto_num>\\d+)\\),\\s*ACL Name:\\s*(?<acl_name>[^,]+),\\s*ACE Action:\\s*(?<ace_action>[^,]+),\\s*Appl Intf:\\s*(?<appl_intf>[^,]+),\\s*Hit-count:\\s*(?<hit_count>\\d+)/",
+          "source": "event.original"
+        },
+        "description": "dissect the Nexus 7000/9000 abbreviated/detailed ACLLOG dialect"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            {
+              "name": "network.transport",
+              "value": "__e['proto_name'] ? __e['proto_name'].toLowerCase() : undefined"
+            },
+            {
+              "name": "network.iana_number",
+              "value": "__e['proto_num'] !== undefined ? Number(__e['proto_num']) : undefined"
+            },
+            {
+              "name": "source.ip",
+              "value": "__e['src_ip'] ? __e['src_ip'].trim() : undefined"
+            },
+            {
+              "name": "destination.ip",
+              "value": "__e['dst_ip'] ? __e['dst_ip'].trim() : undefined"
+            },
+            {
+              "name": "source.port",
+              "value": "__e['src_port'] !== undefined && Number(__e['src_port']) !== 0 ? Number(__e['src_port']) : undefined"
+            },
+            {
+              "name": "destination.port",
+              "value": "__e['dst_port'] !== undefined && Number(__e['dst_port']) !== 0 ? Number(__e['dst_port']) : undefined"
+            },
+            {
+              "name": "observer.ingress.interface.name",
+              "value": "__e['src_intf'] ? __e['src_intf'].trim() : undefined"
+            },
+            {
+              "name": "rule.name",
+              "value": "__e['acl_name'] ? __e['acl_name'].trim() : undefined"
+            },
+            {
+              "name": "event.action",
+              "value": "__e['ace_action'] ? __e['ace_action'].trim().toLowerCase() : undefined"
+            },
+            {
+              "name": "source.packets",
+              "value": "__e['hit_count'] !== undefined ? Number(__e['hit_count']) : undefined"
+            },
+            {
+              "name": "cisco_nexus.log.snmp.truncated",
+              "value": "event.original && event.original.length >= 255"
+            },
+            {
+              "name": "event.severity",
+              "value": "__e['clogHistSeverity'] !== undefined ? Number(__e['clogHistSeverity']) - 1 : undefined"
+            },
+            {
+              "name": "log.level",
+              "value": "__e['clogHistSeverity'] !== undefined ? ['emergency','alert','critical','error','warning','notice','informational','debug'][Number(__e['clogHistSeverity']) - 1] : undefined"
+            },
+            {
+              "name": "cisco_nexus.log.snmp.sysuptime",
+              "value": "__e['clogHistTimestamp']"
+            },
+            {
+              "name": "cisco_nexus.log.snmp.history_index",
+              "value": "__e['clogHistIndex']"
+            }
+          ],
+          "remove": [
+            "src_ip",
+            "dst_ip",
+            "src_port",
+            "dst_port",
+            "src_intf",
+            "proto_name",
+            "proto_num",
+            "hit_count",
+            "acl_name",
+            "ace_action",
+            "appl_intf",
+            "clogHistSeverity",
+            "clogHistTimestamp",
+            "clogHistIndex"
+          ]
+        },
+        "description": "per direct.elastic: split protocol/ports/interface/ACL name/action/hit-count out of the dialect match, suppress the literal zero port, recover the Cisco severity digit and its inverted-scale log.level, route the two remaining unmapped varbinds to custom targets, and drop the now-redundant temp fields"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            {
+              "name": "event.dataset",
+              "value": "'cisco_nxos.acl_logging'"
+            }
+          ]
+        },
+        "description": "tag the event with its dataset"
+      }
+    ]
+  }
+}

@@ -1,0 +1,207 @@
+{
+  "id": "dm_vmware_nsx_dfw_packet_log_syslog_raw",
+  "conf": {
+    "output": "default",
+    "description": "VMware NSX Distributed Firewall dfw-packet-log / syslog-raw: no Elastic integration and no installed Cribl Pack exist, so this hand-built pipeline owns the positional dfwpktlogs grammar natively, branching on the match/TERM token per recommendations.direct.cribl.",
+    "functions": [
+      {
+        "id": "comment",
+        "filter": "true",
+        "conf": {
+          "comment": "vmware-nsx/dfw-packet-log/syslog-raw. Catalog mechanism is cribl-pack (community NSX syslog pack), but no Packs are installed on this instance, so the pack's field naming/ECS coverage is built natively here per the brief. Discriminates dfwpktlogs-ident lines out of the merged ESXi syslog stream, branches match vs TERM (disjoint column sets), resolves direction/protocol/type vocab to ECS, and leaves the per-vNIC IN/OUT-to-source/destination byte/packet split unresolved (documented gap - see README)."
+        },
+        "description": "record scope, pack substitution, and the one known gap up front"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^(?<timestamp>\\S+)\\s+(?<host>\\S+)\\s+dfwpktlogs:\\s+(?<vif_id>[0-9a-fA-F]{8})\\s+(?<inet_type>INET6?)\\s+(?<reason>match|TERM)\\s+(?<tail>.*)$/",
+          "source": "_raw"
+        },
+        "description": "split the common dfwpktlogs prefix (timestamp, host, VIF id, address family, match/TERM discriminator) from the reason-specific tail; assumed space-delimited grammar per the work order's documented field order - no literal raw sample was supplied, so verify against a live feed before production use"
+      },
+      {
+        "id": "drop",
+        "filter": "typeof __e['timestamp'] === 'undefined'",
+        "conf": {},
+        "description": "discard non-dfwpktlogs lines (hostd/vmkernel/vobd etc.) that share the same ESXi syslog stream - this pipeline owns only the DFW packet log ident"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "__e['reason'] == 'match'",
+        "conf": {
+          "regex": "/^(?<action>PASS|DROP|REJECT)\\s+(?<ruleset>.+?)\\s+(?<rule_id>\\d+)\\s+(?<direction>IN|OUT)\\s+(?<packet_size>\\d+)\\s+(?<protocol>TCP|UDP|ICMP|PROTO \\d+)\\s+(?<src_ip>[0-9a-fA-F.:]+)\\/(?<src_port>\\d+)->(?<dst_ip>[0-9a-fA-F.:]+)\\/(?<dst_port>\\d+)\\s+(?<tcp_flags>\\S+)$/",
+          "source": "tail"
+        },
+        "description": "match-record tail: action, rule set/id, direction, packet size, protocol, src/dst ip:port, TCP flags"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "__e['reason'] == 'TERM'",
+        "conf": {
+          "regex": "/^(?<ruleset>.+?)\\s+(?<rule_id>\\d+)\\s+(?<direction>IN|OUT)\\s+(?<protocol>TCP|UDP|ICMP|PROTO \\d+)\\s+(?<src_ip>[0-9a-fA-F.:]+)\\/(?<src_port>\\d+)->(?<dst_ip>[0-9a-fA-F.:]+)\\/(?<dst_port>\\d+)\\s+(?<close_reason>RST|FIN)\\s+(?<packet_counts>\\d+\\/\\d+)\\s+(?<byte_counts>\\d+\\/\\d+)$/",
+          "source": "tail"
+        },
+        "description": "TERM-record tail: rule set/id, direction, protocol, src/dst ip:port, close reason, in/out packet and byte pairs - no action column on this shape"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            {
+              "name": "network.type",
+              "value": "__e['inet_type'] == 'INET' ? 'ipv4' : (__e['inet_type'] == 'INET6' ? 'ipv6' : undefined)"
+            },
+            {
+              "name": "network.direction",
+              "value": "__e['direction'] == 'IN' ? 'ingress' : (__e['direction'] == 'OUT' ? 'egress' : undefined)"
+            },
+            {
+              "name": "network.transport",
+              "value": "(__e['protocol'] == 'TCP' || __e['protocol'] == 'UDP' || __e['protocol'] == 'ICMP') ? __e['protocol'].toLowerCase() : undefined"
+            },
+            {
+              "name": "network.iana_number",
+              "value": "(__e['protocol'] && __e['protocol'].indexOf('PROTO') === 0) ? parseInt(__e['protocol'].split(' ')[1], 10) : undefined"
+            },
+            {
+              "name": "network.packets",
+              "value": "__e['packet_counts'] ? (parseInt(__e['packet_counts'].split('/')[0], 10) + parseInt(__e['packet_counts'].split('/')[1], 10)) : undefined"
+            },
+            {
+              "name": "network.bytes",
+              "value": "__e['byte_counts'] ? (parseInt(__e['byte_counts'].split('/')[0], 10) + parseInt(__e['byte_counts'].split('/')[1], 10)) : undefined"
+            },
+            {
+              "name": "vmware.nsx.dfw.record_type",
+              "value": "__e['reason']"
+            },
+            {
+              "name": "vmware.nsx.dfw.packet_length",
+              "value": "__e['packet_size'] ? parseInt(__e['packet_size'], 10) : undefined"
+            },
+            {
+              "name": "vmware.nsx.dfw.tcp_flags",
+              "value": "__e['tcp_flags']"
+            },
+            {
+              "name": "process.name",
+              "value": "'dfwpktlogs'"
+            },
+            {
+              "name": "event.action",
+              "value": "__e['action'] ? __e['action'].toLowerCase() : undefined"
+            },
+            {
+              "name": "event.outcome",
+              "value": "__e['action'] == 'PASS' ? 'success' : ((__e['action'] == 'DROP' || __e['action'] == 'REJECT') ? 'failure' : undefined)"
+            },
+            {
+              "name": "event.type",
+              "value": "__e['reason'] == 'TERM' ? 'end' : (__e['action'] == 'PASS' ? 'allowed' : ((__e['action'] == 'DROP' || __e['action'] == 'REJECT') ? 'denied' : undefined))"
+            },
+            {
+              "name": "rule.id",
+              "value": "__e['rule_id'] ? parseInt(__e['rule_id'], 10) : undefined"
+            }
+          ]
+        },
+        "description": "compute every derived/normalized field from the ORIGINAL vendor names before the batched rename below (ORDER MATTERS rule) - vocab translation, action/outcome/type derivation, session totals, custom vmware.nsx.dfw.* fields"
+      },
+      {
+        "id": "rename",
+        "filter": "true",
+        "conf": {
+          "rename": [
+            {
+              "currentName": "host",
+              "newName": "observer.name"
+            },
+            {
+              "currentName": "vif_id",
+              "newName": "observer.ingress.interface.id"
+            },
+            {
+              "currentName": "ruleset",
+              "newName": "rule.ruleset"
+            },
+            {
+              "currentName": "close_reason",
+              "newName": "event.reason"
+            },
+            {
+              "currentName": "src_ip",
+              "newName": "source.ip"
+            },
+            {
+              "currentName": "src_port",
+              "newName": "source.port"
+            },
+            {
+              "currentName": "dst_ip",
+              "newName": "destination.ip"
+            },
+            {
+              "currentName": "dst_port",
+              "newName": "destination.port"
+            }
+          ]
+        },
+        "description": "batch every clean-named mapped/partial field into its ECS target in one rename"
+      },
+      {
+        "id": "auto_timestamp",
+        "filter": "true",
+        "conf": {
+          "srcField": "timestamp",
+          "dstField": "_time"
+        },
+        "description": "set Cribl's canonical _time from the record's own ISO 8601 timestamp - never target @timestamp directly (constraint 1)"
+      },
+      {
+        "id": "numerify",
+        "filter": "true",
+        "conf": {},
+        "description": "coerce remaining numeric-looking string fields (rule.id, source.port, destination.port) to numbers"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "remove": [
+            "tail",
+            "reason",
+            "action",
+            "direction",
+            "inet_type",
+            "protocol",
+            "packet_counts",
+            "byte_counts",
+            "timestamp",
+            "packet_size",
+            "tcp_flags",
+            "rule_id",
+            "_raw"
+          ],
+          "add": [
+            {
+              "name": "event.dataset",
+              "value": "'vmware_nsx.dfw_packet_log'"
+            },
+            {
+              "name": "event.category",
+              "value": "['network']"
+            },
+            {
+              "name": "event.kind",
+              "value": "'event'"
+            }
+          ]
+        },
+        "description": "drop now-redundant working fields (including _raw, per the direct recommendation to drop it once the parser is proven) and tag the event"
+      }
+    ]
+  }
+}

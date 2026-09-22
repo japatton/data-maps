@@ -1,0 +1,193 @@
+{
+  "id": "dm_infoblox_ddi_dns_firewall_rpz_syslog_cef",
+  "conf": {
+    "output": "default",
+    "description": "Infoblox NIOS DDI - DNS Firewall / RPZ hit, syslog-cef format. Branches the shared named stream on the RPZ-* device event class (not just the generic CEF:0|Infoblox|NIOS| prefix, which the dns-query dataset also uses), parses the nested rewrite/via msg grammar, and fixes the two documented defects in the stock integration's own RPZ branch.",
+    "functions": [
+      {
+        "id": "comment",
+        "filter": "true",
+        "conf": {
+          "comment": "infoblox-ddi / dns-firewall-rpz / syslog-cef. Deliberately NOT routed through the stock infoblox_nios integration's existing RPZ branch: (1) it writes RPZ-<TYPE> to dns.answers.type, a question-side rule identifier in an answer-side field - kept custom here instead (infoblox.nios.rpz.rule_type); (2) its msg dissect requires a trailing CAT= that locally-authored RPZ rules and older NIOS builds omit, dropping every rpz.* subfield - CAT is optional here. event.severity keeps the CEF numeric 8/7/6/4 scale (ECS wants a long); the NIOS critical/major/warning/informational label is added as infoblox.nios.rpz.severity_label alongside it, not overwriting the number. event.outcome uses allowed/blocked (access-control semantics), not success/failure: PASSTHRU is an allow-list hit, every other action is a block/redirect. The msg rewrite/via grammar was reconstructed from field-table prose, not a raw sample - see README gap."
+        },
+        "description": "why this pipeline exists, scope, and the fixes over the stock integration's RPZ branch"
+      },
+      {
+        "id": "drop",
+        "filter": "!(_raw && _raw.indexOf('CEF:0|Infoblox|NIOS|') !== -1)",
+        "conf": {},
+        "description": "coarse guard: only CEF:0|Infoblox|NIOS| lines from the shared named stream continue"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^(?<syslog_ts>\\w{3}\\s+\\d{1,2}\\s+\\d{2}:\\d{2}:\\d{2})\\s+(?<syslog_host>\\S+)\\s+(?<syslog_tag>[^\\s:\\[]+)(?:\\[\\d+\\])?:\\s*(?<cef_full>CEF:0\\|.*)$/",
+          "source": "_raw"
+        },
+        "description": "split the syslog header (timestamp, grid member, tag) from the CEF payload"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^CEF:0\\|(?<cef_vendor>[^|]*)\\|(?<cef_product>[^|]*)\\|(?<cef_version>[^|]*)\\|(?<cef_sig>[^|]*)\\|(?<cef_name>[^|]*)\\|(?<cef_severity>[^|]*)\\|(?<cef_ext>.*)$/",
+          "source": "cef_full"
+        },
+        "description": "split the 7 pipe-delimited CEF header fields (device event class, name/action, severity) from the extension blob"
+      },
+      {
+        "id": "drop",
+        "filter": "!(__e['cef_sig'] && __e['cef_sig'].indexOf('RPZ-') === 0)",
+        "conf": {},
+        "description": "fine guard: only RPZ-* device event classes are the RPZ hit dataset - a plain DNS query/response CEF line shares the same CEF:0|Infoblox|NIOS| prefix and must not reach this pipeline's mapping"
+      },
+      {
+        "id": "serde",
+        "filter": "true",
+        "conf": {
+          "mode": "extract",
+          "type": "kvp",
+          "srcField": "cef_ext"
+        },
+        "description": "explode the space-separated key=value CEF extensions (src, spt, dst, app, view, qtype, and a first pass at msg which the next step corrects)"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/msg=(?<msg_raw>[\\s\\S]*?)(?:\\s+CAT=(?<cat>\\S+))?$/",
+          "source": "cef_ext"
+        },
+        "description": "capture the msg value without swallowing an optional trailing CAT= extension (CAT is absent on locally-authored RPZ rules and older NIOS builds)"
+      },
+      {
+        "id": "code",
+        "filter": "true",
+        "conf": {
+          "code": "var raw = String(__e['msg_raw']||''); var m = /^rewrite\\s+(\\S+)\\s+via\\s+(\\S+)(?:\\s+\\[(\\S+)\\])?(?:\\s+([\\s\\S]*))?$/.exec(raw); if (m){   var qname = m[1].replace(/\\.$/,'').toLowerCase();   var rpzRecord = m[2];   __e['dns'] = __e['dns'] || {}; __e['dns']['question'] = __e['dns']['question'] || {};   __e['dns']['question']['name'] = qname;   __e['rule'] = __e['rule'] || {};   __e['rule']['name'] = rpzRecord;   var prefix = qname + '.';   if (rpzRecord.indexOf(prefix) === 0){ __e['rule']['ruleset'] = rpzRecord.substring(prefix.length); }   if (m[3]){ __e['infoblox'] = __e['infoblox'] || {}; __e['infoblox']['nios'] = __e['infoblox']['nios'] || {}; __e['infoblox']['nios']['rpz'] = __e['infoblox']['nios']['rpz'] || {}; __e['infoblox']['nios']['rpz']['query_class_rewrite'] = m[3]; }   if (m[4]){ __e['event'] = __e['event'] || {}; __e['event']['reason'] = m[4]; } }"
+        },
+        "description": "parse the nested 'rewrite <QNAME> via <RPZ_RECORD> [<type>] <error>' grammar inside msg into dns.question.name, rule.name, rule.ruleset (derived by stripping the queried name off the trigger record), the bracketed rewrite type, and event.reason"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            {
+              "name": "_time",
+              "value": "__e['syslog_ts'] ? Date.parse(__e['syslog_ts'] + ' ' + (new Date()).getFullYear())/1000 : undefined"
+            },
+            {
+              "name": "observer.hostname",
+              "value": "__e['syslog_host']"
+            },
+            {
+              "name": "observer.name",
+              "value": "__e['syslog_host']"
+            },
+            {
+              "name": "observer.vendor",
+              "value": "'Infoblox'"
+            },
+            {
+              "name": "observer.product",
+              "value": "__e['cef_product']"
+            },
+            {
+              "name": "observer.version",
+              "value": "__e['cef_version'] ? __e['cef_version'].split('-')[0] : undefined"
+            },
+            {
+              "name": "process.name",
+              "value": "__e['syslog_tag']"
+            },
+            {
+              "name": "message",
+              "value": "__e['_raw']"
+            },
+            {
+              "name": "event.action",
+              "value": "__e['cef_name'] ? __e['cef_name'].toLowerCase() : undefined"
+            },
+            {
+              "name": "event.outcome",
+              "value": "__e['cef_name']==='PASSTHRU' ? 'allowed' : (__e['cef_name'] ? 'blocked' : undefined)"
+            },
+            {
+              "name": "event.severity",
+              "value": "__e['cef_severity'] ? parseInt(__e['cef_severity'],10) : undefined"
+            },
+            {
+              "name": "infoblox.nios.rpz.severity_label",
+              "value": "__e['cef_severity']==='8' ? 'critical' : __e['cef_severity']==='7' ? 'major' : __e['cef_severity']==='6' ? 'warning' : __e['cef_severity']==='4' ? 'informational' : undefined"
+            },
+            {
+              "name": "infoblox.nios.rpz.rule_type",
+              "value": "__e['cef_sig']"
+            },
+            {
+              "name": "infoblox.nios.dns.view",
+              "value": "__e['view']"
+            },
+            {
+              "name": "rule.category",
+              "value": "__e['cat']"
+            },
+            {
+              "name": "event.dataset",
+              "value": "'infoblox_ddi.dns_firewall_rpz'"
+            }
+          ],
+          "remove": [
+            "cef_full",
+            "cef_ext",
+            "cef_sig",
+            "cef_name",
+            "cef_severity",
+            "cef_vendor",
+            "cef_product",
+            "cef_version",
+            "syslog_ts",
+            "syslog_host",
+            "syslog_tag",
+            "msg_raw",
+            "msg",
+            "cat",
+            "view"
+          ]
+        },
+        "description": "derived fields read from ORIGINAL vendor/regex-capture names (observer.*, process.name, message, event.action/outcome, event.severity + severity_label, rule_type, rule.category, event.dataset), then drop pipeline-internal scratch fields and superseded originals"
+      },
+      {
+        "id": "rename",
+        "filter": "true",
+        "conf": {
+          "rename": [
+            {
+              "currentName": "src",
+              "newName": "source.ip"
+            },
+            {
+              "currentName": "spt",
+              "newName": "source.port"
+            },
+            {
+              "currentName": "dst",
+              "newName": "destination.ip"
+            },
+            {
+              "currentName": "app",
+              "newName": "network.protocol"
+            },
+            {
+              "currentName": "qtype",
+              "newName": "dns.question.type"
+            }
+          ]
+        },
+        "description": "batch rename every status:mapped 1:1 CEF extension field to its ECS target"
+      }
+    ]
+  }
+}

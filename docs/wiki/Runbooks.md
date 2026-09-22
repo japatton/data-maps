@@ -5,9 +5,11 @@ What to do, in the order to do it.
 ## Publish the site
 
 Nothing to run by hand: the site rebuilds when the default branch moves.
-Both CI definitions in this repository — `.gitlab-ci.yml` and
-`.forgejo/workflows/pages.yml` — publish from that branch and from no
-other.  The Forgejo workflow lives under `.forgejo/` rather than
+All three CI definitions in this repository — `.gitlab-ci.yml`,
+`.forgejo/workflows/pages.yml` and `.github/workflows/pages.yml` —
+publish from that branch and from no other, and the GitHub one publishes
+only from the mirror `japatton/data-maps`, never from the canonical
+Forgejo remote.  The Forgejo workflow lives under `.forgejo/` rather than
 `.github/` so that a mirror to GitHub can carry it: GitHub refuses a
 push that writes `.github/workflows/` unless the credential holds
 workflow permission, and this one deliberately does not.
@@ -20,6 +22,25 @@ A build that fails publishes nothing and replaces nothing: it stops before
 it touches `public/`, so the site that is up stays up. Which problems fail
 a build and which merely get flagged on the published site is in the
 README's [validation tiers][validation].
+
+### Public hosting on GitHub Pages
+
+`.github/workflows/pages.yml` builds and publishes the site from the GitHub
+mirror. Two one-time steps by the repository owner gate it:
+
+1. The Forgejo → GitHub push-mirror credential must carry the `workflow`
+   scope, or GitHub refuses the push that carries this file. Reissue the
+   token with that scope and update the mirror's credential in Forgejo.
+2. In the GitHub repository settings, set Pages → Source to **GitHub
+   Actions**. Do this only after a report exists under
+   `docs/verification/`.
+
+The two steps happen in that order, so the first run after the mirror push
+fails: `actions/deploy-pages` needs Pages → Source already pointing at
+GitHub Actions, and step 1 is what delivers the workflow that step 2 then
+enables. Re-run that failed run once the setting is in place, or start a
+fresh one from the workflow's manual trigger (Actions → pages → Run
+workflow, which the workflow's `workflow_dispatch` provides).
 
 ## Point a deployment at its own endpoints
 
@@ -118,6 +139,22 @@ Add `--flavor gitlab` for a GitLab wiki. It wants a lowercase `_sidebar`
 where Forgejo wants `_Sidebar`, and the tool renames the file on the way
 out; publish with the wrong flavor and the host does not recognise the
 page as a sidebar at all.
+
+## Live validation
+
+Before enabling public hosting, and after any change to `data/pipelines/`
+or `datamaps/ingest/`, run the live validation described in
+`tools/validate_live/README.md` and commit the report it writes under
+`docs/verification/`.  CI runs the offline lint and the transpiler tests on
+every push; this is the one check that needs a real Cribl and a real
+Elasticsearch, so it is run by a person and recorded.  The `dm_` prefix is
+reserved for validation: any pipeline or ingest pipeline already named
+`dm_*` on the target is deleted by the run and not restored, so point it at
+a scratch instance.
+
+A report proves acceptance — Cribl took the conf, Elasticsearch compiled the
+processors.  It does not prove parsing correctness: this repository holds no
+example records to run through either.
 
 [deploy]: {{REPO}}/README.md#studio
 [validation]: {{REPO}}/README.md#validation-and-data-quality

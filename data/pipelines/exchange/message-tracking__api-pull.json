@@ -1,0 +1,131 @@
+{
+  "id": "dm_exchange_message_tracking_api_pull",
+  "conf": {
+    "output": "default",
+    "description": "Exchange message-tracking / api-pull: Get-MessageTrackingLog cmdlet objects (ConvertTo-Json), already field-split with PascalCase names, so this is rename+transform not positional parsing. Direct route: one transport per server, no double count vs. any file-tail feed.",
+    "functions": [
+      {
+        "id": "comment",
+        "filter": "true",
+        "conf": {
+          "comment": "exchange / message-tracking / api-pull. Per recommendations.direct.cribl: cmdlet objects are already discrete properties (no #Fields-header pinning needed), so this pipeline renames to ECS, derives event.outcome from the EventId failure family, splits Recipients/RecipientStatus, promotes dual-purpose MessageInfo only on DELIVER/SEND, and dedups on NetworkMessageId+EventId+Timestamp because pull windows overlap by design."
+        },
+        "description": "record parsing approach and why it differs from the file-tail feed"
+      },
+      {
+        "id": "serde",
+        "filter": "true",
+        "conf": {
+          "mode": "extract",
+          "type": "json",
+          "srcField": "_raw"
+        },
+        "description": "parse the ConvertTo-Json'd Get-MessageTrackingLog object into fields"
+      },
+      {
+        "id": "distinct",
+        "filter": "true",
+        "conf": {
+          "groupBy": ["NetworkMessageId", "EventId", "Timestamp"]
+        },
+        "description": "dedup across overlapping pull windows, per recommendations.direct.cribl"
+      },
+      {
+        "id": "auto_timestamp",
+        "filter": "true",
+        "conf": {
+          "srcField": "Timestamp",
+          "dstField": "_time"
+        },
+        "description": "event time to Cribl's canonical _time (never @timestamp directly)"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "typeof __e['CustomData'] !== 'undefined'",
+        "conf": {
+          "regex": "/S:OriginalFromAddress=(?<OriginalFromAddress>[^;]+)/",
+          "source": "CustomData"
+        },
+        "description": "dissect the OriginalFromAddress token out of CustomData ahead of renaming CustomData to its custom field"
+      },
+      {
+        "id": "rename",
+        "filter": "true",
+        "conf": {
+          "rename": [
+            { "currentName": "ClientIp", "newName": "client.ip" },
+            { "currentName": "ClientHostname", "newName": "client.domain" },
+            { "currentName": "ServerIp", "newName": "server.ip" },
+            { "currentName": "ServerHostname", "newName": "server.domain" },
+            { "currentName": "EventId", "newName": "event.action" },
+            { "currentName": "SourceContext", "newName": "microsoft.exchange.sourcecontext" },
+            { "currentName": "ConnectorId", "newName": "microsoft.exchange.connectorid" },
+            { "currentName": "InternalMessageId", "newName": "microsoft.exchange.internalmessageid" },
+            { "currentName": "MessageId", "newName": "email.message_id" },
+            { "currentName": "NetworkMessageId", "newName": "email.local_id" },
+            { "currentName": "RecipientCount", "newName": "microsoft.exchange.recipientcount" },
+            { "currentName": "RelatedRecipientAddress", "newName": "microsoft.exchange.relatedrecipientaddress" },
+            { "currentName": "Reference", "newName": "microsoft.exchange.reference" },
+            { "currentName": "MessageSubject", "newName": "email.subject" },
+            { "currentName": "Sender", "newName": "email.sender.address" },
+            { "currentName": "ReturnPath", "newName": "microsoft.exchange.returnpath" },
+            { "currentName": "OriginalClientIp", "newName": "microsoft.exchange.originalclientip" },
+            { "currentName": "OriginalServerIp", "newName": "microsoft.exchange.originalserverip" },
+            { "currentName": "TotalBytes", "newName": "network.bytes" },
+            { "currentName": "TransportTrafficType", "newName": "microsoft.exchange.transporttraffictype" },
+            { "currentName": "LogId", "newName": "microsoft.exchange.logid" },
+            { "currentName": "SchemaVersion", "newName": "microsoft.exchange.schemaversion" },
+            { "currentName": "CustomData", "newName": "microsoft.exchange.customdata" },
+            { "currentName": "OriginalFromAddress", "newName": "email.from.address" }
+          ]
+        },
+        "description": "batch rename every clean-identifier mapped/partial/unmapped field to its ECS or microsoft.exchange.* target"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            {
+              "name": "event.outcome",
+              "value": "[\"FAIL\",\"DELIVERFAIL\",\"SUBMITFAIL\",\"RESUBMITFAIL\",\"HAREDIRECTFAIL\",\"MODERATORSALLNDR\",\"BADMAIL\",\"DROP\",\"MODERATORREJECT\"].includes(__e['event.action']) ? 'failure' : ([\"DELIVER\",\"SEND\",\"RECEIVE\",\"PROCESS\",\"SUBMIT\"].includes(__e['event.action']) ? 'success' : 'unknown')"
+            },
+            {
+              "name": "email.direction",
+              "value": "__e['Directionality'] === 'Incoming' ? 'inbound' : (__e['Directionality'] === 'Originating' ? 'outbound' : undefined)"
+            },
+            {
+              "name": "email.origination_timestamp",
+              "value": "(__e['event.action'] === 'DELIVER' || __e['event.action'] === 'SEND') ? __e['MessageInfo'] : undefined"
+            },
+            {
+              "name": "microsoft.exchange.message_info_auth_error",
+              "value": "(__e['event.action'] === 'DELIVER' || __e['event.action'] === 'SEND') ? undefined : __e['MessageInfo']"
+            },
+            {
+              "name": "email.to.address",
+              "value": "__e['Recipients'] ? __e['Recipients'].split(';') : undefined"
+            },
+            {
+              "name": "microsoft.exchange.recipientstatus",
+              "value": "__e['RecipientStatus'] ? __e['RecipientStatus'].split(';') : undefined"
+            }
+          ],
+          "remove": ["TenantId", "Directionality", "Recipients", "RecipientStatus", "MessageInfo"]
+        },
+        "description": "failure-family outcome, directionality vocabulary map, dual-purpose MessageInfo split, Recipients/RecipientStatus arrays; drop always-null TenantId and the now-superseded originals"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            { "name": "event.dataset", "value": "'exchange.message_tracking'" }
+          ],
+          "remove": ["_raw"]
+        },
+        "description": "tag dataset (no hyphen per Elastic data-stream naming) and drop _raw now that every value is field-extracted"
+      }
+    ]
+  }
+}

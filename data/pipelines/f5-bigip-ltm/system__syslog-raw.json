@@ -1,0 +1,135 @@
+{
+  "id": "dm_f5_bigip_ltm_system_syslog_raw",
+  "conf": {
+    "output": "default",
+    "description": "F5 BIG-IP LTM system log (syslog-raw TMOS daemon messages), direct route: generic header + hex message-id parse, per-id dispatch for pool/node monitor status (01070638/01070639/01070640) rather than a global regex over free text, per recommendations.direct.cribl. Route-unrecognised message ids still get event.code/message populated. Keep _raw.",
+    "functions": [
+      {
+        "id": "comment",
+        "filter": "true",
+        "conf": {
+          "comment": "F5 BIG-IP LTM system log, syslog-raw, direct route. No Elastic integration covers OS-level syslog for this technology. The header/message-id/severity-digit extraction is generic per recommendations.direct.cribl; only the handful of pool/node monitor-status ids get a dedicated second-pass regex over the free-text message, everything else keeps event.code + message and nothing more. The RFC 3164 header carries no year or explicit timezone - auto_timestamp's own detection is used as a best-effort, not a verified conversion. pool_member's ip:port split uses a last-colon heuristic and will mis-split IPv6 members rendered with a space before the port (documented gap, not fixed)."
+        },
+        "description": "Pipeline purpose, message-id-lookup approach, and the timestamp/IPv6 gaps"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^(?<timestamp>\\w{3}\\s+\\d{1,2}\\s+(?:\\d{4}\\s+)?\\d{2}:\\d{2}:\\d{2})\\s+(?<hostname>\\S+)\\s+(?<level>\\w+)\\s+(?<service>[\\w.-]+)\\[(?<pid>\\d+)\\]:\\s+(?<message_id>[0-9A-Fa-f]{8}):(?<level_number>\\d+):\\s*(?<message>.*)$/",
+          "source": "_raw"
+        },
+        "description": "Generic syslog header parse: timestamp, hostname, severity keyword, daemon[pid], hex message id, severity digit, free-text message"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "message_id=='01070638' || message_id=='01070639'",
+        "conf": {
+          "regex": "/Pool\\s+(?<pool_name>\\S+)\\s+member\\s+(?<pool_member>\\S+)\\s+(?:monitor|session)\\s+status\\s+(?<monitor_status>.+?)\\.?$/",
+          "source": "message"
+        },
+        "description": "Pool member monitor/session status ids only: extract pool name, member, and status from the free-text message"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "message_id=='01070640'",
+        "conf": {
+          "regex": "/[Nn]ode\\s+\\S*\\s*(?<monitor_status>up|down|forced disabled|checking|unchecked)\\b/",
+          "source": "message"
+        },
+        "description": "Node monitor status id only: extract status from the free-text message (no pool context on a bare node event)"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            {
+              "name": "log.syslog.appname",
+              "value": "__e['service']"
+            },
+            {
+              "name": "f5_bigip.ltm.pool_member.ip",
+              "value": "__e['pool_member'] !== undefined ? __e['pool_member'].slice(0, __e['pool_member'].lastIndexOf(':')) : undefined"
+            },
+            {
+              "name": "f5_bigip.ltm.pool_member.port",
+              "value": "__e['pool_member'] !== undefined ? __e['pool_member'].slice(__e['pool_member'].lastIndexOf(':') + 1) : undefined"
+            }
+          ]
+        },
+        "description": "Copy service into log.syslog.appname and split pool_member address:port (last-colon heuristic, IPv6-space gap documented) - BEFORE rename"
+      },
+      {
+        "id": "rename",
+        "filter": "true",
+        "conf": {
+          "rename": [
+            {
+              "currentName": "message_id",
+              "newName": "event.code"
+            },
+            {
+              "currentName": "level_number",
+              "newName": "log.syslog.severity.code"
+            },
+            {
+              "currentName": "level",
+              "newName": "log.level"
+            },
+            {
+              "currentName": "service",
+              "newName": "process.name"
+            },
+            {
+              "currentName": "pid",
+              "newName": "process.pid"
+            },
+            {
+              "currentName": "hostname",
+              "newName": "observer.hostname"
+            },
+            {
+              "currentName": "pool_name",
+              "newName": "f5_bigip.ltm.pool.name"
+            },
+            {
+              "currentName": "pool_member",
+              "newName": "f5_bigip.ltm.pool_member.name"
+            },
+            {
+              "currentName": "monitor_status",
+              "newName": "f5_bigip.ltm.monitor_status"
+            }
+          ]
+        },
+        "description": "Batch rename of every mapped/custom (no-transform) field; message is already ECS's own field name so it is left as-is rather than renamed to itself"
+      },
+      {
+        "id": "auto_timestamp",
+        "filter": "true",
+        "conf": {
+          "srcField": "timestamp",
+          "dstField": "_time"
+        },
+        "description": "Set _time from the syslog header timestamp (no year/timezone in RFC 3164 - best-effort detection, not a verified conversion)"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            {
+              "name": "event.dataset",
+              "value": "'f5_bigip_ltm.system'"
+            }
+          ],
+          "remove": [
+            "timestamp"
+          ]
+        },
+        "description": "Tag event.dataset; drop now-consumed header scratch. _raw and message are deliberately kept."
+      }
+    ]
+  }
+}

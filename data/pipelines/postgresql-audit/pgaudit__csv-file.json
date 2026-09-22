@@ -1,0 +1,122 @@
+{
+  "id": "dm_postgresql_audit_pgaudit_csv_file",
+  "conf": {
+    "output": "default",
+    "description": "PostgreSQL Audit (pgaudit) / pgaudit dataset / csv-file: serde-splits the fixed 26-column csvlog envelope, then re-parses the pgAudit AUDIT tail out of the message column (same tail parser as the syslog-raw dataset, minus the log_line_prefix strip which csvlog columns make unnecessary).",
+    "functions": [
+      {
+        "id": "comment",
+        "filter": "true",
+        "conf": {
+          "comment": "postgresql-audit / pgaudit / csv-file. csvlog gives attribution (user_name, database_name, process_id, session_id, session_line_num, log_time) as real columns, solving the prefix-attribution and multi-line problems the text form has - embedded newlines in STATEMENT arrive as a quoted CSV field, not a broken record. What csvlog does NOT do is structure the AUDIT body: it is still one opaque string in message. No Elastic integration or Pack has pgAudit awareness, so message still needs the hand-built tail split. Column list/order is the fixed PostgreSQL 14+ csvlog format (26 columns incl. leader_pid, query_id); only the columns this map documents are renamed onward, the rest are dropped. Order: parse envelope -> parse tail -> compute event.type/event.action/_time from ORIGINAL names -> batched rename -> event.dataset."
+        },
+        "description": "why the envelope is already attributable but the AUDIT body still needs a hand-built parser"
+      },
+      {
+        "id": "serde",
+        "filter": "true",
+        "conf": {
+          "mode": "extract",
+          "type": "csv",
+          "srcField": "_raw",
+          "fields": [
+            "log_time", "user_name", "database_name", "process_id", "connection_from",
+            "session_id", "session_line_num", "command_tag", "session_start_time",
+            "virtual_transaction_id", "transaction_id", "error_severity", "sql_state_code",
+            "message", "detail", "hint", "internal_query", "internal_query_pos", "context",
+            "query", "query_pos", "location", "application_name", "backend_type",
+            "leader_pid", "query_id"
+          ]
+        },
+        "description": "split the fixed-order PostgreSQL csvlog envelope into named columns"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^AUDIT: (?<audit_type>SESSION|OBJECT),(?<statement_id>\\d+),(?<substatement_id>\\d+),(?<class>[A-Z_]+),(?<command>[^,]*),(?<object_type>[^,]*),(?<object_name>[^,]*),(?<statement>\"(?:[^\"]|\"\")*\"|<not logged>),(?<parameter>\"(?:[^\"]|\"\")*\"|<none>|<not logged>|<long param suppressed>)(?:,(?<rows>\\d+))?$/",
+          "source": "message"
+        },
+        "description": "split the AUDIT tail out of the csvlog message column; ROWS group optional because pgaudit.log_rows changes the column count"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            {
+              "name": "event.type",
+              "value": "__e['class']==='READ' ? ['access'] : __e['class']==='WRITE' ? ['change'] : __e['class']==='DDL' ? (String(__e['command']).indexOf('CREATE')===0 ? ['creation'] : String(__e['command']).indexOf('DROP')===0 ? ['deletion'] : ['change']) : __e['class']==='ROLE' ? ['admin'] : ['info']"
+            },
+            {
+              "name": "event.action",
+              "value": "__e['command'] === undefined ? undefined : String(__e['command']).toLowerCase().replace(/ /g, '_')"
+            },
+            {
+              "name": "_time",
+              "value": "__e['log_time'] === undefined ? undefined : Date.parse(__e['log_time'])/1000"
+            }
+          ]
+        },
+        "description": "derive event.type/event.action/_time from the ORIGINAL parsed field names, before rename nests them"
+      },
+      {
+        "id": "rename",
+        "filter": "true",
+        "conf": {
+          "rename": [
+            { "currentName": "user_name", "newName": "user.name" },
+            { "currentName": "process_id", "newName": "process.pid" },
+            { "currentName": "database_name", "newName": "postgresql.log.database" },
+            { "currentName": "session_id", "newName": "postgresql.log.session_id" },
+            { "currentName": "session_line_num", "newName": "event.sequence" },
+            { "currentName": "statement_id", "newName": "postgresql.pgaudit.statement_id" },
+            { "currentName": "class", "newName": "postgresql.pgaudit.class" },
+            { "currentName": "audit_type", "newName": "postgresql.pgaudit.audit_type" },
+            { "currentName": "substatement_id", "newName": "postgresql.pgaudit.substatement_id" },
+            { "currentName": "object_type", "newName": "postgresql.pgaudit.object_type" },
+            { "currentName": "object_name", "newName": "postgresql.pgaudit.object_name" },
+            { "currentName": "statement", "newName": "postgresql.pgaudit.statement" },
+            { "currentName": "parameter", "newName": "postgresql.pgaudit.parameter" },
+            { "currentName": "rows", "newName": "postgresql.pgaudit.rows" }
+          ]
+        },
+        "description": "batch rename every clean-named parsed field to its ECS or custom postgresql.pgaudit.* target"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            { "name": "event.dataset", "value": "'postgresql_audit.pgaudit'" }
+          ],
+          "remove": [
+            "log_time",
+            "command",
+            "command_tag",
+            "connection_from",
+            "session_start_time",
+            "virtual_transaction_id",
+            "transaction_id",
+            "error_severity",
+            "sql_state_code",
+            "message",
+            "detail",
+            "hint",
+            "internal_query",
+            "internal_query_pos",
+            "context",
+            "query",
+            "query_pos",
+            "location",
+            "application_name",
+            "backend_type",
+            "leader_pid",
+            "query_id"
+          ]
+        },
+        "description": "tag the dataset (no hyphen, per Elastic data-stream naming) and drop consumed/undocumented envelope columns"
+      }
+    ]
+  }
+}

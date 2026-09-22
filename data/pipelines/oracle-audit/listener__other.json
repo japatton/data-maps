@@ -1,0 +1,102 @@
+{
+  "id": "dm_oracle_audit_listener_other",
+  "conf": {
+    "output": "default",
+    "description": "Oracle Database Audit, listener, other (text listener.log): two-stage parse of the asterisk-delimited connect record - top-level star split, then a walk of the nested TNS (key=(key=value)) groups inside CONNECT_DATA and ADDRESS - per recommendations.direct.cribl. source.ip comes from the observed ADDRESS HOST; the client-asserted CID HOST is kept only as a claim, never overwriting it.",
+    "functions": [
+      {
+        "id": "comment",
+        "filter": "true",
+        "conf": {
+          "comment": "listener / other (text). Scoped to the 'establish' line shape - Timestamp * (CONNECT_DATA=...) * (ADDRESS=...) * Event * Service * ReturnCode - the only shape carrying a client network address; this is deliberately the security-relevant slice the catalogue calls out first. The service_register/service_update/reload housekeeping lines use a shorter, ADDRESS-less segment layout and will NOT match this regex (their fields stay unmapped) - consistent with the catalogue's own advice to suppress those for volume. TIMESTAMP has no offset or zone (DD-MON-YYYY local time) - no per-host timezone table was supplied, so _time is a best-effort Date.parse with no offset correction (gap). These nested-paren regexes are unverified against a real listener.log sample - tune against production data before go-live."
+        },
+        "description": "pipeline summary, scope and gaps"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^(?<ts>\\d{2}-[A-Z]{3}-\\d{4}\\s+\\d{2}:\\d{2}:\\d{2})\\s*\\*\\s*\\(CONNECT_DATA=(?<connect_inner>(?:[^()]|\\((?:[^()]|\\([^()]*\\))*\\))*)\\)\\s*\\*\\s*\\(ADDRESS=(?<addr_inner>(?:[^()]|\\([^()]*\\))*)\\)\\s*\\*\\s*(?<evt_action>[a-zA-Z_]+)\\s*\\*\\s*(?<line_tail>[^*]+?)\\s*\\*\\s*(?<rc>-?\\d+)\\s*$/",
+          "source": "_raw"
+        },
+        "description": "top-level asterisk split of the establish-line shape: timestamp, the whole CONNECT_DATA(...) blob, the whole ADDRESS(...) blob, event, the trailing SID|Service segment (not in this work order's field list, dropped unmapped), return code"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^\\((?:SERVICE_NAME=(?<svc_name>[^()]*)|SID=(?<svc_sid>[^()]*))\\)(?:\\(CID=(?:\\(PROGRAM=(?<cid_program>[^()]*)\\))?(?:\\(HOST=(?<cid_host>[^()]*)\\))?(?:\\(USER=(?<cid_user>[^()]*)\\))?\\))?$/",
+          "source": "connect_inner"
+        },
+        "description": "walk the CONNECT_DATA sub-groups: SERVICE_NAME or SID (mutually exclusive), and the nested CID PROGRAM/HOST/USER triple"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^\\(PROTOCOL=(?<protocol>[^()]*)\\)\\(HOST=(?<addr_host>[^()]*)\\)\\(PORT=(?<addr_port>[^()]*)\\)$/",
+          "source": "addr_inner"
+        },
+        "description": "walk the ADDRESS sub-group: PROTOCOL/HOST/PORT of the observed client connection"
+      },
+      {
+        "id": "rename",
+        "filter": "true",
+        "conf": {
+          "rename": [
+            { "currentName": "svc_name", "newName": "service.name" },
+            { "currentName": "svc_sid", "newName": "oracle.listener.sid" },
+            { "currentName": "cid_program", "newName": "process.name" },
+            { "currentName": "cid_host", "newName": "oracle.listener.client_asserted_host" },
+            { "currentName": "cid_user", "newName": "client.user.name" },
+            { "currentName": "addr_host", "newName": "source.ip" },
+            { "currentName": "evt_action", "newName": "event.action" }
+          ]
+        },
+        "description": "batch rename every straight-copy capture; CID HOST goes to a custom claim field, never source.ip, so the observer-verified ADDRESS HOST is not silently overwritten by the client's own assertion"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            {
+              "name": "_time",
+              "value": "__e['ts'] ? Date.parse(__e['ts'])/1000 : undefined"
+            },
+            {
+              "name": "network.transport",
+              "value": "__e['protocol'] === 'tcps' ? 'tls' : __e['protocol']"
+            },
+            {
+              "name": "source.port",
+              "value": "__e['addr_port'] !== undefined ? Number(__e['addr_port']) : undefined"
+            },
+            {
+              "name": "error.code",
+              "value": "__e['rc'] !== undefined ? Number(__e['rc']) : undefined"
+            },
+            {
+              "name": "event.outcome",
+              "value": "__e['rc'] === undefined ? undefined : (Number(__e['rc']) === 0 ? 'success' : 'failure')"
+            },
+            {
+              "name": "event.dataset",
+              "value": "'oracle_audit.listener'"
+            }
+          ],
+          "remove": [
+            "ts",
+            "protocol",
+            "addr_port",
+            "rc",
+            "connect_inner",
+            "addr_inner",
+            "line_tail"
+          ]
+        },
+        "description": "computed fields from the raw stage-1/2/3 captures (tcps flagged as TLS-wrapped TNS per the catalogue's note, port/return code cast to number, outcome derived from the return code), then drop every intermediate capture and blob field; tag event.dataset for the shared logs-oracle.listener stream"
+      }
+    ]
+  }
+}

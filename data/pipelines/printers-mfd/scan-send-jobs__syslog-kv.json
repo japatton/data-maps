@@ -1,0 +1,181 @@
+{
+  "id": "dm_printers_mfd_scan_send_jobs_syslog_kv",
+  "conf": {
+    "output": "default",
+    "description": "printers-mfd scan-send-jobs dataset, syslog-kv format (HP FutureSmart branch): hand-built header+kv decode of HP job-completion messages, split off the same syslog grammar as the device-security-syslog HP branch but a distinct event family; no stock integration or pack exists.",
+    "functions": [
+      {
+        "id": "comment",
+        "filter": "true",
+        "conf": {
+          "comment": "printers-mfd / scan-send-jobs / syslog-kv: HP job-completion messages, same header+kv grammar as the device-security-syslog HP branch ('<priority> <device type>: <event summary>; key=value pairs') but a different event family (scan/copy/fax/print job completion vs security/config events); built as its own pipeline per the one-pipeline-per-dataset-and-format rule even though a real deployment could share one pipeline branching on event family. device_type is parsed but dropped -- this dataset's field table does not target observer.type. This feed is genuinely thin: scan-to-* messages carry no filename, recipient, or byte count, so recipient-level attribution is out of scope by design, not an implementation gap. job_type's vendor-documented misspelling 'reveived_fax' is normalized to 'received_fax'; source_IP's literal 0.0.0.0 on device-generated reports is nulled rather than indexed as a real source per the map's own instruction."
+        },
+        "description": "record the thin-feed scope, the job_type typo normalization, and the 0.0.0.0 source_IP drop"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^<(?<priority>\\d+)>\\s*(?<device_type>[^:]+):\\s*(?<event_summary>[^;]+);\\s*(?<kv_raw>.*)$/s",
+          "source": "_raw"
+        },
+        "description": "split the syslog PRI, device type, free-text event summary, and the trailing key=value block"
+      },
+      {
+        "id": "serde",
+        "filter": "true",
+        "conf": {
+          "mode": "extract",
+          "type": "kvp",
+          "srcField": "kv_raw"
+        },
+        "description": "extract the key=value pairs (job_name, job_type, destination_type, destination, drive_name, user, source_IP, hostname, outcome, time)"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^(?<ts_year>\\d{4})-(?<ts_mon>[A-Za-z]{3})-(?<ts_day>\\d{2})\\s+(?<ts_hour>\\d{1,2}):(?<ts_min>\\d{2})\\s*(?<ts_ampm>AM|PM)\\s*\\(UTC(?<ts_tzsign>[+-])(?<ts_tzh>\\d{2}):(?<ts_tzm>\\d{2})\\)/",
+          "source": "time"
+        },
+        "description": "decompose HP's 12-hour 'YYYY-MMM-DD HH:MM AM/PM (UTC+HH:MM)' device time into components for RFC3339 reconstruction"
+      },
+      {
+        "id": "rename",
+        "filter": "true",
+        "conf": {
+          "rename": [
+            {
+              "currentName": "event_summary",
+              "newName": "event.action"
+            },
+            {
+              "currentName": "job_name",
+              "newName": "file.name"
+            },
+            {
+              "currentName": "hostname",
+              "newName": "source.domain"
+            }
+          ]
+        },
+        "description": "batch-rename the straight-copy status:mapped/partial fields to their ECS targets"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            {
+              "name": "__sev_code",
+              "value": "Number(__e['priority']) % 8"
+            },
+            {
+              "name": "event.severity",
+              "value": "7 - __sev_code"
+            },
+            {
+              "name": "mfd.job.type",
+              "value": "__e['job_type']=='reveived_fax' ? 'received_fax' : __e['job_type']"
+            },
+            {
+              "name": "mfd.job.destination_type",
+              "value": "__e['destination_type']"
+            },
+            {
+              "name": "mfd.job.destination",
+              "value": "__e['destination']"
+            },
+            {
+              "name": "mfd.job.drive_name",
+              "value": "__e['drive_name']"
+            },
+            {
+              "name": "user.domain",
+              "value": "(__e['user'] && __e['user'].indexOf('\\\\')>-1) ? __e['user'].split('\\\\')[0] : undefined"
+            },
+            {
+              "name": "user.name",
+              "value": "__e['user'] ? (__e['user'].indexOf('\\\\')>-1 ? __e['user'].split('\\\\')[1] : __e['user']) : __e['user']"
+            },
+            {
+              "name": "source.ip",
+              "value": "(__e['source_IP'] && __e['source_IP']!=='0.0.0.0') ? __e['source_IP'] : undefined"
+            },
+            {
+              "name": "event.outcome",
+              "value": "__e['outcome']=='success' ? 'success' : __e['outcome']=='failure' ? 'failure' : (__e['outcome']=='canceled' || __e['outcome']=='partial_success') ? 'unknown' : undefined"
+            },
+            {
+              "name": "mfd.job.outcome_raw",
+              "value": "__e['outcome']"
+            },
+            {
+              "name": "__hp_mon_num",
+              "value": "(__e['ts_mon']=='Jan')?'01':(__e['ts_mon']=='Feb')?'02':(__e['ts_mon']=='Mar')?'03':(__e['ts_mon']=='Apr')?'04':(__e['ts_mon']=='May')?'05':(__e['ts_mon']=='Jun')?'06':(__e['ts_mon']=='Jul')?'07':(__e['ts_mon']=='Aug')?'08':(__e['ts_mon']=='Sep')?'09':(__e['ts_mon']=='Oct')?'10':(__e['ts_mon']=='Nov')?'11':'12'"
+            },
+            {
+              "name": "__hp_hour24",
+              "value": "String((__e['ts_ampm']=='PM' && __e['ts_hour']!='12') ? (Number(__e['ts_hour'])+12) : ((__e['ts_ampm']=='AM' && __e['ts_hour']=='12') ? 0 : Number(__e['ts_hour']))).padStart(2,'0')"
+            },
+            {
+              "name": "__hp_iso",
+              "value": "__e['ts_year']+'-'+__hp_mon_num+'-'+__e['ts_day']+'T'+__hp_hour24+':'+__e['ts_min']+':00'+__e['ts_tzsign']+__e['ts_tzh']+':'+__e['ts_tzm']"
+            }
+          ],
+          "remove": [
+            "priority",
+            "device_type",
+            "kv_raw",
+            "job_type",
+            "destination_type",
+            "destination",
+            "drive_name",
+            "user",
+            "source_IP",
+            "outcome",
+            "time",
+            "ts_year",
+            "ts_mon",
+            "ts_day",
+            "ts_hour",
+            "ts_min",
+            "ts_ampm",
+            "ts_tzsign",
+            "ts_tzh",
+            "ts_tzm",
+            "__sev_code",
+            "__hp_mon_num",
+            "__hp_hour24"
+          ]
+        },
+        "description": "invert the RFC5424 severity derived from PRI into event.severity, normalize job_type's documented misspelling, split user's REALM\\user prefix, null out the literal 0.0.0.0 source_IP, fold event.outcome, route the unmapped kv fields to mfd.job.*, and build an ISO-8601 string from the decomposed device time"
+      },
+      {
+        "id": "auto_timestamp",
+        "filter": "true",
+        "conf": {
+          "srcField": "__hp_iso",
+          "dstField": "_time"
+        },
+        "description": "set Cribl's canonical event time from the reconstructed RFC3339 device time (never write @timestamp directly)"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "remove": [
+            "__hp_iso"
+          ],
+          "add": [
+            {
+              "name": "event.dataset",
+              "value": "'printers_mfd.scan_send_jobs'"
+            }
+          ]
+        },
+        "description": "drop the temp ISO-string field and tag the event with its dataset (no hyphens, per the Elastic data-stream naming constraint)"
+      }
+    ]
+  }
+}

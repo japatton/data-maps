@@ -9,6 +9,7 @@ tests build into a temporary directory instead of over ./public/.
 Templates, static files and the Studio sources still come from ROOT.
 """
 import argparse
+import datetime
 import json
 import os
 import shutil
@@ -16,8 +17,10 @@ import sys
 
 from datamaps import examples as examples_mod
 from datamaps import model as model_mod
+from datamaps import pipelines as pipelines_mod
 from datamaps import studio as studio_mod
-from datamaps import render, schema, yamlio
+from datamaps import export_text, render, schema, yamlio
+from datamaps.ingest import pipeline as ingest_mod
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -104,6 +107,121 @@ def _usage_export(usage):
             "vendor": usage["vendor"],
             "status": usage["status"],
             "recommended": usage["recommended"]}
+
+
+def block_rel(tech_id, ds_id, fmt):
+    return "%s/%s__%s" % (tech_id, ds_id, fmt)
+
+
+def _write_text(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        fh.write(text)
+
+
+def _write_json_at(path, payload):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, ensure_ascii=False)
+        fh.write("\n")
+
+
+def _block_map(tech_view, ds_view, fmt_view, rel, has_pipeline):
+    entry = tech_view["entry"]
+    ds = ds_view["data"]
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "technology": {k: entry.get(k) for k in
+                       ("id", "name", "vendor", "category", "status")},
+        "dataset": {"id": ds["id"], "name": ds.get("name"),
+                    "description": ds.get("description"),
+                    "event_categories": list(ds.get("event_categories") or []),
+                    "route": ds.get("route")},
+        "format": _format_export(fmt_view),
+        "recommended": bool(fmt_view["recommended"]),
+        "coverage": {
+            "required_total": len(fmt_view["required"]),
+            "required_mapped": len(fmt_view["required_mapped"]),
+            "required_pct": fmt_view["required_pct"],
+            "fields_total": fmt_view["fields_total"],
+            "fields_mapped": fmt_view["fields_mapped"],
+        },
+        "artifacts": {
+            "cribl": "exports/cribl/%s.json" % rel if has_pipeline else None,
+            "ingest": "exports/ingest/%s.json" % rel if has_pipeline else None,
+        },
+    }
+
+
+def write_block_exports(page_model, out_dir, data_dir, env):
+    """Per-format-block files plus the ingest envelopes; returns {key: env}."""
+    exports_dir = os.path.join(out_dir, "exports")
+    envelopes = {}
+    for tech_view, ds_view, fmt_view in pipelines_mod.iter_blocks(page_model):
+        key = (tech_view["entry"]["id"], ds_view["data"]["id"],
+               fmt_view["data"]["format"])
+        rel = block_rel(*key)
+        pipeline = page_model["pipelines"].get(key)
+        _write_json_at(os.path.join(exports_dir, "map", rel + ".json"),
+                       _block_map(tech_view, ds_view, fmt_view, rel,
+                                  pipeline is not None))
+        _write_text(os.path.join(exports_dir, "map", rel + ".md"),
+                    export_text.block_markdown(tech_view, ds_view, fmt_view))
+        _write_text(os.path.join(exports_dir, "map", rel + ".csv"),
+                    export_text.block_csv(tech_view, ds_view, fmt_view))
+        _write_text(os.path.join(exports_dir, "map", rel + ".html"),
+                    render.fragment_html(env, ds_view, fmt_view, "../../../"))
+        if pipeline is not None:
+            src = os.path.join(data_dir, "pipelines", rel + ".json")
+            dst = os.path.join(exports_dir, "cribl", rel + ".json")
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copyfile(src, dst)
+            envelope = ingest_mod.translate_pipeline(pipeline)
+            envelopes[key] = envelope
+            _write_json_at(os.path.join(exports_dir, "ingest", rel + ".json"),
+                           envelope)
+    return envelopes
+
+
+def write_picker_index(page_model, out_dir, envelopes, today=None):
+    technologies = []
+    for tech_view in page_model["technologies"]:
+        entry = tech_view["entry"]
+        datasets = []
+        for ds_view in tech_view["datasets"]:
+            ds = ds_view["data"]
+            formats = []
+            for fmt_view in ds_view["formats"]:
+                key = (entry["id"], ds["id"], fmt_view["data"]["format"])
+                envelope = envelopes.get(key)
+                parsing = fmt_view["data"]["parsing"]
+                formats.append({
+                    "format": fmt_view["data"]["format"],
+                    "recommended": bool(fmt_view["recommended"]),
+                    "mechanism": parsing["mechanism"],
+                    "artifact": parsing.get("artifact"),
+                    "has_cribl_pipeline": key in page_model["pipelines"],
+                    "ingest": dict(envelope["coverage"]) if envelope else None,
+                    "fields_total": fmt_view["fields_total"],
+                    "fields_mapped": fmt_view["fields_mapped"],
+                    "path": block_rel(*key),
+                })
+            datasets.append({
+                "id": ds["id"], "name": ds.get("name"),
+                "description": ds.get("description"),
+                "event_categories": list(ds.get("event_categories") or []),
+                "formats": formats})
+        technologies.append({"id": entry["id"], "name": entry["name"],
+                             "vendor": entry.get("vendor"),
+                             "category": entry.get("category"),
+                             "status": entry.get("status"),
+                             "datasets": datasets})
+    _write_json(os.path.join(out_dir, "exports"), "picker.json", {
+        "schema_version": SCHEMA_VERSION,
+        "generated": today or datetime.date.today().isoformat(),
+        "destinations": ["elastic"],
+        "technologies": technologies,
+    })
 
 
 def write_exports(page_model, out_dir):
@@ -318,21 +436,35 @@ def main(argv=None, data_dir=None, out_dir=None, environ=None):
     page_model = model_mod.build_model(
         catalog, technologies, profiles, ecs,
         examples_mod.by_dataset(records))
+    try:
+        loaded = pipelines_mod.load_pipelines(data_dir)
+        page_model["flags"].extend(
+            pipelines_mod.check_pipelines(loaded, page_model))
+    except pipelines_mod.PipelineError as exc:
+        for message in exc.messages:
+            sys.stderr.write("FATAL: %s\n" % message)
+        return 1
+    page_model["pipelines"] = loaded
     if os.path.isdir(out_dir):
         shutil.rmtree(out_dir)
     os.makedirs(out_dir)
+    env = render.build_env(ROOT)
     render.render_site(page_model, ROOT, out_dir)
     write_exports(page_model, out_dir)
+    envelopes = write_block_exports(page_model, out_dir, data_dir, env)
+    page_model["ingest"] = envelopes
+    write_picker_index(page_model, out_dir, envelopes)
     examples_mod.publish(records, out_dir)
     studio_mod.publish(ROOT, out_dir, catalog, technologies, profiles, ecs,
                        config, records)
     print("Built %s: %d technologies (%d with maps), %d datasets, "
-          "%d examples, %d flags"
+          "%d examples, %d pipelines, %d flags"
           % (out_dir,
              page_model["summary"]["technologies"],
              sum(1 for v in page_model["technologies"] if v["doc"]),
              page_model["summary"]["datasets"],
              len(records),
+             len(page_model["pipelines"]),
              len(page_model["flags"])))
     return 0
 

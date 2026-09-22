@@ -1,0 +1,125 @@
+{
+  "id": "dm_aws_guardduty_findings_asff",
+  "conf": {
+    "output": "default",
+    "description": "aws-guardduty findings / asff: Security Hub ASFF re-normalization of GuardDuty findings. Per recommendations.direct.cribl this is NOT the native guardduty data stream - routed to event.dataset 'aws_securityhub.findings' instead of 'aws_guardduty.findings', since the elastic recommendation explicitly says 'Route this to a logs-aws.securityhub data stream... not the guardduty pipeline.' ProductFields/Resources/Types are carried through unflattened (custom fields) rather than re-derived, since flattening/recovering the native GuardDuty network-DNS signal from ProductFields is named only in the Elastic-side recommendation.",
+    "functions": [
+      {
+        "id": "comment",
+        "filter": "true",
+        "conf": {
+          "comment": "aws-guardduty / findings / asff. This is a Security Hub feed that happens to carry GuardDuty detections, not the native GuardDuty finding schema - the native typed service.action.* network/DNS/API fields are collapsed into free-text ProductFields keys on this path (the map's own framing). Two export shapes exist per the work order: an EventBridge envelope ({\"detail-type\":\"Security Hub Findings - Imported\",\"detail\":{...}}) or a bare GetFindings API record - a `code` step detects and unwraps the former, a no-op on the latter. ASSUMPTION: one finding per record (no detail.findings[] multi-finding split attempted - no verified event-splitting function conf exists in the brief for this; flagged in the README). Severity/Workflow.Status are genuinely nested ASFF JSON, not flat dotted keys, so chained bracket access is safe here (not the Zeek flat-dot landmine). event.dataset intentionally overridden per recommendations.direct.cribl - see description. Direct route, no guard hop."
+        },
+        "description": "record dataset, format, the EventBridge-vs-API envelope handling, and the event.dataset routing override"
+      },
+      {
+        "id": "serde",
+        "filter": "true",
+        "conf": {
+          "mode": "extract",
+          "type": "json",
+          "srcField": "_raw"
+        },
+        "description": "deserialize the ASFF (or EventBridge-wrapped ASFF) JSON into fields"
+      },
+      {
+        "id": "code",
+        "filter": "true",
+        "conf": {
+          "code": "if (__e['detail'] !== undefined && __e['detail-type'] === 'Security Hub Findings - Imported') { var _d = __e['detail']; var _f = (_d.findings !== undefined && Array.isArray(_d.findings) && _d.findings.length > 0) ? _d.findings[0] : _d; for (var _k in _f) { __e[_k] = _f[_k]; } }"
+        },
+        "description": "detect and unwrap the EventBridge envelope (finding fields land at top level either way); a no-op when the record is already a bare ASFF finding from the GetFindings API export"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            {
+              "name": "event.severity",
+              "value": "__e['Severity'] !== undefined ? __e['Severity']['Normalized'] : undefined"
+            },
+            {
+              "name": "aws.securityhub.severity_label",
+              "value": "__e['Severity'] !== undefined ? __e['Severity']['Label'] : undefined"
+            },
+            {
+              "name": "aws.securityhub.product_arn",
+              "value": "__e['ProductArn']"
+            },
+            {
+              "name": "aws.securityhub.types",
+              "value": "__e['Types']"
+            },
+            {
+              "name": "aws.securityhub.title",
+              "value": "__e['Title']"
+            },
+            {
+              "name": "aws.securityhub.resources",
+              "value": "__e['Resources']"
+            },
+            {
+              "name": "aws.securityhub.product_fields",
+              "value": "__e['ProductFields']"
+            },
+            {
+              "name": "aws.securityhub.record_state",
+              "value": "__e['RecordState']"
+            },
+            {
+              "name": "aws.securityhub.workflow_status",
+              "value": "__e['Workflow'] !== undefined ? __e['Workflow']['Status'] : undefined"
+            }
+          ]
+        },
+        "description": "compute every unmapped/custom field from ORIGINAL vendor names before the rename - Severity.Normalized kept as ASFF's native 0-100 int rather than rescaled (the map offers either option; keeping the native scale is the simpler, non-lossy choice - see README); ProductFields/Resources/Types kept as their natural nested JSON shape, unflattened, per the Cribl-vs-Elastic scope split"
+      },
+      {
+        "id": "rename",
+        "filter": "true",
+        "conf": {
+          "rename": [
+            { "currentName": "Id", "newName": "event.id" },
+            { "currentName": "ProductName", "newName": "observer.product" },
+            { "currentName": "CompanyName", "newName": "observer.vendor" },
+            { "currentName": "GeneratorId", "newName": "rule.name" },
+            { "currentName": "AwsAccountId", "newName": "cloud.account.id" },
+            { "currentName": "Region", "newName": "cloud.region" },
+            { "currentName": "Description", "newName": "message" },
+            { "currentName": "CreatedAt", "newName": "event.created" },
+            { "currentName": "FirstObservedAt", "newName": "event.start" },
+            { "currentName": "LastObservedAt", "newName": "event.end" },
+            { "currentName": "SourceUrl", "newName": "event.reference" }
+          ]
+        },
+        "description": "batch-rename the eleven clean 1:1 top-level ASFF fields to their ECS targets"
+      },
+      {
+        "id": "auto_timestamp",
+        "filter": "true",
+        "conf": {
+          "srcField": "UpdatedAt",
+          "dstField": "_time"
+        },
+        "description": "ISO8601 UpdatedAt into _time (never @timestamp, constraint 1); as on the native finding feed, an aggregated finding re-stamps this forward on each occurrence, so event.created/event.start hold the original/first-observed times separately"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            { "name": "event.dataset", "value": "'aws_securityhub.findings'" },
+            { "name": "event.provider", "value": "'security_hub_asff'" }
+          ],
+          "remove": [
+            "ProductArn", "Types", "Title", "Severity", "Resources",
+            "ProductFields", "RecordState", "Workflow",
+            "detail", "detail-*", "source", "version", "account", "time", "resources", "region", "id"
+          ]
+        },
+        "description": "tag event.dataset overridden to the securityhub stream per recommendations.direct.cribl (no hyphen, constraint 5) and event.provider distinguishing this from the native GuardDuty feed for dedup; drop the clean-named originals consumed above plus any leftover EventBridge envelope keys (harmless no-op removal when the record was already a bare API export)"
+      }
+    ]
+  }
+}

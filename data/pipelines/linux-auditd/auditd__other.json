@@ -1,0 +1,162 @@
+{
+  "id": "dm_linux_auditd_auditd_other",
+  "conf": {
+    "output": "default",
+    "description": "Linux auditd, auditd, other (ENRICHED log_format): extends the RAW syslog-raw pipeline - splits the record on the 0x1D group-separator byte into the unchanged raw key=value head and the uppercase resolved tail, parses both, then folds the resolved UID/AUID/EUID/GID/EGID/SUID/FSUID/SGID/FSGID/ARCH/SYSCALL/SADDR values onto the same fields the RAW pipeline produces.",
+    "functions": [
+      {
+        "id": "comment",
+        "filter": "true",
+        "conf": {
+          "comment": "linux-auditd/auditd/other = ENRICHED log_format. Same hand-built parser as syslog-raw (RAW) with one added stage: the record is split on the single 0x1D control byte auditd inserts after the last raw field; the head is the identical raw key=value body the RAW pipeline already parses (not re-documented in this map's field list), the uppercase tail is the resolved names auditd computed on the origin host. The 0x1D byte is consumed by the split regex and never stored in a field, so it never reaches Elastic. As with syslog-raw, EXECVE a0..aN reassembly is in-record only; cross-record join by msgid is out of scope (join needs a pre-existing stateful store per the brief) and is left to Elastic via auditd.log.msgid."
+        },
+        "description": "identify technology, dataset, format, and how this pipeline extends the RAW parser"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^type=(?<audit_type>\\S+)\\s+msg=audit\\((?<audit_epoch>\\d+)\\.(?<audit_msec>\\d+):(?<audit_seq>\\d+)\\):\\s*(?<audit_body>.*)$/",
+          "source": "_raw"
+        },
+        "description": "split the audit(epoch.msec:seq) msgid header from the remaining body, identical to the RAW pipeline"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^(?<raw_kv>[\\s\\S]*)\\x1d(?<enriched_kv>[\\s\\S]*)$/",
+          "source": "audit_body"
+        },
+        "description": "split on the 0x1D GS byte itself (not whitespace, per the missing-space-before-ARCH bug) into the unchanged raw fields and the uppercase resolved tail"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/SADDR=(?<saddr_raw>\\{[^}]*\\})/",
+          "source": "enriched_kv"
+        },
+        "description": "pull the brace-delimited SADDR structure out whole before generic kvp parsing, since its internal unescaped spaces would otherwise be split into stray tokens by a naive key=value pass"
+      },
+      {
+        "id": "serde",
+        "filter": "true",
+        "conf": {
+          "mode": "extract",
+          "type": "kvp",
+          "srcField": "raw_kv"
+        },
+        "description": "parse the unchanged raw key=value fields (arch=, syscall=, exe=, comm=, pid=, uid=, ppid=, auid=, success=, key=, a0..aN=, addr=, terminal=, hostname=) - identical to the RAW pipeline"
+      },
+      {
+        "id": "serde",
+        "filter": "true",
+        "conf": {
+          "mode": "extract",
+          "type": "kvp",
+          "srcField": "enriched_kv"
+        },
+        "description": "parse the uppercase resolved tail (UID=, AUID=, EUID=, GID=, EGID=, SUID=, FSUID=, SGID=, FSGID=, ARCH=, SYSCALL=, plus any stray tokens the SADDR structure leaves behind - harmless clutter, the clean value already came from the dedicated SADDR extract above)"
+        },
+      {
+        "id": "code",
+        "filter": "true",
+        "conf": {
+          "code": "function auditdDecode(v) { if (typeof v !== 'string') return v; if (/^[0-9A-Fa-f]{2,}$/.test(v) && v.length % 2 === 0) {   var out = '';   for (var i = 0; i < v.length; i += 2) { out += String.fromCharCode(parseInt(v.substr(i, 2), 16)); }   return out; } return v;}if (__e['exe'] !== undefined) { __e['exe'] = auditdDecode(__e['exe']); }if (__e['comm'] !== undefined) { __e['comm'] = auditdDecode(__e['comm']); }if (__e['key'] !== undefined) { __e['key'] = auditdDecode(__e['key']); }if (__e['audit_type'] === 'EXECVE') {  var args = [];  for (var i = 0; i < 64; i++) {    var k = 'a' + i;    if (__e[k] === undefined) break;    args.push(auditdDecode(__e[k]));  }  for (var j = 0; j < args.length; j++) {    if (typeof args[j] === 'string' && /^-p.+/.test(args[j])) { args[j] = '-pREDACTED'; }    else if (args[j] === '-p' || args[j] === '-u') { if (args[j+1] !== undefined) { args[j+1] = 'REDACTED'; } }    else if (args[j] === 'sshpass') { if (args[j+1] === '-p' && args[j+2] !== undefined) { args[j+2] = 'REDACTED'; } }  }  if (args.length) { __e['process.args'] = args; }}"
+        },
+        "description": "decode auditd's escaped/hex string encoding on exe, comm, key, and each EXECVE argv token; reassemble a0..aN into process.args; best-effort redact credential-bearing argv tokens - identical to the RAW pipeline, operating on the raw_kv-parsed fields"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            {
+              "name": "auditd.log.record_type",
+              "value": "__e['audit_type']"
+            },
+            {
+              "name": "auditd.log.syscall",
+              "value": "__e['syscall'] !== undefined ? Number(__e['syscall']) : undefined"
+            },
+            {
+              "name": "auditd.log.auid",
+              "value": "__e['auid'] !== undefined ? Number(__e['auid']) : undefined"
+            },
+            {
+              "name": "auditd.log.terminal",
+              "value": "__e['terminal']"
+            },
+            {
+              "name": "auditd.log.key",
+              "value": "__e['key']"
+            },
+            {
+              "name": "rule.name",
+              "value": "__e['key'] !== undefined && __e['key'] !== '(null)' ? __e['key'].split(String.fromCharCode(1)) : undefined"
+            },
+            {
+              "name": "event.outcome",
+              "value": "__e['success'] === 'yes' ? 'success' : (__e['success'] === 'no' ? 'failure' : undefined)"
+            },
+            {
+              "name": "source.domain",
+              "value": "__e['hostname'] !== undefined && !/^\\d{1,3}(\\.\\d{1,3}){3}$/.test(String(__e['hostname'])) ? __e['hostname'] : undefined"
+            },
+            {
+              "name": "auditd.log.msgid",
+              "value": "__e['audit_epoch'] !== undefined ? (__e['audit_epoch'] + '.' + __e['audit_msec'] + ':' + __e['audit_seq']) : undefined"
+            },
+            {
+              "name": "_time",
+              "value": "__e['audit_epoch'] !== undefined ? Number(__e['audit_epoch']) + (Number(__e['audit_msec']) / 1000) : undefined"
+            },
+            {
+              "name": "event.dataset",
+              "value": "'linux_auditd.auditd'"
+            }
+          ]
+        },
+        "description": "same RAW-derived transforms as the syslog-raw pipeline, unaffected by enrichment: success yes/no to event.outcome, key split into rule.name, numeric casts, hostname-vs-IP for source.domain, msgid, _time, event.dataset"
+      },
+      {
+        "id": "rename",
+        "filter": "true",
+        "conf": {
+          "rename": [
+            { "currentName": "exe", "newName": "process.executable" },
+            { "currentName": "comm", "newName": "process.name" },
+            { "currentName": "pid", "newName": "process.pid" },
+            { "currentName": "ppid", "newName": "process.parent.pid" },
+            { "currentName": "uid", "newName": "user.id" },
+            { "currentName": "addr", "newName": "source.ip" },
+            { "currentName": "UID", "newName": "user.name" },
+            { "currentName": "EUID", "newName": "user.effective.name" },
+            { "currentName": "GID", "newName": "user.group.name" },
+            { "currentName": "EGID", "newName": "user.effective.group.name" },
+            { "currentName": "AUID", "newName": "auditd.log.auid_name" },
+            { "currentName": "SUID", "newName": "auditd.log.suid_name" },
+            { "currentName": "FSUID", "newName": "auditd.log.fsuid_name" },
+            { "currentName": "SGID", "newName": "auditd.log.sgid_name" },
+            { "currentName": "FSGID", "newName": "auditd.log.fsgid_name" },
+            { "currentName": "ARCH", "newName": "host.architecture" },
+            { "currentName": "SYSCALL", "newName": "auditd.log.syscall_name" },
+            { "currentName": "saddr_raw", "newName": "auditd.log.saddr" }
+          ]
+        },
+        "description": "batch-rename the RAW mapped fields plus every resolved ENRICHED-tail field to its ECS or custom target, once every transform above has already read the original vendor/resolved names"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "remove": [
+            "audit_body"
+          ]
+        },
+        "description": "drop audit_body, which still carries the raw 0x1D control byte embedded in it - never forward that byte to Elastic"
+      }
+    ]
+  }
+}

@@ -1,0 +1,95 @@
+{
+  "id": "dm_aws_cloudtrail_console_signin_eventbridge",
+  "conf": {
+    "output": "default",
+    "description": "AWS GovCloud CloudTrail console-signin / eventbridge direct route: strip the EventBridge envelope, scrub the HIDDEN_DUE_TO_SECURITY_REASONS sentinel username BEFORE it is indexed OR re-serialized, then restore the scrubbed record to _raw, per recommendations.direct.cribl - overrides the field table's aws.cloudtrail.flattened.detail custom target the same way management-events does, but scrub-before-snapshot instead of snapshot-before-mutate because this dataset's own security note requires it",
+    "functions": [
+      {
+        "id": "comment",
+        "filter": "true",
+        "conf": {
+          "comment": "EventBridge delivers one console sign-in record per message under detail{}. This is the lowest-volume, highest-value dataset (per description) so detail is kept as _raw like management-events - but userIdentity.userName can carry HIDDEN_DUE_TO_SECURITY_REASONS on a failed sign-in, which the field notes say 'can contain a password a user typed into the wrong box' and 'must be scrubbed rather than indexed'. So the scrub runs on the nested detail object BEFORE the _raw snapshot, unlike management-events which snapshots first - here fidelity loses to the explicit security instruction for this one field."
+        },
+        "description": "Pipeline purpose and why the scrub-then-snapshot order differs from the sibling management-events pipeline"
+      },
+      {
+        "id": "serde",
+        "filter": "true",
+        "conf": {
+          "mode": "extract",
+          "type": "json",
+          "srcField": "_raw"
+        },
+        "description": "Parse the EventBridge envelope and native console sign-in record under detail{} from _raw JSON"
+      },
+      {
+        "id": "code",
+        "filter": "true",
+        "conf": {
+          "code": "if (__e['detail'] && __e['detail'].userIdentity && __e['detail'].userIdentity.userName === 'HIDDEN_DUE_TO_SECURITY_REASONS') { __e['detail'].userIdentity.userName = '[REDACTED_SENTINEL]'; } __e['_raw'] = JSON.stringify(__e['detail']);"
+        },
+        "description": "Scrub the sentinel username IN the nested detail object first (statement form, not a single eval expression, since it needs an if-block), then snapshot the now-scrubbed record into _raw - the mask function's fields[] path-addressing on a nested key is unverified against this instance, so code (proven-safe __e bracket/dot access) is used instead"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            {
+              "name": "aws.eventbridge.detail_type",
+              "value": "__e['detail-type']"
+            },
+            {
+              "name": "event.outcome",
+              "value": "(__e['detail']&&__e['detail'].responseElements&&__e['detail'].responseElements.ConsoleLogin==='Success')?'success':((__e['detail']&&__e['detail'].responseElements&&__e['detail'].responseElements.ConsoleLogin==='Failure')?'failure':undefined)"
+            },
+            {
+              "name": "aws.cloudtrail.console_login.additional_eventdata.mfa_used",
+              "value": "(__e['detail']&&__e['detail'].additionalEventData&&__e['detail'].additionalEventData.MFAUsed==='Yes')?true:((__e['detail']&&__e['detail'].additionalEventData&&__e['detail'].additionalEventData.MFAUsed==='No')?false:undefined)"
+            },
+            {
+              "name": "user.name",
+              "value": "(__e['detail']&&__e['detail'].userIdentity&&__e['detail'].userIdentity.userName==='HIDDEN_DUE_TO_SECURITY_REASONS')?undefined:(__e['detail']&&__e['detail'].userIdentity?__e['detail'].userIdentity.userName:undefined)"
+            }
+          ]
+        },
+        "description": "Computed fields read from ORIGINAL vendor names before rename: 'detail-type' bracket access (hyphen); event.outcome lowercased from the responseElements key matching eventName (ConsoleLogin), per the field notes' 'authoritative outcome read from the responseElements key matching eventName'; MFAUsed Yes/No string to boolean; user.name deliberately omitted (left undefined, i.e. NOT indexed) rather than set to the sentinel literal - the code step above already scrubbed the copy going to _raw, this is the copy going to the ECS field"
+      },
+      {
+        "id": "auto_timestamp",
+        "filter": "true",
+        "conf": {
+          "srcField": "detail.eventTime",
+          "dstField": "_time"
+        },
+        "description": "_time from the in-record sign-in-attempt time (genuinely nested path) - never @timestamp"
+      },
+      {
+        "id": "rename",
+        "filter": "true",
+        "conf": {
+          "rename": [
+            { "currentName": "source", "newName": "aws.eventbridge.source" },
+            { "currentName": "region", "newName": "cloud.region" },
+            { "currentName": "detail.eventName", "newName": "event.action" }
+          ]
+        },
+        "description": "Batch rename of the clean envelope field and the clean nested detail.eventName ECS anchor"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            { "name": "event.dataset", "value": "'aws_cloudtrail.console_signin'" }
+          ],
+          "remove": [
+            "detail",
+            "detail-*"
+          ]
+        },
+        "description": "event.dataset (no hyphen) and cleanup of the now-partially-mutated 'detail' object (superseded by the scrubbed _raw snapshot above) and the hyphenated envelope key via glob"
+      }
+    ]
+  }
+}

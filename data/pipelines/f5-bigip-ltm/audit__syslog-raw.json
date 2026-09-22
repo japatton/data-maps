@@ -1,0 +1,168 @@
+{
+  "id": "dm_f5_bigip_ltm_audit_syslog_raw",
+  "conf": {
+    "output": "default",
+    "description": "F5 BIG-IP LTM configuration audit log (syslog-raw MCP/tmsh + httpd auth records), direct route: header + AUDIT-marker kv-style parse handling the two record shapes (mcpd 01420002 config, httpd 01070417 auth) separately, event.outcome from bracketed status, event.action verb lift from cmd_data, cmd_data length-capped. No masking regex implemented - see README gap. Keep _raw.",
+    "functions": [
+      {
+        "id": "comment",
+        "filter": "true",
+        "conf": {
+          "comment": "F5 BIG-IP LTM audit log, syslog-raw, direct route. No Elastic integration covers this feed. Two record shapes share the AUDIT marker but not the key set: mcpd 01420002 (pid/user/folder/module/status/cmd_data) and httpd 01070417 (user/partition/level/tty/host/attempts/start). cmd_data and start are each the last key in their shape and are captured to end-of-line so embedded spaces in the verbatim command / quoted date survive; module's documented space-containing values (Configuration Utility, iControl REST) are matched via a small enumerated alternation and any other worded value will truncate at the first space. cmd_data is length-capped (2048 chars) as a cheap safety net, but per the brief's rule against inventing an undocumented algorithm, NO masking regex is applied - the recommendation names cmd_data as a secrets risk but gives no concrete pattern, so full redaction is a documented gap, not implemented."
+        },
+        "description": "Pipeline purpose, the two-shape split, and the masking gap"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^(?<timestamp>\\w{3}\\s+\\d{1,2}\\s+(?:\\d{4}\\s+)?\\d{2}:\\d{2}:\\d{2})\\s+(?<hostname>\\S+)\\s+(?<service>[\\w.-]+)\\[\\d+\\]:\\s+(?<message_id>[0-9A-Fa-f]{8}):\\d+:\\s+AUDIT\\s+-\\s+(?<audit_tail>.*)$/",
+          "source": "_raw"
+        },
+        "description": "Generic syslog header + AUDIT marker parse: timestamp, hostname, daemon, hex message id, and the key=value tail"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "message_id=='01420002'",
+        "conf": {
+          "regex": "/pid=(?<pid>\\d+)\\s+user=(?<user>\\S+)\\s+folder=(?<folder>\\S+)\\s+module=(?<module>\\([^)]*\\)#?|Configuration Utility|iControl REST|\\S+)\\s+status=(?<status>\\[[^\\]]*\\])\\s+cmd_data=(?<cmd_data>.*)$/",
+          "source": "audit_tail"
+        },
+        "description": "mcpd configuration/tmsh audit shape: pid, user, folder, module, bracketed status, verbatim cmd_data (captured to end-of-tail)"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "message_id=='01070417'",
+        "conf": {
+          "regex": "/user=(?<user>\\S+)\\s+partition=(?<partition>\\[[^\\]]*\\]|\\S+)\\s+level=(?<level>\\S+)\\s+tty=(?<tty>\\S+)\\s+host=(?<host>\\S+)\\s+attempts=(?<attempts>\\d+)\\s+start=(?<start>.*)$/",
+          "source": "audit_tail"
+        },
+        "description": "httpd administrative authentication shape: user, partition, level, tty, host, attempts, start (captured to end-of-tail)"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            {
+              "name": "event.action",
+              "value": "(__e['cmd_data'] || '').match(/^(\\w+)/) ? __e['cmd_data'].match(/^(\\w+)/)[1] : undefined"
+            },
+            {
+              "name": "event.outcome",
+              "value": "__e['status']=='[Command OK]' ? 'success' : (__e['status'] !== undefined ? 'failure' : undefined)"
+            },
+            {
+              "name": "error.message",
+              "value": "__e['status'] !== undefined && __e['status'] !== '[Command OK]' ? __e['status'].replace(/^\\[|\\]$/g, '') : undefined"
+            },
+            {
+              "name": "user.roles",
+              "value": "__e['level'] ? [__e['level']] : undefined"
+            },
+            {
+              "name": "cmd_data",
+              "value": "(__e['cmd_data'] || '').slice(0, 2048)"
+            }
+          ]
+        },
+        "description": "Lift the leading verb into event.action, derive event.outcome/error.message from the bracketed status, wrap level into user.roles, and length-cap cmd_data - all BEFORE rename, reading the flat vendor field names in evaluation order"
+      },
+      {
+        "id": "rename",
+        "filter": "true",
+        "conf": {
+          "rename": [
+            {
+              "currentName": "message_id",
+              "newName": "event.code"
+            },
+            {
+              "currentName": "user",
+              "newName": "user.name"
+            },
+            {
+              "currentName": "pid",
+              "newName": "process.pid"
+            },
+            {
+              "currentName": "hostname",
+              "newName": "observer.hostname"
+            },
+            {
+              "currentName": "service",
+              "newName": "process.name"
+            },
+            {
+              "currentName": "folder",
+              "newName": "f5_bigip.audit.folder"
+            },
+            {
+              "currentName": "module",
+              "newName": "f5_bigip.audit.module"
+            },
+            {
+              "currentName": "cmd_data",
+              "newName": "f5_bigip.audit.cmd_data"
+            },
+            {
+              "currentName": "partition",
+              "newName": "f5_bigip.audit.partition"
+            },
+            {
+              "currentName": "tty",
+              "newName": "f5_bigip.audit.tty"
+            },
+            {
+              "currentName": "host",
+              "newName": "source.ip"
+            },
+            {
+              "currentName": "attempts",
+              "newName": "f5_bigip.audit.attempts"
+            }
+          ]
+        },
+        "description": "Batch rename of every mapped/custom (no-transform) field; status/level excluded (already consumed above)"
+      },
+      {
+        "id": "auto_timestamp",
+        "filter": "true",
+        "conf": {
+          "srcField": "start",
+          "dstField": "event.start"
+        },
+        "description": "Set event.start from the httpd shape's session-start string (no timezone carried - device timezone assumption is unverified, per the work order's own caution)"
+      },
+      {
+        "id": "auto_timestamp",
+        "filter": "true",
+        "conf": {
+          "srcField": "timestamp",
+          "dstField": "_time"
+        },
+        "description": "Set _time from the syslog header timestamp (no year/timezone in RFC 3164 - best-effort detection, not a verified conversion)"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            {
+              "name": "event.dataset",
+              "value": "'f5_bigip_ltm.audit'"
+            }
+          ],
+          "remove": [
+            "level",
+            "status",
+            "start",
+            "timestamp",
+            "audit_tail"
+          ]
+        },
+        "description": "Tag event.dataset; drop now-consumed header/tail scratch. _raw is deliberately kept."
+      }
+    ]
+  }
+}

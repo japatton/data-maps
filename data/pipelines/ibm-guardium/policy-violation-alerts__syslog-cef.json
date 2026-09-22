@@ -1,0 +1,82 @@
+{
+  "id": "dm_ibm_guardium_policy_violation_alerts_syslog_cef",
+  "conf": {
+    "output": "default",
+    "description": "IBM Guardium DAM policy-violation-alerts, syslog-cef: strips the Guardium/SQLGUARD syslog wrapper, parses the CEF header+extension by regex (the cef function only serializes, it cannot parse), resolves cs1/cs2 via their csNLabel companions, un-inverts src/dst for exception events, and normalizes severity/action/outcome per recommendations.direct.cribl.",
+    "functions": [
+      {
+        "id": "comment",
+        "filter": "true",
+        "conf": { "comment": "Guardium real-time alert, shipped CEF template. Parser must key on the CEF: banner (site can flip to LEEF) and tolerate APAR GA17140's extra space after CEF:." },
+        "description": "Dataset/format banner"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^\\S+\\s+\\S+\\s+\\S+\\s+(?<syslog_host>\\S+)\\s+.*?(?<cef_raw>CEF:\\s?\\d+\\|.*)$/",
+          "source": "_raw"
+        },
+        "description": "Peel the Guardium syslog header hostname and the quoted SQLGUARD ALERT subject, and locate the CEF record (tolerant of the GA17140 extra space)"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^CEF:\\s?(?<cef_version>\\d+)\\|(?<cef_vendor>[^|]*)\\|(?<cef_product>[^|]*)\\|(?<cef_device_version>[^|]*)\\|(?<cef_signature_id>[^|]*)\\|(?<cef_name>[^|]*)\\|(?<cef_severity>[^|]*)\\|(?<cef_extension>.*)$/",
+          "source": "cef_raw"
+        },
+        "description": "Split the CEF pipe-delimited header into its positional fields and isolate the extension blob"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^rt=(?<rt>\\S+)\\s+cs1Label=(?<cs1Label>.*?)\\s+cs1=(?<cs1>.*?)\\s+cs2Label=(?<cs2Label>.*?)\\s+cs2=(?<cs2>.*?)\\s+cat=(?<cat>.*?)\\s+app=(?<app>.*?)\\s+suser=(?<suser>.*?)\\s+sproc=(?<sproc>.*?)\\s+act=(?<act>\\S+)\\s+start=(?<start>\\S+)\\s+externalId=(?<externalId>\\S+)\\s+duser=(?<duser>\\S+)\\s+dst=(?<dst>\\S+)\\s+dpt=(?<dpt>\\S+)\\s+src=(?<src>\\S+)\\s+spt=(?<spt>\\S+)\\s+proto=(?<proto>.*?)\\s+msg=(?<msg>.*)$/",
+          "source": "cef_extension"
+        },
+        "description": "Extract every extension key by fixed position with bounded lazy groups instead of a naive space-delimited kv split: Guardium extension values such as cs2 (MS SQL SERVER), proto (Named Pipes) and sproc (JDBC THIN CLIENT) carry unescaped spaces that a generic kvp parser would truncate"
+      },
+      {
+        "id": "code",
+        "filter": "true",
+        "conf": {
+          "code": "var __labels = {}; if (__e['cs1Label']) { __labels[__e['cs1Label']] = __e['cs1']; } if (__e['cs2Label']) { __labels[__e['cs2Label']] = __e['cs2']; } var __sev = __labels['Severity']; if (__sev === 'INFO') { __e['event.severity'] = 1; } else if (__sev === 'LOW') { __e['event.severity'] = 3; } else if (__sev === 'MED') { __e['event.severity'] = 5; } else if (__sev === 'HIGH') { __e['event.severity'] = 8; } var __srvType = __labels['Server Type']; if (__srvType !== undefined) { __e['guardium.alert.server_type'] = __srvType; } var __actRaw = __e['act']; var __actionMap = {'0':'unknown','1':'sql_access','2':'sql_error','3':'login_failed','8':'rpc','9':'sql_success','11':'raw_statement','12':'bind_data','15':'data_value'}; var __action = (__actRaw !== undefined && __actionMap[String(__actRaw)] !== undefined) ? __actionMap[String(__actRaw)] : (typeof __actRaw === 'string' ? __actRaw.toLowerCase() : undefined); if (__action !== undefined) { __e['event.action'] = __action; } if (__action === 'sql_error' || __action === 'login_failed') { __e['event.outcome'] = 'failure'; } else if (__action === 'sql_success') { __e['event.outcome'] = 'success'; } var __isException = (__action === 'sql_error' || __action === 'login_failed'); var __srcRaw = __e['src']; var __dstRaw = __e['dst']; var __sptRaw = __e['spt']; var __dptRaw = __e['dpt']; if (__isException) { __e['source.ip'] = __dstRaw; __e['destination.ip'] = __srcRaw; __e['source.port'] = __dptRaw; __e['destination.port'] = __sptRaw; } else { __e['source.ip'] = __srcRaw; __e['destination.ip'] = __dstRaw; __e['source.port'] = __sptRaw; __e['destination.port'] = __dptRaw; } var __proto = __e['proto']; if (typeof __proto === 'string' && __proto.toUpperCase() === 'TCP') { __e['network.transport'] = 'tcp'; } else if (__proto !== undefined) { __e['guardium.alert.local_transport'] = __proto; }"
+        },
+        "description": "Resolve cs1/cs2 through their csNLabel companions rather than hardcoded slots (Global Profile template is site-editable); convert INFO/LOW/MED/HIGH to numeric event.severity (the CEF header severity is a hard-coded constant and must be ignored); normalize numeric/string act to one event.action vocabulary and derive event.outcome only for sql_error/login_failed/sql_success; un-invert src/dst/spt/dpt for those same exception-class events; route non-TCP local transports off network.transport"
+      },
+      {
+        "id": "rename",
+        "filter": "true",
+        "conf": {
+          "rename": [
+            { "currentName": "cef_signature_id", "newName": "rule.id" },
+            { "currentName": "cef_name", "newName": "rule.name" },
+            { "currentName": "cat", "newName": "rule.category" },
+            { "currentName": "app", "newName": "network.protocol" },
+            { "currentName": "suser", "newName": "source.user.name" },
+            { "currentName": "sproc", "newName": "process.name" },
+            { "currentName": "start", "newName": "event.start" },
+            { "currentName": "externalId", "newName": "guardium.alert.violation_id" },
+            { "currentName": "duser", "newName": "user.name" },
+            { "currentName": "msg", "newName": "message" },
+            { "currentName": "syslog_host", "newName": "observer.name" }
+          ]
+        },
+        "description": "Batch-rename every status:mapped/status:unmapped field whose source name is a clean identifier straight to its ECS or custom target"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            { "name": "_time", "value": "Number(__e['rt'])/1000" },
+            { "name": "event.dataset", "value": "'ibm_guardium.policy_violation_alerts'" }
+          ],
+          "remove": ["rt", "cs1", "cs1Label", "cs2", "cs2Label", "cef_raw", "cef_extension", "cef_version", "cef_vendor", "cef_product", "cef_device_version", "cef_severity", "src", "dst", "spt", "dpt", "act", "proto"]
+        },
+        "description": "Set _time from rt (receiptTimeMills, ms epoch) since @timestamp cannot be targeted directly; tag event.dataset; drop the intermediate/raw fields consumed above"
+      }
+    ]
+  }
+}

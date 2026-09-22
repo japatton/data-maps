@@ -1,0 +1,198 @@
+{
+  "id": "dm_infoblox_ddi_dns_query_syslog_cef",
+  "conf": {
+    "output": "default",
+    "description": "Infoblox NIOS DDI - dns-query (named combined query/response log), syslog-cef format. Branches the shared named syslog stream on the CEF:0|Infoblox|NIOS| prefix, parses CEF header+extensions and the nested msg RR-set grammar, de-collides the InfobloxDNSQFlags query/response overload, then maps to ECS.",
+    "functions": [
+      {
+        "id": "comment",
+        "filter": "true",
+        "conf": {
+          "comment": "infoblox-ddi / dns-query / syslog-cef. Per recommendations.direct.cribl this is parsed low-side/here, never sent through the stock infoblox_nios integration's pipeline_dns (its groks are BIND-grammar only and never match CEF). Two documented hazards handled explicitly: (1) Query Flags and Response Flags both use the extension key InfobloxDNSQFlags and collide - both occurrences are captured and kept separate; (2) the answer RR set lives inside the msg extension value and can itself contain '=' and spaces (TXT rdata) - parsed with a dedicated code step, not a naive kv split. The map's 'Timestamp' field names no literal CEF key, so _time is taken from the syslog header instead (the field's own notes flag this as an acceptable alternative) - see README gap."
+        },
+        "description": "why this pipeline exists, scope, and the two known hazards"
+      },
+      {
+        "id": "drop",
+        "filter": "!(_raw && _raw.indexOf('CEF:0|Infoblox|NIOS|') !== -1)",
+        "conf": {},
+        "description": "coarse guard: only CEF:0|Infoblox|NIOS| lines from the shared named stream continue"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^(?<syslog_ts>\\w{3}\\s+\\d{1,2}\\s+\\d{2}:\\d{2}:\\d{2})\\s+(?<syslog_host>\\S+)\\s+(?<syslog_tag>[^\\s:\\[]+)(?:\\[\\d+\\])?:\\s*(?<cef_full>CEF:0\\|.*)$/",
+          "source": "_raw"
+        },
+        "description": "split the syslog header (timestamp, grid member, tag) from the CEF payload"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^CEF:0\\|(?<cef_vendor>[^|]*)\\|(?<cef_product>[^|]*)\\|(?<cef_version>[^|]*)\\|(?<cef_sig>[^|]*)\\|(?<cef_name>[^|]*)\\|(?<cef_severity>[^|]*)\\|(?<cef_ext>.*)$/",
+          "source": "cef_full"
+        },
+        "description": "split the 7 pipe-delimited CEF header fields from the extension blob"
+      },
+      {
+        "id": "serde",
+        "filter": "true",
+        "conf": {
+          "mode": "extract",
+          "type": "kvp",
+          "srcField": "cef_ext"
+        },
+        "description": "explode the space-separated key=value CEF extensions (src, spt, dst, dest_port, InfobloxDNSView, destinationDnsDomain, InfobloxDNSQClass, InfobloxDNSQType, proto, InfobloxDNSRCode, transaction_id, opcode, and a first pass at msg/InfobloxDNSQFlags which the next two steps correct)"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/msg=(?<msg_raw>[\\s\\S]*)$/",
+          "source": "cef_ext"
+        },
+        "description": "capture the full msg extension value (answer RR set) to end of line, undoing any truncation the kvp pass made on embedded '=' or spaces"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/InfobloxDNSQFlags=(?<qflags_a>\\S+)[\\s\\S]*InfobloxDNSQFlags=(?<qflags_b>\\S+)/",
+          "source": "cef_ext"
+        },
+        "description": "de-collide InfobloxDNSQFlags: capture the query-side (first) and response-side (second) occurrences separately when both are present"
+      },
+      {
+        "id": "code",
+        "filter": "true",
+        "conf": {
+          "code": "var rrs = String(__e['msg_raw']||'').split(';').map(function(s){return s.trim();}).filter(function(s){return s.length>0;}); var answers = []; var resolved = []; for (var i=0;i<rrs.length;i++){   var m = /^(\\S+)\\s+(\\S+)\\s+(\\S+)\\s+(\\S+)\\s+([\\s\\S]*)$/.exec(rrs[i]);   if (m){     var rrType = m[4]; var rdata = m[5];     answers.push({name:m[1], ttl:parseInt(m[2],10), class:m[3], type:rrType, data:rdata});     if ((rrType==='A'||rrType==='AAAA') && resolved.indexOf(rdata)===-1){ resolved.push(rdata); }   } } __e['dns'] = __e['dns'] || {}; __e['dns']['answers'] = answers; if (resolved.length>0){ __e['dns']['resolved_ip'] = resolved; }"
+        },
+        "description": "parse msg_raw's semicolon-delimited RR set (name ttl class type rdata) into dns.answers[], feeding dns.resolved_ip from the A/AAAA members; rdata keeps embedded spaces/'=' intact since it is not further kv-split"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            {
+              "name": "_time",
+              "value": "__e['syslog_ts'] ? Date.parse(__e['syslog_ts'] + ' ' + (new Date()).getFullYear())/1000 : undefined"
+            },
+            {
+              "name": "observer.hostname",
+              "value": "__e['syslog_host']"
+            },
+            {
+              "name": "observer.name",
+              "value": "__e['syslog_host']"
+            },
+            {
+              "name": "observer.vendor",
+              "value": "'Infoblox'"
+            },
+            {
+              "name": "observer.product",
+              "value": "__e['cef_product']"
+            },
+            {
+              "name": "observer.version",
+              "value": "__e['cef_version'] ? __e['cef_version'].split('-')[0] : undefined"
+            },
+            {
+              "name": "dns.question.name",
+              "value": "__e['destinationDnsDomain'] ? __e['destinationDnsDomain'].replace(/\\.$/,'').toLowerCase() : undefined"
+            },
+            {
+              "name": "network.transport",
+              "value": "__e['proto'] ? __e['proto'].toLowerCase() : undefined"
+            },
+            {
+              "name": "infoblox.nios.dns.view",
+              "value": "__e['InfobloxDNSView']"
+            },
+            {
+              "name": "infoblox.nios.dns.query_flags",
+              "value": "__e['qflags_a'] ? __e['qflags_a'] : __e['InfobloxDNSQFlags']"
+            },
+            {
+              "name": "infoblox.nios.dns.response_flags",
+              "value": "__e['qflags_b'] ? __e['qflags_b'] : undefined"
+            },
+            {
+              "name": "event.dataset",
+              "value": "'infoblox_ddi.dns_query'"
+            }
+          ],
+          "remove": [
+            "cef_full",
+            "cef_ext",
+            "cef_sig",
+            "cef_name",
+            "syslog_ts",
+            "syslog_host",
+            "syslog_tag",
+            "msg_raw",
+            "qflags_a",
+            "qflags_b",
+            "msg",
+            "proto",
+            "InfobloxDNSQFlags",
+            "destinationDnsDomain",
+            "cef_vendor",
+            "cef_product",
+            "cef_version"
+          ]
+        },
+        "description": "derived fields read from ORIGINAL vendor/regex-capture names (observer.*, dns.question.name strip+lowercase, network.transport lowercase, QFlags de-collision, event.dataset), then drop pipeline-internal scratch fields and superseded originals"
+      },
+      {
+        "id": "rename",
+        "filter": "true",
+        "conf": {
+          "rename": [
+            {
+              "currentName": "src",
+              "newName": "source.ip"
+            },
+            {
+              "currentName": "spt",
+              "newName": "source.port"
+            },
+            {
+              "currentName": "dst",
+              "newName": "destination.ip"
+            },
+            {
+              "currentName": "dest_port",
+              "newName": "destination.port"
+            },
+            {
+              "currentName": "InfobloxDNSQClass",
+              "newName": "dns.question.class"
+            },
+            {
+              "currentName": "InfobloxDNSQType",
+              "newName": "dns.question.type"
+            },
+            {
+              "currentName": "InfobloxDNSRCode",
+              "newName": "dns.response_code"
+            },
+            {
+              "currentName": "transaction_id",
+              "newName": "dns.id"
+            },
+            {
+              "currentName": "opcode",
+              "newName": "dns.op_code"
+            }
+          ]
+        },
+        "description": "batch rename every status:mapped 1:1 CEF extension field to its ECS target"
+      }
+    ]
+  }
+}

@@ -1,0 +1,93 @@
+{
+  "id": "dm_postgresql_audit_pgaudit_syslog_raw",
+  "conf": {
+    "output": "default",
+    "description": "PostgreSQL Audit (pgaudit) / pgaudit dataset / syslog-raw: strips the operator log_line_prefix (assumed %m [%p] %u@%d %c) to recover timestamp/pid/user/database/session-id, then splits the AUDIT: CSV tail (config-dependent column count) with a second regex_extract; no Elastic integration or pack understands pgAudit's AUDIT body.",
+    "functions": [
+      {
+        "id": "comment",
+        "filter": "true",
+        "conf": {
+          "comment": "postgresql-audit / pgaudit / syslog-raw. pgAudit rides the ordinary server log, so an audit line is <log_line_prefix><AUDIT: CSV tail>. No Elastic integration or Cribl Pack has pgAudit awareness (integration grok stops at the LOG token; no Packs installed), so this is a hand-built parser. ASSUMES log_line_prefix = '%m [%p] %u@%d %c ' per the map's documented escapes (%m,%p,%u,%d,%c) - the literal prefix is operator-configured and unverifiable from the map alone; say so in README. Multi-line reassembly of STATEMENT (which can contain literal newlines) is expected to happen at the Source event breaker before this pipeline runs - out of scope for a pipeline object. Order: parse -> compute event.type/event.action/_time from ORIGINAL field names -> batched rename -> event.dataset, per the compute-before-rename rule."
+        },
+        "description": "why this is a hand-built parser and what the prefix format assumes"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^(?<pg_timestamp>\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}\\.\\d{3}(?: [A-Za-z]+)?) \\[(?<pg_pid>\\d+)\\] (?<pg_user>[^@]+)@(?<pg_database>\\S+) (?<pg_session_id>\\S+) LOG:\\s+AUDIT: (?<audit_tail>[\\s\\S]+)$/",
+          "source": "_raw"
+        },
+        "description": "strip log_line_prefix, recover timestamp/pid/user/database/session id, isolate the AUDIT CSV tail"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^(?<audit_type>SESSION|OBJECT),(?<statement_id>\\d+),(?<substatement_id>\\d+),(?<class>[A-Z_]+),(?<command>[^,]*),(?<object_type>[^,]*),(?<object_name>[^,]*),(?<statement>\"(?:[^\"]|\"\")*\"|<not logged>),(?<parameter>\"(?:[^\"]|\"\")*\"|<none>|<not logged>|<long param suppressed>)(?:,(?<rows>\\d+))?$/",
+          "source": "audit_tail"
+        },
+        "description": "split the AUDIT tail; ROWS group is optional because pgaudit.log_rows changes the column count"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            {
+              "name": "event.type",
+              "value": "__e['class']==='READ' ? ['access'] : __e['class']==='WRITE' ? ['change'] : __e['class']==='DDL' ? (String(__e['command']).indexOf('CREATE')===0 ? ['creation'] : String(__e['command']).indexOf('DROP')===0 ? ['deletion'] : ['change']) : __e['class']==='ROLE' ? ['admin'] : ['info']"
+            },
+            {
+              "name": "event.action",
+              "value": "__e['command'] === undefined ? undefined : String(__e['command']).toLowerCase().replace(/ /g, '_')"
+            },
+            {
+              "name": "_time",
+              "value": "__e['pg_timestamp'] === undefined ? undefined : Date.parse(__e['pg_timestamp'])/1000"
+            }
+          ]
+        },
+        "description": "derive event.type/event.action/_time from the ORIGINAL parsed field names, before rename nests them"
+      },
+      {
+        "id": "rename",
+        "filter": "true",
+        "conf": {
+          "rename": [
+            { "currentName": "pg_user", "newName": "user.name" },
+            { "currentName": "pg_pid", "newName": "process.pid" },
+            { "currentName": "pg_database", "newName": "postgresql.log.database" },
+            { "currentName": "pg_session_id", "newName": "postgresql.log.session_id" },
+            { "currentName": "statement_id", "newName": "event.sequence" },
+            { "currentName": "class", "newName": "postgresql.pgaudit.class" },
+            { "currentName": "audit_type", "newName": "postgresql.pgaudit.audit_type" },
+            { "currentName": "substatement_id", "newName": "postgresql.pgaudit.substatement_id" },
+            { "currentName": "object_type", "newName": "postgresql.pgaudit.object_type" },
+            { "currentName": "object_name", "newName": "postgresql.pgaudit.object_name" },
+            { "currentName": "statement", "newName": "postgresql.pgaudit.statement" },
+            { "currentName": "parameter", "newName": "postgresql.pgaudit.parameter" },
+            { "currentName": "rows", "newName": "postgresql.pgaudit.rows" }
+          ]
+        },
+        "description": "batch rename every clean-named parsed field to its ECS or custom postgresql.pgaudit.* target"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            { "name": "event.dataset", "value": "'postgresql_audit.pgaudit'" }
+          ],
+          "remove": [
+            "pg_timestamp",
+            "audit_tail",
+            "command"
+          ]
+        },
+        "description": "tag the dataset (no hyphen, per Elastic data-stream naming) and drop intermediate/consumed fields"
+      }
+    ]
+  }
+}

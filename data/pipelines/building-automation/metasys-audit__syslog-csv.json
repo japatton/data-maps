@@ -1,0 +1,108 @@
+{
+  "id": "dm_building_automation_metasys_audit_syslog_csv",
+  "conf": {
+    "output": "default",
+    "description": "Building Automation (Metasys) audit syslog-csv direct route: RFC3164 envelope + documented positional pipe-delimited Audit Viewer record parse, dash-to-null restoration, host disambiguation between the DDA server and the audited engine",
+    "functions": [
+      {
+        "id": "comment",
+        "filter": "true",
+        "conf": {
+          "comment": "Metasys Syslog DDA: one BSD frame per Audit Repository entry, MSG = When|Item|ClassLevel|OriginApp|User|ActionType|Description|PreviousValue|PostValue|Status, '-' for empty columns, fixed Facility 13/Severity 6. No Elastic integration or Cribl pack exists for Metasys."
+        },
+        "description": "Pipeline purpose and documented MSG grammar"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^<(?<pri>\\d{1,3})>(?<header_ts>[A-Za-z]{3}\\s+\\d{1,2}\\s+\\d{2}:\\d{2}:\\d{2})\\s+(?<HOSTNAME>\\S+)\\s+(?<TAG>[^:]+):\\s*(?<MSG>.*)$/",
+          "source": "_raw"
+        },
+        "description": "Split the RFC3164 envelope (HOSTNAME = the ADS/ADX/OAS server running the DDA) from the pipe-delimited audit content (MSG)"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^(?<m_when>[^|]*)\\|(?<m_item>[^|]*)\\|(?<m_classlevel>[^|]*)\\|(?<m_originapp>[^|]*)\\|(?<m_user>[^|]*)\\|(?<m_actiontype>[^|]*)\\|(?<m_description>[^|]*)\\|(?<m_prevvalue>[^|]*)\\|(?<m_postvalue>[^|]*)\\|(?<m_status>[^|]*)$/",
+          "source": "MSG"
+        },
+        "description": "Positional split of the ten documented Audit Viewer columns on the vertical bar"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            { "name": "m_when", "value": "__e['m_when']==='-' ? undefined : __e['m_when']" },
+            { "name": "m_item", "value": "__e['m_item']==='-' ? undefined : __e['m_item']" },
+            { "name": "m_classlevel", "value": "__e['m_classlevel']==='-' ? undefined : __e['m_classlevel']" },
+            { "name": "m_originapp", "value": "__e['m_originapp']==='-' ? undefined : __e['m_originapp']" },
+            { "name": "m_user", "value": "__e['m_user']==='-' ? undefined : __e['m_user']" },
+            { "name": "m_actiontype", "value": "__e['m_actiontype']==='-' ? undefined : __e['m_actiontype']" },
+            { "name": "m_description", "value": "__e['m_description']==='-' ? undefined : __e['m_description']" },
+            { "name": "m_prevvalue", "value": "__e['m_prevvalue']==='-' ? undefined : __e['m_prevvalue']" },
+            { "name": "m_postvalue", "value": "__e['m_postvalue']==='-' ? undefined : __e['m_postvalue']" },
+            { "name": "m_status", "value": "__e['m_status']==='-' ? undefined : __e['m_status']" }
+          ]
+        },
+        "description": "Restore '-' (Metasys' empty-column marker) to unset before anything downstream shapes these fields"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            { "name": "observer.name", "value": "__e['m_item'] ? __e['m_item'].split(':')[1].split('/')[0] : undefined" },
+            { "name": "source.ip", "value": "/log[- ]?(on|in|off|out)/i.test(__e['m_actiontype']||'') ? __e['m_postvalue'] : undefined" },
+            { "name": "event.outcome", "value": "__e['m_status'] ? __e['m_status'].toLowerCase() : (/fail/i.test((__e['m_actiontype']||'')+' '+(__e['m_description']||'')) ? 'failure' : 'success')" },
+            { "name": "log.syslog.facility.name", "value": "'log audit'" },
+            { "name": "log.syslog.severity.name", "value": "'Informational'" }
+          ]
+        },
+        "description": "Item's deviceHostname segment goes to observer.name (not host.name - Header hostname already formally claims host.name and is a different real host, the DDA-emitting server, not the audited engine); postData-style client IP promoted to source.ip only for log-in/log-out Action Types; event.outcome cross-checks Status against Action Type/Description since Status is frequently '-'; PRI Facility/Severity are fixed constants per the DDA spec, not parsed"
+      },
+      {
+        "id": "rename",
+        "filter": "true",
+        "conf": {
+          "rename": [
+            { "currentName": "m_item", "newName": "bas.metasys.audit.item_reference" },
+            { "currentName": "m_classlevel", "newName": "bas.metasys.audit.class_level" },
+            { "currentName": "m_originapp", "newName": "event.provider" },
+            { "currentName": "m_user", "newName": "user.name" },
+            { "currentName": "m_actiontype", "newName": "event.action" },
+            { "currentName": "m_description", "newName": "message" },
+            { "currentName": "m_prevvalue", "newName": "bas.metasys.audit.pre_data" },
+            { "currentName": "m_postvalue", "newName": "bas.metasys.audit.post_data" },
+            { "currentName": "HOSTNAME", "newName": "host.name" }
+          ]
+        },
+        "description": "Batch rename of the directly-mapped columns, run after the eval above so observer.name/source.ip/event.outcome could still read the original m_item/m_postvalue/m_status"
+      },
+      {
+        "id": "auto_timestamp",
+        "filter": "true",
+        "conf": {
+          "srcField": "m_when",
+          "dstField": "_time"
+        },
+        "description": "Event time from the body When column, preferred over the BSD header which carries no year (platform constraint: never target @timestamp)"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            { "name": "event.dataset", "value": "'building_automation.metasys_audit'" }
+          ],
+          "remove": [
+            "m_status", "m_when", "TAG", "pri", "header_ts"
+          ]
+        },
+        "description": "Set event.dataset (no hyphen) and drop staging fields consumed into their ECS/custom targets above"
+      }
+    ]
+  }
+}

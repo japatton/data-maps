@@ -1,0 +1,150 @@
+{
+  "id": "dm_zos_acf2_logon_events_syslog_raw",
+  "conf": {
+    "output": "default",
+    "description": "z/OS ACF2/Top Secret logon-events, syslog-raw: branches on record shape (no-pipe => Top Secret EARLOUT fixed byte positions per work order; pipe-delimited => ACF2 zSecure/CDP unload). Per recommendations.direct.cribl: derive event.reason from RC via lookup, event.outcome from the L flag / TSS return code.",
+    "functions": [
+      {
+        "id": "comment",
+        "filter": "true",
+        "conf": {
+          "comment": "logon-events / syslog-raw. Two products share this feed: Top Secret EARLOUT (fixed byte positions given in the work order: ACID NAME 14-21, TERMINAL ID 54-61, FACILITY NAME 70-77, RETURN CODE 82-83, DETAIL REASON CODE 84-86, SYSID 111-114 - extracted verbatim) and ACF2 (only column NAMES are published, not byte offsets, so this pipeline targets the pipe-delimited zSecure/CDP unload variant the work order also describes, in the field table's documented order). Branch discriminator is presence of '|' - a heuristic, not a documented discriminator field; both the discriminator and the ACF2 column order are unverified against a captured sample. See README."
+        },
+        "description": "pipeline summary"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "_raw.indexOf('|') === -1",
+        "conf": {
+          "regex": "/^.{13}(?<ACID_NAME>.{8}).{32}(?<TERMINAL_ID>.{8}).{8}(?<FACILITY_NAME>.{8}).{4}(?<RETURN_CODE>.{2})(?<DETAIL_REASON_CODE>.{3}).{24}(?<SYSID>.{4})/",
+          "source": "_raw"
+        },
+        "description": "Top Secret EARLOUT branch: fixed byte positions taken verbatim from the work order."
+      },
+      {
+        "id": "regex_extract",
+        "filter": "_raw.indexOf('|') !== -1",
+        "conf": {
+          "regex": "/^(?<_rec_descriptor>[^|]*)\\|(?<DATE>[^|]*)\\|(?<TIME>[^|]*)\\|(?<LID>[^|]*)\\|(?<JNAME>[^|]*)\\|(?<SUBMITR>[^|]*)\\|(?<SOURCE>[^|]*)\\|(?<PROGRAM>[^|]*)\\|(?<RC>[^|]*)\\|(?<L>[^|]*)\\|(?<CPU>[^|]*)\\|(?<AUTH>[^|]*)\\|(?<APPLID>[^|]*)/",
+          "source": "_raw"
+        },
+        "description": "ACF2 branch: pipe-delimited zSecure/CDP unload (record descriptor + DATE + TIME prefix, then named columns in the work order's documented field order). Column order is inferred, not confirmed against a real unload sample."
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            {
+              "name": "event.code",
+              "value": "__e['RC']"
+            },
+            {
+              "name": "event.reason",
+              "value": "__e['RC'] === '4' ? 'logonid does not exist' : (__e['RC'] === '11' || __e['RC'] === '13') ? 'suspended or cancelled' : __e['RC'] === '12' ? 'invalid password' : __e['RC'] === '17' ? 'expired password' : undefined"
+            },
+            {
+              "name": "event.outcome",
+              "value": "__e['L'] !== undefined ? (__e['L'] === '*' ? 'success' : 'failure') : (__e['RETURN_CODE'] !== undefined ? (__e['RETURN_CODE'] === '00' ? 'success' : 'failure') : undefined)"
+            }
+          ],
+          "remove": [
+            "_rec_descriptor"
+          ]
+        },
+        "description": "RC -> event.code + event.reason via the RC values the recommendation enumerates (4/11/13/12/17 only - 'plus shift/source and authorization ranges' is not itemized anywhere, so those stay unresolved, a documented gap); event.outcome from the ACF2 L flag or, on the Top Secret branch, from RETURN CODE. Computed before the rename step below, straight off the raw column names."
+      },
+      {
+        "id": "rename",
+        "filter": "true",
+        "conf": {
+          "rename": [
+            {
+              "currentName": "LID",
+              "newName": "user.name"
+            },
+            {
+              "currentName": "JNAME",
+              "newName": "process.name"
+            },
+            {
+              "currentName": "SUBMITR",
+              "newName": "acf2.submitter_lid"
+            },
+            {
+              "currentName": "SOURCE",
+              "newName": "source.address"
+            },
+            {
+              "currentName": "PROGRAM",
+              "newName": "acf2.program"
+            },
+            {
+              "currentName": "CPU",
+              "newName": "host.name"
+            },
+            {
+              "currentName": "AUTH",
+              "newName": "acf2.system_entry.auth_source"
+            },
+            {
+              "currentName": "APPLID",
+              "newName": "acf2.applid"
+            },
+            {
+              "currentName": "ACID_NAME",
+              "newName": "user.name"
+            },
+            {
+              "currentName": "TERMINAL_ID",
+              "newName": "source.address"
+            },
+            {
+              "currentName": "FACILITY_NAME",
+              "newName": "tss.facility"
+            },
+            {
+              "currentName": "SYSID",
+              "newName": "host.name"
+            },
+            {
+              "currentName": "DETAIL_REASON_CODE",
+              "newName": "tss.drc"
+            }
+          ]
+        },
+        "description": "Batch-rename every straight-copy status:mapped/partial/unmapped field (no computed transform, and not read again downstream) to its ECS or custom target. ACF2 and Top Secret both land on user.name/source.address/host.name so one rule covers the estate."
+      },
+      {
+        "id": "auto_timestamp",
+        "filter": "true",
+        "conf": {
+          "srcField": "_raw",
+          "dstField": "_time"
+        },
+        "description": "Fallback event time. DATE+TIME->UTC needs a Julian/packed-date conversion plus an LPAR timezone offset keyed on CPU/SYSID that recommendations.direct.cribl calls for but supplies no lookup table for - documented gap, not implemented. auto_timestamp's own heuristic against _raw is used instead."
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            {
+              "name": "event.category",
+              "value": "['authentication']"
+            },
+            {
+              "name": "event.action",
+              "value": "_raw.indexOf('|') !== -1 ? 'logon' : undefined"
+            },
+            {
+              "name": "event.dataset",
+              "value": "'zos_acf2.logon_events'"
+            }
+          ]
+        },
+        "description": "Tag event.category from the dataset's own event_categories; event.action 'logon' for the ACF2 branch (every record in this dataset is a system-entry attempt by definition - RECORD TYPE IN/TR would give the Top Secret equivalent but its byte position isn't documented, so it's left unset there, a gap). Re-uses the '|' branch discriminator on _raw (still intact this late in the pipeline, unlike LID which the earlier rename step already retargeted to user.name) rather than testing a field the rename step consumed. event.dataset set to the data stream's own dataset component (logs-zos_acf2.logon_events), not a generic tech.dataset string."
+      }
+    ]
+  }
+}

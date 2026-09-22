@@ -1,0 +1,123 @@
+{
+  "id": "dm_moveit_mft_audit_syslog_kv",
+  "conf": {
+    "output": "default",
+    "description": "MOVEit Transfer audit, syslog-kv: hand-built Key:Value body parse (colon-split loop, not the kvp parser's unverified defaults) into ECS + moveit.transfer.*, per recommendations.direct.cribl.",
+    "functions": [
+      {
+        "id": "comment",
+        "filter": "true",
+        "conf": {
+          "comment": "moveit-mft / audit / syslog-kv: Progress MOVEit Transfer's SysLog audit feed - a free-text summary line followed by newline-separated 'Key: Value' pairs mirroring the 'log' table columns. No Elastic integration or Cribl pack exists (confirmed absent per the map), so this hand-built pipeline splits the summary line from the KV block, parses each 'Key: Value' line with a colon-split loop (avoids relying on unverified kvp-parser delimiter defaults for values containing spaces), runs the Action-code lookup for event.category (file_*/sec_signon(off)/user_*|perm_*), derives event.outcome from Error while retaining the numeric code, converts Duration to nanoseconds, gates TargetName on the Action family per the map's warning, and caps/truncates Cert, FolderPath and Parm1-4 per recommendations.direct.cribl. Needs a review cadence tied to MOVEit upgrades adding new action codes."
+        },
+        "description": "record parsing scope and the design decisions this pipeline makes"
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "conf": {
+          "regex": "/^(?<_summary>[^\\n]*)\\n(?<_kvblock>[\\s\\S]*)$/",
+          "source": "_raw"
+        },
+        "description": "split the free-text summary line from the newline-separated Key: Value block, per recommendations.direct.cribl"
+      },
+      {
+        "id": "code",
+        "filter": "true",
+        "conf": {
+          "code": "var lines=(__e['_kvblock']||'').split('\\n'); for (var i=0;i<lines.length;i++){ var line=lines[i]; if(!line) continue; var idx=line.indexOf(':'); if(idx<0) continue; var k=line.substring(0,idx).trim(); var v=line.substring(idx+1).trim(); if(k){ __e[k]=v; } }"
+        },
+        "description": "deterministically split each 'Key: Value' line on its first colon (values may contain spaces/colons themselves, e.g. timestamps and file paths) into top-level fields named after the log table columns"
+      },
+      {
+        "id": "rename",
+        "filter": "true",
+        "conf": {
+          "rename": [
+            { "currentName": "Username", "newName": "user.name" },
+            { "currentName": "IPAddress", "newName": "source.ip" },
+            { "currentName": "Message", "newName": "message" },
+            { "currentName": "FileName", "newName": "file.name" },
+            { "currentName": "TargetID", "newName": "moveit.transfer.target_id" },
+            { "currentName": "FileID", "newName": "moveit.transfer.file_id" },
+            { "currentName": "InstID", "newName": "organization.id" },
+            { "currentName": "AgentBrand", "newName": "user_agent.name" },
+            { "currentName": "AgentVersion", "newName": "user_agent.version" },
+            { "currentName": "Hash", "newName": "moveit.transfer.hash" },
+            { "currentName": "Action", "newName": "event.action" },
+            { "currentName": "XferSize", "newName": "file.size" },
+            { "currentName": "host", "newName": "host.name" }
+          ]
+        },
+        "description": "batch-rename the status:mapped/unmapped-with-custom-target fields that need no computation; host->host.name assumes Cribl's syslog source populates the envelope hostname as 'host' (unverified against a live MOVEit feed, documented in README)"
+      },
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "add": [
+            {
+              "name": "_time",
+              "value": "Date.parse(__e['LogTime'])/1000"
+            },
+            {
+              "name": "event.category",
+              "value": "__e['Action'] && __e['Action'].indexOf('file_')===0 ? ['file'] : (__e['Action']==='sec_signon' || __e['Action']==='sec_signoff' ? ['authentication'] : ((__e['Action'] && (__e['Action'].indexOf('user_')===0 || __e['Action'].indexOf('perm_')===0)) ? ['iam'] : undefined))"
+            },
+            {
+              "name": "event.outcome",
+              "value": "__e['Error']===undefined ? undefined : (Number(__e['Error'])===0 ? 'success' : 'failure')"
+            },
+            {
+              "name": "moveit.transfer.error_code",
+              "value": "__e['Error']!==undefined ? Number(__e['Error']) : undefined"
+            },
+            {
+              "name": "event.duration",
+              "value": "__e['Duration']!==undefined ? Number(__e['Duration'])*1e9 : undefined"
+            },
+            {
+              "name": "file.directory",
+              "value": "__e['FolderPath'] ? String(__e['FolderPath']).substring(0,2500) : undefined"
+            },
+            {
+              "name": "moveit.transfer.client_cert",
+              "value": "__e['Cert'] ? String(__e['Cert']).substring(0,500) : undefined"
+            },
+            {
+              "name": "moveit.transfer.params",
+              "value": "{ parm1: __e['Parm1'] ? String(__e['Parm1']).substring(0,4096) : undefined, parm2: __e['Parm2'] ? String(__e['Parm2']).substring(0,4096) : undefined, parm3: __e['Parm3'] ? String(__e['Parm3']).substring(0,4096) : undefined, parm4: __e['Parm4'] ? String(__e['Parm4']).substring(0,4096) : undefined }"
+            },
+            {
+              "name": "user.target.name",
+              "value": "__e['Action'] && (__e['Action'].indexOf('user_')===0 || __e['Action'].indexOf('perm_')===0) ? __e['TargetName'] : undefined"
+            },
+            {
+              "name": "moveit.transfer.target_display_name",
+              "value": "__e['Action'] && (__e['Action'].indexOf('user_')===0 || __e['Action'].indexOf('perm_')===0) ? undefined : __e['TargetName']"
+            },
+            {
+              "name": "event.dataset",
+              "value": "'moveit_mft.audit'"
+            }
+          ],
+          "remove": [
+            "_summary",
+            "_kvblock",
+            "LogTime",
+            "Error",
+            "Duration",
+            "FolderPath",
+            "Cert",
+            "Parm1",
+            "Parm2",
+            "Parm3",
+            "Parm4",
+            "TargetName"
+          ]
+        },
+        "description": "derive event.category from the Action-code lookup, fold Error into event.outcome while retaining the numeric code, convert Duration to nanoseconds, cap Cert/FolderPath/Parm1-4, gate TargetName on the Action family, tag event.dataset, and drop consumed temp/raw fields"
+      }
+    ]
+  }
+}
