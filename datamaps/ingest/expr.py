@@ -471,6 +471,10 @@ class _Emitter(object):
             return True
         if k == "call" and node[1] in ("Array.isArray", "Boolean"):
             return True
+        # Painless types `t ? a : b` from its branches, so two boolean branches
+        # make a boolean ternary and truthy() may hand back the raw value.
+        if k == "cond":
+            return self.is_bool(node[2]) and self.is_bool(node[3])
         return False
 
     def is_stringy(self, node):
@@ -486,7 +490,21 @@ class _Emitter(object):
         # which is a Painless compile error that fails the whole PUT.
         if k == "binary" and node[1] == "+":
             return self.is_stringy(node[2]) or self.is_stringy(node[3])
+        if k == "cond":
+            return self.is_stringy(node[2]) and self.is_stringy(node[3])
         return False
+
+    def _is_numeric_sum(self, left, right):
+        """True when `left + right` is numeric addition, not concatenation.
+
+        binary() and is_numeric() have to agree about this: when binary() emits
+        a numeric sum but is_numeric() calls the result untyped, truthy() emits
+        `int != null` and the whole script fails to compile at PUT time.  One
+        predicate, both callers, so they cannot drift apart.
+        """
+        if self.is_stringy(left) or self.is_stringy(right):
+            return False
+        return self.is_numeric(left) or self.is_numeric(right)
 
     def is_numeric(self, node):
         k = node[0]
@@ -502,6 +520,10 @@ class _Emitter(object):
             return True
         if k == "binary" and node[1] in ("-", "*", "/", "%"):
             return True
+        if k == "binary" and node[1] == "+":
+            return self._is_numeric_sum(node[2], node[3])
+        if k == "cond":
+            return self.is_numeric(node[2]) and self.is_numeric(node[3])
         return False
 
     def truthy(self, node):
@@ -616,7 +638,7 @@ class _Emitter(object):
         if op == "+":
             if self.is_stringy(left) or self.is_stringy(right):
                 return "(%s + %s)" % (self.stringify(left), self.stringify(right))
-            if self.is_numeric(left) or self.is_numeric(right):
+            if self._is_numeric_sum(left, right):
                 return "(%s + %s)" % (self.value(left), self.value(right))
             raise Untranslatable("ambiguous + (string or numeric): %s"
                                  % " + ".join(x[0] for x in (left, right)))
