@@ -2,8 +2,11 @@
 
 The launch gate before public hosting: every committed Cribl pipeline is
 POSTed to a real Cribl Stream 4.19 and every generated ingest pipeline is
-PUT (and `_simulate`d) against a real Elasticsearch.  Run it from a
-workstation; it is deliberately not a CI job.
+PUT (and `_simulate`d) against a real Elasticsearch.  A `_simulate` that
+answers 200 but carries a per-document `error` is reported as a failure with
+that error object as its detail, because Elasticsearch returns 200 for a
+processor that threw at run time.  Run it from a workstation; it is
+deliberately not a CI job.
 
 Bring the throwaway Elasticsearch up and name both targets (edit the Cribl
 URL to your own instance):

@@ -124,6 +124,28 @@ def es_version(url):
         return "unknown"
 
 
+def simulate_error(text):
+    """First per-document error in a `_simulate` body, or None when clean.
+
+    Elasticsearch answers 200 even when a processor threw at run time: the
+    failure is per document, inside the body.  Returns the `error` object, or
+    {"type": "unparseable", "reason": <text[:200]>} when the body is not JSON
+    or carries no `docs` list.
+    """
+    try:
+        body = json.loads(text)
+    except ValueError:
+        return {"type": "unparseable", "reason": text[:200]}
+    if not isinstance(body, dict) or not isinstance(body.get("docs"), list):
+        return {"type": "unparseable", "reason": text[:200]}
+    for doc in body["docs"]:
+        if isinstance(doc, dict) and "error" in doc:
+            err = doc["error"]
+            return err if isinstance(err, dict) else {"type": "error",
+                                                      "reason": str(err)}
+    return None
+
+
 def es_validate(url, envelopes):
     results = []
     for key in sorted(envelopes):
@@ -137,6 +159,11 @@ def es_validate(url, envelopes):
                              SIMULATE_BODY)
             if s2 != 200:
                 ok, status, detail = False, s2, t2[:2000]
+            else:
+                err = simulate_error(t2)
+                if err is not None:
+                    ok = False
+                    detail = json.dumps(err, indent=2, sort_keys=True)[:2000]
         results.append({"id": pid, "key": "%s/%s__%s" % key, "ok": ok,
                         "status": status, "detail": detail})
         request("DELETE", url + "/_ingest/pipeline/" + pid)
