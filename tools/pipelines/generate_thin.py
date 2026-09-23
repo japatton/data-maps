@@ -23,12 +23,16 @@ import glob
 import json
 import os
 import re
+import sys
+
 import yaml
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 DATA = os.path.join(REPO, "data", "technologies")
 OUT = os.path.join(REPO, "data", "pipelines")
+sys.path.insert(0, REPO)
+from datamaps import cribl_paths  # noqa: E402
 THIN = {"elastic-integration", "elastic-ingest-pipeline"}
 # The three pilot technologies' thin-mechanism pipelines were hand-authored
 # during the pilot - several of them parse the format in Cribl anyway, with
@@ -96,15 +100,16 @@ def main(out_dir=None):
                                                              mech, parsing.get("artifact"))},
                              "description": "record why this pipeline does not parse"},
                             {"id": "eval", "filter": "true",
-                             "conf": {"add": [{"name": "event.dataset", "value": "'%s'" % tag}]},
+                             "conf": {"add": [{"name": "'event.dataset'", "value": "'%s'" % tag}]},
                              "description": "tag the dataset before Elastic parses _raw"},
+                            cribl_paths.renest_function(),
                         ],
                     },
                 }
                 os.makedirs(outdir, exist_ok=True)
                 fn = os.path.join(outdir, "%s__%s.json" % (ds["id"], fmt_name))
-                with open(fn, "w") as fh:
-                    json.dump(pipeline, fh, indent=2)
+                with open(fn, "w", encoding="utf-8") as fh:
+                    json.dump(pipeline, fh, indent=2, ensure_ascii=False)
                     fh.write("\n")
                 made += 1
     print("thin pipelines written: %d" % made)

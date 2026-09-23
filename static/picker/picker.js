@@ -8,8 +8,8 @@ let index = null;
 let state = null;
 let loaded = { path: null, cribl: null, ingest: null, map: null };
 let blobUrl = null;
-// Bumped on every fetch so a slow earlier selection cannot render over a
-// newer one when the responses come back out of order.
+// Bumped on every selection, a memo hit included, so a slow earlier selection
+// cannot render over a newer one when the responses come back out of order.
 let requestId = 0;
 
 function fill(selectEl, items, value, label) {
@@ -49,10 +49,10 @@ function getText(url) {
 }
 
 function loadArtifacts(sel) {
+  const id = ++requestId;
   const path = sel.format.path;
   if (loaded.path === path) return Promise.resolve(loaded);
   const wants = sel.format.has_cribl_pipeline;
-  const id = ++requestId;
   return Promise.all([
     getText("exports/map/" + path + ".html"),
     wants ? getJson("exports/cribl/" + path + ".json") : Promise.resolve(null),

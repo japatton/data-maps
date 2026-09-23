@@ -40,6 +40,8 @@ def translate_eval(conf, description):
 
     for row in conf.get("add") or []:
         name = str(row.get("name", ""))
+        if len(name) >= 2 and name[0] == name[-1] and name[0] in "'\"":
+            name = name[1:-1]
         value = str(row.get("value", ""))
         if name.startswith("__"):
             notes.append("eval: %s is a Cribl internal field; row skipped" % name)

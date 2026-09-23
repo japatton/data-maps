@@ -393,5 +393,69 @@ class TestEmitCondition(unittest.TestCase):
         self.assertEqual(translate_value("_raw").source, "ctx.message")
 
 
+class TestTruthinessNarrowing(unittest.TestCase):
+    """Operands whose static type Painless can see must not get the four-way test.
+
+    `long != null` and `String != false` are compile-time errors, so a wrongly
+    untyped operand fails the whole PUT rather than just misbehaving.
+    """
+
+    PARSEINT = "(long) Double.parseDouble(String.valueOf(ctx.a).trim())"
+
+    def v(self, js):
+        return translate_value(js).source
+
+    def test_numeric_sum_of_a_parseint_narrows_to_zero(self):
+        total = "(%s + 1)" % self.PARSEINT
+        self.assertEqual(self.v("(parseInt(__e['a']) + 1) || 0"),
+                         "((%s != 0) ? %s : 0)" % (total, total))
+
+    def test_numeric_sum_of_a_def_and_an_int_narrows_to_zero(self):
+        self.assertEqual(self.v("(__e['a'] + 1) || 0"),
+                         "(((ctx.a + 1) != 0) ? (ctx.a + 1) : 0)")
+
+    def test_concat_holding_a_lambda_uses_concat(self):
+        # Elasticsearch 8.15 fails to compile a string `+` whose operand
+        # holds a lambda (NPE in the compiler), so that one shape goes
+        # through String.concat instead.
+        rep = "ctx.a.replaceAll(/\\//, m -> '-')"
+        self.assertEqual(self.v("__e['a'].replace(/\\//g, '-') + 'Z'"),
+                         "String.valueOf(%s).concat('Z')" % rep)
+        self.assertEqual(self.v("'Z' + __e['a'].replace(/\\//g, '-')"),
+                         "'Z'.concat(String.valueOf(%s))" % rep)
+
+    def test_integer_literal_past_int_range_is_long(self):
+        self.assertEqual(self.v("__e['d'] * 86400000000000"),
+                         "(ctx.d * 86400000000000L)")
+        self.assertEqual(self.v("__e['d'] * 2147483647"), "(ctx.d * 2147483647)")
+        self.assertEqual(self.v("__e['d'] * 1.5e20"), "(ctx.d * 1.5e20)")
+
+    def test_string_concat_keeps_the_stringy_template(self):
+        cat = "(String.valueOf(ctx.a) + 'x')"
+        self.assertEqual(self.v("(__e['a'] + 'x') || 0"),
+                         "((%s != null && %s != '') ? %s : 0)" % (cat, cat, cat))
+
+    def test_two_stringy_branches_make_the_ternary_stringy(self):
+        tern = "(%s ? 'x' : 'y')" % truthy("ctx.t")
+        self.assertEqual(self.v("(__e['t'] ? 'x' : 'y') || __e['z']"),
+                         "((%s != null && %s != '') ? %s : ctx.z)"
+                         % (tern, tern, tern))
+
+    def test_two_numeric_branches_make_the_ternary_numeric(self):
+        tern = "(%s ? 1 : 2)" % truthy("ctx.t")
+        self.assertEqual(self.v("(__e['t'] ? 1 : 2) || __e['z']"),
+                         "((%s != 0) ? %s : ctx.z)" % (tern, tern))
+
+    def test_disagreeing_branches_keep_the_four_way_template(self):
+        tern = "(%s ? ctx.a : 'y')" % truthy("ctx.t")
+        self.assertEqual(self.v("(__e['t'] ? __e['a'] : 'y') || __e['z']"),
+                         "(%s ? %s : ctx.z)" % (truthy(tern), tern))
+
+    def test_two_boolean_branches_are_their_own_truthiness(self):
+        tern = "(%s ? true : false)" % truthy("ctx.t")
+        self.assertEqual(self.v("(__e['t'] ? true : false) || __e['z']"),
+                         "(%s ? %s : ctx.z)" % (tern, tern))
+
+
 if __name__ == "__main__":
     unittest.main()

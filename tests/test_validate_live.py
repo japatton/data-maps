@@ -40,6 +40,117 @@ class TestDisplayEndpoint(unittest.TestCase):
                          "https://<private host>")
 
 
+class TestCriblVersion(unittest.TestCase):
+    def version_from(self, status, body):
+        saved = vl.request
+        vl.request = lambda *a, **k: (status, body)
+        try:
+            return vl.cribl_version("http://c:19000", "t")
+        finally:
+            vl.request = saved
+
+    def test_items_envelope_as_cribl_4_19_answers(self):
+        body = '{"items":[{"BUILD":{"VERSION":"4.19.0-0fbd6d34"}}],"count":1}'
+        self.assertEqual(self.version_from(200, body), "4.19.0-0fbd6d34")
+
+    def test_bare_object(self):
+        self.assertEqual(self.version_from(200, '{"BUILD":{"VERSION":"4.1.0"}}'),
+                         "4.1.0")
+
+    def test_unexpected_shapes_are_unknown(self):
+        for body in ("[]", '{"items":[]}', '{"items":"x"}', "not json"):
+            self.assertEqual(self.version_from(200, body), "unknown", body)
+        self.assertEqual(self.version_from(401, "{}"), "unknown")
+
+
+class TestBehaviour(unittest.TestCase):
+    def doc(self, *functions):
+        return {"id": "dm_x", "conf": {"functions": list(functions)}}
+
+    def rename(self, *pairs):
+        return {"id": "rename", "filter": "true", "conf": {"rename": [
+            {"currentName": c, "newName": n} for c, n in pairs]}}
+
+    def test_sentinels_follow_cribl_addressing(self):
+        doc = self.doc(self.rename(("src", "'source.ip'"), ("'a.b'", "'x.y'"),
+                                   ("n.m", "'z.z'")))
+        events, sentinels = vl.sentinel_events(doc)
+        self.assertEqual(len(events), 1)
+        event = events[0]
+        self.assertEqual(event["src"], sentinels[0][0])
+        self.assertEqual(event["a.b"], sentinels[1][0])
+        self.assertEqual(event["n"]["m"], sentinels[2][0])
+        self.assertEqual(event["_raw"], "")
+
+    def test_names_the_pipeline_writes_first_are_not_seeded(self):
+        doc = self.doc({"id": "eval", "filter": "true", "conf": {"add": [
+                           {"name": "tmp", "value": "1"}]}},
+                       {"id": "regex_extract", "filter": "true", "conf": {
+                           "regex": "/(?<grp>\\d+)/", "source": "_raw"}},
+                       self.rename(("tmp", "a"), ("grp", "b"), ("_raw", "c"),
+                                   ("vendor", "d")))
+        _, sentinels = vl.sentinel_events(doc)
+        self.assertEqual([s[1] for s in sentinels], ["vendor"])
+
+    def test_code_assignments_count_as_written(self):
+        code = ("var m = /x/.exec(__e['_raw']); __e['Cmdlet'] = m ? m[1] : undefined;"
+                " __e.Caller = 'x'; __e[\"Dq\"]=1; if (__e['Read'] === 1) {}")
+        doc = self.doc({"id": "code", "filter": "true", "conf": {"code": code}},
+                       self.rename(("Cmdlet", "a"), ("Caller", "b"), ("Dq", "c"),
+                                   ("Read", "d")))
+        _, sentinels = vl.sentinel_events(doc)
+        self.assertEqual([s[1] for s in sentinels], ["Read"])
+
+    def test_alternate_sources_of_one_target_go_to_separate_events(self):
+        doc = self.doc(self.rename(("user", "'user.name'"), ("USER", "user.name"),
+                                   ("id", "'event.id'")))
+        events, sentinels = vl.sentinel_events(doc)
+        self.assertEqual(len(events), 2)
+        self.assertIn("user", events[0])
+        self.assertNotIn("USER", events[0])
+        self.assertIn("USER", events[1])
+        self.assertNotIn("user", events[1])
+        self.assertNotEqual(events[0]["id"], events[1]["id"])
+        self.assertEqual(len(set(s[0] for s in sentinels)), 4)
+
+    def test_numeric_shape_mirrors_the_text_shape(self):
+        doc = self.doc(self.rename(("a", "'x.a'"), ("b", "'x.b'")))
+        _, text = vl.sentinel_events(doc)
+        events, num = vl.sentinel_events(doc, numeric=True)
+        self.assertEqual([s[1:] for s in text], [s[1:] for s in num])
+        self.assertTrue(all(s[0].isdigit() for s in num))
+        self.assertEqual(events[0]["a"], num[0][0])
+
+    def test_findings(self):
+        sentinels = [("dmsentinel0000", "src", "'source.ip'"),
+                     ("dmsentinel0001", "usr", "'user.name'")]
+        clean = [{"source": {"ip": "dmsentinel0000"}, "user": {"name": "DMSENTINEL0001"}}]
+        self.assertEqual(vl.behaviour_findings(sentinels, clean), [])
+        lost = [{"source": {"ip": "dmsentinel0000"}, "user.name": "x", "__i": 1}]
+        self.assertEqual(vl.behaviour_findings(sentinels, lost), [
+            "flat key survived re-nest: user.name",
+            "value lost: usr -> 'user.name'"])
+        self.assertEqual(vl.behaviour_findings(sentinels, []), [])
+
+    def test_a_masked_value_is_not_lost(self):
+        import hashlib
+        sentinels = [("dmsentinel0000", "Card", "'pacs.card'")]
+        digest = hashlib.md5(b"dmsentinel0000").hexdigest()
+        self.assertEqual(vl.behaviour_findings(
+            sentinels, [{"pacs": {"card": digest}}]), [])
+
+    def test_a_value_is_lost_only_when_both_shapes_lose_it(self):
+        text = [("dmsentinel0000", "d", "'event.duration'")]
+        num = [("7310000000", "d", "'event.duration'")]
+        gone = [{"event": {"duration": None}}]
+        coerced = [{"event": {"duration": 7310000000000}}]
+        self.assertEqual(vl.behaviour_findings(text, gone, (num, coerced)), [])
+        self.assertEqual(vl.behaviour_findings(text, gone, (num, gone)),
+                         ["value lost: d -> 'event.duration'"])
+        self.assertEqual(vl.behaviour_findings(text, gone, (num, [])),
+                         ["value lost: d -> 'event.duration'"])
+
+
 class TestReport(unittest.TestCase):
     def test_report_lists_failures_verbatim(self):
         out = tempfile.mkdtemp()
@@ -84,6 +195,87 @@ class TestReport(unittest.TestCase):
                                          "cribl_version": None, "es_version": "8"})
         with open(path, encoding="utf-8") as fh:
             self.assertIn("Cribl: skipped (CRIBL_URL unset)", fh.read())
+
+
+class TestSimulateError(unittest.TestCase):
+    def test_clean_body_is_none(self):
+        self.assertIsNone(vl.simulate_error('{"docs":[{"doc":{"_source":{}}}]}'))
+
+    def test_error_body_returns_the_error_object(self):
+        body = ('{"docs":[{"error":{"type":"illegal_argument_exception",'
+                '"reason":"cannot cast [foo] to a long"}}]}')
+        self.assertEqual(vl.simulate_error(body),
+                         {"type": "illegal_argument_exception",
+                          "reason": "cannot cast [foo] to a long"})
+
+    def test_second_doc_erroring_is_reported(self):
+        body = ('{"docs":[{"doc":{"_source":{}}},'
+                '{"error":{"type":"script_exception","reason":"runtime error"}}]}')
+        self.assertEqual(vl.simulate_error(body),
+                         {"type": "script_exception", "reason": "runtime error"})
+
+    def test_non_json_body_is_unparseable(self):
+        self.assertEqual(vl.simulate_error("502 Bad Gateway"),
+                         {"type": "unparseable", "reason": "502 Bad Gateway"})
+
+    def test_unparseable_reason_keeps_only_the_first_200_characters(self):
+        err = vl.simulate_error("x" * 500)
+        self.assertEqual(err["type"], "unparseable")
+        self.assertEqual(err["reason"], "x" * 200)
+
+    def test_docs_not_a_list_is_unparseable(self):
+        self.assertEqual(vl.simulate_error('{"docs": "x"}'),
+                         {"type": "unparseable", "reason": '{"docs": "x"}'})
+
+    def test_non_dict_error_value_is_wrapped(self):
+        self.assertEqual(vl.simulate_error('{"docs":[{"error":"boom"}]}'),
+                         {"type": "error", "reason": "boom"})
+
+
+def fake_request(simulate_body):
+    """A vl.request stand-in: 200 everywhere, simulate_body for the _simulate POST.
+
+    Returns the fake and the list it records (method, url) into, so a test can
+    assert the pipeline was deleted again whatever the simulate body said.
+    """
+    calls = []
+
+    def fake(method, url, body=None, headers=None):
+        calls.append((method, url))
+        if method == "POST" and url.endswith("/_simulate"):
+            return 200, simulate_body
+        return 200, "{}"
+
+    return fake, calls
+
+
+class TestEsValidateSimulate(unittest.TestCase):
+    URL = "http://es.example:9200"
+    ENVELOPES = {("a", "b", "c"): {"id": "dm_a", "pipeline": {"processors": []}}}
+
+    def setUp(self):
+        self.addCleanup(setattr, vl, "request", vl.request)
+
+    def test_a_200_carrying_a_per_document_error_is_a_failure(self):
+        body = ('{"docs":[{"error":{"type":"script_exception",'
+                '"reason":"runtime error in painless"}}]}')
+        vl.request, calls = fake_request(body)
+        results = vl.es_validate(self.URL, self.ENVELOPES)
+        self.assertEqual(len(results), 1)
+        self.assertIs(results[0]["ok"], False)
+        self.assertEqual(results[0]["status"], 200)
+        self.assertIn("reason", results[0]["detail"])
+        self.assertIn("runtime error in painless", results[0]["detail"])
+        self.assertIn(("DELETE", self.URL + "/_ingest/pipeline/dm_a"), calls)
+
+    def test_a_clean_200_stays_green(self):
+        vl.request, calls = fake_request('{"docs":[{"doc":{"_source":{}}}]}')
+        results = vl.es_validate(self.URL, self.ENVELOPES)
+        self.assertEqual(len(results), 1)
+        self.assertIs(results[0]["ok"], True)
+        self.assertEqual(results[0]["status"], 200)
+        self.assertEqual(results[0]["detail"], "")
+        self.assertIn(("DELETE", self.URL + "/_ingest/pipeline/dm_a"), calls)
 
 
 if __name__ == "__main__":

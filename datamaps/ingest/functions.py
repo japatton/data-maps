@@ -9,10 +9,11 @@ pipeline.
 import re
 
 from datamaps.ingest import expr
+from datamaps import cribl_paths
 from datamaps.ingest.expr import Untranslatable, map_field
 
-MANUAL_FUNCTIONS = ("code", "distinct", "unroll", "xml_unroll", "flatten",
-                    "rollup_metrics")
+MANUAL_FUNCTIONS = ("code", "distinct", "suppress", "unroll", "xml_unroll",
+                    "flatten", "rollup_metrics")
 DATE_FORMATS = ["ISO8601", "UNIX", "UNIX_MS"]
 KVP_NOTE = ("kvp: pairs are scanned key=value left to right as Cribl does; a "
             "quoted value keeps its spaces, an unquoted one ends at the next "
@@ -58,8 +59,17 @@ def _java_regex(pattern, flags):
 
 
 def _grok_pattern(pattern, flags):
-    # grok reads %{...} as a pattern reference; a literal one must be escaped.
-    return _java_regex(pattern.replace("%{", "\\%\\{"), flags)
+    """Pattern with JS flags in Joni's (Ruby) spelling: grok is not Java regex.
+
+    Ruby's dotall is (?m) and (?s) is a compile error; ^ and $ always match
+    at line breaks, so JS m needs nothing.  grok reads %{...} as a pattern
+    reference, so a literal one must be escaped.
+    """
+    bad = [f for f in flags if f not in "gims"]
+    if bad:
+        raise Untranslatable("regex flag %r has no grok equivalent" % bad[0])
+    inline = ("m" if "s" in flags else "") + ("i" if "i" in flags else "")
+    return ("(?%s)" % inline if inline else "") + pattern.replace("%{", "\\%\\{")
 
 
 def _kv_regex(ch, what):
@@ -242,6 +252,10 @@ def _apply_condition(result, cond):
 
 def translate_function(fn, description):
     fid = fn.get("id")
+    if cribl_paths.is_renest(fn):
+        # Re-nesting flat dotted keys is exactly what dot_expander does.
+        return Result([{"dot_expander": {"field": "*", "ignore_failure": True,
+                                         "description": description}}])
     if fid in MANUAL_FUNCTIONS:
         raise Untranslatable("%s has no ingest-processor equivalent" % fid)
     if fid == "eval":

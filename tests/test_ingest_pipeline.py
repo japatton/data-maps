@@ -103,7 +103,7 @@ class TestCorpus(unittest.TestCase):
     def test_every_pipeline_translates(self):
         self.assertEqual(len(self.envelopes), len(self.loaded))
         known = {"set", "script", "remove", "json", "kv", "csv", "grok", "rename",
-                 "drop", "gsub", "date", "convert"}
+                 "drop", "gsub", "date", "convert", "dot_expander"}
         for key, env in self.envelopes.items():
             for proc in env["pipeline"]["processors"]:
                 self.assertEqual(len(proc), 1, key)

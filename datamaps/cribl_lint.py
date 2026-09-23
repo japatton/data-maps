@@ -12,6 +12,9 @@ import re
 import sys
 from collections import defaultdict
 
+from datamaps import cribl_paths
+from datamaps.cribl_paths import unquote
+
 VALID_PATH = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$')
 GARBAGE = {"name", "value", "field", "ecs", "vendor", "todo", "tbd",
            "placeholder"}
@@ -19,9 +22,21 @@ GLOBALS = ("Date", "Math", "String", "Number", "Boolean", "Array", "Object",
            "JSON", "RegExp", "parseInt", "parseFloat", "isNaN", "isFinite")
 
 
+def _valid_name(name):
+    # A quoted name is a literal key (a flat dotted key, `@timestamp`); only
+    # an unquoted one is a path the accessor has to parse.
+    if cribl_paths.is_quoted(name):
+        return len(name) > 2
+    return bool(VALID_PATH.match(name))
+
+
 def lint_pipeline(doc):
     """[(code, detail)] for one pipeline document."""
     out = []
+    _, changes, _ = cribl_paths.rewrite_pipeline(doc)
+    for code, detail in changes:
+        out.append(("renest-not-last" if code == "renest" else
+                    "flat-key-rewrite-pending", detail[:160]))
     conf = doc.get("conf") or {}
     fns = conf.get("functions") or []
     if not fns:
@@ -46,7 +61,7 @@ def lint_pipeline(doc):
                 out.append(("global-read-off-event", "__e['%s'].*" % g))
         if fid == "eval":
             for add in c.get("add") or []:
-                n = str(add.get("name", ""))
+                n = unquote(str(add.get("name", "")))
                 v = str(add.get("value", ""))
                 # Both sides generic - the observed bug was literally
                 # {"name":"name","value":"value"}.  Either side alone
@@ -60,10 +75,11 @@ def lint_pipeline(doc):
                     has_dataset = True
                     if "-" in v:
                         out.append(("dataset-has-hyphen", v))
-                if n and not VALID_PATH.match(n):
-                    out.append(("invalid-path-in-eval-add", n))
+                raw = str(add.get("name", ""))
+                if raw and not _valid_name(raw):
+                    out.append(("invalid-path-in-eval-add", raw))
             for rm in c.get("remove") or []:
-                if isinstance(rm, str) and "*" not in rm and not VALID_PATH.match(rm):
+                if isinstance(rm, str) and "*" not in rm and not _valid_name(rm):
                     out.append(("invalid-path-in-eval-remove", rm))
         if fid == "rename":
             # Cribl does NOT validate the rename conf: a bogus key set and
@@ -81,11 +97,16 @@ def lint_pipeline(doc):
                     continue
                 cn = str(pair.get("currentName", ""))
                 nn = str(pair.get("newName", ""))
-                if cn and cn == nn:
+                if cn and unquote(cn) == unquote(nn):
                     out.append(("rename-noop", cn))
                 for nm in (cn, nn):
-                    if nm and not VALID_PATH.match(nm):
+                    if nm and not _valid_name(nm):
                         out.append(("invalid-path-in-rename", nm))
+        # `distinct` is an aggregation: it emits one event per new groupBy
+        # combination carrying ONLY the groupBy fields.  Probed on 4.19 it
+        # turned {Identity, Op} into {Identity}.  Dedup is `suppress`.
+        if fid == "distinct" and fn.get("disabled") is not True:
+            out.append(("distinct-drops-fields", str(c.get("groupBy"))[:160]))
         if fid in ("regex_extract", "regex_filter"):
             rx = c.get("regex")
             if isinstance(rx, str) and rx and not rx.startswith("/"):
