@@ -8,48 +8,61 @@
         "id": "comment",
         "filter": "true",
         "conf": {
-          "comment": "vmware-nsx/dfw-packet-log/syslog-raw. Catalog mechanism is cribl-pack (community NSX syslog pack), but no Packs are installed on this instance, so the pack's field naming/ECS coverage is built natively here per the brief. Discriminates dfwpktlogs-ident lines out of the merged ESXi syslog stream, branches match vs TERM (disjoint column sets), resolves direction/protocol/type vocab to ECS, and leaves the per-vNIC IN/OUT-to-source/destination byte/packet split unresolved (documented gap - see README)."
+          "comment": "vmware-nsx/dfw-packet-log/syslog-raw. No Cribl Pack is installed here, so the DFW grammar is parsed natively, following the NSX 4.0 Administration Guide's 'Distributed Firewall Packet Logs' layout. Header: optional <pri>, RFC 3164 or RFC 5424, ident dfwpktlogs (ESXi) or FIREWALL-PKTLOG (NSX 4 syslog); a bare log-file line starts at its timestamp. Record: optional 8-hex VIF ID, INET|INET6, then match or TERM. The rule slot is ruleset/rule_id or a bare rule_id; PROTO n records carry no ports; TCP flags are optional and a trailing FQDN, L7 app ID or rule tag is kept as vmware.nsx.dfw.annotation. TERM records carry an action only on NSX 4's feed - never defaulted. Per-vNIC IN/OUT byte/packet split to source/destination stays unresolved (documented gap)."
         },
         "description": "record scope, pack substitution, and the one known gap up front"
       },
       {
         "id": "regex_extract",
         "filter": "true",
+        "description": "syslog header or log-file timestamp, and the DFW ident when present",
         "conf": {
-          "regex": "/^(?:<\\d{1,3}>)?(?<timestamp>\\S+)\\s+(?<host>\\S+)\\s+dfwpktlogs:\\s+(?<vif_id>[0-9a-fA-F]{8})\\s+(?<inet_type>INET6?)\\s+(?<reason>match|TERM)\\s+(?<tail>.*)$/",
-          "source": "_raw"
-        },
-        "description": "split the common dfwpktlogs prefix (timestamp, host, VIF id, address family, match/TERM discriminator) from the reason-specific tail; assumed space-delimited grammar per the work order's documented field order - no literal raw sample was supplied, so verify against a live feed before production use"
+          "source": "_raw",
+          "regex": "/^(?:<\\d{1,3}>)?\\s*(?:1\\s+)?(?<timestamp>\\d{4}-\\d{2}-\\d{2}T\\S+|[A-Z][a-z]{2}\\s+\\d{1,2}\\s+\\d{2}:\\d{2}:\\d{2})\\s+(?:(?<dfw_host>\\S+)\\s+(?<ident>dfwpktlogs|FIREWALL-PKTLOG)\\b)?/"
+        }
+      },
+      {
+        "id": "regex_extract",
+        "filter": "true",
+        "description": "DFW record wherever the framing put it: optional VIF ID, address family, record shape",
+        "conf": {
+          "source": "_raw",
+          "regex": "/(?:^|\\s)(?:(?<vif_id>[0-9a-fA-F]{1,8})\\s+)?(?<inet_type>INET6?)\\s+(?<reason>match|TERM)\\s+(?<tail>.*)$/"
+        }
       },
       {
         "id": "drop",
-        "filter": "typeof __e['timestamp'] === 'undefined'",
+        "filter": "__e['reason'] === undefined",
         "conf": {},
-        "description": "discard non-dfwpktlogs lines (hostd/vmkernel/vobd etc.) that share the same ESXi syslog stream - this pipeline owns only the DFW packet log ident"
+        "description": "not a DFW packet log line"
       },
       {
         "id": "regex_extract",
         "filter": "__e['reason'] == 'match'",
+        "description": "per-packet match record",
         "conf": {
-          "regex": "/^(?<action>PASS|DROP|REJECT)\\s+(?<ruleset>.+?)\\s+(?<rule_id>\\d+)\\s+(?<direction>IN|OUT)\\s+(?<packet_size>\\d+)\\s+(?<protocol>TCP|UDP|ICMP|PROTO \\d+)\\s+(?<src_ip>[0-9a-fA-F.:]+)\\/(?<src_port>\\d+)->(?<dst_ip>[0-9a-fA-F.:]+)\\/(?<dst_port>\\d+)\\s+(?<tcp_flags>\\S+)$/",
-          "source": "tail"
-        },
-        "description": "match-record tail: action, rule set/id, direction, packet size, protocol, src/dst ip:port, TCP flags"
+          "source": "tail",
+          "regex": "/^(?<action>PASS|DROP|REJECT)\\s+(?:(?<ruleset>\\S+)\\/)?(?<rule_id>\\d+)\\s+(?<direction>IN|OUT)\\s+(?<packet_size>\\d+)\\s+(?<protocol>TCP|UDP|ICMP|PROTO \\d+)\\s+(?<src_ip>[0-9a-fA-F.:]+?)(?:\\/(?<src_port>\\d+))?->(?<dst_ip>[0-9a-fA-F.:]+?)(?:\\/(?<dst_port>\\d+))?(?:\\s+(?<tcp_flags>[SAPURFEWC]+))?(?:\\s+(?<annotation>.+))?$/"
+        }
       },
       {
         "id": "regex_extract",
         "filter": "__e['reason'] == 'TERM'",
+        "description": "connection-close summary",
         "conf": {
-          "regex": "/^(?<ruleset>.+?)\\s+(?<rule_id>\\d+)\\s+(?<direction>IN|OUT)\\s+(?<protocol>TCP|UDP|ICMP|PROTO \\d+)\\s+(?<src_ip>[0-9a-fA-F.:]+)\\/(?<src_port>\\d+)->(?<dst_ip>[0-9a-fA-F.:]+)\\/(?<dst_port>\\d+)\\s+(?<close_reason>RST|FIN)\\s+(?<packet_counts>\\d+\\/\\d+)\\s+(?<byte_counts>\\d+\\/\\d+)$/",
-          "source": "tail"
-        },
-        "description": "TERM-record tail: rule set/id, direction, protocol, src/dst ip:port, close reason, in/out packet and byte pairs - no action column on this shape"
+          "source": "tail",
+          "regex": "/^(?:(?<action>PASS|DROP|REJECT)\\s+)?(?:(?<ruleset>\\S+)\\/)?(?<rule_id>\\d+)\\s+(?<direction>IN|OUT)\\s+(?<protocol>TCP|UDP|ICMP|PROTO \\d+)\\s+(?:(?<close_reason>RST|FIN)\\s+)?(?<src_ip>[0-9a-fA-F.:]+?)(?:\\/(?<src_port>\\d+))?->(?<dst_ip>[0-9a-fA-F.:]+?)(?:\\/(?<dst_port>\\d+))?\\s+(?<packet_counts>\\d+\\/\\d+)\\s+(?<byte_counts>\\d+\\/\\d+)(?:\\s+(?<annotation>.+))?$/"
+        }
       },
       {
         "id": "eval",
         "filter": "true",
         "conf": {
           "add": [
+            {
+              "name": "dfw_host",
+              "value": "__e['dfw_host'] !== undefined ? __e['dfw_host'] : __e['host']"
+            },
             {
               "name": "'network.type'",
               "value": "__e['inet_type'] == 'INET' ? 'ipv4' : (__e['inet_type'] == 'INET6' ? 'ipv6' : undefined)"
@@ -64,15 +77,15 @@
             },
             {
               "name": "'network.iana_number'",
-              "value": "(__e['protocol'] && __e['protocol'].indexOf('PROTO') === 0) ? parseInt(__e['protocol'].split(' ')[1], 10) : undefined"
+              "value": "(__e['protocol'] && __e['protocol'].indexOf('PROTO') === 0) ? Number.parseInt(__e['protocol'].split(' ')[1], 10) : undefined"
             },
             {
               "name": "'network.packets'",
-              "value": "__e['packet_counts'] ? (parseInt(__e['packet_counts'].split('/')[0], 10) + parseInt(__e['packet_counts'].split('/')[1], 10)) : undefined"
+              "value": "__e['packet_counts'] ? (Number.parseInt(__e['packet_counts'].split('/')[0], 10) + Number.parseInt(__e['packet_counts'].split('/')[1], 10)) : undefined"
             },
             {
               "name": "'network.bytes'",
-              "value": "__e['byte_counts'] ? (parseInt(__e['byte_counts'].split('/')[0], 10) + parseInt(__e['byte_counts'].split('/')[1], 10)) : undefined"
+              "value": "__e['byte_counts'] ? (Number.parseInt(__e['byte_counts'].split('/')[0], 10) + Number.parseInt(__e['byte_counts'].split('/')[1], 10)) : undefined"
             },
             {
               "name": "'vmware.nsx.dfw.record_type'",
@@ -80,7 +93,7 @@
             },
             {
               "name": "'vmware.nsx.dfw.packet_length'",
-              "value": "__e['packet_size'] ? parseInt(__e['packet_size'], 10) : undefined"
+              "value": "__e['packet_size'] ? Number.parseInt(__e['packet_size'], 10) : undefined"
             },
             {
               "name": "'vmware.nsx.dfw.tcp_flags'",
@@ -88,7 +101,7 @@
             },
             {
               "name": "'process.name'",
-              "value": "'dfwpktlogs'"
+              "value": "__e['ident'] !== undefined ? __e['ident'] : (__e['appname'] !== undefined ? __e['appname'] : 'dfwpktlogs')"
             },
             {
               "name": "'event.action'",
@@ -104,7 +117,7 @@
             },
             {
               "name": "'rule.id'",
-              "value": "__e['rule_id'] ? parseInt(__e['rule_id'], 10) : undefined"
+              "value": "__e['rule_id'] ? Number.parseInt(__e['rule_id'], 10) : undefined"
             }
           ]
         },
@@ -116,7 +129,7 @@
         "conf": {
           "rename": [
             {
-              "currentName": "host",
+              "currentName": "dfw_host",
               "newName": "'observer.name'"
             },
             {
@@ -146,6 +159,10 @@
             {
               "currentName": "dst_port",
               "newName": "'destination.port'"
+            },
+            {
+              "currentName": "annotation",
+              "newName": "'vmware.nsx.dfw.annotation'"
             }
           ]
         },
@@ -153,7 +170,7 @@
       },
       {
         "id": "auto_timestamp",
-        "filter": "true",
+        "filter": "__e['timestamp'] !== undefined",
         "conf": {
           "srcField": "timestamp",
           "dstField": "_time"
@@ -163,8 +180,12 @@
       {
         "id": "numerify",
         "filter": "true",
-        "conf": {},
-        "description": "coerce remaining numeric-looking string fields (rule.id, source.port, destination.port) to numbers"
+        "conf": {
+          "ignoreFields": [
+            "observer.ingress.interface.id"
+          ]
+        },
+        "description": "VIF IDs are hex and stay strings, even when every digit is decimal"
       },
       {
         "id": "eval",
@@ -183,7 +204,9 @@
             "packet_size",
             "tcp_flags",
             "rule_id",
-            "_raw"
+            "_raw",
+            "ident",
+            "host"
           ],
           "add": [
             {

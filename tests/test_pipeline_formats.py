@@ -43,6 +43,9 @@ def _filter_allows(expr, event):
     m = re.match(r"^__e\['([^']+)'\]\s*===\s*undefined$", expr)
     if m:
         return m.group(1) not in event
+    m = re.match(r"^__e\['([^']+)'\]\s*===?\s*'([^']*)'$", expr)
+    if m:
+        return event.get(m.group(1)) == m.group(2)
     raise Unsupported("filter not understood by this test: %r" % expr)
 
 
@@ -147,6 +150,73 @@ class TestPgauditSyslog(unittest.TestCase):
 
     def test_pgaudit_readme_prefix(self):
         self.check("[5] " + self.readme_prefix + self.unquoted)
+
+
+class TestNsxDfwPacketLog(unittest.TestCase):
+    """The layouts in the NSX 4.0 Administration Guide, 'Distributed Firewall
+    Packet Logs', with reserved values, framed as a log file, an ESXi syslog
+    line and NSX 4's RFC 5424 feed."""
+    key = "vmware-nsx/dfw-packet-log__syslog-raw"
+    ts = "2026-09-23T12:00:00.000Z"
+
+    def ev(self, record):
+        return extract(self.key, "%s b6507827 %s" % (self.ts, record))
+
+    def test_match_with_ruleset_and_flags(self):
+        ev = self.ev("INET match PASS mainrs/1024 IN 52 TCP "
+                     "192.0.2.3/49627->192.0.2.4/49153 SEW")
+        self.assertEqual((ev["vif_id"], ev["action"], ev["ruleset"], ev["rule_id"],
+                          ev["direction"], ev["packet_size"], ev["src_port"],
+                          ev["dst_ip"], ev["tcp_flags"]),
+                         ("b6507827", "PASS", "mainrs", "1024", "IN", "52",
+                          "49627", "192.0.2.4", "SEW"))
+        self.assertEqual(ev["timestamp"], self.ts)
+
+    def test_proto_without_ports(self):
+        ev = self.ev("INET match DROP mainrs/1027 IN 36 PROTO 2 0.0.0.0->224.0.0.1")
+        self.assertEqual((ev["protocol"], ev["src_ip"], ev["dst_ip"]),
+                         ("PROTO 2", "0.0.0.0", "224.0.0.1"))
+        self.assertNotIn("src_port", ev)
+
+    def test_ipv6_udp(self):
+        ev = self.ev("INET6 match DROP mainrs/1027 OUT 143 UDP "
+                     "fe80:0:0:0:0:0:0:1/546->ff02:0:0:0:0:0:1:2/547")
+        self.assertEqual((ev["inet_type"], ev["src_ip"], ev["src_port"], ev["dst_port"]),
+                         ("INET6", "fe80:0:0:0:0:0:0:1", "546", "547"))
+        self.assertNotIn("tcp_flags", ev)
+
+    def test_bare_rule_id_with_fqdn_and_app_id(self):
+        ev = self.ev("INET match PASS 1031 OUT 48 TCP 192.0.2.5/32808->"
+                     "203.0.113.7/80 S www.example.com(00000000-0000-0000-0000-000000000001)")
+        self.assertEqual((ev["rule_id"], ev["tcp_flags"], ev["annotation"]),
+                         ("1031", "S", "www.example.com(00000000-0000-0000-0000-000000000001)"))
+        self.assertNotIn("ruleset", ev)
+        ev = self.ev("INET match PASS 1030 OUT 48 UDP 192.0.2.5/42035->192.0.2.1/53 APP_DNS")
+        self.assertEqual(ev["annotation"], "APP_DNS")
+        self.assertNotIn("tcp_flags", ev)
+
+    def test_term(self):
+        ev = self.ev("INET TERM mainrs/1024 OUT TCP RST 192.0.2.3/49627->"
+                     "192.0.2.4/49153 20/16 1718/76308")
+        self.assertEqual((ev["reason"], ev["ruleset"], ev["close_reason"],
+                          ev["packet_counts"], ev["byte_counts"]),
+                         ("TERM", "mainrs", "RST", "20/16", "1718/76308"))
+        self.assertNotIn("action", ev)
+
+    def test_nsx4_syslog_term_with_action_and_rule_tag(self):
+        ev = extract(self.key, "<13>1 2026-09-23T12:00:00.001Z host01 FIREWALL-PKTLOG - - - "
+                     "INET TERM PASS 5096 OUT TCP RST 192.0.2.11/60517->192.0.2.10/443 "
+                     "9/8 1461/4677 DR-Allow")
+        self.assertEqual((ev["dfw_host"], ev["ident"], ev["action"], ev["rule_id"],
+                          ev["close_reason"], ev["annotation"]),
+                         ("host01", "FIREWALL-PKTLOG", "PASS", "5096", "RST", "DR-Allow"))
+        self.assertNotIn("vif_id", ev)
+
+    def test_esxi_syslog(self):
+        ev = extract(self.key, "<134>Sep 23 12:00:00 host01 dfwpktlogs: b6507827 INET match "
+                     "PASS mainrs/1024 IN 52 TCP 192.0.2.3/49627->192.0.2.4/49153 S")
+        self.assertEqual((ev["dfw_host"], ev["ident"], ev["vif_id"], ev["rule_id"]),
+                         ("host01", "dfwpktlogs", "b6507827", "1024"))
 
 
 HEADER = "<134>Sep 23 12:00:00 host01 "
