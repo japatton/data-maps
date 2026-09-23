@@ -116,6 +116,13 @@ class TestRegexExtract(unittest.TestCase):
         self.assertEqual(r.processors[1]["grok"]["patterns"], ["duser=(?<duser>\\S+)"])
         self.assertTrue(any("iterations" in n for n in r.notes))
 
+    def test_grok_flags_use_oniguruma_spelling(self):
+        # grok compiles with Joni (Ruby syntax): dotall is (?m), (?s) is
+        # "undefined group option", and ^/$ already match at line breaks.
+        r = fx.translate_function(
+            fn("regex_extract", {"regex": "/^a(?<b>.*)$/sim", "source": "m"}), D)
+        self.assertEqual(r.processors[0]["grok"]["patterns"], ["(?mi)^a(?<b>.*)$"])
+
     def test_percent_brace_is_escaped(self):
         r = fx.translate_function(
             fn("regex_extract", {"regex": "/%{(?<a>\\w+)}/", "source": "m"}), D)

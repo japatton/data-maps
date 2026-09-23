@@ -584,6 +584,10 @@ class _Emitter(object):
         if k == "str":
             return painless_string(node[1])
         if k == "num":
+            # Painless reads a bare integer literal as an int; past its range
+            # the literal is a compile error, so it must be a long.
+            if node[1].isdigit() and int(node[1]) > 2147483647:
+                return node[1] + "L"
             return node[1]
         if k == "bool":
             return "true" if node[1] else "false"
@@ -637,7 +641,12 @@ class _Emitter(object):
             return "(%s %s %s)" % (self.value(left), op, self.value(right))
         if op == "+":
             if self.is_stringy(left) or self.is_stringy(right):
-                return "(%s + %s)" % (self.stringify(left), self.stringify(right))
+                a, b = self.stringify(left), self.stringify(right)
+                if "->" in a or "->" in b:
+                    # Elasticsearch 8.15 throws an NPE compiling a string +
+                    # whose operand holds a lambda; concat() compiles.
+                    return "%s.concat(%s)" % (a, b)
+                return "(%s + %s)" % (a, b)
             if self._is_numeric_sum(left, right):
                 return "(%s + %s)" % (self.value(left), self.value(right))
             raise Untranslatable("ambiguous + (string or numeric): %s"

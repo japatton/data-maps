@@ -414,6 +414,22 @@ class TestTruthinessNarrowing(unittest.TestCase):
         self.assertEqual(self.v("(__e['a'] + 1) || 0"),
                          "(((ctx.a + 1) != 0) ? (ctx.a + 1) : 0)")
 
+    def test_concat_holding_a_lambda_uses_concat(self):
+        # Elasticsearch 8.15 fails to compile a string `+` whose operand
+        # holds a lambda (NPE in the compiler), so that one shape goes
+        # through String.concat instead.
+        rep = "ctx.a.replaceAll(/\\//, m -> '-')"
+        self.assertEqual(self.v("__e['a'].replace(/\\//g, '-') + 'Z'"),
+                         "String.valueOf(%s).concat('Z')" % rep)
+        self.assertEqual(self.v("'Z' + __e['a'].replace(/\\//g, '-')"),
+                         "'Z'.concat(String.valueOf(%s))" % rep)
+
+    def test_integer_literal_past_int_range_is_long(self):
+        self.assertEqual(self.v("__e['d'] * 86400000000000"),
+                         "(ctx.d * 86400000000000L)")
+        self.assertEqual(self.v("__e['d'] * 2147483647"), "(ctx.d * 2147483647)")
+        self.assertEqual(self.v("__e['d'] * 1.5e20"), "(ctx.d * 1.5e20)")
+
     def test_string_concat_keeps_the_stringy_template(self):
         cat = "(String.valueOf(ctx.a) + 'x')"
         self.assertEqual(self.v("(__e['a'] + 'x') || 0"),

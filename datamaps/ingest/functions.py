@@ -58,8 +58,17 @@ def _java_regex(pattern, flags):
 
 
 def _grok_pattern(pattern, flags):
-    # grok reads %{...} as a pattern reference; a literal one must be escaped.
-    return _java_regex(pattern.replace("%{", "\\%\\{"), flags)
+    """Pattern with JS flags in Joni's (Ruby) spelling: grok is not Java regex.
+
+    Ruby's dotall is (?m) and (?s) is a compile error; ^ and $ always match
+    at line breaks, so JS m needs nothing.  grok reads %{...} as a pattern
+    reference, so a literal one must be escaped.
+    """
+    bad = [f for f in flags if f not in "gims"]
+    if bad:
+        raise Untranslatable("regex flag %r has no grok equivalent" % bad[0])
+    inline = ("m" if "s" in flags else "") + ("i" if "i" in flags else "")
+    return ("(?%s)" % inline if inline else "") + pattern.replace("%{", "\\%\\{")
 
 
 def _kv_regex(ch, what):
