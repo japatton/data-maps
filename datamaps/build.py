@@ -417,6 +417,7 @@ def main(argv=None, data_dir=None, out_dir=None, environ=None):
     # and example problems together, in one pass.
     records = []
     samples = []
+    synthetic = []
     if not errors:
         records, example_errors = examples_mod.discover(data_dir, catalog,
                                                         technologies)
@@ -424,6 +425,9 @@ def main(argv=None, data_dir=None, out_dir=None, environ=None):
         samples, sample_errors = examples_mod.discover_samples(
             data_dir, catalog, technologies)
         errors.extend(sample_errors)
+        synthetic, synthetic_errors = examples_mod.discover_synthetic(
+            data_dir, catalog, technologies, samples)
+        errors.extend(synthetic_errors)
     if errors:
         for error in errors:
             sys.stderr.write("FATAL: %s\n" % error)
@@ -441,7 +445,7 @@ def main(argv=None, data_dir=None, out_dir=None, environ=None):
             return 1
     page_model = model_mod.build_model(
         catalog, technologies, profiles, ecs,
-        examples_mod.by_dataset(records + samples))
+        examples_mod.by_dataset(records + samples + synthetic))
     try:
         loaded = pipelines_mod.load_pipelines(data_dir)
         page_model["flags"].extend(
@@ -460,16 +464,16 @@ def main(argv=None, data_dir=None, out_dir=None, environ=None):
     envelopes = write_block_exports(page_model, out_dir, data_dir, env)
     page_model["ingest"] = envelopes
     write_picker_index(page_model, out_dir, envelopes)
-    examples_mod.publish(records + samples, out_dir, data_dir)
+    examples_mod.publish(records + samples + synthetic, out_dir, data_dir)
     studio_mod.publish(ROOT, out_dir, catalog, technologies, profiles, ecs,
                        config, records)
     print("Built %s: %d technologies (%d with maps), %d datasets, "
-          "%d examples, %d samples, %d pipelines, %d flags"
+          "%d examples, %d samples, %d synthetic, %d pipelines, %d flags"
           % (out_dir,
              page_model["summary"]["technologies"],
              sum(1 for v in page_model["technologies"] if v["doc"]),
              page_model["summary"]["datasets"],
-             len(records), len(samples),
+             len(records), len(samples), len(synthetic),
              len(page_model["pipelines"]),
              len(page_model["flags"])))
     return 0
