@@ -23,6 +23,7 @@ this repository:
 | [arkime/arkime](https://github.com/arkime/arkime) capture tests | Apache License 2.0 | [LICENSES/Apache-2.0.txt](LICENSES/Apache-2.0.txt) |
 | [domainaware/parsedmarc](https://github.com/domainaware/parsedmarc) sample reports | Apache License 2.0 | [LICENSES/Apache-2.0.txt](LICENSES/Apache-2.0.txt) |
 | [DefectDojo/django-DefectDojo](https://github.com/DefectDojo/django-DefectDojo) unit-test scans | BSD 3-Clause, Copyright (c) DefectDojo, Inc. | [LICENSES/BSD-3-Clause-DefectDojo.txt](LICENSES/BSD-3-Clause-DefectDojo.txt) |
+| [zeek/zeek](https://github.com/zeek/zeek) btest baselines | BSD 3-Clause, Copyright (c) 1995-now, The Regents of the University of California (LBNL) and ICSI | [LICENSES/BSD-3-Clause-Zeek.txt](LICENSES/BSD-3-Clause-Zeek.txt) |
 
 The Elastic License 2.0 allows copying and redistribution provided these terms
 travel with the copy. It does not allow providing the software to third parties
@@ -43,6 +44,8 @@ The exceptions, each named in its file's `extracted` note:
   parser; the XML layout is that renderer's, not Windows' own.
 - The DMARC records are parsedmarc's JSON output for its own sample reports,
   produced offline so no DNS or geolocation data was looked up.
+- Zeek's TSV logs drop btest's first banner line, and the test suite masks
+  their timestamps (`#open`/`#close` and the `ts` column) with X's.
 
 Samples from load generators and feed-format templates were rejected even
 where openly licensed: they are invented records or placeholders, not logs.
