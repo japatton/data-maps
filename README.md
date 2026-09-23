@@ -1001,6 +1001,8 @@ to `undefined.parse(x)` and throws at runtime), echoed placeholder rows, a
 row whose name equals its value, an `event.dataset` value containing a
 hyphen, a field path Cribl's property accessor will reject, a malformed or
 no-op `rename`, a `regex_extract` whose regex is missing its slashes, a
+`distinct` step (an aggregation that keeps only its `groupBy` fields, so
+used for dedup it discards the rest of every event; dedup is `suppress`), a
 pipeline that never sets `event.dataset`, and two pipelines sharing an id.
 `tests/test_cribl_lint.py` asserts that all 605 lint clean and that each
 rule fires on a hand-built bad example, so the lint runs on every push

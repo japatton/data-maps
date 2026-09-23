@@ -120,6 +120,13 @@ class TestRules(unittest.TestCase):
                              "conf": {"regex": "(?<a>\\d+)", "source": "_raw"}})
         self.assertIn("bare-regex", codes(doc))
 
+    def test_distinct_drops_fields(self):
+        dedup = {"id": "distinct", "filter": "true",
+                 "conf": {"groupBy": ["Identity"]}}
+        self.assertIn("distinct-drops-fields", codes(pipe(DATASET, dedup)))
+        off = dict(dedup, disabled=True)
+        self.assertNotIn("distinct-drops-fields", codes(pipe(DATASET, off)))
+
 
 class TestCorpus(unittest.TestCase):
     def test_every_committed_pipeline_lints_clean(self):

@@ -120,8 +120,14 @@ for temp fields.
 **More verified shapes** (all confirmed HTTP 200 against the live instance, so you
 may use these rather than declining the work):
 
-- `distinct`: `{"groupBy":["user.name"]}` — `groupBy` is required, an array of
-  field names. Use it for the sys_id / event-id de-duplication the maps ask for.
+- `suppress`: `` {"keyExpr":"`${__e['sys_id']}`","allow":1,"suppressPeriodSec":3600,"dropEventsMode":true} ``
+  with filter `__e['sys_id'] !== undefined`, then an `eval` with
+  `{"remove":["suppress"]}`. Use it for the sys_id / event-id de-duplication
+  the maps ask for. The filter matters: without it every event missing the key
+  shares the key `undefined` and all but the first are dropped. `suppress`
+  stamps `suppress: 0` on each event it keeps, which the `eval` removes.
+  ★ NOT `distinct`: it is an aggregation that emits only the `groupBy` fields
+  and discards the rest of the event (lint: `distinct-drops-fields`).
 - `mask`: `{"rules":[{"matchRegex":"/password=(\\S+)/","replaceExpr":"'REDACTED'"}],"fields":["_raw","message"]}`
   — ★ `replaceExpr` is a JS expression and **must not contain `=`**; a literal
   like `'password=REDACTED'` is rejected with `Unallowed assignment operator`.

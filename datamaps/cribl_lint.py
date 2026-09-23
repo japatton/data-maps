@@ -102,6 +102,11 @@ def lint_pipeline(doc):
                 for nm in (cn, nn):
                     if nm and not _valid_name(nm):
                         out.append(("invalid-path-in-rename", nm))
+        # `distinct` is an aggregation: it emits one event per new groupBy
+        # combination carrying ONLY the groupBy fields.  Probed on 4.19 it
+        # turned {Identity, Op} into {Identity}.  Dedup is `suppress`.
+        if fid == "distinct" and fn.get("disabled") is not True:
+            out.append(("distinct-drops-fields", str(c.get("groupBy"))[:160]))
         if fid in ("regex_extract", "regex_filter"):
             rx = c.get("regex")
             if isinstance(rx, str) and rx and not rx.startswith("/"):

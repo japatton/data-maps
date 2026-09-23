@@ -12,8 +12,8 @@ from datamaps.ingest import expr
 from datamaps import cribl_paths
 from datamaps.ingest.expr import Untranslatable, map_field
 
-MANUAL_FUNCTIONS = ("code", "distinct", "unroll", "xml_unroll", "flatten",
-                    "rollup_metrics")
+MANUAL_FUNCTIONS = ("code", "distinct", "suppress", "unroll", "xml_unroll",
+                    "flatten", "rollup_metrics")
 DATE_FORMATS = ["ISO8601", "UNIX", "UNIX_MS"]
 KVP_NOTE = ("kvp: pairs are scanned key=value left to right as Cribl does; a "
             "quoted value keeps its spaces, an unquoted one ends at the next "
