@@ -219,7 +219,7 @@ in the event — a harmless duplicate field beats a rejected pipeline. Say so in
 pipeline's `conf.description` rather than pretending it was cleaned up.
 
 
-## ★ Six platform constraints found the hard way — respect all of them
+## ★ Seven platform constraints found the hard way — respect all of them
 
 1. **A field path containing `@` is rejected.** `rename.currentName/newName`,
    `eval.add[].name` and `auto_timestamp.srcField/dstField` all fail on
@@ -259,6 +259,17 @@ pipeline's `conf.description` rather than pretending it was cleaned up.
    __e['message'] : __e['_raw']`; and if the regex reads the syslog header
    itself, start it `^(?:<\d{1,3}>)?`. Lint: `syslog-anchored-on-raw`,
    `syslog-serde-on-raw`.
+7. **The `eval`/filter sandbox lacks some JS globals.** `parseInt`,
+   `parseFloat`, `isNaN`, `isFinite`, `encodeURI`, `decodeURI`, `escape`,
+   `atob`, `btoa`, `Symbol`, `BigInt`, `Buffer`, `Intl`, `Error`, `NaN` and
+   `Infinity` are all `undefined` there (probed on 4.19.0): the expression
+   silently yields nothing, and HTTP 200 on save. Use `Number.parseInt`,
+   `Number.parseFloat`, `Number.isNaN(Number(x))`; `Date`, `Math`, `String`,
+   `Number`, `JSON`, `RegExp`, `Map`, `Set` and `encodeURIComponent` work. A
+   `code` function has the full set. When such an expression assigns `_time`,
+   make every fallback branch keep `__e['_time']` - an expression that yields
+   `undefined`, `null` or `NaN` there removes or nulls the event time. Lint:
+   `eval-missing-global`.
 
 ## Build each pipeline like this
 

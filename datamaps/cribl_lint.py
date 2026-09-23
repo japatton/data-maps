@@ -21,6 +21,24 @@ GARBAGE = {"name", "value", "field", "ecs", "vendor", "todo", "tbd",
 GLOBALS = ("Date", "Math", "String", "Number", "Boolean", "Array", "Object",
            "JSON", "RegExp", "parseInt", "parseFloat", "isNaN", "isFinite")
 
+# Globals the eval/filter expression sandbox does not provide.  Probed on
+# 4.19.0 (2026-09-23): `typeof parseInt` is 'undefined' there, so an
+# expression calling it yields nothing - silently, and HTTP 200 on save.
+# Number.parseInt / Number.parseFloat / Number.isNaN / Number.isFinite work,
+# as do Date, Math, String, Number, JSON, RegExp, Map, Set and
+# encodeURIComponent.  A `code` function has the full set.
+EXPR_MISSING = ("parseInt", "parseFloat", "isNaN", "isFinite", "encodeURI",
+                "decodeURI", "escape", "unescape", "atob", "btoa", "Symbol",
+                "BigInt", "Buffer", "Intl", "Error", "Infinity", "NaN")
+_MISSING_RE = re.compile(r"(?<![.\w$])(%s)\b" % "|".join(EXPR_MISSING))
+_STRING_RE = re.compile(r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"")
+
+
+def missing_globals(expr):
+    """Sandbox-missing globals an eval/filter expression uses, string
+    literals ignored."""
+    return sorted(set(_MISSING_RE.findall(_STRING_RE.sub("''", str(expr)))))
+
 
 def _valid_name(name):
     # A quoted name is a literal key (a flat dotted key, `@timestamp`); only
@@ -59,6 +77,12 @@ def lint_pipeline(doc):
         for g in GLOBALS:
             if "__e['%s']." % g in blob or '__e["%s"].' % g in blob:
                 out.append(("global-read-off-event", "__e['%s'].*" % g))
+        exprs = [fn.get("filter", "")]
+        if fid == "eval":
+            exprs += [a.get("value", "") for a in c.get("add") or []]
+        for expr in exprs:
+            for g in missing_globals(expr):
+                out.append(("eval-missing-global", "%s in %s" % (g, str(expr)[:80])))
         if fid == "eval":
             for add in c.get("add") or []:
                 n = unquote(str(add.get("name", "")))
