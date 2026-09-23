@@ -22,6 +22,7 @@ Elasticsearch.  What it does not prove: correct parsing of real events;
 the public tree carries no example records to run through them.
 """
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -108,6 +109,9 @@ def cribl_version(url, token):
 
 
 _GROUP = re.compile(r"\(\?<([A-Za-z_][A-Za-z0-9_]*)>")
+# An assignment in a `code` body: __e['x'] = / __e["x"] = / __e.x = (not ==).
+_CODE_WRITE = re.compile(
+    r"""__e(?:\[\s*['"]([^'"\]]+)['"]\s*\]|\.([A-Za-z_$][\w$]*))\s*=(?!=)""")
 
 
 def _written_before(functions):
@@ -129,6 +133,9 @@ def _written_before(functions):
         for rx in [c.get("regex")] + [r.get("regex") for r in c.get("regexList") or []]:
             if isinstance(rx, str):
                 seen.update(_GROUP.findall(rx))
+        if fn.get("id") == "code":
+            for quoted, dotted in _CODE_WRITE.findall(str(c.get("code", ""))):
+                seen.add(quoted or dotted)
     return written
 
 
@@ -149,17 +156,25 @@ def _put(event, name, value):
     return True
 
 
-def sentinel_event(doc):
-    """(event, [(value, currentName, newName)]) for the behaviour check.
+def sentinel_events(doc, numeric=False):
+    """([event, ...], [(value, currentName, newName)]) for the behaviour check.
 
     Every rename that reads a vendor field gets a unique sentinel value at
     that field, addressed the way Cribl addresses it: a quoted name is a
     flat key, an unquoted dotted one a nested path.  Fields the pipeline
     writes itself before the rename are left alone.
+
+    Renames that share one target are alternates for the same value (`user`
+    or `USER`); a real record carries one of them, so the k-th alternate goes
+    in the k-th event and each event carries every other source afresh.
+
+    `numeric` seeds digit strings instead of words, for the second pass:
+    a value a pipeline legitimately coerces (`Number(x) * 1000`) survives a
+    digit sentinel, while one a rename or a flat-key read destroys does not.
     """
     functions = (doc.get("conf") or {}).get("functions") or []
     before = _written_before(functions)
-    event, sentinels = {"_raw": ""}, []
+    sources, groups = [], {}
     for i, fn in enumerate(functions):
         if fn.get("id") != "rename" or fn.get("disabled") is True:
             continue
@@ -171,14 +186,38 @@ def sentinel_event(doc):
             if (not cur or bare in ("_raw", "_time") or bare.startswith("__")
                     or "*" in cur or bare in before[i]):
                 continue
-            value = "dmsentinel%04d" % len(sentinels)
+            new = str(pair.get("newName", ""))
+            group = groups.setdefault(cribl_paths.unquote(new), [])
+            group.append(len(sources))
+            sources.append((cur, new, group))
+    width = max([len(g) for g in groups.values()] or [1])
+    events, sentinels = [], []
+    for k in range(width):
+        event = {"_raw": ""}
+        for n, (cur, new, group) in enumerate(sources):
+            if group[min(k, len(group) - 1)] != n:
+                continue
+            value = ("731%07d" if numeric else "dmsentinel%04d") % len(sentinels)
             if _put(event, cur, value):
-                sentinels.append((value, cur, str(pair.get("newName", ""))))
-    return event, sentinels
+                sentinels.append((value, cur, new))
+        events.append(event)
+    return events, sentinels
 
 
-def behaviour_findings(sentinels, items):
-    """Data-loss findings for one preview run; an empty output is not one."""
+def _lost(sentinels, items):
+    """Indexes of sentinels absent from the output, raw or md5-masked."""
+    blob = json.dumps(items).lower()
+    return set(i for i, (value, _, _) in enumerate(sentinels)
+               if value not in blob
+               and hashlib.md5(value.encode("utf-8")).hexdigest() not in blob)
+
+
+def behaviour_findings(sentinels, items, retry=None):
+    """Data-loss findings for one preview run; an empty output is not one.
+
+    `retry` is (sentinels, items) from the numeric pass; a value counts as
+    lost only when both passes lost it.
+    """
     if not items:
         return []
     out = []
@@ -186,11 +225,26 @@ def behaviour_findings(sentinels, items):
         for k in sorted(item):
             if "." in k and not k.startswith("__"):
                 out.append("flat key survived re-nest: %s" % k)
-    blob = json.dumps(items).lower()
-    for value, cur, new in sentinels:
-        if value not in blob:
-            out.append("value lost: %s -> %s" % (cur, new))
+    lost = _lost(sentinels, items)
+    if lost and retry is not None:
+        num_sentinels, num_items = retry
+        lost &= (_lost(num_sentinels, num_items) if num_items
+                 else set(range(len(num_sentinels))))
+    for i in sorted(lost):
+        out.append("value lost: %s -> %s" % (sentinels[i][1], sentinels[i][2]))
     return out
+
+
+def cribl_preview(url, auth, pid, events):
+    """(status, items or error text) for one preview of pipeline `pid`."""
+    status, text = request("POST", url + "/api/v1/preview",
+                           {"mode": "pipe", "pipelineId": pid, "events": events},
+                           headers=auth)
+    if status != 200:
+        return status, text
+    return status, [{k: v for k, v in it.items() if k != "cribl_pipe"}
+                    for it in json.loads(text).get("items") or []
+                    if isinstance(it, dict)]
 
 
 def cribl_validate(url, token, pipelines):
@@ -205,17 +259,17 @@ def cribl_validate(url, token, pipelines):
                   "status": status, "detail": "" if status == 200 else text[:2000],
                   "behaviour": None}
         if status == 200:
-            event, sentinels = sentinel_event(doc)
-            s2, t2 = request("POST", url + "/api/v1/preview",
-                             {"mode": "pipe", "pipelineId": pid, "events": [event]},
-                             headers=auth)
+            events, sentinels = sentinel_events(doc)
+            s2, items = cribl_preview(url, auth, pid, events)
+            retry = None
+            if s2 == 200 and items and _lost(sentinels, items):
+                num_events, num_sentinels = sentinel_events(doc, numeric=True)
+                s3, num_items = cribl_preview(url, auth, pid, num_events)
+                retry = (num_sentinels, num_items if s3 == 200 else [])
             if s2 != 200:
-                result["behaviour"] = ["preview failed: HTTP %s %s" % (s2, t2[:300])]
+                result["behaviour"] = ["preview failed: HTTP %s %s" % (s2, items[:300])]
             else:
-                items = [{k: v for k, v in it.items() if k != "cribl_pipe"}
-                         for it in json.loads(t2).get("items") or []
-                         if isinstance(it, dict)]
-                result["behaviour"] = behaviour_findings(sentinels, items)
+                result["behaviour"] = behaviour_findings(sentinels, items, retry)
                 result["sentinels"] = len(sentinels)
                 result["dropped"] = not items
         results.append(result)
@@ -309,10 +363,13 @@ def _behaviour_section(results):
     seeded = sum(r.get("sentinels", 0) for r in ran)
     dropped = sum(1 for r in ran if r.get("dropped"))
     lines = ["## Cribl behaviour: %d of %d clean" % (len(ran) - len(bad), len(ran)), "",
-             "One preview event per pipeline, seeded with a sentinel at every field a "
-             "`rename` reads (%d sentinels). A finding is a sentinel that vanished or "
-             "a dotted key the re-nest step left flat. %d pipelines dropped the "
-             "synthetic event and prove nothing here." % (seeded, dropped), ""]
+             "One preview per pipeline, seeded with a sentinel at every field a "
+             "`rename` reads (%d sentinels); alternate sources of one target go in "
+             "separate events. A finding is a dotted key the re-nest step left flat, "
+             "or a sentinel that vanished, neither raw nor md5-masked, in both the "
+             "word pass and the digit pass that retries a loss (a legitimate numeric "
+             "coercion keeps the digits). %d pipelines dropped the synthetic event and "
+             "prove nothing here." % (seeded, dropped), ""]
     if not bad:
         lines.append("No findings.")
     for r in bad:

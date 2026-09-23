@@ -74,7 +74,9 @@ class TestBehaviour(unittest.TestCase):
     def test_sentinels_follow_cribl_addressing(self):
         doc = self.doc(self.rename(("src", "'source.ip'"), ("'a.b'", "'x.y'"),
                                    ("n.m", "'z.z'")))
-        event, sentinels = vl.sentinel_event(doc)
+        events, sentinels = vl.sentinel_events(doc)
+        self.assertEqual(len(events), 1)
+        event = events[0]
         self.assertEqual(event["src"], sentinels[0][0])
         self.assertEqual(event["a.b"], sentinels[1][0])
         self.assertEqual(event["n"]["m"], sentinels[2][0])
@@ -87,8 +89,37 @@ class TestBehaviour(unittest.TestCase):
                            "regex": "/(?<grp>\\d+)/", "source": "_raw"}},
                        self.rename(("tmp", "a"), ("grp", "b"), ("_raw", "c"),
                                    ("vendor", "d")))
-        event, sentinels = vl.sentinel_event(doc)
+        _, sentinels = vl.sentinel_events(doc)
         self.assertEqual([s[1] for s in sentinels], ["vendor"])
+
+    def test_code_assignments_count_as_written(self):
+        code = ("var m = /x/.exec(__e['_raw']); __e['Cmdlet'] = m ? m[1] : undefined;"
+                " __e.Caller = 'x'; __e[\"Dq\"]=1; if (__e['Read'] === 1) {}")
+        doc = self.doc({"id": "code", "filter": "true", "conf": {"code": code}},
+                       self.rename(("Cmdlet", "a"), ("Caller", "b"), ("Dq", "c"),
+                                   ("Read", "d")))
+        _, sentinels = vl.sentinel_events(doc)
+        self.assertEqual([s[1] for s in sentinels], ["Read"])
+
+    def test_alternate_sources_of_one_target_go_to_separate_events(self):
+        doc = self.doc(self.rename(("user", "'user.name'"), ("USER", "user.name"),
+                                   ("id", "'event.id'")))
+        events, sentinels = vl.sentinel_events(doc)
+        self.assertEqual(len(events), 2)
+        self.assertIn("user", events[0])
+        self.assertNotIn("USER", events[0])
+        self.assertIn("USER", events[1])
+        self.assertNotIn("user", events[1])
+        self.assertNotEqual(events[0]["id"], events[1]["id"])
+        self.assertEqual(len(set(s[0] for s in sentinels)), 4)
+
+    def test_numeric_shape_mirrors_the_text_shape(self):
+        doc = self.doc(self.rename(("a", "'x.a'"), ("b", "'x.b'")))
+        _, text = vl.sentinel_events(doc)
+        events, num = vl.sentinel_events(doc, numeric=True)
+        self.assertEqual([s[1:] for s in text], [s[1:] for s in num])
+        self.assertTrue(all(s[0].isdigit() for s in num))
+        self.assertEqual(events[0]["a"], num[0][0])
 
     def test_findings(self):
         sentinels = [("dmsentinel0000", "src", "'source.ip'"),
@@ -100,6 +131,24 @@ class TestBehaviour(unittest.TestCase):
             "flat key survived re-nest: user.name",
             "value lost: usr -> 'user.name'"])
         self.assertEqual(vl.behaviour_findings(sentinels, []), [])
+
+    def test_a_masked_value_is_not_lost(self):
+        import hashlib
+        sentinels = [("dmsentinel0000", "Card", "'pacs.card'")]
+        digest = hashlib.md5(b"dmsentinel0000").hexdigest()
+        self.assertEqual(vl.behaviour_findings(
+            sentinels, [{"pacs": {"card": digest}}]), [])
+
+    def test_a_value_is_lost_only_when_both_shapes_lose_it(self):
+        text = [("dmsentinel0000", "d", "'event.duration'")]
+        num = [("7310000000", "d", "'event.duration'")]
+        gone = [{"event": {"duration": None}}]
+        coerced = [{"event": {"duration": 7310000000000}}]
+        self.assertEqual(vl.behaviour_findings(text, gone, (num, coerced)), [])
+        self.assertEqual(vl.behaviour_findings(text, gone, (num, gone)),
+                         ["value lost: d -> 'event.duration'"])
+        self.assertEqual(vl.behaviour_findings(text, gone, (num, [])),
+                         ["value lost: d -> 'event.duration'"])
 
 
 class TestReport(unittest.TestCase):
