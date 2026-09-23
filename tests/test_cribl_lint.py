@@ -128,6 +128,23 @@ class TestRules(unittest.TestCase):
         self.assertNotIn("distinct-drops-fields", codes(pipe(DATASET, off)))
 
 
+    def test_syslog_framing(self):
+        cef = {"id": "regex_extract", "filter": "true",
+               "conf": {"regex": "/^CEF:(?<v>\\d+)\\|/", "source": "_raw"}}
+        kvp = {"id": "serde", "filter": "true",
+               "conf": {"mode": "extract", "type": "kvp", "srcField": "_raw"}}
+        found = lambda fmt, *fns: cribl_lint.lint_all(
+            {("t", "d", fmt): pipe(DATASET, *fns)})
+        self.assertIn("syslog-anchored-on-raw", found("syslog-cef", cef))
+        self.assertIn("syslog-serde-on-raw", found("syslog-kv", kvp))
+        unanchored = dict(cef, conf={"regex": "/CEF:(?<v>\\d+)\\|/",
+                                     "source": "_raw"})
+        body = dict(kvp, conf=dict(kvp["conf"], srcField="__body"))
+        self.assertEqual(found("syslog-cef", unanchored), {})
+        self.assertEqual(found("syslog-kv", body), {})
+        self.assertEqual(found("json", kvp), {})
+
+
 class TestCorpus(unittest.TestCase):
     def test_every_committed_pipeline_lints_clean(self):
         loaded = pipelines.load_pipelines(DATA)
