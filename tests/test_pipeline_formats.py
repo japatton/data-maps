@@ -186,6 +186,65 @@ class TestPanConfigCef(unittest.TestCase):
         self.assertEqual(ev.get("externalId"), "1000005")
 
 
+class TestIvantiEventsStandard(unittest.TestCase):
+    """Ivanti ICS Standard format: date time - node - [source ip]
+    [ivs::]user(realm)[roles] - message.  Real records arrive double-framed
+    (a relay's RFC 3164 header around the appliance's RFC 5424 one)."""
+    key = "ivanti-ics/events__syslog-raw"
+
+    def test_elastic_fixture_line_as_filed(self):
+        with open(os.path.join(ROOT, "data", "samples", "ivanti-ics",
+                               "events-syslog-raw-elastic.log"), encoding="utf-8") as fh:
+            line = fh.readline().rstrip("\n")
+        ev = extract(self.key, line)
+        self.assertEqual((ev.get("datetime"), ev.get("node"), ev.get("srcip"), ev.get("user")),
+                         ("2021-10-19 09:11:09", "pcs-node0", "127.0.0.1", "System"))
+        self.assertTrue(ev.get("ics_message", "").startswith("No new virus signature list"))
+        self.assertNotIn("ivs", ev)
+
+    def test_virtual_system_user_realm_roles(self):
+        ev = extract(self.key, "2026-09-23 12:00:00 - host01 - [192.0.2.5] "
+                     "Default Network::user01(Users)[Role01, Role02] - AUT24414: Agent login succeeded")
+        self.assertEqual((ev.get("ivs"), ev.get("user"), ev.get("realm"), ev.get("roles")),
+                         ("Default Network", "user01", "Users", "Role01, Role02"))
+        self.assertEqual(ev.get("ics_message"), "AUT24414: Agent login succeeded")
+
+
+class TestIvantiEventsWelf(unittest.TestCase):
+    """Ivanti ICS WELF, in the layout of SEKOIA-IO/intake-formats' Pulse
+    Connect Secure test events (keys vary by event class, ivs is optional and
+    may contain spaces)."""
+    key = "ivanti-ics/events__syslog-kv"
+    sys_no_ivs = ('id=firewall time="2026-09-23 12:00:00" pri=6 fw=192.0.2.10 vpn=host01 '
+                  'user=System realm="" roles="" type=mgmt proto= src=192.0.2.20 dst= dstname= '
+                  'sent= rcvd= msg="SYS32039: Integrity Scan Completed: 1 new file"')
+    sys_ivs = sys_no_ivs.replace("vpn=host01 ", "vpn=host01 ivs=Default Network ")
+    aut = ('id=firewall time="2026-09-23 12:00:00" pri=6 fw=192.0.2.10 vpn=host01 '
+           'ivs=Default Network user=user01@example.com realm="Users" roles="Role01" '
+           'sessionID="9000001" proto=auth src=192.0.2.30 dst= dstname= type=vpn op= arg="" '
+           'result= sent= rcvd= agent="Pulse-Secure/22.8.1 (Windows 10)" duration= '
+           'msg="AUT24414: Agent login succeeded for user01@example.com/Users"')
+
+    def test_system_event_without_ivs(self):
+        ev = extract(self.key, self.sys_no_ivs)
+        self.assertEqual((ev.get("time"), ev.get("pri"), ev.get("fw"), ev.get("vpn"),
+                          ev.get("user"), ev.get("type"), ev.get("msg")),
+                         ("2026-09-23 12:00:00", "6", "192.0.2.10", "host01", "System", "mgmt",
+                          "SYS32039: Integrity Scan Completed: 1 new file"))
+        self.assertNotIn("ivs", ev)
+        self.assertNotIn("realm", ev)
+
+    def test_ivs_with_a_space(self):
+        self.assertEqual(extract(self.key, self.sys_ivs).get("ivs"), "Default Network")
+
+    def test_user_access_layout(self):
+        ev = extract(self.key, self.aut)
+        self.assertEqual((ev.get("ivs"), ev.get("user"), ev.get("realm"), ev.get("type"),
+                          ev.get("msg")),
+                         ("Default Network", "user01@example.com", "Users", "vpn",
+                          "AUT24414: Agent login succeeded for user01@example.com/Users"))
+
+
 class TestNsxDfwPacketLog(unittest.TestCase):
     """The layouts in the NSX 4.0 Administration Guide, 'Distributed Firewall
     Packet Logs', with reserved values, framed as a log file, an ESXi syslog
