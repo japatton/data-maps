@@ -72,10 +72,11 @@ def extract(key, raw):
         source = event.get(conf.get("source", "_raw"))
         if not isinstance(source, str):
             continue
-        m = _py_regex(conf["regex"]).search(source)
-        if m:
-            event.update({k: v for k, v in m.groupdict().items()
-                          if v is not None})
+        for rx in [conf["regex"]] + [r["regex"] for r in conf.get("regexList") or []]:
+            m = _py_regex(rx).search(source)
+            if m:
+                event.update({k: v for k, v in m.groupdict().items()
+                              if v is not None})
     return event
 
 
@@ -150,6 +151,39 @@ class TestPgauditSyslog(unittest.TestCase):
 
     def test_pgaudit_readme_prefix(self):
         self.check("[5] " + self.readme_prefix + self.unquoted)
+
+
+class TestPanConfigCef(unittest.TestCase):
+    """PAN-OS 10.0 CEF Configuration Guide, config log: extension values
+    carry spaces (rt, msg, labels), and cs1/cs2 hold free-form change
+    detail."""
+    key = "paloalto-ngfw/config__syslog-cef"
+    record = ("CEF:0|Palo Alto Networks|PAN-OS|10.0.0|Succeeded|CONFIG|1|"
+              "rt=Sep 23 2026 12:00:00 GMT deviceExternalId=007200000000001 "
+              "shost=192.0.2.50 cs3Label=Virtual System cs3=vsys1 act=set "
+              "duser=admin01 destinationServiceName=Web msg= deviceconfig system "
+              "hostname externalId=1000005 PanOSDGl1=0 PanOSVsysName= dvchost=host01 "
+              "PanOSActionFlags=0x0 cs1Label=Before Change Detail "
+              "cs1=<entry name=\"old01\"/> cs2Label=After Change Detail "
+              "cs2=<entry name=\"host01\"/> PanOSFWDeviceGroup= "
+              "PanOSPolicyAuditComment=")
+
+    def test_values_with_spaces(self):
+        ev = extract(self.key, self.record)
+        self.assertEqual(ev.get("rt"), "Sep 23 2026 12:00:00 GMT")
+        self.assertEqual(ev.get("msg"), "deviceconfig system hostname")
+        self.assertEqual(ev.get("duser"), "admin01")
+        self.assertEqual(ev.get("externalId"), "1000005")
+
+    def test_change_detail_stops_at_the_next_key(self):
+        ev = extract(self.key, self.record)
+        self.assertEqual(ev.get("cs1"), '<entry name="old01"/>')
+        self.assertEqual(ev.get("cs2"), '<entry name="host01"/>')
+
+    def test_empty_values_stay_absent(self):
+        ev = extract(self.key, self.record.replace("msg= deviceconfig system hostname", "msg="))
+        self.assertNotIn("msg", ev)
+        self.assertEqual(ev.get("externalId"), "1000005")
 
 
 class TestNsxDfwPacketLog(unittest.TestCase):
