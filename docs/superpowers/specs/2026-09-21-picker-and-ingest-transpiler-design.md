@@ -166,12 +166,13 @@ produces Painless source:
 - Field references: `__e['name']`, `__e["name"]`, `__e.name`, and dotted
   paths inside the string (`__e['source.ip']` → `ctx.source?.ip`). A bare
   identifier reads the field of that name (Cribl evaluates expressions inside
-  `with(__e)`); the authoring brief (`tools/pipelines/AGENT-BRIEF.md`) still
-  tells authors to read fields as `__e['name']` in `eval` values, where an
-  absent field throws in Cribl; 104 committed rows predate that rule and rely
-  on the `with(__e)` scope, and `filter`s use the idiom widely.
-  A missing bare read is `null` in Painless rather than an exception, so a
-  transpiled filter is more forgiving than the Cribl filter it came from.
+  `with(__e)`). An absent field reads as `undefined` in Cribl's `eval` and
+  filters and as `null` in Painless, so the two engines agree (corrected on
+  2026-09-22: this note once said Cribl throws). In Cribl, `__e['a.b']` reads
+  the flat key; the corpus writes dotted targets as flat keys and re-nests
+  them in its last step, so on the Elasticsearch side the nested
+  `ctx.a?.b` is the equivalent read. See
+  `docs/superpowers/plans/2026-09-22-cribl-flat-keys.md`.
   A bare identifier followed by `(` is untranslatable.
 - Operators: `?:`, `||`, `&&`, `!`, `===`, `!==`, `==`, `!=`, `<`, `<=`,
   `>`, `>=`, `+`, `-`, `*`, `/`, `%`, unary `-`, parentheses, `typeof x`.

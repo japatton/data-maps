@@ -396,6 +396,10 @@ def _escape_regex_slashes(pattern):
 
 
 def map_field(name):
+    # A quoted Cribl name is a flat key that the pipeline's re-nest step
+    # turns into the nested path; Elasticsearch writes that path directly.
+    if len(name) >= 2 and name[0] == name[-1] and name[0] in "'\"":
+        name = name[1:-1]
     if name in FIELD_MAP:
         return FIELD_MAP[name]
     if name.startswith("__"):

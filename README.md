@@ -1006,11 +1006,20 @@ pipeline that never sets `event.dataset`, and two pipelines sharing an id.
 rule fires on a hand-built bad example, so the lint runs on every push
 whether or not anyone types the command.
 
-One known gap the lint does not yet flag: 104 `eval` rows in the committed
-corpus read their fields as bare identifiers (`src_ip` rather than
-`__e['src_ip']`), which works only because Cribl evaluates an expression
-inside `with(__e)` and throws there when the field is absent. Re-authoring
-those rows into the `__e['name']` form the brief asks for is open work.
+It also fails any pipeline that the flat-key discipline
+(`datamaps/cribl_paths.py`) would still rewrite, and any pipeline that does
+not end with the canonical re-nest step. Cribl writes an unquoted dotted name
+(`source.ip`) only when its parent object already exists, and a `rename`
+into a missing parent deletes the source value. So every dotted target is
+written as a quoted flat key (`'source.ip'`) and read as `__e['source.ip']`,
+and the last step (`datamaps/renest.js`) re-nests them, as Cribl's own
+`prep_for_ECS` pack pipeline does. `python3 tools/pipelines/flat_keys.py`
+applies this in place. The evidence is in
+`docs/verification/2026-09-22-cribl-field-semantics.md`.
+
+Bare identifiers are not a hazard in `eval` values or filters: an absent
+field reads as `undefined` there and does not throw (verified on 4.19.0). Only
+inside a `code` function does a bare name throw.
 
 **Regenerating one.** `tools/pipelines/README.md` is the procedure, and it
 splits by what changed: a thin block (the mechanism defers to Elastic) is
@@ -1125,9 +1134,11 @@ pipelines.** Each of these is a place where the generated pipeline is
   it cannot parse where JavaScript returns `NaN`. A Cribl idiom like
   `Date.parse(x) || 0` therefore **never reaches its fallback**: the
   exception is taken before the `||` is evaluated.
-- A **missing** bare-identifier read is `null` in Painless, where Cribl
-  throws. The divergence runs toward forgiveness: a transpiled filter
-  evaluates on events that Cribl would have failed on.
+- A **missing** bare-identifier read is `null` in Painless and `undefined`
+  in Cribl, so both engines treat it as absent.
+- A quoted Cribl name (`'event.code'`) is a flat key that the pipeline's
+  re-nest step turns into `event.code`. Elasticsearch writes the nested path
+  directly, and the canonical re-nest step becomes `dot_expander` on `*`.
 - `.replace('a', 'b')` with a **string** pattern replaces every
   occurrence, because Painless's `String.replace` does; JavaScript
   replaces only the first. A regex pattern keeps the distinction —

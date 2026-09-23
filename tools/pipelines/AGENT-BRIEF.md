@@ -171,10 +171,10 @@ path. But the accessor then resolves it as NESTED (`id` -> `orig_h`), which is n
 where the value lives, so the rename quietly matches nothing. Unlike a hyphen,
 you get no error at all.
 
-Handle it by renaming to an underscore form inside your own parse step (a `code`
-function assigning `__e[newName] = value` lets you choose clean names up front),
-or read it with `__e['id.orig_h']` in an `eval.add` value, which does resolve the
-flat key. Do not put a dotted source key in `rename` and assume it worked.
+Handle it by QUOTING the name: `"currentName": "'id.orig_h'"` addresses the flat
+key (verified on 4.19.0, 2026-09-22), exactly as `__e['id.orig_h']` does in an
+`eval.add` value. Do not put an unquoted dotted source key in `rename` and assume
+it worked.
 
 Path-based keys (all affected): `rename.currentName`, `rename.newName`,
 `eval.add[].name`, `eval.remove[]`, `auto_timestamp.srcField/dstField`.
@@ -230,11 +230,15 @@ pipeline's `conf.description` rather than pretending it was cleaned up.
    have nested scopes`. No `let`/`const`/`function`/`=>`. Replace `.find()` and
    loops with bounded ternary chains over fixed indices. If logic genuinely
    needs statements, use the `code` function instead.
-4. **Read fields inside `eval` with `__e['name']`, not a bare identifier.** Cribl
-   evaluates expressions in a `with` scope, so a bare identifier for a field that
-   is absent on a given record throws `ReferenceError` at runtime. Bracket access
-   on `__e` yields `undefined` instead, which your ternary can handle. This one
-   does NOT fail schema validation - it fails later, on real data, which is worse.
+4. **Read fields with `__e['name']`.** In an `eval` value or a filter, a bare
+   identifier (`src_ip`) and a bare path (`event.action`) read the field and
+   yield `undefined` when it is absent. They do not throw (re-verified on 4.19.0
+   on 2026-09-22; this rule used to claim they did). But a bare dotted path
+   addresses the NESTED object, and a field this pipeline wrote is a flat key
+   (see the flat-key section below), so `event.action` misses a value that
+   `__e['event.action']` finds. Bracket access is right in both cases. Inside a
+   `code` function a bare identifier really does throw `ReferenceError`, because
+   that is real JavaScript.
 5. **`event.dataset` must not contain a hyphen** — it becomes the dataset
    component of an Elastic data stream name, which forbids `-`. Use
    `<tech_id>.<dataset_id>` with every hyphen replaced by `_`, e.g.
@@ -247,23 +251,49 @@ pipeline's `conf.description` rather than pretending it was cleaned up.
    `regex_extract` for text, and for CEF/LEEF see the warning below — **not**
    the `cef` function
 3. ONE `rename` batching every `status: mapped` row: `currentName` = the field
-   name your parse step actually produced, `newName` = `ecs`
+   name your parse step actually produced, `newName` = `ecs`, QUOTED when it
+   contains a dot (`"'source.ip'"`)
 4. `eval` implementing each row's `transform`, and routing `status: unmapped`
    rows with a `custom` value to that custom target
 5. `eval remove` or `drop` for rows the notes or transform say to discard
 6. set `_time` from the event's own timestamp field (constraint 1)
 7. `eval` adding `event.dataset` (constraint 4)
+8. the canonical re-nest `code` step, LAST: run
+   `python3 tools/pipelines/flat_keys.py` and it is appended (and every dotted
+   write and flat read quoted for you); `python3 -m datamaps.cribl_lint` fails a
+   pipeline without it
 
-★★ **ORDER MATTERS: compute BEFORE you rename.** `rename` and `eval.add` build a
-real nested object, so renaming `RETURN_CODE` to `error.code` produces
-`error: {code: ...}` — and a later `__e['error.code']` (a flat key containing a
-dot) does NOT see that value. Deriving `event.outcome` from an already-renamed
-field therefore reads `undefined` and silently produces nothing. This passes
-schema validation and passes the linter; it only shows up on real data.
+★★★ **DOTTED TARGETS ARE FLAT KEYS, AND THE PIPELINE ENDS BY RE-NESTING THEM.**
+An unquoted dotted `eval.add` name or `rename.newName` is written ONLY when its
+parent object already exists. Otherwise `eval` writes nothing and `rename`
+DELETES the source value. That holds for `source.ip` when there is no `source`,
+and for two renames into the same new parent. It was verified on 4.19.0 and
+4.14.0 through preview and through a real source-to-destination path
+(`docs/verification/2026-09-22-cribl-field-semantics.md`). Every pipeline
+committed before 2026-09-22 lost most of its mapped fields this way, and the
+API accepted all of them with HTTP 200.
 
-So order every pipeline: parse -> `eval` all derived/computed fields reading the
-ORIGINAL vendor names -> batched `rename` -> `event.dataset`. Two agents arrived
-at this independently after hitting it.
+So, as Cribl's own `prep_for_ECS` pipeline does:
+- quote every dotted target, `"name": "'event.action'"`, which writes a flat
+  key and never loses anything;
+- from then on, read it flat, `__e['event.action']`, and name it quoted in a
+  later `rename.currentName`, `eval.remove`, `srcField` or `groupBy`. The
+  exception is `mask.fields`: it is a wildcard pattern that matches the flat
+  key when unquoted, and nothing when quoted;
+- never guard on the parent (`__e['event'] && ...`): the object does not exist
+  until the re-nest step builds it;
+- end with the canonical re-nest step (`datamaps/renest.js`). It turns every
+  flat dotted key into nested objects and merges into parents that already
+  exist. Where a parent is a scalar (a vendor `user` string) it leaves the flat
+  key in place, and the live gate reports that as a collision: rename or
+  remove the vendor field first.
+
+`tools/pipelines/flat_keys.py` applies all of this mechanically. The lint and the
+live gate's behaviour check (a sentinel at every renamed field must survive) hold
+you to it.
+
+Computing derived fields from the ORIGINAL vendor names before the batched
+`rename` is still the clearest order.
 
 Skip a step the data does not call for. Do not pad with no-op functions. Prefer
 one `rename` with many pairs over many `rename` functions.

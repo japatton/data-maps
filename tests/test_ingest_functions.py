@@ -146,6 +146,25 @@ class TestRenameDropMask(unittest.TestCase):
                         "ignore_missing": True, "ignore_failure": True,
                         "description": D}}])
 
+    def test_quoted_names_are_the_same_elasticsearch_path(self):
+        # Cribl writes 'event.code' as a flat key and the re-nest step makes
+        # it event.code; Elasticsearch builds the nested path directly.
+        r = fx.translate_function(
+            fn("rename", {"rename": [{"currentName": "'a.b'",
+                                      "newName": "'event.code'"}]}), D)
+        self.assertEqual(r.processors[0]["rename"]["field"], "a.b")
+        self.assertEqual(r.processors[0]["rename"]["target_field"], "event.code")
+
+    def test_renest_step_becomes_dot_expander(self):
+        from datamaps import cribl_paths
+        r = fx.translate_function(cribl_paths.renest_function(), D)
+        self.assertEqual(r.processors, [{"dot_expander": {
+            "field": "*", "ignore_failure": True, "description": D}}])
+
+    def test_other_code_stays_manual(self):
+        with self.assertRaises(Untranslatable):
+            fx.translate_function(fn("code", {"code": "__e.x = 1"}), D)
+
     def test_drop_with_and_without_condition(self):
         r = fx.translate_function(fn("drop", filt="__e['a'] === 'x'"), D)
         self.assertEqual(r.processors, [{"drop": {"if": "(ctx.a == 'x')", "description": D}}])

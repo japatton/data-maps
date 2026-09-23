@@ -24,6 +24,7 @@ the public tree carries no example records to run through them.
 import datetime
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -33,6 +34,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, REPO)
 
+from datamaps import cribl_paths  # noqa: E402
 from datamaps import pipelines as pipelines_mod  # noqa: E402
 from datamaps.ingest import pipeline as ingest_mod  # noqa: E402
 
@@ -105,6 +107,92 @@ def cribl_version(url, token):
     return info["BUILD"].get("VERSION", "unknown")
 
 
+_GROUP = re.compile(r"\(\?<([A-Za-z_][A-Za-z0-9_]*)>")
+
+
+def _written_before(functions):
+    """Names each function index can rely on the pipeline itself producing."""
+    written, seen = [], set()
+    for fn in functions:
+        written.append(set(seen))
+        if fn.get("disabled") is True:
+            continue
+        c = fn.get("conf") or {}
+        for row in c.get("add") or []:
+            seen.add(cribl_paths.unquote(str(row.get("name", ""))))
+        for pair in c.get("rename") or []:
+            if isinstance(pair, dict):
+                seen.add(cribl_paths.unquote(str(pair.get("newName", ""))))
+        for key in ("dstField",):
+            if c.get(key):
+                seen.add(cribl_paths.unquote(str(c[key])))
+        for rx in [c.get("regex")] + [r.get("regex") for r in c.get("regexList") or []]:
+            if isinstance(rx, str):
+                seen.update(_GROUP.findall(rx))
+    return written
+
+
+def _put(event, name, value):
+    if cribl_paths.is_quoted(name):
+        event[cribl_paths.unquote(name)] = value
+        return True
+    parts = name.split(".")
+    node = event
+    for part in parts[:-1]:
+        nxt = node.setdefault(part, {})
+        if not isinstance(nxt, dict):
+            return False
+        node = nxt
+    if parts[-1] in node:
+        return False
+    node[parts[-1]] = value
+    return True
+
+
+def sentinel_event(doc):
+    """(event, [(value, currentName, newName)]) for the behaviour check.
+
+    Every rename that reads a vendor field gets a unique sentinel value at
+    that field, addressed the way Cribl addresses it: a quoted name is a
+    flat key, an unquoted dotted one a nested path.  Fields the pipeline
+    writes itself before the rename are left alone.
+    """
+    functions = (doc.get("conf") or {}).get("functions") or []
+    before = _written_before(functions)
+    event, sentinels = {"_raw": ""}, []
+    for i, fn in enumerate(functions):
+        if fn.get("id") != "rename" or fn.get("disabled") is True:
+            continue
+        for pair in (fn.get("conf") or {}).get("rename") or []:
+            if not isinstance(pair, dict):
+                continue
+            cur = str(pair.get("currentName", ""))
+            bare = cribl_paths.unquote(cur)
+            if (not cur or bare in ("_raw", "_time") or bare.startswith("__")
+                    or "*" in cur or bare in before[i]):
+                continue
+            value = "dmsentinel%04d" % len(sentinels)
+            if _put(event, cur, value):
+                sentinels.append((value, cur, str(pair.get("newName", ""))))
+    return event, sentinels
+
+
+def behaviour_findings(sentinels, items):
+    """Data-loss findings for one preview run; an empty output is not one."""
+    if not items:
+        return []
+    out = []
+    for item in items:
+        for k in sorted(item):
+            if "." in k and not k.startswith("__"):
+                out.append("flat key survived re-nest: %s" % k)
+    blob = json.dumps(items).lower()
+    for value, cur, new in sentinels:
+        if value not in blob:
+            out.append("value lost: %s -> %s" % (cur, new))
+    return out
+
+
 def cribl_validate(url, token, pipelines):
     auth = {"Authorization": "Bearer " + token}
     results = []
@@ -113,10 +201,27 @@ def cribl_validate(url, token, pipelines):
         pid = doc["id"]
         request("DELETE", url + "/api/v1/pipelines/" + pid, headers=auth)
         status, text = request("POST", url + "/api/v1/pipelines", doc, headers=auth)
-        results.append({"id": pid, "key": "%s/%s__%s" % key, "ok": status == 200,
-                        "status": status, "detail": "" if status == 200 else text[:2000]})
+        result = {"id": pid, "key": "%s/%s__%s" % key, "ok": status == 200,
+                  "status": status, "detail": "" if status == 200 else text[:2000],
+                  "behaviour": None}
+        if status == 200:
+            event, sentinels = sentinel_event(doc)
+            s2, t2 = request("POST", url + "/api/v1/preview",
+                             {"mode": "pipe", "pipelineId": pid, "events": [event]},
+                             headers=auth)
+            if s2 != 200:
+                result["behaviour"] = ["preview failed: HTTP %s %s" % (s2, t2[:300])]
+            else:
+                items = [{k: v for k, v in it.items() if k != "cribl_pipe"}
+                         for it in json.loads(t2).get("items") or []
+                         if isinstance(it, dict)]
+                result["behaviour"] = behaviour_findings(sentinels, items)
+                result["sentinels"] = len(sentinels)
+                result["dropped"] = not items
+        results.append(result)
         request("DELETE", url + "/api/v1/pipelines/" + pid, headers=auth)
-        sys.stdout.write("cribl %s %s\n" % (status, pid))
+        sys.stdout.write("cribl %s %s%s\n" % (status, pid,
+                         " BEHAVIOUR" if result["behaviour"] else ""))
     return results
 
 
@@ -196,6 +301,29 @@ def _section(name, results, skipped_reason):
     return lines
 
 
+def _behaviour_section(results):
+    if results is None:
+        return []
+    ran = [r for r in results if r.get("behaviour") is not None]
+    bad = [r for r in ran if r["behaviour"]]
+    seeded = sum(r.get("sentinels", 0) for r in ran)
+    dropped = sum(1 for r in ran if r.get("dropped"))
+    lines = ["## Cribl behaviour: %d of %d clean" % (len(ran) - len(bad), len(ran)), "",
+             "One preview event per pipeline, seeded with a sentinel at every field a "
+             "`rename` reads (%d sentinels). A finding is a sentinel that vanished or "
+             "a dotted key the re-nest step left flat. %d pipelines dropped the "
+             "synthetic event and prove nothing here." % (seeded, dropped), ""]
+    if not bad:
+        lines.append("No findings.")
+    for r in bad:
+        lines.append("### %s (`%s`)" % (r["key"], r["id"]))
+        lines.append("")
+        lines.extend("- %s" % f for f in r["behaviour"])
+        lines.append("")
+    lines.append("")
+    return lines
+
+
 def write_report(path, cribl_results, es_results, meta):
     lines = ["# Live validation — %s" % meta["date"], "",
              "| target | endpoint | version |", "|---|---|---|",
@@ -210,6 +338,7 @@ def write_report(path, cribl_results, es_results, meta):
              "valid for Cribl, compiled and loaded for Elasticsearch. Neither proves "
              "correct parsing of real events.", ""]
     lines += _section("Cribl", cribl_results, "CRIBL_URL unset")
+    lines += _behaviour_section(cribl_results)
     lines += _section("Elasticsearch", es_results, "ES_URL unset")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
@@ -241,7 +370,7 @@ def main():
     write_report(path, cribl_results, es_results, meta)
     sys.stdout.write("report: %s\n" % os.path.relpath(path, REPO))
     failed = sum(1 for rs in (cribl_results, es_results) if rs
-                 for r in rs if not r["ok"])
+                 for r in rs if not r["ok"] or r.get("behaviour"))
     return 1 if failed else 0
 
 

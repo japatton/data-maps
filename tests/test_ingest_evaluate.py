@@ -20,6 +20,13 @@ class TestEval(unittest.TestCase):
             "ignore_failure": True, "description": D}}])
         self.assertIsNone(r.manual)
 
+    def test_quoted_name_and_remove(self):
+        r = evaluate.translate_eval(
+            {"add": [{"name": "'event.dataset'", "value": "'ad.account'"}],
+             "remove": ["'a.b'"]}, D)
+        self.assertEqual(r.processors[0]["set"]["field"], "event.dataset")
+        self.assertEqual(r.processors[1]["remove"]["field"], ["a.b"])
+
     def test_array_and_number_constants(self):
         r = evaluate.translate_eval(
             {"add": [{"name": "event.category", "value": "['network','dns']"},

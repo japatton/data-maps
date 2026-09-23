@@ -9,6 +9,7 @@ pipeline.
 import re
 
 from datamaps.ingest import expr
+from datamaps import cribl_paths
 from datamaps.ingest.expr import Untranslatable, map_field
 
 MANUAL_FUNCTIONS = ("code", "distinct", "unroll", "xml_unroll", "flatten",
@@ -251,6 +252,10 @@ def _apply_condition(result, cond):
 
 def translate_function(fn, description):
     fid = fn.get("id")
+    if cribl_paths.is_renest(fn):
+        # Re-nesting flat dotted keys is exactly what dot_expander does.
+        return Result([{"dot_expander": {"field": "*", "ignore_failure": True,
+                                         "description": description}}])
     if fid in MANUAL_FUNCTIONS:
         raise Untranslatable("%s has no ingest-processor equivalent" % fid)
     if fid == "eval":

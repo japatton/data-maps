@@ -63,6 +63,45 @@ class TestCriblVersion(unittest.TestCase):
         self.assertEqual(self.version_from(401, "{}"), "unknown")
 
 
+class TestBehaviour(unittest.TestCase):
+    def doc(self, *functions):
+        return {"id": "dm_x", "conf": {"functions": list(functions)}}
+
+    def rename(self, *pairs):
+        return {"id": "rename", "filter": "true", "conf": {"rename": [
+            {"currentName": c, "newName": n} for c, n in pairs]}}
+
+    def test_sentinels_follow_cribl_addressing(self):
+        doc = self.doc(self.rename(("src", "'source.ip'"), ("'a.b'", "'x.y'"),
+                                   ("n.m", "'z.z'")))
+        event, sentinels = vl.sentinel_event(doc)
+        self.assertEqual(event["src"], sentinels[0][0])
+        self.assertEqual(event["a.b"], sentinels[1][0])
+        self.assertEqual(event["n"]["m"], sentinels[2][0])
+        self.assertEqual(event["_raw"], "")
+
+    def test_names_the_pipeline_writes_first_are_not_seeded(self):
+        doc = self.doc({"id": "eval", "filter": "true", "conf": {"add": [
+                           {"name": "tmp", "value": "1"}]}},
+                       {"id": "regex_extract", "filter": "true", "conf": {
+                           "regex": "/(?<grp>\\d+)/", "source": "_raw"}},
+                       self.rename(("tmp", "a"), ("grp", "b"), ("_raw", "c"),
+                                   ("vendor", "d")))
+        event, sentinels = vl.sentinel_event(doc)
+        self.assertEqual([s[1] for s in sentinels], ["vendor"])
+
+    def test_findings(self):
+        sentinels = [("dmsentinel0000", "src", "'source.ip'"),
+                     ("dmsentinel0001", "usr", "'user.name'")]
+        clean = [{"source": {"ip": "dmsentinel0000"}, "user": {"name": "DMSENTINEL0001"}}]
+        self.assertEqual(vl.behaviour_findings(sentinels, clean), [])
+        lost = [{"source": {"ip": "dmsentinel0000"}, "user.name": "x", "__i": 1}]
+        self.assertEqual(vl.behaviour_findings(sentinels, lost), [
+            "flat key survived re-nest: user.name",
+            "value lost: usr -> 'user.name'"])
+        self.assertEqual(vl.behaviour_findings(sentinels, []), [])
+
+
 class TestReport(unittest.TestCase):
     def test_report_lists_failures_verbatim(self):
         out = tempfile.mkdtemp()

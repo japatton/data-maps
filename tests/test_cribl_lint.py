@@ -5,12 +5,17 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from datamaps import cribl_lint, pipelines
+from datamaps import cribl_lint, cribl_paths, pipelines
 
 DATA = os.path.join(ROOT, "data")
 
 
 def pipe(*functions):
+    """A pipeline in the committed shape: the re-nest step comes last."""
+    return raw_pipe(*(list(functions) + [cribl_paths.renest_function()]))
+
+
+def raw_pipe(*functions):
     return {"id": "dm_t_d_f", "conf": {"output": "default",
                                        "description": "t",
                                        "functions": list(functions)}}
@@ -25,7 +30,7 @@ def ev(add=None, remove=None):
     return {"id": "eval", "filter": "true", "conf": conf}
 
 
-DATASET = ev(add=[{"name": "event.dataset", "value": "'t.d'"}])
+DATASET = ev(add=[{"name": "'event.dataset'", "value": "'t.d'"}])
 
 
 def codes(doc):
@@ -37,7 +42,7 @@ class TestRules(unittest.TestCase):
         self.assertEqual(codes(pipe(DATASET)), [])
 
     def test_empty_pipeline(self):
-        self.assertIn("empty-pipeline", codes(pipe()))
+        self.assertIn("empty-pipeline", codes(raw_pipe()))
 
     def test_no_event_dataset(self):
         self.assertIn("no-event-dataset",
@@ -65,7 +70,7 @@ class TestRules(unittest.TestCase):
         self.assertIn("name-equals-value", found)
 
     def test_dataset_has_hyphen(self):
-        doc = pipe(ev(add=[{"name": "event.dataset", "value": "'a-b.c'"}]))
+        doc = pipe(ev(add=[{"name": "'event.dataset'", "value": "'a-b.c'"}]))
         self.assertIn("dataset-has-hyphen", codes(doc))
 
     def test_invalid_paths(self):
@@ -90,6 +95,25 @@ class TestRules(unittest.TestCase):
                              "conf": {"rename": [{"currentName": "a",
                                                   "newName": "@b"}]}})
         self.assertIn("invalid-path-in-rename", codes(bad))
+
+    def test_quoted_literal_names_are_valid(self):
+        doc = pipe(DATASET, ev(add=[{"name": "'@timestamp'", "value": "1"}],
+                               remove=["'user-agent'"]))
+        self.assertEqual(codes(doc), [])
+
+    def test_unquoted_dotted_write_is_pending(self):
+        doc = pipe(DATASET, ev(add=[{"name": "source.ip", "value": "'1'"}]))
+        self.assertIn("flat-key-rewrite-pending", codes(doc))
+
+    def test_nested_read_of_a_flat_key_is_pending(self):
+        doc = pipe(DATASET, ev(add=[{"name": "'a.b'", "value": "'1'"},
+                                    {"name": "o", "value": "a.b"}]))
+        self.assertIn("flat-key-rewrite-pending", codes(doc))
+
+    def test_renest_must_be_last(self):
+        self.assertIn("renest-not-last", codes(raw_pipe(DATASET)))
+        early = raw_pipe(cribl_paths.renest_function(), DATASET)
+        self.assertIn("renest-not-last", codes(early))
 
     def test_bare_regex(self):
         doc = pipe(DATASET, {"id": "regex_extract", "filter": "true",
