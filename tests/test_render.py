@@ -497,6 +497,25 @@ class TestExamples(unittest.TestCase):
                       html)
         self.assertIn('href="../samples/NOTICE.md"', html)
 
+    def test_synthetic_record_is_labelled_and_names_its_structure(self):
+        syn = {"structure_from": [{"what": "PAN-OS CEF format string",
+                                   "url": "https://docs.example/cef",
+                                   "ref": "read 2026-09-23"}],
+               "method": "placeholders filled with invented values"}
+        html = self.render_with([self.rec(
+            root="synthetic", synthetic=syn,
+            relpath="paloalto-ngfw/traffic-syslog-cef-synthetic.log")])
+        self.assertIn("Synthetic record", html)
+        self.assertIn('class="panel example example-synthetic"', html)
+        self.assertIn('class="example-structure"', html)
+        self.assertIn('href="https://docs.example/cef"', html)
+        self.assertIn("PAN-OS CEF format string", html)
+        self.assertIn("Values invented, not captured", html)
+        self.assertIn('href="../synthetic/NOTICE.md"', html)
+        self.assertIn('href="../synthetic/'
+                      'paloalto-ngfw/traffic-syslog-cef-synthetic.log"', html)
+        self.assertNotIn("example-source", html)
+
     def test_example_without_source_has_no_source_line(self):
         html = self.render_with([self.rec()])
         self.assertNotIn("example-source", html)

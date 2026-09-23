@@ -268,5 +268,113 @@ class TestDiscoverSamples(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(out, "examples")))
 
 
+STRUCT = [{"what": "PAN-OS CEF format string", "url": "https://example.org/fmt",
+           "ref": "read 2026-09-23"}]
+
+
+class TestDiscoverSynthetic(unittest.TestCase):
+    """Our own records in a vendor's structure: data/synthetic/."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.manifest = {"files": {}}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def put(self, relpath, data):
+        path = os.path.join(self.tmp, examples.SYNTHETIC, *relpath.split("/"))
+        if not os.path.isdir(os.path.dirname(path)):
+            os.makedirs(os.path.dirname(path))
+        with open(path, "wb") as fh:
+            fh.write(data)
+
+    def write(self, tech, name, data=b"x\n", row=True):
+        if row:
+            self.manifest["files"]["%s/%s" % (tech, name)] = {
+                "structure_from": list(STRUCT), "values": "invented",
+                "method": "placeholders filled"}
+        self.put("%s/%s" % (tech, name), data)
+
+    def discover(self, samples=(), manifest=True):
+        if manifest:
+            self.put(examples.MANIFEST,
+                     json.dumps(self.manifest).encode("utf-8"))
+        return examples.discover_synthetic(self.tmp, CATALOG, TECHS,
+                                           list(samples))
+
+    def test_absent_directory_is_not_an_error(self):
+        self.assertEqual(
+            examples.discover_synthetic(self.tmp, CATALOG, TECHS, []),
+            ([], []))
+
+    def test_record_carries_root_and_structure(self):
+        self.write("fireeye", "cm-audit-syslog-raw-synthetic.log")
+        records, errors = self.discover()
+        self.assertEqual(errors, [])
+        rec = records[0]
+        self.assertEqual(rec["root"], "synthetic")
+        self.assertEqual(rec["dataset"], "cm-audit")
+        self.assertEqual(rec["synthetic"]["structure_from"], STRUCT)
+        self.assertEqual(rec["synthetic"]["method"], "placeholders filled")
+
+    def test_missing_manifest_is_fatal(self):
+        self.write("fireeye", "cm-audit-syslog-raw-synthetic.log")
+        records, errors = self.discover(manifest=False)
+        self.assertEqual(records, [])
+        self.assertTrue(any(examples.MANIFEST in e for e in errors))
+
+    def test_file_without_row_is_fatal(self):
+        self.write("fireeye", "cm-audit-syslog-raw-synthetic.log", row=False)
+        records, errors = self.discover()
+        self.assertEqual(records, [])
+        self.assertTrue(any("no structure row" in e for e in errors))
+
+    def test_row_without_file_is_fatal(self):
+        self.write("fireeye", "cm-audit-syslog-raw-synthetic.log")
+        self.manifest["files"]["fireeye/gone-synthetic.log"] = {
+            "structure_from": list(STRUCT), "values": "invented"}
+        _, errors = self.discover()
+        self.assertTrue(any("fireeye/gone-synthetic.log" in e and "no such" in e
+                            for e in errors))
+
+    def test_row_must_name_a_structure_and_invented_values(self):
+        self.write("fireeye", "cm-audit-syslog-raw-synthetic.log")
+        row = self.manifest["files"]["fireeye/cm-audit-syslog-raw-synthetic.log"]
+        row["structure_from"] = []
+        row["values"] = "captured"
+        records, errors = self.discover()
+        self.assertEqual(records, [])
+        self.assertTrue(any("structure_from" in e for e in errors))
+        self.assertTrue(any("invented" in e for e in errors))
+
+    def test_name_must_say_synthetic(self):
+        self.write("fireeye", "cm-audit-syslog-raw.log")
+        records, errors = self.discover()
+        self.assertEqual(records, [])
+        self.assertTrue(any("-synthetic.log" in e for e in errors))
+
+    def test_a_block_with_a_real_sample_takes_no_synthetic(self):
+        self.write("fireeye", "cm-audit-syslog-raw-synthetic.log")
+        sample = {"tech": "fireeye",
+                  "relpath": "fireeye/cm-audit-syslog-raw-elastic.log"}
+        records, errors = self.discover(samples=[sample])
+        self.assertEqual(records, [])
+        self.assertTrue(any("real sample" in e for e in errors))
+
+    def test_publish_ships_synthetic_with_notice(self):
+        self.write("fireeye", "cm-audit-syslog-raw-synthetic.log", b"s\n")
+        self.put(examples.NOTICE, b"notice\n")
+        records, errors = self.discover()
+        self.assertEqual(errors, [])
+        out = os.path.join(self.tmp, "public")
+        examples.publish(records, out, self.tmp)
+        base = os.path.join(out, "synthetic")
+        self.assertTrue(os.path.isfile(os.path.join(
+            base, "fireeye", "cm-audit-syslog-raw-synthetic.log")))
+        self.assertTrue(os.path.isfile(os.path.join(base, examples.NOTICE)))
+        self.assertTrue(os.path.isfile(os.path.join(base, examples.MANIFEST)))
+
+
 if __name__ == "__main__":
     unittest.main()

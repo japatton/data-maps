@@ -12,6 +12,13 @@ repository, pinned commit, upstream paths and licence, and the licence text
 must sit in data/samples/LICENSES/.  A sample without its row is fatal.
 The manifest, NOTICE.md and LICENSES/ publish beside the samples.
 data/examples/ needs none of that: Studio attaches captured records there.
+
+data/synthetic/ holds records we wrote ourselves in a vendor's documented
+structure, for blocks no public record covers.  They must never pass for
+captured data, so every name ends in -synthetic.log and every file needs a
+row in data/synthetic/SOURCES.json naming the structure it follows
+(structure_from) and declaring its values "invented".  A block that has a
+real sample takes no synthetic record: the real one always wins.
 """
 import glob
 import json
@@ -27,6 +34,7 @@ INLINE_BYTES = 32768
 EXCLUDED = frozenset(["everfox-hsg"])
 EXAMPLES = "examples"
 SAMPLES = "samples"
+SYNTHETIC = "synthetic"
 # Provenance for data/samples/, relative to that directory.
 MANIFEST = "SOURCES.json"
 NOTICE = "NOTICE.md"
@@ -127,6 +135,75 @@ def discover_samples(data_dir, catalog, technologies):
     return records, errors
 
 
+def _block(relpath):
+    """'tech/<dataset>-<format>' - a record's file stem without its tag."""
+    tech, name = relpath.split("/", 1)
+    return "%s/%s" % (tech, name[:-4].rsplit("-", 1)[0])
+
+
+def discover_synthetic(data_dir, catalog, technologies, samples):
+    """Our own records in a vendor structure; (records, FATAL strings).
+
+    `samples` are the discovered sample records: a block one of them
+    covers must not also carry a synthetic record.
+    """
+    root = os.path.join(data_dir, SYNTHETIC)
+    if not glob.glob(os.path.join(root, "*", "*.log")):
+        return [], []
+    errors = []
+    path = os.path.join(root, MANIFEST)
+    files = {}
+    if not os.path.isfile(path):
+        errors.append("synthetic: %s is missing; every synthetic record "
+                      "needs a structure row" % MANIFEST)
+    else:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                files = json.load(fh).get("files") or {}
+        except ValueError as exc:
+            errors.append("synthetic: %s is not valid JSON: %s"
+                          % (MANIFEST, exc))
+    found, layout_errors = _discover(data_dir, SYNTHETIC, "synthetic record",
+                                     catalog, technologies)
+    errors.extend(layout_errors)
+    real = set(_block(r["relpath"]) for r in samples)
+    on_disk = set("%s/%s" % (os.path.basename(os.path.dirname(p)),
+                             os.path.basename(p))
+                  for p in glob.glob(os.path.join(root, "*", "*.log")))
+    records = []
+    for rec in found:
+        where = "synthetic record '%s'" % rec["relpath"]
+        bad = False
+        if not rec["relpath"].endswith("-synthetic.log"):
+            errors.append("%s: the name must end in -synthetic.log" % where)
+            bad = True
+        if _block(rec["relpath"]) in real:
+            errors.append("%s: this block already has a real sample"
+                          % where)
+            bad = True
+        row = files.get(rec["relpath"])
+        if row is None:
+            if os.path.isfile(path):
+                errors.append("%s: no structure row in %s" % (where, MANIFEST))
+            continue
+        if not row.get("structure_from"):
+            errors.append("%s: structure_from must name the structure it "
+                          "follows" % where)
+            bad = True
+        if row.get("values") != "invented":
+            errors.append("%s: values must be declared \"invented\"" % where)
+            bad = True
+        if bad:
+            continue
+        rec["synthetic"] = {"structure_from": list(row["structure_from"]),
+                            "method": row.get("method", "")}
+        records.append(rec)
+    for relpath in sorted(set(files) - on_disk):
+        errors.append("synthetic: %s has a structure row for %s but no such "
+                      "file" % (MANIFEST, relpath))
+    return records, errors
+
+
 def _discover(data_dir, subdir, noun, catalog, technologies):
     records = []
     errors = []
@@ -173,12 +250,15 @@ def by_dataset(records):
 def publish(records, out_dir, data_dir=None):
     """Copy every record verbatim to <out_dir>/<root>/<relpath>.
 
-    Samples take their manifest, NOTICE.md and LICENSES/ with them (from
-    `data_dir`), so a download carries the licence it is distributed under.
+    Samples and synthetic records take their manifest, NOTICE.md and any
+    LICENSES/ with them (from `data_dir`), so a download carries the terms
+    and the provenance it is distributed with.
     """
-    if data_dir and any(r.get("root") == SAMPLES for r in records):
-        src = os.path.join(data_dir, SAMPLES)
-        dest = os.path.join(out_dir, SAMPLES)
+    for root in (SAMPLES, SYNTHETIC):
+        if not data_dir or not any(r.get("root") == root for r in records):
+            continue
+        src = os.path.join(data_dir, root)
+        dest = os.path.join(out_dir, root)
         if not os.path.isdir(dest):
             os.makedirs(dest)
         for name in (MANIFEST, NOTICE):
