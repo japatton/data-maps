@@ -94,9 +94,15 @@ def cribl_version(url, token):
     if status != 200:
         return "unknown"
     try:
-        return json.loads(text).get("BUILD", {}).get("VERSION", "unknown")
+        info = json.loads(text)
     except ValueError:
         return "unknown"
+    # 4.19 wraps the answer in {"items": [...]}; older builds answer bare.
+    if isinstance(info, dict) and isinstance(info.get("items"), list):
+        info = info["items"][0] if info["items"] else None
+    if not isinstance(info, dict) or not isinstance(info.get("BUILD"), dict):
+        return "unknown"
+    return info["BUILD"].get("VERSION", "unknown")
 
 
 def cribl_validate(url, token, pipelines):

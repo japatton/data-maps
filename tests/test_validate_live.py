@@ -40,6 +40,29 @@ class TestDisplayEndpoint(unittest.TestCase):
                          "https://<private host>")
 
 
+class TestCriblVersion(unittest.TestCase):
+    def version_from(self, status, body):
+        saved = vl.request
+        vl.request = lambda *a, **k: (status, body)
+        try:
+            return vl.cribl_version("http://c:19000", "t")
+        finally:
+            vl.request = saved
+
+    def test_items_envelope_as_cribl_4_19_answers(self):
+        body = '{"items":[{"BUILD":{"VERSION":"4.19.0-0fbd6d34"}}],"count":1}'
+        self.assertEqual(self.version_from(200, body), "4.19.0-0fbd6d34")
+
+    def test_bare_object(self):
+        self.assertEqual(self.version_from(200, '{"BUILD":{"VERSION":"4.1.0"}}'),
+                         "4.1.0")
+
+    def test_unexpected_shapes_are_unknown(self):
+        for body in ("[]", '{"items":[]}', '{"items":"x"}', "not json"):
+            self.assertEqual(self.version_from(200, body), "unknown", body)
+        self.assertEqual(self.version_from(401, "{}"), "unknown")
+
+
 class TestReport(unittest.TestCase):
     def test_report_lists_failures_verbatim(self):
         out = tempfile.mkdtemp()
