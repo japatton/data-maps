@@ -116,6 +116,27 @@ def lint_pipeline(doc):
     return out
 
 
+def lint_syslog_framing(doc):
+    """[(code, detail)] for a syslog-* pipeline that parses the message body
+    out of `_raw`.  A Cribl Syslog Source leaves the whole line, header
+    included, in `_raw` (docs/verification/2026-09-23-cribl-syslog-source-
+    framing.md): a `^CEF:` anchor never matches it, and a CSV parser folds
+    the header into the first column."""
+    out = []
+    for fn in (doc.get("conf") or {}).get("functions") or []:
+        if fn.get("disabled") is True:
+            continue
+        c = fn.get("conf") or {}
+        if fn.get("id") == "regex_extract" and c.get("source", "_raw") == "_raw":
+            rx = str(c.get("regex", ""))
+            if rx.startswith("/^CEF:") or rx.startswith("/^LEEF:"):
+                out.append(("syslog-anchored-on-raw", rx[:40]))
+        if (fn.get("id") == "serde" and c.get("type") in ("kvp", "csv")
+                and c.get("srcField", "_raw") == "_raw"):
+            out.append(("syslog-serde-on-raw", c.get("type")))
+    return out
+
+
 def lint_all(pipelines):
     """{code: [detail lines]} over a {(tech, ds, fmt): doc} mapping."""
     findings = defaultdict(list)
@@ -124,7 +145,10 @@ def lint_all(pipelines):
         doc = pipelines[key]
         rel = "%s/%s__%s" % key
         ids[doc.get("id", "")].append(rel)
-        for code, detail in lint_pipeline(doc):
+        found = lint_pipeline(doc)
+        if key[2].startswith("syslog-"):
+            found += lint_syslog_framing(doc)
+        for code, detail in found:
             findings[code].append(("%s  %s" % (rel, detail)).rstrip())
     for pid, rels in ids.items():
         if len(rels) > 1:

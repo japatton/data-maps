@@ -4,9 +4,11 @@ Offline: each regex_extract in a pipeline is applied in order the way Cribl
 applies it (the regex against the named source field, named groups becoming
 fields, a step skipped when its filter says so), and the test asserts that a
 record in the documented format comes out with the fields the rest of the
-pipeline reads.  The records are message bodies - what a Syslog Source leaves
-once it has taken the header off.
+pipeline reads.  The records are message bodies; TestSyslogSourceFraming
+also frames them the way a Cribl Syslog Source hands them to a pipeline
+(docs/verification/2026-09-23-cribl-syslog-source-framing.md).
 """
+import glob
 import json
 import os
 import re
@@ -30,6 +32,10 @@ def _py_regex(literal):
     return re.compile(body, (re.I if "i" in flags else 0) | (re.M if "m" in flags else 0))
 
 
+class Unsupported(AssertionError):
+    pass
+
+
 def _filter_allows(expr, event):
     expr = (expr or "true").strip()
     if expr == "true":
@@ -37,14 +43,25 @@ def _filter_allows(expr, event):
     m = re.match(r"^__e\['([^']+)'\]\s*===\s*undefined$", expr)
     if m:
         return m.group(1) not in event
-    raise AssertionError("filter not understood by this test: %r" % expr)
+    raise Unsupported("filter not understood by this test: %r" % expr)
+
+
+BODY = "__e['message'] !== undefined ? __e['message'] : __e['_raw']"
 
 
 def extract(key, raw):
-    """Run the pipeline's regex_extract steps over {_raw: raw}."""
-    event = {"_raw": raw}
+    """Run the pipeline's regex_extract steps over {_raw: raw}, or over an
+    event dict as a Syslog Source would build it."""
+    event = dict(raw) if isinstance(raw, dict) else {"_raw": raw}
     for fn in _pipeline(key)["conf"]["functions"]:
-        if fn.get("id") != "regex_extract" or fn.get("disabled") is True:
+        if fn.get("disabled") is True:
+            continue
+        if fn.get("id") == "eval":
+            for add in (fn.get("conf") or {}).get("add") or []:
+                if add.get("value") == BODY:
+                    event[add["name"]] = event.get("message", event["_raw"])
+            continue
+        if fn.get("id") != "regex_extract":
             continue
         if not _filter_allows(fn.get("filter"), event):
             continue
@@ -130,6 +147,83 @@ class TestPgauditSyslog(unittest.TestCase):
 
     def test_pgaudit_readme_prefix(self):
         self.check("[5] " + self.readme_prefix + self.unquoted)
+
+
+HEADER = "<134>Sep 23 12:00:00 host01 "
+RFC3164 = re.compile(r"^(?:<\d{1,3}>)?[A-Z][a-z]{2} [ \d]\d \d\d:\d\d:\d\d ")
+RECORD = re.compile(r"^(?P<ds>.+?)-(?P<fmt>syslog-[a-z]+)-(?P<src>.+)\.log$")
+
+
+def _syslog_records():
+    """(pipeline key, record) for every sample and synthetic syslog record."""
+    for kind in ("samples", "synthetic"):
+        base = os.path.join(ROOT, "data", kind)
+        for tech in sorted(os.listdir(base)):
+            tdir = os.path.join(base, tech)
+            if not os.path.isdir(tdir):
+                continue
+            for name in sorted(os.listdir(tdir)):
+                m = RECORD.match(name)
+                key = m and "%s/%s__%s" % (tech, m.group("ds"), m.group("fmt"))
+                if not key or not os.path.exists(
+                        os.path.join(ROOT, "data", "pipelines", key + ".json")):
+                    continue
+                with open(os.path.join(tdir, name), encoding="utf-8") as fh:
+                    for line in fh.read().splitlines():
+                        if line.strip():
+                            yield key, line
+
+
+def _groups(key, event):
+    """Fields the regex steps produce, or None where a step's filter is one
+    this offline runner can't evaluate."""
+    try:
+        ev = extract(key, event)
+    except Unsupported:
+        return None
+    return {k: v for k, v in ev.items()
+            if k not in ("_raw", "message") and not k.startswith("__")}
+
+
+class TestSyslogSourceFraming(unittest.TestCase):
+    """A Syslog Source keeps the whole line, header included, in _raw and puts
+    the body in message; sent with no application tag, a CEF line loses
+    `CEF` from message.  Whatever the framing, the regex steps must pull
+    the same fields out of a record as they do from the bare record."""
+
+    def test_framed_records_parse_like_bare_ones(self):
+        checked = 0
+        for key, rec in _syslog_records():
+            bare = _groups(key, rec)
+            if not bare:
+                continue
+            if rec.startswith("<"):
+                continue
+            if RFC3164.match(rec):
+                framings = [{"_raw": "<134>" + rec}]
+            else:
+                framings = [{"_raw": HEADER + rec, "message": rec}]
+                if rec.startswith("CEF:"):
+                    framings.append({"_raw": HEADER + rec, "message": rec[3:]})
+            for event in framings:
+                with self.subTest(key=key, framing=event["_raw"][:60]):
+                    framed = _groups(key, event) or {}
+                    self.assertEqual({k: framed.get(k) for k in bare}, bare)
+            checked += 1
+        self.assertGreater(checked, 20)
+
+    def test_no_body_parser_reads_raw_from_the_start(self):
+        for path in sorted(glob.glob(os.path.join(
+                ROOT, "data", "pipelines", "*", "*__syslog-*.json"))):
+            with open(path, encoding="utf-8") as fh:
+                fns = json.load(fh)["conf"]["functions"]
+            for fn in fns:
+                c = fn.get("conf") or {}
+                with self.subTest(path=os.path.relpath(path, ROOT)):
+                    if fn.get("id") == "regex_extract" and c.get("source", "_raw") == "_raw":
+                        self.assertNotRegex(c["regex"], r"^/\^(?:CEF|LEEF):")
+                    if fn.get("id") == "serde" and c.get("type") in ("kvp", "csv"):
+                        self.assertNotEqual(c.get("srcField", "_raw"), "_raw")
 
 
 if __name__ == "__main__":

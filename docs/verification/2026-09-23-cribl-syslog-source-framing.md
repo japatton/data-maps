@@ -41,3 +41,48 @@ match real traffic from a Syslog Source. At the time of this probe that is 76
 pipelines (26 anchored at `^CEF`, 20 at `^LEEF`, 30 at a body field). The 29
 whose regex begins with an optional `<pri>` header are unaffected. Reading
 `message` instead is not enough on its own, because of findings 2 and 3.
+
+## Fix
+
+Applied to the 96 pipelines the probe implicates:
+
+- 46 that anchored a CEF or LEEF header at the start of `_raw` now find it
+  anywhere in `_raw`. That covers the mis-framed case too: `_raw` still holds
+  `CEF:0|` when `message` has lost it.
+- 43 that parse a message body (a body-anchored regex, or a `kvp`/`csv`
+  `serde`) first set `__body` to `message`, or to `_raw` when there is no
+  `message`, and parse that. `__`-prefixed fields never reach a destination.
+- 7 whose regex parses the RFC 3164 header itself now accept a leading
+  `<pri>`.
+
+The lint rules `syslog-anchored-on-raw` and `syslog-serde-on-raw` keep the
+anchors and `_raw` parsers from coming back.
+`tests/test_pipeline_formats.py` runs every syslog sample and synthetic record
+through its pipeline's regex steps bare, framed as a Syslog Source frames it,
+and (for CEF) mis-framed, and requires the same fields each time.
+
+**Checked on lab Cribl.** Every sample and synthetic record of a changed
+pipeline (83 lines, 29 pipelines) was sent over TCP to a temporary Syslog
+Source whose pre-processing pipeline dropped everything; a line without a
+header was sent as `<134>Sep 23 12:00:00 host01 <record>`, with no application
+tag. The 83 events it built were captured at level 0 and previewed through
+both the old and the new version of their pipeline:
+
+| Result | Pipelines |
+|---|---|
+| New version extracts more, loses nothing | 13 |
+| Identical output | 16 |
+| New version loses a field | 0 |
+
+Improved: `cisco-duo/auth` and `telephony` CEF, `fireeye-hx/hx-audit` CEF,
+`paloalto-ngfw` config, globalprotect, threat, traffic and userid CEF and
+traffic LEEF, `zscaler-zia/web` LEEF, `f5-bigip-ltm/system` raw,
+`infoblox-ddi/dns-firewall-rpz` CEF, `postgresql-audit/pgaudit` raw.
+
+The identical ones are mostly `kvp`/`csv` parsers, which were already tolerant
+of a header containing no `=` or comma. Three pipelines drop or fail to parse
+their own sample in both versions - a pre-existing mismatch between record and
+pipeline, not framing: `ivanti-ics/events` kv (the sample is not the WELF
+`id=` format), `vmware-nsx/dfw-packet-log` raw (the sample is NSX 4's RFC 5424
+`FIREWALL-PKTLOG` layout, the pipeline expects `dfwpktlogs:`), and
+`workspace-one-uem/device-events` kv.

@@ -219,7 +219,7 @@ in the event — a harmless duplicate field beats a rejected pipeline. Say so in
 pipeline's `conf.description` rather than pretending it was cleaned up.
 
 
-## ★ Five platform constraints found the hard way — respect all of them
+## ★ Six platform constraints found the hard way — respect all of them
 
 1. **A field path containing `@` is rejected.** `rename.currentName/newName`,
    `eval.add[].name` and `auto_timestamp.srcField/dstField` all fail on
@@ -249,6 +249,16 @@ pipeline's `conf.description` rather than pretending it was cleaned up.
    component of an Elastic data stream name, which forbids `-`. Use
    `<tech_id>.<dataset_id>` with every hyphen replaced by `_`, e.g.
    `paloalto_ngfw.traffic`.
+6. **A Syslog Source leaves the whole line in `_raw`.** Priority and header
+   stay in `_raw`; the body is in `message` (probed on 4.19.0, see
+   `docs/verification/2026-09-23-cribl-syslog-source-framing.md`). Sent with no
+   application tag, a CEF line even loses `CEF` from `message`. So in a
+   `syslog-*` pipeline: find a CEF/LEEF header anywhere in `_raw`
+   (`/CEF:(?<v>\d+)\|.../`, never `/^CEF:/`); parse a body format from
+   `__body`, set first by an `eval` of `__e['message'] !== undefined ?
+   __e['message'] : __e['_raw']`; and if the regex reads the syslog header
+   itself, start it `^(?:<\d{1,3}>)?`. Lint: `syslog-anchored-on-raw`,
+   `syslog-serde-on-raw`.
 
 ## Build each pipeline like this
 
