@@ -1,4 +1,7 @@
+import json
 import os
+import shutil
+import subprocess
 import sys
 import unittest
 
@@ -128,6 +131,22 @@ class TestRules(unittest.TestCase):
         self.assertNotIn("distinct-drops-fields", codes(pipe(DATASET, off)))
 
 
+    def test_eval_missing_global(self):
+        def ev(value, filt="true"):
+            return pipe(DATASET, {"id": "eval", "filter": filt,
+                                  "conf": {"add": [{"name": "x", "value": value}]}})
+        self.assertIn("eval-missing-global", codes(ev("parseInt(__e['a'], 10)")))
+        self.assertIn("eval-missing-global", codes(ev("!isNaN(Number(__e['a']))")))
+        self.assertIn("eval-missing-global",
+                      codes(ev("1", filt="parseFloat(__e['a']) > 1")))
+        for ok in ("Number.parseInt(__e['a'], 10)", "Number.isNaN(Number(__e['a']))",
+                   "__e['m'] === 'Authentication Provider Error'",
+                   "__e[\"isNaN\"]", "Math.round(Number(__e['a']))"):
+            self.assertNotIn("eval-missing-global", codes(ev(ok)), ok)
+        code = {"id": "code", "filter": "true",
+                "conf": {"code": "__e['x'] = parseInt(__e['a'], 10);"}}
+        self.assertNotIn("eval-missing-global", codes(pipe(DATASET, code)))
+
     def test_syslog_framing(self):
         cef = {"id": "regex_extract", "filter": "true",
                "conf": {"regex": "/^CEF:(?<v>\\d+)\\|/", "source": "_raw"}}
@@ -150,6 +169,28 @@ class TestCorpus(unittest.TestCase):
         loaded = pipelines.load_pipelines(DATA)
         findings = cribl_lint.lint_all(loaded)
         self.assertEqual(findings, {}, cribl_lint.format_report(findings))
+
+    @unittest.skipUnless(shutil.which("node"), "node not installed")
+    def test_every_expression_compiles(self):
+        """Lint cannot parse JavaScript; Node can.  Every eval value and
+        filter must compile as an expression, or Cribl rejects the pipeline
+        (or, for a filter, never matches)."""
+        exprs = []
+        for key, doc in sorted(pipelines.load_pipelines(DATA).items()):
+            for fn in doc["conf"]["functions"]:
+                exprs.append(("%s/%s__%s" % key, fn.get("filter", "true")))
+                if fn.get("id") == "eval":
+                    exprs += [("%s/%s__%s" % key, a.get("value", ""))
+                              for a in (fn.get("conf") or {}).get("add") or []]
+        script = ("const xs = JSON.parse(require('fs').readFileSync(0, 'utf8'));"
+                  "const bad = xs.filter(([k, x]) => { try { new Function('__e',"
+                  " 'with (__e) { return (' + x + '); }'); return false; }"
+                  " catch (e) { return true; } });"
+                  "process.stdout.write(JSON.stringify(bad));")
+        out = subprocess.run(["node", "-e", script], input=json.dumps(exprs),
+                             capture_output=True, text=True, check=True).stdout
+        self.assertEqual(json.loads(out), [])
+        self.assertGreater(len(exprs), 1000)
 
     def test_duplicate_id_detected(self):
         a = pipe(DATASET)
