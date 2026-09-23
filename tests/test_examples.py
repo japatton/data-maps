@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import sys
@@ -135,6 +136,13 @@ class TestDiscover(unittest.TestCase):
         grouped = examples.by_dataset(records)
         self.assertEqual(len(grouped[("fireeye", "cm-audit")]), 2)
 
+    def test_examples_need_no_provenance_manifest(self):
+        self.write("fireeye", "cm-audit.log", b"x")
+        records, errors = self.discover()
+        self.assertEqual(errors, [])
+        self.assertEqual(records[0]["root"], "examples")
+        self.assertNotIn("source", records[0])
+
     def test_publish_copies_bytes_verbatim(self):
         blob = b"raw\xff\x00bytes"
         self.write("fireeye", "cm-audit.log", blob)
@@ -144,6 +152,120 @@ class TestDiscover(unittest.TestCase):
         path = os.path.join(out, "examples", "fireeye", "cm-audit.log")
         with open(path, "rb") as fh:
             self.assertEqual(fh.read(), blob)
+
+
+SOURCE = {"repo": "https://github.com/example/upstream", "commit": "abc123",
+          "license": "MIT", "license_file": "LICENSES/MIT.txt"}
+
+
+class TestDiscoverSamples(unittest.TestCase):
+    """Third-party samples: data/samples/, every file attributed."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.manifest = {"sources": {"upstream": dict(SOURCE)}, "files": {}}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def put(self, relpath, data):
+        path = os.path.join(self.tmp, examples.SAMPLES, *relpath.split("/"))
+        if not os.path.isdir(os.path.dirname(path)):
+            os.makedirs(os.path.dirname(path))
+        with open(path, "wb") as fh:
+            fh.write(data)
+        return path
+
+    def write(self, tech, name, data, provenance=True):
+        if provenance:
+            self.manifest["files"]["%s/%s" % (tech, name)] = {
+                "source": "upstream", "paths": ["fixtures/%s" % name]}
+        return self.put("%s/%s" % (tech, name), data)
+
+    def discover(self, manifest=True):
+        if manifest:
+            self.put("LICENSES/MIT.txt", b"MIT licence text\n")
+            self.put(examples.MANIFEST,
+                     json.dumps(self.manifest).encode("utf-8"))
+        return examples.discover_samples(self.tmp, CATALOG, TECHS)
+
+    def test_absent_directory_is_not_an_error(self):
+        self.assertEqual(examples.discover_samples(self.tmp, CATALOG, TECHS),
+                         ([], []))
+
+    def test_record_carries_root_label_and_source(self):
+        self.write("fireeye", "cm-audit-syslog-raw-upstream.log", b"x\n")
+        records, errors = self.discover()
+        self.assertEqual(errors, [])
+        rec = records[0]
+        self.assertEqual(rec["root"], "samples")
+        self.assertEqual(rec["dataset"], "cm-audit")
+        self.assertEqual(rec["label"], "syslog raw upstream")
+        self.assertEqual(rec["source"], {
+            "name": "upstream", "repo": SOURCE["repo"], "commit": "abc123",
+            "license": "MIT",
+            "paths": ["fixtures/cm-audit-syslog-raw-upstream.log"]})
+
+    def test_missing_manifest_is_fatal(self):
+        self.write("fireeye", "cm-audit.log", b"x")
+        records, errors = self.discover(manifest=False)
+        self.assertEqual(records, [])
+        self.assertTrue(any(examples.MANIFEST in e for e in errors))
+
+    def test_sample_without_provenance_is_fatal(self):
+        self.write("fireeye", "cm-audit.log", b"x", provenance=False)
+        records, errors = self.discover()
+        self.assertEqual(records, [])
+        self.assertTrue(any("cm-audit.log" in e and "provenance" in e
+                            for e in errors))
+
+    def test_unknown_source_is_fatal(self):
+        self.write("fireeye", "cm-audit.log", b"x")
+        self.manifest["files"]["fireeye/cm-audit.log"]["source"] = "nope"
+        records, errors = self.discover()
+        self.assertEqual(records, [])
+        self.assertTrue(any("nope" in e and "source" in e for e in errors))
+
+    def test_stale_provenance_row_is_fatal(self):
+        self.write("fireeye", "cm-audit.log", b"x")
+        self.manifest["files"]["fireeye/gone.log"] = {
+            "source": "upstream", "paths": ["fixtures/gone.log"]}
+        _, errors = self.discover()
+        self.assertTrue(any("fireeye/gone.log" in e and "no such" in e
+                            for e in errors))
+
+    def test_source_licence_file_must_exist(self):
+        self.write("fireeye", "cm-audit.log", b"x")
+        self.manifest["sources"]["upstream"]["license_file"] = "LICENSES/X.txt"
+        _, errors = self.discover()
+        self.assertTrue(any("LICENSES/X.txt" in e for e in errors))
+
+    def test_layout_rules_match_examples(self):
+        self.write("fireeye", "nx-alerts.log", b"x")
+        self.write("everfox-hsg", "transfer-audit.log", b"x")
+        self.write("not-a-tech", "cm-audit.log", b"x")
+        records, errors = self.discover()
+        self.assertEqual(records, [])
+        self.assertTrue(any("nx-alerts" in e for e in errors))
+        self.assertTrue(any("everfox-hsg" in e and "excluded" in e
+                            for e in errors))
+        self.assertTrue(any("not-a-tech" in e for e in errors))
+
+    def test_publish_ships_samples_with_notice_and_licences(self):
+        self.write("fireeye", "cm-audit.log", b"raw\xff")
+        self.put(examples.NOTICE, b"notice\n")
+        records, errors = self.discover()
+        self.assertEqual(errors, [])
+        out = os.path.join(self.tmp, "public")
+        examples.publish(records, out, self.tmp)
+        with open(os.path.join(out, "samples", "fireeye", "cm-audit.log"),
+                  "rb") as fh:
+            self.assertEqual(fh.read(), b"raw\xff")
+        for rel in (examples.NOTICE, examples.MANIFEST,
+                    os.path.join("LICENSES", "MIT.txt")):
+            self.assertTrue(os.path.isfile(
+                os.path.join(out, "samples", rel)), rel)
+        self.assertFalse(os.path.exists(os.path.join(out, "examples")))
 
 
 if __name__ == "__main__":

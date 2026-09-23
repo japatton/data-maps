@@ -252,6 +252,25 @@ class TestExampleExports(unittest.TestCase):
         for ds in techs[tech_id]["datasets"]:
             self.assertNotIn("recommendation", ds)
 
+    def test_export_lists_a_sample_under_samples(self):
+        catalog, techs, profiles, ecs = self.inputs()
+        tech_id = sorted(techs)[0]
+        ds_id = techs[tech_id]["datasets"][0]["id"]
+        rec = {"tech": tech_id, "dataset": ds_id, "label": "json elastic",
+               "path": "/tmp/x.log", "root": "samples",
+               "relpath": "%s/%s-json-elastic.log" % (tech_id, ds_id),
+               "size": 3, "text": "raw", "truncated": False}
+        page_model = model_mod.build_model(
+            catalog, techs, profiles, ecs, {(tech_id, ds_id): [rec]})
+        out = temp_dir(self)
+        build.write_exports(page_model, out)
+        with open(os.path.join(out, "exports", tech_id + ".json"),
+                  encoding="utf-8") as fh:
+            doc = json.load(fh)
+        self.assertEqual(doc["examples"], [
+            {"dataset": ds_id, "label": "json elastic",
+             "path": "samples/%s/%s-json-elastic.log" % (tech_id, ds_id)}])
+
     def test_export_omits_the_key_when_there_are_no_examples(self):
         catalog, techs, profiles, ecs = self.inputs()
         page_model = model_mod.build_model(catalog, techs, profiles, ecs)
