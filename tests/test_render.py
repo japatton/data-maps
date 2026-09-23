@@ -477,6 +477,31 @@ class TestExamples(unittest.TestCase):
         self.assertIn('class="example-truncated"', html)
         self.assertIn("download the full record", html)
 
+    def test_example_names_its_source_and_licence(self):
+        src = {"name": "elastic-integrations",
+               "repo": "https://github.com/elastic/integrations",
+               "commit": "0123456789abcdef0123", "license": "Elastic-2.0",
+               "paths": ["packages/panw/x/test-traffic.log"]}
+        html = self.render_with([self.rec(
+            source=src, root="samples",
+            relpath="paloalto-ngfw/traffic-syslog-csv-elastic.log")])
+        self.assertIn("Sample record", html)
+        self.assertIn('href="../samples/'
+                      'paloalto-ngfw/traffic-syslog-csv-elastic.log"', html)
+        self.assertIn('class="example-source"', html)
+        self.assertIn("elastic/integrations", html)
+        self.assertIn("0123456789ab", html)
+        self.assertIn("Elastic-2.0", html)
+        self.assertIn('href="https://github.com/elastic/integrations/blob/'
+                      '0123456789abcdef0123/packages/panw/x/test-traffic.log"',
+                      html)
+        self.assertIn('href="../samples/NOTICE.md"', html)
+
+    def test_example_without_source_has_no_source_line(self):
+        html = self.render_with([self.rec()])
+        self.assertNotIn("example-source", html)
+        self.assertIn("Example record", html)
+
     def test_untruncated_example_has_no_notice(self):
         self.assertNotIn("example-truncated",
                          self.render_with([self.rec()]))

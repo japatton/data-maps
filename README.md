@@ -92,6 +92,29 @@ typo fails the build rather than silently unpublishing a record.
 - Empty files and files over 256 KB publish but raise a data-quality
   flag asking for a representative record.
 
+### Sample records
+
+    data/samples/<tech-id>/<dataset-id>-<format>-<source>.log
+
+Third-party records, not captured ones: vendor-format test fixtures and pack
+samples from public repositories (Elastic's integration fixtures, Cribl
+packs, Splunk's attack data, Microsoft Sentinel's sample data). Same layout
+and stem rules as examples; they render in the same dataset panel as a
+*Sample record* and publish at `samples/<tech-id>/<file>`. Studio neither
+lists nor edits them.
+
+- Every file needs a row in `data/samples/SOURCES.json`: upstream
+  repository, pinned commit, upstream paths, how the records were
+  extracted, and the licence, whose text sits in `data/samples/LICENSES/`.
+  A sample without its row, a row without its file, or a source whose
+  licence text is missing is a **hard error**.
+- Each file stays under its source's licence, not this repository's; the
+  page shows the source and licence under every sample, and the manifest,
+  `NOTICE.md` and `LICENSES/` publish beside the samples. The Elastic
+  fixtures are under the Elastic License 2.0.
+- A sample is filed only against a format the catalog already lists for
+  that dataset; a record in another format is left out, not relabelled.
+
 What the repository *does* record is internal engineering context:
 which technologies we ingest, that a cross-domain guard exists in the
 architecture, and our parsing decisions. That is ordinary

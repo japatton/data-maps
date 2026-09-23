@@ -264,7 +264,9 @@ def write_exports(page_model, out_dir):
                 for rec in ds_view["examples"]:
                     listing.append({"dataset": rec["dataset"],
                                     "label": rec["label"],
-                                    "path": "examples/" + rec["relpath"]})
+                                    "path": "%s/%s" % (
+                                        rec.get("root", "examples"),
+                                        rec["relpath"])})
             if listing:
                 payload["examples"] = listing
             _write_json(exports_dir, view["entry"]["id"] + ".json", payload)
@@ -414,10 +416,14 @@ def main(argv=None, data_dir=None, out_dir=None, environ=None):
     # says exactly that.  When the data is valid this still reports schema
     # and example problems together, in one pass.
     records = []
+    samples = []
     if not errors:
         records, example_errors = examples_mod.discover(data_dir, catalog,
                                                         technologies)
         errors.extend(example_errors)
+        samples, sample_errors = examples_mod.discover_samples(
+            data_dir, catalog, technologies)
+        errors.extend(sample_errors)
     if errors:
         for error in errors:
             sys.stderr.write("FATAL: %s\n" % error)
@@ -435,7 +441,7 @@ def main(argv=None, data_dir=None, out_dir=None, environ=None):
             return 1
     page_model = model_mod.build_model(
         catalog, technologies, profiles, ecs,
-        examples_mod.by_dataset(records))
+        examples_mod.by_dataset(records + samples))
     try:
         loaded = pipelines_mod.load_pipelines(data_dir)
         page_model["flags"].extend(
@@ -454,16 +460,16 @@ def main(argv=None, data_dir=None, out_dir=None, environ=None):
     envelopes = write_block_exports(page_model, out_dir, data_dir, env)
     page_model["ingest"] = envelopes
     write_picker_index(page_model, out_dir, envelopes)
-    examples_mod.publish(records, out_dir)
+    examples_mod.publish(records + samples, out_dir, data_dir)
     studio_mod.publish(ROOT, out_dir, catalog, technologies, profiles, ecs,
                        config, records)
     print("Built %s: %d technologies (%d with maps), %d datasets, "
-          "%d examples, %d pipelines, %d flags"
+          "%d examples, %d samples, %d pipelines, %d flags"
           % (out_dir,
              page_model["summary"]["technologies"],
              sum(1 for v in page_model["technologies"] if v["doc"]),
              page_model["summary"]["datasets"],
-             len(records),
+             len(records), len(samples),
              len(page_model["pipelines"]),
              len(page_model["flags"])))
     return 0
