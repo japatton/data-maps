@@ -45,6 +45,9 @@ def _filter_allows(expr, event):
     m = re.match(r"^__e\['([^']+)'\]\s*(===|!==)\s*undefined$", expr)
     if m:
         return (m.group(1) not in event) == (m.group(2) == "===")
+    m = re.match(r"^(?:__e\['([^']+)'\]|(\w+))\s*===?\s*'([^']*)'$", expr)
+    if m:
+        return event.get(m.group(1) or m.group(2)) == m.group(3)
     m = re.match(r"^__e\['([^']+)'\]\s*===?\s*'([^']*)'$", expr)
     if m:
         return event.get(m.group(1)) == m.group(2)
@@ -65,6 +68,12 @@ def extract(key, raw):
             for add in (fn.get("conf") or {}).get("add") or []:
                 if add.get("value") == BODY:
                     event[add["name"]] = event.get("message", event["_raw"])
+                    continue
+                m = re.match(r"^(/.*/[a-z]*)\.test\((\w+)\) \? '([^']*)' : '([^']*)'$",
+                             add.get("value", ""))
+                if m and isinstance(event.get(m.group(2)), str):
+                    hit = _py_regex(m.group(1)).search(event[m.group(2)])
+                    event[add["name"]] = m.group(3) if hit else m.group(4)
             continue
         if fn.get("id") != "regex_extract":
             continue
@@ -298,6 +307,34 @@ class TestF5ApmHeader(unittest.TestCase):
             for head in ("<134>Sep 23 12:00:00 host01 notice ", "<134>Sep 23 12:00:00 host01 "):
                 ev = extract("f5-bigip-apm/%s__syslog-raw" % key, head + tail)
                 self.assertEqual(ev.get("message_id"), "01490102", (key, head))
+
+
+class TestNetappManagementAudit(unittest.TestCase):
+    """ONTAP 9 audit.log: <seq> <id> <time with offset> [kern_audit...]
+    <session>:<command> :: <vserver>:<app> :: <remote> :: <vserver>:<user>
+    :: <input> :: <state> [:: <message>], as SC4S recorded it."""
+    key = "netapp-ontap/management-audit__syslog-raw"
+
+    def test_sc4s_record(self):
+        with open(os.path.join(ROOT, "data", "samples", "netapp-ontap",
+                               "management-audit-syslog-raw-sc4s.log"), encoding="utf-8") as fh:
+            line = fh.readline().rstrip("\n")
+        ev = extract(self.key, line)
+        self.assertEqual((ev.get("timestamp"), ev.get("session_id"), ev.get("command_id"),
+                          ev.get("vserver"), ev.get("application"), ev.get("location"),
+                          ev.get("username"), ev.get("state")),
+                         ("Thu Oct 03 2024 11:36:44 -06:00", "8004b7000021e73b", "4005f7000021e73d",
+                          "cluster", "ssh", "0.0.0.0:32879", "admin", "Pending"))
+        self.assertEqual(ev.get("input"), "qos statistics volume performance show -rows 20 -iter 1")
+        self.assertEqual((ev.get("location_ip"), ev.get("location_port")), ("0.0.0.0", "32879"))
+
+    def test_error_with_message(self):
+        ev = extract(self.key, "<14>Sep 23 12:00:00 host01: host01: 00000030.00c8f1e2 11e5347f "
+                     "Wed Sep 23 2026 12:00:00 +00:00 [kern_audit:info:1740] 8003e9000000b7d8:8003e9000000b7d9 "
+                     ":: cluster1:ssh :: 192.0.2.5:57404 :: cluster1:admin01 :: volume delete -volume vol9 "
+                     ":: Error :: entry doesn't exist")
+        self.assertEqual((ev.get("username"), ev.get("state"), ev.get("message"), ev.get("location")),
+                         ("admin01", "Error", "entry doesn't exist", "192.0.2.5:57404"))
 
 
 class TestNsxDfwPacketLog(unittest.TestCase):
