@@ -161,6 +161,30 @@ def lint_syslog_framing(doc):
     return out
 
 
+# Fields a Cribl Syslog Source sets.  A regex_extract capture of the same
+# name, without `overwrite`, turns the field into an array (probed on
+# 4.19.0: severity 6 plus a captured '9' became [6, '9']).  serde overwrites.
+SYSLOG_SOURCE_FIELDS = ("message", "host", "appname", "procid", "msgid",
+                        "severity", "facility", "severityName",
+                        "facilityName", "structuredData")
+
+
+def lint_syslog_captures(doc):
+    """[(code, detail)] for a syslog-* regex_extract that captures into a
+    field the Syslog Source has already set, without overwrite."""
+    out = []
+    for fn in (doc.get("conf") or {}).get("functions") or []:
+        c = fn.get("conf") or {}
+        if (fn.get("id") != "regex_extract" or fn.get("disabled") is True
+                or c.get("overwrite") is True):
+            continue
+        rxs = [c.get("regex", "")] + [r.get("regex", "") for r in c.get("regexList") or []]
+        names = set(re.findall(r"\(\?<(\w+)>", " ".join(str(r) for r in rxs)))
+        for g in sorted(names & set(SYSLOG_SOURCE_FIELDS)):
+            out.append(("syslog-capture-collides", g))
+    return out
+
+
 def lint_all(pipelines):
     """{code: [detail lines]} over a {(tech, ds, fmt): doc} mapping."""
     findings = defaultdict(list)
@@ -172,6 +196,7 @@ def lint_all(pipelines):
         found = lint_pipeline(doc)
         if key[2].startswith("syslog-"):
             found += lint_syslog_framing(doc)
+            found += lint_syslog_captures(doc)
         for code, detail in found:
             findings[code].append(("%s  %s" % (rel, detail)).rstrip())
     for pid, rels in ids.items():

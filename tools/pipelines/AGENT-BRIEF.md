@@ -219,7 +219,7 @@ in the event — a harmless duplicate field beats a rejected pipeline. Say so in
 pipeline's `conf.description` rather than pretending it was cleaned up.
 
 
-## ★ Seven platform constraints found the hard way — respect all of them
+## ★ Eight platform constraints found the hard way — respect all of them
 
 1. **A field path containing `@` is rejected.** `rename.currentName/newName`,
    `eval.add[].name` and `auto_timestamp.srcField/dstField` all fail on
@@ -270,6 +270,13 @@ pipeline's `conf.description` rather than pretending it was cleaned up.
    make every fallback branch keep `__e['_time']` - an expression that yields
    `undefined`, `null` or `NaN` there removes or nulls the event time. Lint:
    `eval-missing-global`.
+8. **`regex_extract` into an existing field makes an array** unless its conf
+   sets `"overwrite": true` (probed on 4.19.0: `severity` 6 plus a captured
+   `'9'` became `[6, '9']`). A Syslog Source has already set `message`,
+   `host`, `appname`, `procid`, `msgid`, `severity` and `facility`, so a
+   `syslog-*` regex that captures any of those names - the CEF header's
+   `severity` is the usual one - needs `overwrite`. `serde` overwrites on its
+   own. Lint: `syslog-capture-collides`.
 
 ## Build each pipeline like this
 
