@@ -337,6 +337,78 @@ class TestNetappManagementAudit(unittest.TestCase):
                          ("admin01", "Error", "entry doesn't exist", "192.0.2.5:57404"))
 
 
+sys.path.insert(0, ROOT)
+from datamaps import cribl_paths  # noqa: E402
+RENEST_CODE = cribl_paths.renest_function()["conf"]["code"]
+
+
+def run_code_steps(key, event):
+    """Run a pipeline's code steps, and the evals written in the guarded
+    _time form, over one event in Node - the way Cribl runs them."""
+    import shutil
+    import subprocess
+    if not shutil.which("node"):
+        raise unittest.SkipTest("node not installed")
+    steps = []
+    for fn in _pipeline(key)["conf"]["functions"]:
+        if fn.get("disabled") is True:
+            continue
+        if fn.get("id") == "code":
+            if fn["conf"]["code"] == RENEST_CODE:
+                continue
+            steps.append(["code", fn["conf"]["code"]])
+        elif fn.get("id") == "eval":
+            steps.append(["eval", [[a["name"].strip("'"), a["value"]]
+                                   for a in (fn.get("conf") or {}).get("add") or []]])
+    script = ("const {steps, ev} = JSON.parse(require('fs').readFileSync(0, 'utf8'));"
+              "const __e = ev;"
+              "for (const [kind, body] of steps) {"
+              "  if (kind === 'code') { new Function('__e', body)(__e); continue; }"
+              "  for (const [name, value] of body) {"
+              "    try { __e[name] = new Function('__e', 'with (__e) { return (' + value + '); }')(__e); }"
+              "    catch (e) { __e[name] = null; } } }"
+              "process.stdout.write(JSON.stringify(__e));")
+    out = subprocess.run(["node", "-e", script], input=json.dumps({"steps": steps, "ev": event}),
+                         capture_output=True, text=True, check=True).stdout
+    return json.loads(out)
+
+
+class TestTenableCsv(unittest.TestCase):
+    """Header-labelled rows as Cribl's CSV event breaker hands them over, from
+    a Security Center Vulnerability Detail List export and a Nessus scanner
+    export."""
+    key = "tenable-nessus/vulnerability__csv-file"
+
+    def row(self, name):
+        import csv
+        with open(os.path.join(ROOT, "data", "samples", "tenable-nessus", name),
+                  encoding="utf-8") as fh:
+            rows = list(csv.reader(fh))
+        ev = {h: v for h, v in zip(rows[0], rows[1]) if h}
+        ev.update({"_raw": "row", "_time": 1, "host": "collector01"})
+        return ev
+
+    def test_security_center_export(self):
+        ev = run_code_steps(self.key, self.row("vulnerability-csv-file-defectdojo-sc.log"))
+        self.assertEqual((ev.get("tenable_sc.vulnerability.plugin_id"), ev.get("vulnerability.severity"),
+                          ev.get("vulnerability.id"), ev.get("vulnerability.score.base"),
+                          ev.get("host.ip"), ev.get("destination.port"), ev.get("network.transport"),
+                          ev.get("labels.collector_host")),
+                         (42873, "High", "CVE-2016-2183", 7.5, "1.2.3.4", 443, "tcp", "collector01"))
+        self.assertEqual(ev.get("event.start"), "2024-02-09T10:48:42.000Z")
+        self.assertNotEqual(ev.get("_time"), 1)
+        self.assertEqual(ev.get("tenable_sc.vulnerability.extra.repository"), "Individual Scan")
+        self.assertFalse([k for k in ev if " " in k])
+
+    def test_nessus_export(self):
+        ev = run_code_steps(self.key, self.row("vulnerability-csv-file-defectdojo.log"))
+        self.assertEqual((ev.get("tenable_sc.vulnerability.plugin_id"), ev.get("vulnerability.severity"),
+                          ev.get("host.ip"), ev.get("destination.port")),
+                         (42873, "High", "192.168.0.100", 3389))
+        self.assertEqual(ev.get("_time"), 1)
+        self.assertFalse([k for k in ev if " " in k])
+
+
 class TestNsxDfwPacketLog(unittest.TestCase):
     """The layouts in the NSX 4.0 Administration Guide, 'Distributed Firewall
     Packet Logs', with reserved values, framed as a log file, an ESXi syslog
