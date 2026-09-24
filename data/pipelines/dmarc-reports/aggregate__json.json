@@ -8,7 +8,7 @@
         "id": "comment",
         "filter": "true",
         "conf": {
-          "comment": "dmarc-reports / aggregate / json. parsedmarc is the collector (mailbox poll + XML parse + fan-out), not a Cribl/Elastic pack -- no dmarc integration exists anywhere, so every field is hand-mapped. Per recommendations.direct.cribl: _time/@timestamp derives from date_end, never parse-time, since reports arrive 24-48h after the window they describe. message_count is the unit of volume (one row = N messages), kept off event.* so nothing double-counts it. The work order calls parsedmarc's output 'flat' JSON, so dotted vendor names (published_policy.domain, policy_overrides.type, dkim_results.result, spf_results.result) are treated as literal flat keys with a dot, not nested paths -- bracket read, not rename (see README, assumption pending a real sample). source_country's alpha-2-vs-full-name variance is split heuristically by length, no GeoIP lookup here. _raw dropped per the recommendation."
+          "comment": "dmarc-reports / aggregate / json. parsedmarc is the collector (mailbox poll + XML parse + fan-out), not a Cribl/Elastic pack -- no dmarc integration exists anywhere, so every field is hand-mapped. Per recommendations.direct.cribl: _time/@timestamp derives from date_end, never parse-time, since reports arrive 24-48h after the window they describe. message_count is the unit of volume (one row = N messages), kept off event.* so nothing double-counts it. Three parsedmarc output shapes are normalised onto per-row names first (see the unroll and code steps); the dotted vendor names (published_policy.domain, policy_overrides.type, dkim_results.result, spf_results.result) are treated as literal flat keys with a dot, not nested paths -- bracket read, not rename (see README, assumption pending a real sample). source_country's alpha-2-vs-full-name variance is split heuristically by length, no GeoIP lookup here. _raw dropped per the recommendation."
         },
         "description": "record approach, flat-vs-nested dotted-key decision, and rationale"
       },
@@ -21,6 +21,24 @@
           "srcField": "_raw"
         },
         "description": "parse the per-row JSON document parsedmarc ships to the collector"
+      },
+      {
+        "id": "unroll",
+        "filter": "Array.isArray(__e['records'])",
+        "conf": {
+          "srcExpr": "__e['records']",
+          "dstField": "__dm_record"
+        },
+        "description": "parsedmarc's per-report JSON (its JSON file output) carries every record in records[]: one event per record, report fields copied"
+      },
+      {
+        "id": "code",
+        "filter": "true",
+        "conf": {
+          "maxNumOfIterations": 5000,
+          "code": "const md = (__e['report_metadata'] && typeof __e['report_metadata'] === 'object') ? __e['report_metadata'] : {};\nconst rec = __e['__dm_record'] !== undefined ? __e['__dm_record'] : ((__e['source'] && typeof __e['source'] === 'object' && __e['alignment'] && typeof __e['alignment'] === 'object') ? __e : null);\nconst pol = __e['policy_published'] || __e['published_policy'];\nconst set = (k, v) => { if (v !== undefined && v !== null && v !== '' && __e[k] === undefined) __e[k] = v; };\nconst epoch = (s) => {\n  if (s === undefined || s === null || s === '') return undefined;\n  if (typeof s === 'number') return s;\n  const str = String(s).trim().replace(' ', 'T');\n  const t = Date.parse(/(?:[zZ]|[+-]\\d\\d:?\\d\\d)$/.test(str) ? str : str + 'Z');\n  return Number.isNaN(t) ? undefined : t / 1000;\n};\nset('org_name', md.org_name); set('org_email', md.org_email); set('report_id', md.report_id);\nif (rec) {\n  const s = rec.source || {};\n  set('source_ip_address', s.ip_address); set('source_reverse_dns', s.reverse_dns); set('source_base_domain', s.base_domain);\n  set('source_country', s.country); set('source_asn', s.asn); set('source_as_name', s.as_name);\n  set('message_count', rec.count);\n  const pe = rec.policy_evaluated || {};\n  set('disposition', pe.disposition);\n  if (Array.isArray(pe.policy_override_reasons) && pe.policy_override_reasons.length) set('policy_overrides.type', pe.policy_override_reasons[0].type);\n  if (rec.alignment && typeof rec.alignment.dmarc === 'boolean') set('passed_dmarc', rec.alignment.dmarc);\n  const ids = rec.identifiers || {};\n  set('header_from', ids.header_from); set('envelope_from', ids.envelope_from);\n  const ar = rec.auth_results || {};\n  if (Array.isArray(ar.dkim) && ar.dkim.length) set('dkim_results.result', ar.dkim[0].result);\n  if (Array.isArray(ar.spf) && ar.spf.length) set('spf_results.result', ar.spf[0].result);\n  set('date_begin', epoch(rec.interval_begin)); set('date_end', epoch(rec.interval_end));\n}\nif (Array.isArray(__e['dkim_results']) && __e['dkim_results'].length) set('dkim_results.result', __e['dkim_results'][0].result);\nif (Array.isArray(__e['spf_results']) && __e['spf_results'].length) set('spf_results.result', __e['spf_results'][0].result);\nif (pol && typeof pol === 'object') { set('published_policy.domain', pol.domain); set('published_policy.p', pol.p); }\nconst dr = Array.isArray(__e['date_range']) ? __e['date_range'] : [];\nset('date_begin', epoch(__e['interval_begin'] !== undefined ? __e['interval_begin'] : (md.begin_date !== undefined ? md.begin_date : (__e['begin_date'] !== undefined ? __e['begin_date'] : dr[0]))));\nset('date_end', epoch(__e['interval_end'] !== undefined ? __e['interval_end'] : (md.end_date !== undefined ? md.end_date : (__e['end_date'] !== undefined ? __e['end_date'] : dr[1]))));\nfor (const k of ['__dm_record', 'records', 'report_metadata', 'policy_published', 'published_policy', 'source', 'alignment', 'policy_evaluated', 'identifiers', 'auth_results', 'dkim_results', 'spf_results', 'date_range']) {\n  if (__e[k] !== null && typeof __e[k] === 'object') delete __e[k];\n}"
+        },
+        "description": "Normalise the three parsedmarc shapes - per-report JSON (unrolled above), Kafka per-record slices (nested source/alignment/... plus policy_published and date_range) and Splunk HEC per-row events (flat source_*, nested published_policy, dkim/spf result lists) - onto the per-row names this map reads; epoch dates from the record interval, else the report window. Nothing already present is overwritten."
       },
       {
         "id": "eval",
