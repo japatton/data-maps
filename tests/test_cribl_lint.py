@@ -147,6 +147,28 @@ class TestRules(unittest.TestCase):
                 "conf": {"code": "__e['x'] = parseInt(__e['a'], 10);"}}
         self.assertNotIn("eval-missing-global", codes(pipe(DATASET, code)))
 
+    def test_time_guard(self):
+        def ev(*adds):
+            return cribl_lint.lint_all({("t", "d", "json"): pipe(DATASET, {
+                "id": "eval", "filter": "true", "conf": {"add": list(adds)}})})
+        raw = {"name": "_time", "value": "Date.parse(__e['ts'])/1000"}
+        self.assertIn("eval-time-unguarded", ev(raw))
+        guarded = [{"name": "__dm_time", "value": raw["value"]},
+                   {"name": "_time", "value": cribl_lint.TIME_GUARD}]
+        self.assertEqual(ev(*guarded), {})
+        self.assertIn("eval-time-guard-orphaned", ev(guarded[1]))
+
+    def test_syslog_capture_collides(self):
+        rx = {"id": "regex_extract", "filter": "true",
+              "conf": {"regex": "/sev=(?<severity>\\d+) (?<body>.*)$/", "source": "_raw"}}
+        found = lambda fmt, fn: cribl_lint.lint_all({("t", "d", fmt): pipe(DATASET, fn)})
+        self.assertIn("syslog-capture-collides", found("syslog-cef", rx))
+        listed = dict(rx, conf={"regex": "/(?<body>.*)/", "source": "_raw",
+                                "regexList": [{"regex": "/h=(?<host>\\S+)/"}]})
+        self.assertIn("syslog-capture-collides", found("syslog-raw", listed))
+        self.assertEqual(found("syslog-cef", dict(rx, conf=dict(rx["conf"], overwrite=True))), {})
+        self.assertEqual(found("json", rx), {})
+
     def test_syslog_framing(self):
         cef = {"id": "regex_extract", "filter": "true",
                "conf": {"regex": "/^CEF:(?<v>\\d+)\\|/", "source": "_raw"}}

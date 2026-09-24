@@ -46,7 +46,8 @@ class TestEnvelope(unittest.TestCase):
         self.assertEqual(env["id"], "dm_t_d_f")
         self.assertEqual(env["coverage"], {"translated": 2, "partial": 1,
                                            "manual": 1, "total": 4})
-        self.assertEqual(env["field_map"], {"_time": "@timestamp", "_raw": "message"})
+        self.assertEqual(env["field_map"], {"_time": "@timestamp", "_raw": "message",
+                                            "__body": "message"})
         self.assertEqual(env["requires"], ["painless-regex"])
         self.assertEqual(
             env["pipeline"]["description"],
@@ -94,6 +95,21 @@ class TestEnvelope(unittest.TestCase):
         self.assertIn("had no g flag", mask_notes[0])
 
 
+class TestScratchCleanup(unittest.TestCase):
+    def test_scratch_object_is_removed_at_the_end(self):
+        env = ip.translate_pipeline(cribl(
+            {"id": "eval", "filter": "true", "conf": {"add": [
+                {"name": "__dm_time", "value": "Date.parse(__e['ts'])/1000"},
+                {"name": "_time", "value": "__e['__dm_time'] !== undefined ? __e['__dm_time'] : __e['_time']"}]}},
+            DATASET))
+        self.assertEqual(env["pipeline"]["processors"][-1],
+                         {"remove": {"field": "dm_tmp", "ignore_missing": True}})
+
+    def test_no_scratch_no_cleanup(self):
+        env = ip.translate_pipeline(cribl(DATASET))
+        self.assertNotIn("remove", env["pipeline"]["processors"][-1])
+
+
 class TestCorpus(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -124,8 +140,8 @@ class TestCorpus(unittest.TestCase):
         self.assertGreaterEqual(total["translated"], TRANSLATED_FLOOR)
 
 
-FLOOR = 1952
-TRANSLATED_FLOOR = 1758
+FLOOR = 2617
+TRANSLATED_FLOOR = 2449
 
 
 if __name__ == "__main__":

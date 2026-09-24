@@ -167,6 +167,21 @@ class TestPaths(unittest.TestCase):
         self.assertEqual(write_target("_time"), ([], "ctx['@timestamp']"))
         self.assertEqual(write_target("x"), ([], "ctx.x"))
 
+    def test_body_and_scratch_fields(self):
+        self.assertEqual(read_path("__body"), "ctx.message")
+        self.assertEqual(read_path("__dm_time"), "ctx.dm_tmp?.time")
+        self.assertEqual(write_target("__dm_time"),
+                         (["if (ctx.dm_tmp == null) { ctx.dm_tmp = [:]; }"],
+                          "ctx.dm_tmp.time"))
+
+    def test_number_parse_methods_translate_like_the_globals(self):
+        self.assertEqual(translate_value("Number.parseInt(__e['a'], 10)").source,
+                         translate_value("parseInt(__e['a'], 10)").source)
+        self.assertEqual(translate_value("Number.parseFloat(__e['a'])").source,
+                         translate_value("parseFloat(__e['a'])").source)
+        with self.assertRaises(Untranslatable):
+            translate_value("Number.isNaN(__e['a'])")
+
     def test_internal_field_is_untranslatable(self):
         with self.assertRaises(Untranslatable):
             translate_value("__e['__inputId']")

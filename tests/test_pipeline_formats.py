@@ -40,9 +40,14 @@ def _filter_allows(expr, event):
     expr = (expr or "true").strip()
     if expr == "true":
         return True
-    m = re.match(r"^__e\['([^']+)'\]\s*===\s*undefined$", expr)
+    if " || " in expr:
+        return any(_filter_allows(part, event) for part in expr.split(" || "))
+    m = re.match(r"^__e\['([^']+)'\]\s*(===|!==)\s*undefined$", expr)
     if m:
-        return m.group(1) not in event
+        return (m.group(1) not in event) == (m.group(2) == "===")
+    m = re.match(r"^(?:__e\['([^']+)'\]|(\w+))\s*===?\s*'([^']*)'$", expr)
+    if m:
+        return event.get(m.group(1) or m.group(2)) == m.group(3)
     m = re.match(r"^__e\['([^']+)'\]\s*===?\s*'([^']*)'$", expr)
     if m:
         return event.get(m.group(1)) == m.group(2)
@@ -63,6 +68,12 @@ def extract(key, raw):
             for add in (fn.get("conf") or {}).get("add") or []:
                 if add.get("value") == BODY:
                     event[add["name"]] = event.get("message", event["_raw"])
+                    continue
+                m = re.match(r"^(/.*/[a-z]*)\.test\((\w+)\) \? '([^']*)' : '([^']*)'$",
+                             add.get("value", ""))
+                if m and isinstance(event.get(m.group(2)), str):
+                    hit = _py_regex(m.group(1)).search(event[m.group(2)])
+                    event[add["name"]] = m.group(3) if hit else m.group(4)
             continue
         if fn.get("id") != "regex_extract":
             continue
@@ -243,6 +254,87 @@ class TestIvantiEventsWelf(unittest.TestCase):
                           ev.get("msg")),
                          ("Default Network", "user01@example.com", "Users", "vpn",
                           "AUT24414: Agent login succeeded for user01@example.com/Users"))
+
+
+class TestIvantiAccessWelf(unittest.TestCase):
+    """admin-access and user-access WELF, in the key layouts of SEKOIA-IO's
+    Pulse Connect Secure tests: mgmt lines put proto..rcvd between type and
+    msg; newer vpn lines add sessionID before proto."""
+    head = 'id=firewall time="2026-09-23 12:00:00" pri=6 fw=192.0.2.10 vpn=host01 ivs=Default Network '
+    mgmt = head + ('user=admin01 realm="Admin Users" roles=".Administrators" type=mgmt proto= '
+                   'src=192.0.2.40 dst= dstname= sent= rcvd= '
+                   'msg="ADM22668: Login succeeded for admin01/Admin Users from 192.0.2.40."')
+    vpn_old = head + ('user=user01 realm="Users" roles="Role01" proto=auth src=192.0.2.30 dst= '
+                      'dstname= type=vpn op= arg="" result= sent= rcvd= agent="" duration= '
+                      'msg="AUT23457: Login failed using auth server Local (Local Authentication)."')
+    vpn_new = vpn_old.replace('roles="Role01" proto=', 'roles="Role01" sessionID="9000001" proto=') \
+                     .replace('AUT23457: Login failed', 'AUT24326: Primary authentication successful')
+
+    def test_admin_mgmt_layout(self):
+        ev = extract("ivanti-ics/admin-access__syslog-kv", self.mgmt)
+        self.assertEqual((ev.get("ivs"), ev.get("user"), ev.get("realm"), ev.get("roles"),
+                          ev.get("type"), ev.get("admin_src_ip")),
+                         ("Default Network", "admin01", "Admin Users", ".Administrators",
+                          "mgmt", "192.0.2.40"))
+        self.assertTrue(ev.get("msg", "").startswith("ADM22668:"))
+
+    def test_user_access_with_and_without_session_id(self):
+        for line in (self.vpn_old, self.vpn_new):
+            ev = extract("ivanti-ics/user-access__syslog-kv", line)
+            self.assertEqual((ev.get("user"), ev.get("realm"), ev.get("proto"), ev.get("src"),
+                              ev.get("ivs")),
+                             ("user01", "Users", "auth", "192.0.2.30", "Default Network"), line)
+            self.assertTrue(ev.get("msg", "").startswith("AUT2"), line)
+            self.assertNotIn("dst", ev)
+
+
+class TestF5ApmHeader(unittest.TestCase):
+    """BIG-IP's syslog puts the level word between host and process
+    ('host01 notice tmm1[12390]:'), as in SC4S's APM test records."""
+
+    def test_access_policy_sc4s_record(self):
+        with open(os.path.join(ROOT, "data", "samples", "f5-bigip-apm",
+                               "access-policy-syslog-raw-sc4s.log"), encoding="utf-8") as fh:
+            line = fh.readline().rstrip("\n")
+        ev = extract("f5-bigip-apm/access-policy__syslog-raw", line)
+        self.assertEqual((ev.get("service"), ev.get("pid"), ev.get("message_id"),
+                          ev.get("session_id"), ev.get("client_ip")),
+                         ("tmm1", "12390", "01490500", "e03c2ca8", "71.0.0.0"))
+
+    def test_level_word_is_optional_in_every_apm_header(self):
+        tail = "apmd[11023]: 01490102:5: /Common/ap01:Common:8c6be305: Access policy result: Network_Access"
+        for key in ("access-policy", "acl", "network-access"):
+            for head in ("<134>Sep 23 12:00:00 host01 notice ", "<134>Sep 23 12:00:00 host01 "):
+                ev = extract("f5-bigip-apm/%s__syslog-raw" % key, head + tail)
+                self.assertEqual(ev.get("message_id"), "01490102", (key, head))
+
+
+class TestNetappManagementAudit(unittest.TestCase):
+    """ONTAP 9 audit.log: <seq> <id> <time with offset> [kern_audit...]
+    <session>:<command> :: <vserver>:<app> :: <remote> :: <vserver>:<user>
+    :: <input> :: <state> [:: <message>], as SC4S recorded it."""
+    key = "netapp-ontap/management-audit__syslog-raw"
+
+    def test_sc4s_record(self):
+        with open(os.path.join(ROOT, "data", "samples", "netapp-ontap",
+                               "management-audit-syslog-raw-sc4s.log"), encoding="utf-8") as fh:
+            line = fh.readline().rstrip("\n")
+        ev = extract(self.key, line)
+        self.assertEqual((ev.get("timestamp"), ev.get("session_id"), ev.get("command_id"),
+                          ev.get("vserver"), ev.get("application"), ev.get("location"),
+                          ev.get("username"), ev.get("state")),
+                         ("Thu Oct 03 2024 11:36:44 -06:00", "8004b7000021e73b", "4005f7000021e73d",
+                          "cluster", "ssh", "0.0.0.0:32879", "admin", "Pending"))
+        self.assertEqual(ev.get("input"), "qos statistics volume performance show -rows 20 -iter 1")
+        self.assertEqual((ev.get("location_ip"), ev.get("location_port")), ("0.0.0.0", "32879"))
+
+    def test_error_with_message(self):
+        ev = extract(self.key, "<14>Sep 23 12:00:00 host01: host01: 00000030.00c8f1e2 11e5347f "
+                     "Wed Sep 23 2026 12:00:00 +00:00 [kern_audit:info:1740] 8003e9000000b7d8:8003e9000000b7d9 "
+                     ":: cluster1:ssh :: 192.0.2.5:57404 :: cluster1:admin01 :: volume delete -volume vol9 "
+                     ":: Error :: entry doesn't exist")
+        self.assertEqual((ev.get("username"), ev.get("state"), ev.get("message"), ev.get("location")),
+                         ("admin01", "Error", "entry doesn't exist", "192.0.2.5:57404"))
 
 
 class TestNsxDfwPacketLog(unittest.TestCase):
