@@ -161,6 +161,31 @@ def lint_syslog_framing(doc):
     return out
 
 
+# An eval that assigns _time from an expression that fails - a missing field,
+# an unparseable date, a throw - writes null or NaN over the event time.  The
+# expression goes to a scratch field and _time takes it only when it is a
+# real value; this exact form translates to Painless.
+TIME_GUARD = ("__e['__dm_time'] !== undefined && __e['__dm_time'] !== null && "
+              "__e['__dm_time'] === __e['__dm_time'] ? __e['__dm_time'] : __e['_time']")
+
+
+def lint_time_guard(doc):
+    out = []
+    for fn in (doc.get("conf") or {}).get("functions") or []:
+        if fn.get("id") != "eval" or fn.get("disabled") is True:
+            continue
+        adds = (fn.get("conf") or {}).get("add") or []
+        for i, a in enumerate(adds):
+            if a.get("name") != "_time" or a.get("value") == TIME_GUARD:
+                continue
+            out.append(("eval-time-unguarded", str(a.get("value", ""))[:80]))
+        for i, a in enumerate(adds):
+            if (a.get("value") == TIME_GUARD and
+                    (i == 0 or adds[i - 1].get("name") != "__dm_time")):
+                out.append(("eval-time-guard-orphaned", "guard without __dm_time before it"))
+    return out
+
+
 # Fields a Cribl Syslog Source sets.  A regex_extract capture of the same
 # name, without `overwrite`, turns the field into an array (probed on
 # 4.19.0: severity 6 plus a captured '9' became [6, '9']).  serde overwrites.
@@ -193,7 +218,7 @@ def lint_all(pipelines):
         doc = pipelines[key]
         rel = "%s/%s__%s" % key
         ids[doc.get("id", "")].append(rel)
-        found = lint_pipeline(doc)
+        found = lint_pipeline(doc) + lint_time_guard(doc)
         if key[2].startswith("syslog-"):
             found += lint_syslog_framing(doc)
             found += lint_syslog_captures(doc)

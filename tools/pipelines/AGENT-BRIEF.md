@@ -219,7 +219,7 @@ in the event — a harmless duplicate field beats a rejected pipeline. Say so in
 pipeline's `conf.description` rather than pretending it was cleaned up.
 
 
-## ★ Eight platform constraints found the hard way — respect all of them
+## ★ Nine platform constraints found the hard way — respect all of them
 
 1. **A field path containing `@` is rejected.** `rename.currentName/newName`,
    `eval.add[].name` and `auto_timestamp.srcField/dstField` all fail on
@@ -277,6 +277,16 @@ pipeline's `conf.description` rather than pretending it was cleaned up.
    `syslog-*` regex that captures any of those names - the CEF header's
    `severity` is the usual one - needs `overwrite`. `serde` overwrites on its
    own. Lint: `syslog-capture-collides`.
+9. **Never assign `_time` straight from an expression.** One that fails - a
+   missing field, an unparseable date, a throw - writes `null` or `NaN` over
+   the event time (probed on 4.19.0: a throwing expression yields `null`). Put
+   the expression in `__dm_time`, then in the same `eval`, next entry:
+   `_time` = `__e['__dm_time'] !== undefined && __e['__dm_time'] !== null &&
+   __e['__dm_time'] === __e['__dm_time'] ? __e['__dm_time'] : __e['_time']`
+   (the `x === x` test rejects `NaN`). Entries of one `eval` run in order.
+   That exact form translates to Painless; `__dm_*` scratch fields become
+   `dm_tmp.*` in Elasticsearch and are removed at the end. Lint:
+   `eval-time-unguarded`.
 
 ## Build each pipeline like this
 

@@ -140,8 +140,8 @@ class TestCorpus(unittest.TestCase):
         self.assertGreaterEqual(total["translated"], TRANSLATED_FLOOR)
 
 
-FLOOR = 2611
-TRANSLATED_FLOOR = 2429
+FLOOR = 2617
+TRANSLATED_FLOOR = 2449
 
 
 if __name__ == "__main__":
