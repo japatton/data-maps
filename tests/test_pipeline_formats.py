@@ -245,6 +245,38 @@ class TestIvantiEventsWelf(unittest.TestCase):
                           "AUT24414: Agent login succeeded for user01@example.com/Users"))
 
 
+class TestIvantiAccessWelf(unittest.TestCase):
+    """admin-access and user-access WELF, in the key layouts of SEKOIA-IO's
+    Pulse Connect Secure tests: mgmt lines put proto..rcvd between type and
+    msg; newer vpn lines add sessionID before proto."""
+    head = 'id=firewall time="2026-09-23 12:00:00" pri=6 fw=192.0.2.10 vpn=host01 ivs=Default Network '
+    mgmt = head + ('user=admin01 realm="Admin Users" roles=".Administrators" type=mgmt proto= '
+                   'src=192.0.2.40 dst= dstname= sent= rcvd= '
+                   'msg="ADM22668: Login succeeded for admin01/Admin Users from 192.0.2.40."')
+    vpn_old = head + ('user=user01 realm="Users" roles="Role01" proto=auth src=192.0.2.30 dst= '
+                      'dstname= type=vpn op= arg="" result= sent= rcvd= agent="" duration= '
+                      'msg="AUT23457: Login failed using auth server Local (Local Authentication)."')
+    vpn_new = vpn_old.replace('roles="Role01" proto=', 'roles="Role01" sessionID="9000001" proto=') \
+                     .replace('AUT23457: Login failed', 'AUT24326: Primary authentication successful')
+
+    def test_admin_mgmt_layout(self):
+        ev = extract("ivanti-ics/admin-access__syslog-kv", self.mgmt)
+        self.assertEqual((ev.get("ivs"), ev.get("user"), ev.get("realm"), ev.get("roles"),
+                          ev.get("type"), ev.get("admin_src_ip")),
+                         ("Default Network", "admin01", "Admin Users", ".Administrators",
+                          "mgmt", "192.0.2.40"))
+        self.assertTrue(ev.get("msg", "").startswith("ADM22668:"))
+
+    def test_user_access_with_and_without_session_id(self):
+        for line in (self.vpn_old, self.vpn_new):
+            ev = extract("ivanti-ics/user-access__syslog-kv", line)
+            self.assertEqual((ev.get("user"), ev.get("realm"), ev.get("proto"), ev.get("src"),
+                              ev.get("ivs")),
+                             ("user01", "Users", "auth", "192.0.2.30", "Default Network"), line)
+            self.assertTrue(ev.get("msg", "").startswith("AUT2"), line)
+            self.assertNotIn("dst", ev)
+
+
 class TestNsxDfwPacketLog(unittest.TestCase):
     """The layouts in the NSX 4.0 Administration Guide, 'Distributed Firewall
     Packet Logs', with reserved values, framed as a log file, an ESXi syslog
