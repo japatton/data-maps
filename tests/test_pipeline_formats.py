@@ -40,9 +40,11 @@ def _filter_allows(expr, event):
     expr = (expr or "true").strip()
     if expr == "true":
         return True
-    m = re.match(r"^__e\['([^']+)'\]\s*===\s*undefined$", expr)
+    if " || " in expr:
+        return any(_filter_allows(part, event) for part in expr.split(" || "))
+    m = re.match(r"^__e\['([^']+)'\]\s*(===|!==)\s*undefined$", expr)
     if m:
-        return m.group(1) not in event
+        return (m.group(1) not in event) == (m.group(2) == "===")
     m = re.match(r"^__e\['([^']+)'\]\s*===?\s*'([^']*)'$", expr)
     if m:
         return event.get(m.group(1)) == m.group(2)
@@ -275,6 +277,27 @@ class TestIvantiAccessWelf(unittest.TestCase):
                              ("user01", "Users", "auth", "192.0.2.30", "Default Network"), line)
             self.assertTrue(ev.get("msg", "").startswith("AUT2"), line)
             self.assertNotIn("dst", ev)
+
+
+class TestF5ApmHeader(unittest.TestCase):
+    """BIG-IP's syslog puts the level word between host and process
+    ('host01 notice tmm1[12390]:'), as in SC4S's APM test records."""
+
+    def test_access_policy_sc4s_record(self):
+        with open(os.path.join(ROOT, "data", "samples", "f5-bigip-apm",
+                               "access-policy-syslog-raw-sc4s.log"), encoding="utf-8") as fh:
+            line = fh.readline().rstrip("\n")
+        ev = extract("f5-bigip-apm/access-policy__syslog-raw", line)
+        self.assertEqual((ev.get("service"), ev.get("pid"), ev.get("message_id"),
+                          ev.get("session_id"), ev.get("client_ip")),
+                         ("tmm1", "12390", "01490500", "e03c2ca8", "71.0.0.0"))
+
+    def test_level_word_is_optional_in_every_apm_header(self):
+        tail = "apmd[11023]: 01490102:5: /Common/ap01:Common:8c6be305: Access policy result: Network_Access"
+        for key in ("access-policy", "acl", "network-access"):
+            for head in ("<134>Sep 23 12:00:00 host01 notice ", "<134>Sep 23 12:00:00 host01 "):
+                ev = extract("f5-bigip-apm/%s__syslog-raw" % key, head + tail)
+                self.assertEqual(ev.get("message_id"), "01490102", (key, head))
 
 
 class TestNsxDfwPacketLog(unittest.TestCase):
