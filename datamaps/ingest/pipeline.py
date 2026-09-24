@@ -1,5 +1,6 @@
 """Cribl pipeline -> Elasticsearch ingest pipeline envelope."""
 import copy
+import json
 import re
 from collections import OrderedDict
 
@@ -68,6 +69,9 @@ def translate_pipeline(cribl):
         else:
             counts["translated"] += 1
         index += 1
+    if any(expr.SCRATCH_OBJECT in json.dumps(p) for p in processors):
+        processors.append(OrderedDict([("remove", OrderedDict([
+            ("field", expr.SCRATCH_OBJECT), ("ignore_missing", True)]))]))
     # A translator that emits the same note per rule (mask) says it once here.
     notes = list(OrderedDict.fromkeys(notes))
     summary = ("%s (translated from Cribl by data-maps: %d of %d steps "

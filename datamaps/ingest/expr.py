@@ -31,7 +31,8 @@ KNOWN_GLOBALS = ("__e", "true", "false", "null", "undefined", "typeof",
                  "new", "Date", "Math", "Array", "String", "Number",
                  "Boolean", "parseInt", "parseFloat", "JSON", "isNaN",
                  "isFinite", "C")
-CALLS = ("parseInt", "parseFloat", "Number", "String", "Boolean",
+CALLS = ("parseInt", "parseFloat", "Number.parseInt", "Number.parseFloat",
+         "Number", "String", "Boolean",
          "Date.parse", "Math.floor", "Math.round", "Math.abs", "Math.max",
          "Math.min", "Array.isArray")
 
@@ -327,6 +328,14 @@ class _Parser(object):
                 if name not in CALLS:
                     raise Untranslatable("%s is not supported" % name, offset)
                 return ("call", name, self.args())
+            if value == "Number" and self.peek(1)[:2] == ("punct", "."):
+                self.take()
+                self.take()
+                member = self.expect("ident")[1]
+                name = "Number.%s" % member
+                if name not in CALLS:
+                    raise Untranslatable("%s is not supported" % name, offset)
+                return ("call", name, self.args())
             if value in CALLS:
                 self.take()
                 return ("call", value, self.args())
@@ -348,7 +357,14 @@ def parse(src):
 
 # ---------------------------------------------------------------- emitter
 
-FIELD_MAP = {"_time": "@timestamp", "_raw": "message"}
+FIELD_MAP = {"_time": "@timestamp", "_raw": "message",
+             # The syslog pipelines' working copy of the message body: in
+             # Elasticsearch the body is already `message`.
+             "__body": "message"}
+# data-maps' own scratch fields (`__dm_*`) live under one object that the
+# envelope removes at the end - the Cribl originals are internal fields,
+# which never reach a destination.
+SCRATCH_PREFIX, SCRATCH_OBJECT = "__dm_", "dm_tmp"
 _PAINLESS_RESERVED = set("""if else while do for in continue break return new
 try catch throw this instanceof def void boolean byte short char int long
 float double true false null""".split())
@@ -402,6 +418,8 @@ def map_field(name):
         name = name[1:-1]
     if name in FIELD_MAP:
         return FIELD_MAP[name]
+    if name.startswith(SCRATCH_PREFIX) and len(name) > len(SCRATCH_PREFIX):
+        return "%s.%s" % (SCRATCH_OBJECT, name[len(SCRATCH_PREFIX):])
     if name.startswith("__"):
         raise Untranslatable("Cribl internal field %s has no Elasticsearch "
                              "equivalent" % name)
@@ -688,6 +706,8 @@ class _Emitter(object):
 
     def call(self, node):
         name, args = node[1], node[2]
+        if name in ("Number.parseInt", "Number.parseFloat"):
+            name = name[len("Number."):]
         if name == "parseInt":
             if len(args) == 2 and args[1] != ("num", "10"):
                 raise Untranslatable("parseInt with a radix other than 10")
