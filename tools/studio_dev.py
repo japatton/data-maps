@@ -89,8 +89,8 @@ def build_handler(root, proxies, opener, studio_src=None):
             overlay = self._overlay_path(clean)
             if overlay is not None:
                 return overlay
-            # SimpleHTTPRequestHandler(directory=...) is 3.7+, and the floor
-            # here is 3.6: rebase its cwd-relative answer onto `root`.
+            # Rebase the handler's cwd-relative answer onto `root` (written
+            # before SimpleHTTPRequestHandler's directory= could be assumed).
             rel = SimpleHTTPRequestHandler.translate_path(self, path)
             base = getattr(self, "directory", None) or os.getcwd()
             return os.path.join(root, os.path.relpath(rel, base))

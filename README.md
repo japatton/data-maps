@@ -533,10 +533,10 @@ an analysis suggestion into the editor, and editing
 YAML changes).
 
 Developer notes. The JavaScript tests run under Node (let the shell expand
-the glob; Node 20 does not expand a quoted one), and CI runs them: a
+the glob), and CI runs them: a
 `test-js` job on the stock Node image runs the JS suite and nothing else,
 so it needs no packages and no network. On Forgejo Actions the Python
-suite and the deploy run on the Python floor image; on GitLab the `test`
+suite and the deploy run on the Python image; on GitLab the `test`
 and `pages` jobs name no image and take the runner's default. Neither
 image ever needs the other runtime.
 
@@ -1268,9 +1268,10 @@ The suite takes about 15 seconds when PyYAML is built with libyaml
 not: parsing `data/technologies/` is most of what a build costs, and the
 suite builds many times.
 
-The code is Python 3.6-compatible by design (the CI runner floor);
-`requirements.txt` uses environment markers to pin working
-PyYAML/Jinja2/MarkupSafe versions on both old and modern interpreters.
+CI runs Python 3.14 and Node 24 (the current LTS). The Python 3.6 and
+Node 20 floor the code was first written to no longer applies;
+`requirements.txt` still carries environment markers that pin working
+PyYAML/Jinja2/MarkupSafe versions on older interpreters.
 Dependencies install from the approved PyPI index for your environment
 (point pip at it with `--index-url`, the `PIP_INDEX_URL` environment
 variable, or a group-level CI/CD variable); the build itself needs no
